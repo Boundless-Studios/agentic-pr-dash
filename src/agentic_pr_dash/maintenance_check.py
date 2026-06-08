@@ -6,20 +6,21 @@ Subcommands:
   complete — re-fetch unresolved review threads from GitHub and resolve them
              statelessly (no ledger required). Best-effort close the bead.
 
-Run via the CLI:  agentic-pr-dash <subcommand> [args]
-Or as a module:   python -m agentic_pr_dash <subcommand> [args]
+Run via:  agentic-pr-dash <subcommand> [args]
 
-Module-level imports are stdlib only (plus the dependency-free ``config``
-module); heavy deps are deferred into subcommand functions so that ``--help``
-works without the optional web extras installed.
+Module-level imports are stdlib only; heavy deps are deferred into subcommand
+functions so that ``--help`` works without the project venv's heavy deps.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import subprocess
 import sys
+import time
 
 from .config import load as load_config
 
@@ -182,7 +183,6 @@ _DEFAULT_FIX_LEASE_SECONDS = 1800  # 30 min — covers a long fix phase; overrid
 
 
 def _fix_lease_seconds() -> int:
-    # Legacy override kept as a fallback so existing installs keep working.
     raw = os.environ.get("GAIA_PR_WATCH_LEASE_SECONDS", "")
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
@@ -428,19 +428,18 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
 
 
 def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bool:
-    """Write the `pr-watch.armed` ownership marker (the single writer).
+    """Write the pr-watch.armed ownership marker (the single writer).
 
     Produces the EXACT same marker `.claude/hooks/arm-pr-watch.sh` writes
     (pr=/armed_at=/session_id=/pid=), atomically (tempfile + os.replace) so a
-    concurrent reader never sees a torn marker. Also writes `pr-watch.session`
+    concurrent reader never sees a torn marker. Also writes pr-watch.session
     so the worktree self-identifies. Reused by both the explicit `arm` subcommand
     and `list-owned` reconciliation (BOU-1442). Returns True on success.
     """
     import tempfile  # noqa: PLC0415
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    cfg = load_config(cwd)
-    state_dir = str(cfg.state_dir_for(cwd))
+    state_dir = str(load_config(cwd).state_dir_for(cwd))
     try:
         os.makedirs(state_dir, exist_ok=True)
     except OSError:
@@ -523,8 +522,14 @@ def _list_my_open_prs(cwd: str) -> dict[str, tuple[int, bool]]:
     out: dict[str, tuple[int, bool]] = {}
     for entry in data:
         branch = entry.get("headRefName")
-        if branch:
-            out[branch] = (int(entry.get("number")), bool(entry.get("isDraft", False)))
+        if not branch:
+            continue
+        number = int(entry.get("number"))
+        is_draft = bool(entry.get("isDraft", False))
+        existing = out.get(branch)
+        if existing is not None and not existing[1] and is_draft:
+            continue
+        out[branch] = (number, is_draft)
     return out
 
 
@@ -576,36 +581,43 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     return 1
 
 
-def _cmd_check(args: argparse.Namespace) -> int:
+def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
+    """Read-only blocker check for ONE worktree. Returns ``(exit_code, text)``.
+
+    The single shared core of the ``check`` CLI and the ``stop-gate`` Stop hook:
+      * 0  — clean / deferred-to-live-owner / no PR / draft (``text`` explains).
+      * 2  — gh unavailable.
+      * 10 — work pending; ``text`` is the self-contained maintenance prompt
+             (ending in ``PR_NUMBER=<n>``).
+
+    READ-ONLY except for the owner heartbeat/lease stamp (same as before the
+    extraction). ``check`` prints ``text`` and returns the code; ``stop-gate``
+    aggregates the exit-10 texts across owned worktrees.
+    """
     from . import github_api, maintenance  # noqa: PLC0415
 
-    cwd = os.path.abspath(args.cwd)
-    self_session_id = args.session_id or ""
+    cwd = os.path.abspath(cwd)
 
     # Ownership gate — defer to a live, actively-looping in-session owner before
     # doing any work (cheap, before resolving the PR). See _live_foreign_owner.
     owner = _live_foreign_owner(cwd, self_session_id)
     if owner is not None:
-        print(f"deferring to live PR-watch owner session {owner}")
-        return 0
+        return 0, f"deferring to live PR-watch owner session {owner}"
 
     # Resolve PR
     pr = _resolve_pr_for_branch(cwd)
 
     if pr is _GH_UNAVAILABLE:
-        print("could not list PRs (gh unavailable)")
-        return 2
+        return 2, "could not list PRs (gh unavailable)"
     if pr is None:
-        print("no open PR for this branch")
-        return 0
+        return 0, "no open PR for this branch"
 
     # Never service a DRAFT — the author marked it not-ready. This guards the
     # case where a PR was armed while open and later converted to draft
     # (arm/reconcile already refuse to arm a draft in the first place; this is
     # defense-in-depth on the read path, PR #1949 review).
     if pr.is_draft:
-        print("PR is a draft; nothing pending")
-        return 0
+        return 0, "PR is a draft; nothing pending"
 
     # Check for blockers — no state written, purely read
     blockers = maintenance.blockers_for_pr(pr)
@@ -615,19 +627,23 @@ def _cmd_check(args: argparse.Namespace) -> int:
     _touch_owner_heartbeat(cwd, self_session_id, bool(blockers))
 
     if not blockers:
-        print("nothing pending")
-        return 0
+        return 0, "nothing pending"
 
     # Fetch failed CI logs
     logs: dict[str, str] = {}
     if pr.failing_checks:
         logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
 
-    # Print the maintenance prompt and exit 10 — NO writes
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    print(prompt, end="")
-    print(f"\nPR_NUMBER={pr.number}")
-    return 10
+    return 10, f"{prompt}\nPR_NUMBER={pr.number}"
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    code, text = _check_worktree(args.cwd, args.session_id or "")
+    # Preserve the historical stdout shape: the prompt is printed with a single
+    # trailing newline (print adds it); the non-10 messages are one-liners.
+    print(text)
+    return code
 
 
 def _iter_worktrees_with_branch(cwd: str):
@@ -724,22 +740,38 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     to decide it may service one), so the pid/heartbeat ownership gate still
     yields exactly one executor per PR — no cross-session double-servicing.
     """
-    session_id = args.session_id
-    cwd = os.path.abspath(args.cwd)
+    paths = _collect_owned_worktrees(args.session_id, args.cwd, args.pid)
+    for path in paths:
+        print(path)
+    return 0
+
+
+def _collect_owned_worktrees(
+    session_id: str, cwd: str, pid: int | None
+) -> list[str]:
+    """Return the worktree paths this session owns — markered OR adopted.
+
+    Extracted from ``_cmd_list_owned`` so the ``stop-gate`` Stop hook can scope
+    its block to the same set the CLI prints. Behavior is unchanged: emit order
+    is `git worktree list` order, with reconciliation adopting unowned sibling
+    PR worktrees (BOU-1442). Returns [] when no session_id is given.
+    """
+    cwd = os.path.abspath(cwd)
     if not session_id:
-        return 0
-    pid = args.pid if args.pid is not None else _resolve_owner_pid()
+        return []
+    eff_pid = pid if pid is not None else _resolve_owner_pid()
 
     # One repo-wide gh call; {} when gh is unavailable → reconciliation is simply
     # skipped (the markered pass below still works deps-free).
     pr_map = _list_my_open_prs(cwd)
 
+    result: list[str] = []
     seen: set[str] = set()
 
     def _emit(path: str) -> None:
         if path not in seen:
             seen.add(path)
-            print(path)
+            result.append(path)
 
     # `git worktree list` is already scoped to THIS repo's worktree pool (wherever
     # they live on disk — a sibling `<repo>-worktrees/` dir for bug-bash, or
@@ -770,9 +802,9 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
         # (sub-agent PR) is still adopted.
         if _marker_live_foreign_pid(worktree_path, session_id):
             continue
-        if _write_arm_marker(worktree_path, session_id, int(pid), int(number)):
+        if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)
-    return 0
+    return result
 
 
 def _mark_maintenance_complete(maintenance, cwd: str, pr_number: int) -> None:  # type: ignore[no-untyped-def]
@@ -941,24 +973,211 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print(f"completed (bead left open; blockers remain: {', '.join(remaining)})")
         return 0
 
-    # Best-effort close the open tracked task via the configured tracker.
+    # Best-effort close the open maintenance bead
     branch = pr.branch
     if branch:
-        from .config import load as _load_config  # noqa: PLC0415
-        from .tracker import get_tracker  # noqa: PLC0415
+        try:
+            from .config import load as _load_config  # noqa: PLC0415
+            from .tracker import get_tracker  # noqa: PLC0415
+            tracker = get_tracker(_load_config(cwd))
+            task_id = tracker.find_task(pr=resolved_pr_number, branch=branch, cwd=cwd)
+            if task_id:
+                tracker.close_task(task_id, cwd=cwd)
+        except Exception:  # noqa: BLE001
+            pass
 
-        tracker = get_tracker(_load_config(cwd))
-        task_id = tracker.find_task(pr=resolved_pr_number, branch=branch, cwd=cwd)
-        if task_id:
-            tracker.close_task(task_id, cwd=cwd)
-
-    print("completed (task closed; no blockers remain)")
+    print("completed (bead closed; no blockers remain)")
     return 0
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# stop-gate — block-to-address Stop hook core
+# ---------------------------------------------------------------------------
+#
+# Replaces the old model-armed `/loop 3m /pr-maintenance-check` nudge. A Stop
+# hook runs this; on pending review/CI work it prints the maintenance prompt to
+# stderr and returns 2 (the harness surfaces that as a non-ignorable "keep
+# going"), so the SAME session addresses its PR feedback before going idle —
+# deterministic, session-scoped, no cron, no directive the model can ignore.
+# Two guards keep it from over-firing (mirroring pre-completion-pr-status.py):
+#   * a TIME rate-limit (GAIA_PR_WATCH_STOP_INTERVAL, default 180s) so the
+#     expensive gh check runs at most once per window, not every turn; and
+#   * a LOOP-BREAK counter (GAIA_PR_WATCH_STOP_LOOP_THRESHOLD, default 3) that
+#     releases the gate (exit 0) after N identical pending states, so an item
+#     the agent cannot resolve does not trap the session — it can then ask the
+#     user. State lives in <cwd>/<state-dir>/pr-watch.stop-loop.json.
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get("PR_AGENT_OPS_" + name) or os.environ.get("GAIA_PR_WATCH_" + name) or ""
+    try:
+        return int(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _stop_state_path(cwd: str) -> str:
+    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.stop-loop.json")
+
+
+def _load_stop_state(cwd: str) -> dict:
+    try:
+        with open(_stop_state_path(cwd), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_stop_state(cwd: str, state: dict) -> None:
+    try:
+        path = _stop_state_path(cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(state, fh)
+    except OSError:
+        pass
+
+
+def _read_session_marker(cwd: str) -> str:
+    """Best-effort: read the owning session id from pr-watch.session."""
+    try:
+        with open(
+            str(load_config(cwd).session_marker_for(cwd)),
+            encoding="utf-8",
+        ) as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
+    """Stable hash of the pending (worktree, prompt) set — identical pending
+    state across stops yields the same fingerprint so the loop-break counter can
+    detect "no progress"."""
+    h = hashlib.sha256()
+    for path, text in sorted(pending):
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(text.encode("utf-8"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _extract_pr_number(text: str) -> str:
+    """Pull the trailing PR_NUMBER=<n> the check appends, or '' if absent."""
+    for line in reversed(text.splitlines()):
+        if line.startswith("PR_NUMBER="):
+            return line[len("PR_NUMBER=") :].strip()
+    return ""
+
+
+def _build_stop_block(pending: list[tuple[str, str]]) -> str:
+    lines = [
+        "[pr-watch] Open PR(s) you own have pending review/CI work. Address it "
+        "before stopping — commit and push to the EXISTING branch (do not open a "
+        "new PR), then re-stop:\n"
+    ]
+    for path, text in pending:
+        lines.append(f"───── worktree: {path} ─────")
+        lines.append(text)
+        # Per-worktree completion command with the EXPLICIT --cwd so a sibling PR
+        # resolved from the launch cwd doesn't mark maintenance state / close the
+        # bead against the wrong worktree path (codex P2).
+        pr_ref = _extract_pr_number(text) or "<N>"
+        lines.append(
+            f"FIRST, before changing anything, capture this worktree's pre-fix "
+            f"baseline head: `gh pr view --json headRefOid -q .headRefOid` (run "
+            f"from {path}). THEN fix + commit + push, and finally:\n"
+            f"  agentic-pr-dash complete "
+            f"--pr {pr_ref} --baseline <that-pre-fix-sha> --cwd {path}\n"
+            f"(Passing the post-fix head as --baseline leaves threads unresolved.)"
+        )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def _cmd_stop_gate(args: argparse.Namespace) -> int:
+    # Fail SAFE: this runs on every Stop. A transient git/gh error must never
+    # block the stop (exit 2) or spew a traceback each turn — degrade to exit 0.
+    try:
+        return _stop_gate_impl(args)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _stop_gate_impl(args: argparse.Namespace) -> int:
+    cwd = os.path.abspath(args.cwd)
+
+    # --- time rate-limit: skip the expensive gh check if we ran recently -------
+    # ONLY when the previous run was CLEAN. If the last run found blockers
+    # (state carries a fingerprint), a within-window stop must NOT release —
+    # _check_worktree already refreshed this session's fix lease, so going idle
+    # would leave the detached loop deferring to us while the work sits unhandled
+    # (codex P1). Re-check instead (the loop-break counter still bounds blocking).
+    interval = _env_int("STOP_INTERVAL", 180)
+    state = _load_stop_state(cwd)
+    now = time.time()
+    last_pending = bool(state.get("fingerprint"))
+    if interval > 0 and not last_pending and (now - float(state.get("ts", 0) or 0)) < interval:
+        return 0
+    # Record this run's timestamp up-front; preserve any loop counter.
+    _save_stop_state(cwd, {**state, "ts": now})
+
+    # --- scope to owned worktrees ----------------------------------------------
+    # When this session has an identity, service ONLY what it owns. Do NOT fall
+    # back to [cwd]: an empty result can mean the cwd is owned by another LIVE
+    # session (collection skipped it on the foreign-pid check), and servicing it
+    # would let two sessions fix the same PR (codex P2). Fall back to cwd only
+    # when ownership is genuinely unknown (no session identity at all).
+    session_id = args.session_id or _read_session_marker(cwd)
+    if session_id:
+        owned = _collect_owned_worktrees(session_id, cwd, args.pid)
+    else:
+        owned = [cwd]
+
+    pending: list[tuple[str, str]] = []
+    for worktree in owned:
+        code, text = _check_worktree(worktree, session_id)
+        if code == 10:
+            pending.append((worktree, text))
+
+    if not pending:
+        # Clear the loop counter but KEEP the timestamp so a clean idle session
+        # does not re-run gh on every single turn.
+        _save_stop_state(cwd, {"ts": now})
+        return 0
+
+    fingerprint = _stop_fingerprint(pending)
+    count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+    _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+
+    print(_build_stop_block(pending), file=sys.stderr)
+
+    threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
+    if count >= threshold:
+        print(
+            f"[pr-watch] Same pending PR state seen {count}× with no progress — "
+            f"releasing the stop gate so you can ask the user or take a safe "
+            f"action. A later stop will re-enforce it.",
+            file=sys.stderr,
+        )
+        _save_stop_state(cwd, {"ts": now})  # reset counter, keep the rate-limit ts
+        return 0
+
+    print(
+        "[pr-watch] Address the items above (commit + push to each EXISTING "
+        "branch), run the per-worktree `complete` command shown in that section, "
+        "then try stopping again. If you cannot resolve an item yourself, tell "
+        "the user.",
+        file=sys.stderr,
+    )
+    return 2
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1066,6 +1285,30 @@ def main(argv: list[str] | None = None) -> int:
         "@me PR via gh and refuses to arm a draft or a branch with no open PR.",
     )
 
+    # --- stop-gate ---
+    stop_gate_p = subparsers.add_parser(
+        "stop-gate",
+        help="Stop-hook gate: block (exit 2 + stderr prompt) when owned PRs have "
+        "pending review/CI work, else exit 0. Time-rate-limited + loop-broken.",
+    )
+    stop_gate_p.add_argument(
+        "--cwd", default=".", help="Worktree root (default: current directory)."
+    )
+    stop_gate_p.add_argument(
+        "--session-id",
+        default="",
+        metavar="ID",
+        help="Owning session id. Scopes the check to this session's worktrees; "
+        "falls back to pr-watch.session, then to the cwd only.",
+    )
+    stop_gate_p.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        metavar="PID",
+        help="Owner pid for marker adoption (default: os.getppid()).",
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -1076,6 +1319,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_list_owned(args)
     if args.command == "arm":
         return _cmd_arm(args)
+    if args.command == "stop-gate":
+        return _cmd_stop_gate(args)
     # Unreachable (subparsers required=True)
     return 1
 

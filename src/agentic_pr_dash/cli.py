@@ -6,19 +6,21 @@ Subcommands:
     complete      Resolve review threads the fix addressed; post completion replies.
     arm           Stamp a worktree's open PR with an ownership marker for a session.
     list-owned    Print worktree paths a session owns.
+    stop-gate     Stop-hook core: block idling while owned PRs have pending work.
+    record        Record a session lifecycle event (for the dashboard's live view).
     loop          Run check/fix/complete continuously, dispatching to a configured agent.
     serve         Run the web dashboard.
 
-``check/complete/arm/list-owned`` route into the stateless maintenance executor;
-``loop`` and ``serve`` are runtime drivers. Run ``agentic-pr-dash <cmd> --help`` for
-per-subcommand options.
+``check/complete/arm/list-owned/stop-gate`` route into the stateless maintenance
+executor; ``record`` into the session registry; ``loop`` and ``serve`` are runtime
+drivers. Run ``agentic-pr-dash <cmd> --help`` for per-subcommand options.
 """
 
 from __future__ import annotations
 
 import sys
 
-_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned"}
+_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate"}
 _USAGE = __doc__
 
 
@@ -33,6 +35,10 @@ def main(argv: list[str] | None = None) -> int:
     if cmd in _EXECUTOR_CMDS:
         from . import maintenance_check
         return maintenance_check.main([cmd, *rest])
+
+    if cmd == "record":
+        from . import session_registry
+        return session_registry.main([cmd, *rest])
 
     if cmd == "loop":
         from . import loop
