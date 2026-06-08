@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pr-agent-ops"
+version = "0.1.0"
+description = "Watch your open PRs, detect what's blocking each (CI, review comments, conflicts), and let an agent resolve them — with a one-agent-per-PR ownership lease."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Boundless Studios" }]
+keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review"]
+
+# Core install is intentionally lean: the maintenance executor (check/complete/
+# arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
+dependencies = [
+    "pydantic>=2.0",
+]
+
+[project.optional-dependencies]
+# The web dashboard (`pr-agent-ops serve`) pulls in the web stack.
+serve = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "jinja2>=3.1",
+    "python-multipart>=0.0.9",
+    "httpx>=0.27",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.urls]
+Homepage = "https://github.com/Boundless-Studios/pr-agent-ops"
+Repository = "https://github.com/Boundless-Studios/pr-agent-ops"
+
+[project.scripts]
+pr-agent-ops = "pr_agent_ops.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pr_agent_ops"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/pr_agent_ops/templates" = "pr_agent_ops/templates"
+"src/pr_agent_ops/static" = "pr_agent_ops/static"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

@@ -1,0 +1,33 @@
+# pr-agent-ops configuration. Copy to `pr-agent-ops.toml` at your repo root.
+# Every value is optional and has a project-agnostic default. Any value can be
+# overridden by a PR_AGENT_OPS_* environment variable (e.g. PR_AGENT_OPS_TRACKER).
+
+[project]
+# GitHub repo as "owner/name". Auto-detected from the git remote when omitted.
+# repo = "octocat/hello-world"
+
+# Where ownership markers and per-PR maintenance state are written.
+state_dir = ".pr-agent-ops"
+
+# Task tracker for blocked PRs: "none" (default) | "beads" | "github-issues".
+tracker = "none"
+
+# Agent the loop dispatches fix prompts to. {prompt} is the injection point.
+executor = "claude --dangerously-skip-permissions -p {prompt}"
+
+# Process names treated as "a live agent" for ownership/liveness checks.
+discovery_names = ["claude", "codex"]
+
+# Self-hosted CI runner label to surface in the dashboard. Omit to hide the
+# runner-fleet panel entirely (the default for projects on GitHub-hosted runners).
+# runner_label = "my-ci-fleet"
+
+# Ownership lease tuning (seconds).
+lease_seconds = 1800
+heartbeat_ttl_seconds = 600
+
+# Optional: override the maintenance prompt wording (inline string or a file path).
+# prompt_template = "docs/pr-fix-prompt.md"
+
+# Optional: a session-event log the dashboard reads to show "agent working".
+# session_registry_path = "~/.pr-agent-ops/sessions/events.jsonl"

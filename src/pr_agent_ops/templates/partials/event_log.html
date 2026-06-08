@@ -1,0 +1,13 @@
+{% if not events %}
+<div class="empty-hint">Waiting for first poll...</div>
+{% endif %}
+
+{% for event in events %}
+<div class="event level-{{ event.level }}">
+    <span class="event-time">{{ event.timestamp.strftime('%H:%M:%S') }}</span>
+    {% if event.pr_number %}
+    <a class="event-pr" href="https://github.com/Boundless-Studios/gaia-free/pull/{{ event.pr_number }}" target="_blank" rel="noopener">#{{ event.pr_number }}</a>
+    {% endif %}
+    <span class="event-msg">{{ event.message }}</span>
+</div>
+{% endfor %}

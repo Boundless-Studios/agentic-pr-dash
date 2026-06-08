@@ -1,0 +1,113 @@
+<div class="runner-issues-header">
+    <div>
+        <h2>Runner Issues</h2>
+        <p>{{ runner_summary_label }}</p>
+    </div>
+    <span>{{ runner_issues | length }} issue{{ 's' if runner_issues | length != 1 }}</span>
+</div>
+
+<section class="desktop-docker-summary">
+    <div class="desktop-docker-top">
+        <h3>Remote desktop Docker</h3>
+        <span>{{ desktop_docker_container_count }} containers · {{ desktop_docker_instances | length }} branch{{ 'es' if desktop_docker_instances | length != 1 }}</span>
+    </div>
+    {% if desktop_docker_instances %}
+    <div class="desktop-docker-list">
+        {% for instance in desktop_docker_instances %}
+        <div class="desktop-docker-instance">
+            <div>
+                <strong>{{ instance.branch }}</strong>
+                <span>{{ instance.docker_daemon_name }}</span>
+            </div>
+            <div class="desktop-docker-containers">
+                {% for name in instance.container_names %}
+                <code>{{ name }}</code>
+                {% endfor %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="runner-issues-empty">No remote desktop Docker containers recorded.</div>
+    {% endif %}
+</section>
+
+<section class="desktop-docker-summary">
+    <div class="desktop-docker-top">
+        <h3>Running GitHub jobs</h3>
+        <span>{{ running_github_jobs | length }} job{{ 's' if running_github_jobs | length != 1 }}</span>
+    </div>
+    {% if running_github_jobs %}
+    <div class="runner-issues-list">
+        {% for item in running_github_jobs %}
+        {% set card = item.card %}
+        {% set job = item.job %}
+        <article class="runner-issue">
+            <div class="runner-issue-top">
+                <div>
+                    <a href="{{ card.pr_url or 'https://github.com/Boundless-Studios/gaia-free/pull/' ~ card.pr_number }}" target="_blank" rel="noopener">
+                        PR #{{ card.pr_number }}: {{ card.pr_title }}
+                    </a>
+                    <div>{{ card.branch }}</div>
+                </div>
+                <strong>{{ job.status | replace('_', ' ') }}</strong>
+            </div>
+            <div class="runner-issue-meta">
+                <span>{{ job.name }}</span>
+                <span>{{ job.runner_pool }}</span>
+                <span>{{ job.queue_age_label }}</span>
+                {% if job.matching_online_runner_count is not none %}
+                <span>{{ job.matching_online_runner_count }} matching online</span>
+                {% endif %}
+            </div>
+            {% if job.labels %}
+            <div class="runner-issue-labels">
+                {% for label in job.labels %}
+                <code>{{ label }}</code>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </article>
+        {% endfor %}
+    </div>
+    {% else %}
+    <div class="runner-issues-empty">No GitHub jobs currently running.</div>
+    {% endif %}
+</section>
+
+{% if runner_issues %}
+<div class="runner-issues-list">
+    {% for issue in runner_issues %}
+    {% set card = issue.card %}
+    {% set job = issue.job %}
+    <article class="runner-issue">
+        <div class="runner-issue-top">
+            <div>
+                <a href="{{ card.pr_url or 'https://github.com/Boundless-Studios/gaia-free/pull/' ~ card.pr_number }}" target="_blank" rel="noopener">
+                    PR #{{ card.pr_number }}: {{ card.pr_title }}
+                </a>
+                <div>{{ card.branch }}</div>
+            </div>
+            <strong>{{ job.warning }}</strong>
+        </div>
+        <div class="runner-issue-meta">
+            <span>{{ job.name }}</span>
+            <span>{{ job.runner_pool }}</span>
+            <span>{{ job.queue_age_label }}</span>
+            {% if job.matching_online_runner_count is not none %}
+            <span>{{ job.matching_online_runner_count }} matching online</span>
+            {% endif %}
+        </div>
+        {% if job.labels %}
+        <div class="runner-issue-labels">
+            {% for label in job.labels %}
+            <code>{{ label }}</code>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </article>
+    {% endfor %}
+</div>
+{% else %}
+<div class="runner-issues-empty">No runner issues identified.</div>
+{% endif %}

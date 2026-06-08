@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Worktree Dashboard</title>
+    <link rel="icon" type="image/svg+xml" href="/static/icon.svg">
+    <link rel="apple-touch-icon" href="/static/icon.svg">
+    <link rel="manifest" href="/static/manifest.json">
+    <meta name="theme-color" content="#161b22">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <link rel="stylesheet" href="/static/style.css?v={{ asset_version }}">
+    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
+</head>
+<body>
+    <script>
+        if ("serviceWorker" in navigator) {
+            // Auto-reload once when a new worker takes control so the page
+            // never lingers on stale cached JS/CSS after a deploy.
+            let swReloading = false;
+            navigator.serviceWorker.addEventListener("controllerchange", function () {
+                if (swReloading) return;
+                swReloading = true;
+                window.location.reload();
+            });
+            navigator.serviceWorker.register("/sw.js").then(function (reg) {
+                reg.update();
+            });
+        }
+    </script>
+    <header>
+        <div class="header-left">
+            <h1>Worktree Dashboard</h1>
+            <span class="pr-count">
+                {{ worktree_count }} worktrees{% if not show_agent_worktrees %} shown{% endif %} · {{ pr_count }} open PRs{% if hidden_agent_worktree_count %} · {{ hidden_agent_worktree_count }} agent worktrees hidden{% endif %}
+            </span>
+            <span class="runner-summary">{{ runner_summary_label }}</span>
+            <span class="bug-bash-banner-slot"
+                  hx-get="/partials/bug-bash-banner"
+                  hx-trigger="every 5s"
+                  hx-swap="innerHTML">
+                {% include 'partials/bug_bash_banner.html' %}
+            </span>
+        </div>
+        <div class="header-actions">
+            <label class="search-filter" for="pr-card-filter">
+                <span>Search</span>
+                <input id="pr-card-filter" type="search" placeholder="PR, branch, worktree">
+            </label>
+            <form method="get" action="/" class="filter-form">
+                <label class="toggle-filter">
+                    <input type="checkbox"
+                           name="show_agents"
+                           value="1"
+                           {% if show_agent_worktrees %}checked{% endif %}
+                           onchange="this.form.requestSubmit()">
+                    <span>Show agent worktrees</span>
+                </label>
+            </form>
+            <span class="live-dot"></span>
+            <span class="live-label">Live</span>
+            <form method="post" action="/api/refresh" style="display:inline">
+                <button type="submit" class="btn btn-ghost">Refresh</button>
+            </form>
+        </div>
+    </header>
+
+    <nav class="dashboard-tabs" aria-label="Dashboard views">
+        <a class="dashboard-tab{% if active_tab == 'board' %} dashboard-tab-active{% endif %}" href="{{ board_tab_url | default('/?tab=board', true) }}">Board</a>
+        <a class="dashboard-tab{% if active_tab == 'runner_issues' %} dashboard-tab-active{% endif %}" href="{{ runner_issues_tab_url | default('/?tab=runner_issues', true) }}">Runner Issues</a>
+    </nav>
+
+    <div class="layout">
+        {% if active_tab == 'runner_issues' %}
+        <section class="runner-issues-panel"
+                 hx-get="{{ runner_issues_partial_url }}"
+                 hx-trigger="every 5s"
+                 hx-swap="innerHTML">
+            {% include 'partials/runner_issues.html' %}
+        </section>
+        {% else %}
+        <section class="board"
+                 hx-get="{{ board_partial_url }}"
+                 hx-trigger="every 5s"
+                 hx-swap="innerHTML">
+            {% include 'partials/board.html' %}
+        </section>
+        {% endif %}
+
+        <aside class="sidebar">
+            {% if runner_fleet is defined %}
+            <div hx-get="/partials/runner-fleet"
+                 hx-trigger="every 15s"
+                 hx-swap="innerHTML">
+                {% include 'partials/runner_fleet.html' %}
+            </div>
+            {% endif %}
+            <h2>Activity</h2>
+            <div class="event-list"
+                 hx-get="/partials/event-log"
+                 hx-trigger="every 3s"
+                 hx-swap="innerHTML">
+                {% include 'partials/event_log.html' %}
+            </div>
+        </aside>
+    </div>
+    <script src="/static/app.js?v={{ asset_version }}"></script>
+</body>
+</html>

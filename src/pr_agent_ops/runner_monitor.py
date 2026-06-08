@@ -1,0 +1,223 @@
+"""GitHub Actions desktop runner load aggregation for the PR dashboard."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import json
+import subprocess
+from typing import Any, Callable, Optional
+from urllib.parse import urlparse
+
+
+DEFAULT_LABEL = "gaia-ci-desktop"
+
+
+@dataclass(frozen=True)
+class RunnerInfo:
+    id: int
+    name: str
+    status: str
+    busy: bool
+    labels: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class RunnerFleetLoad:
+    total: int = 0
+    online: int = 0
+    busy: int = 0
+    idle: int = 0
+    offline: int = 0
+    utilization_percent: int = 0
+    recommendation: str = "Desktop CI runner load is unavailable."
+    busy_runners: list[RunnerInfo] = field(default_factory=list)
+    idle_runners: list[RunnerInfo] = field(default_factory=list)
+    offline_runners: list[RunnerInfo] = field(default_factory=list)
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    error: str | None = None
+
+    @property
+    def is_degraded(self) -> bool:
+        return self.error is not None
+
+
+RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProcess[str]]
+
+
+def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        timeout=timeout_s,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+
+def parse_runner_inventory(
+    payload: dict[str, Any],
+    *,
+    label: str = DEFAULT_LABEL,
+) -> RunnerFleetLoad:
+    runners = [
+        _runner_from_payload(item)
+        for item in payload.get("runners", [])
+        if isinstance(item, dict) and label in _label_names(item)
+    ]
+    runners = [runner for runner in runners if runner is not None]
+
+    total = len(runners)
+    online_runners = [runner for runner in runners if runner.status == "online"]
+    busy_runners = [runner for runner in online_runners if runner.busy]
+    idle_runners = [runner for runner in online_runners if not runner.busy]
+    offline_runners = [runner for runner in runners if runner.status != "online"]
+    utilization = round((len(busy_runners) / len(online_runners)) * 100) if online_runners else 0
+
+    return RunnerFleetLoad(
+        total=total,
+        online=len(online_runners),
+        busy=len(busy_runners),
+        idle=len(idle_runners),
+        offline=len(offline_runners),
+        utilization_percent=utilization,
+        recommendation=_recommendation(
+            total=total,
+            online=len(online_runners),
+            busy=len(busy_runners),
+            idle=len(idle_runners),
+            offline=len(offline_runners),
+            label=label,
+        ),
+        busy_runners=sorted(busy_runners, key=lambda runner: runner.name),
+        idle_runners=sorted(idle_runners, key=lambda runner: runner.name),
+        offline_runners=sorted(offline_runners, key=lambda runner: runner.name),
+    )
+
+
+def get_runner_fleet_load(
+    *,
+    repo: str | None = None,
+    label: str = DEFAULT_LABEL,
+    cwd: str | None = None,
+    run: RunCommand = _run,
+) -> RunnerFleetLoad:
+    repo_name = repo or _get_repo_full_name(cwd=cwd, run=run)
+    if not repo_name:
+        return _degraded_load("Runner probe failed: could not determine active GitHub repository.")
+
+    cmd = ["gh", "api", f"repos/{repo_name}/actions/runners", "--paginate", "--slurp"]
+    try:
+        result = run(cmd, cwd, 20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _degraded_load(f"Runner probe failed: {exc}")
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        return _degraded_load(f"Runner probe failed: {detail}")
+
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return _degraded_load(f"Runner probe returned invalid JSON: {exc}")
+
+    try:
+        payload = _merge_runner_pages(payload)
+    except TypeError:
+        return _degraded_load("Runner probe returned an unexpected response shape.")
+
+    return parse_runner_inventory(payload, label=label)
+
+
+def _get_repo_full_name(*, cwd: str | None, run: RunCommand) -> str | None:
+    try:
+        result = run(["git", "remote", "get-url", "origin"], cwd, 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _repo_full_name_from_remote(result.stdout.strip())
+
+
+def _repo_full_name_from_remote(remote_url: str) -> str | None:
+    if remote_url.startswith("git@"):
+        path = remote_url.split(":", 1)[-1]
+    else:
+        parsed = urlparse(remote_url)
+        path = parsed.path
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    return f"{parts[-2]}/{parts[-1]}"
+
+
+def _merge_runner_pages(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, list):
+        raise TypeError("runner payload must be a dict or list of dict pages")
+    runners: list[Any] = []
+    for page in payload:
+        if not isinstance(page, dict):
+            raise TypeError("runner page must be a dict")
+        page_runners = page.get("runners", [])
+        if not isinstance(page_runners, list):
+            raise TypeError("runner page runners must be a list")
+        runners.extend(page_runners)
+    return {"runners": runners}
+
+
+def _runner_from_payload(item: dict[str, Any]) -> RunnerInfo | None:
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    return RunnerInfo(
+        id=int(item.get("id") or 0),
+        name=name,
+        status=str(item.get("status") or "unknown"),
+        busy=bool(item.get("busy")),
+        labels=tuple(_label_names(item)),
+    )
+
+
+def _label_names(item: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    for raw_label in item.get("labels", []):
+        if isinstance(raw_label, dict) and isinstance(raw_label.get("name"), str):
+            names.append(raw_label["name"])
+    return names
+
+
+def _recommendation(
+    *,
+    total: int,
+    online: int,
+    busy: int,
+    idle: int,
+    offline: int,
+    label: str,
+) -> str:
+    if total == 0:
+        return f"No {label} runners were found. Check runner labels or registration."
+    if online == 0:
+        return "Desktop CI is offline; heavy jobs will fall back to ubuntu-latest."
+    if idle > 0:
+        suffix = "s" if idle != 1 else ""
+        return f"Desktop CI has spare capacity for {idle} more concurrent job{suffix}."
+    if busy >= online and offline > 0:
+        return "Desktop CI is saturated, and offline runners could restore more parallel capacity."
+    if busy >= online:
+        return "Desktop CI is saturated. Add runners or raise concurrency if queues persist."
+    return "Desktop CI load is available."
+
+
+def _degraded_load(error: str) -> RunnerFleetLoad:
+    return RunnerFleetLoad(
+        recommendation="Desktop CI runner load is unavailable.",
+        error=error,
+    )

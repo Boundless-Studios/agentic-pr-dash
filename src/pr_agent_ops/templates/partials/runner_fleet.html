@@ -1,0 +1,64 @@
+<section class="runner-panel{% if runner_fleet.is_degraded %} runner-panel-degraded{% endif %}">
+    <div class="runner-panel-top">
+        <h2>Desktop CI</h2>
+        <span class="runner-updated">{{ runner_fleet.fetched_at.strftime('%H:%M:%S') }} UTC</span>
+    </div>
+
+    <div class="runner-metrics" aria-label="Desktop CI runner load">
+        <div class="runner-metric">
+            <span>Online</span>
+            <strong>{{ runner_fleet.online }}</strong>
+        </div>
+        <div class="runner-metric">
+            <span>Busy</span>
+            <strong>{{ runner_fleet.busy }}</strong>
+        </div>
+        <div class="runner-metric">
+            <span>Idle</span>
+            <strong>{{ runner_fleet.idle }}</strong>
+        </div>
+        <div class="runner-metric">
+            <span>Offline</span>
+            <strong>{{ runner_fleet.offline }}</strong>
+        </div>
+    </div>
+
+    <div class="runner-utilization" aria-label="Desktop CI utilization {{ runner_fleet.utilization_percent }} percent">
+        <span style="width: {{ runner_fleet.utilization_percent }}%"></span>
+    </div>
+
+    <p class="runner-recommendation">{{ runner_fleet.recommendation }}</p>
+
+    {% if runner_fleet.error %}
+    <div class="runner-error">{{ runner_fleet.error }}</div>
+    {% endif %}
+
+    {% if runner_fleet.total %}
+    <div class="runner-groups">
+        {% if runner_fleet.busy_runners %}
+        <div>
+            <span>Busy</span>
+            {% for runner in runner_fleet.busy_runners %}
+            <code>{{ runner.name }}</code>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% if runner_fleet.idle_runners %}
+        <div>
+            <span>Idle</span>
+            {% for runner in runner_fleet.idle_runners %}
+            <code>{{ runner.name }}</code>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% if runner_fleet.offline_runners %}
+        <div>
+            <span>Offline</span>
+            {% for runner in runner_fleet.offline_runners %}
+            <code>{{ runner.name }}</code>
+            {% endfor %}
+        </div>
+        {% endif %}
+    </div>
+    {% endif %}
+</section>

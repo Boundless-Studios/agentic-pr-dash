@@ -1,0 +1,348 @@
+"""Pydantic models for PR dashboard state."""
+
+from __future__ import annotations
+
+from datetime import datetime
+from enum import Enum
+
+from pydantic import BaseModel
+
+
+class PRStatus(str, Enum):
+    CLEAN = "clean"
+    NO_PR = "no_pr"
+    CI_FAILING = "ci_failing"
+    CI_PENDING = "ci_pending"
+    HAS_COMMENTS = "has_comments"
+    CI_AND_COMMENTS = "ci_and_comments"
+    MERGE_CONFLICT = "merge_conflict"
+    AGENT_WORKING = "agent_working"
+    AGENT_FAILED = "agent_failed"
+
+
+class MaintenanceStatus(str, Enum):
+    QUEUED = "queued"
+    SIGNALED = "signaled"
+    RUNNING = "running"
+    WAITING_FOR_PUSH = "waiting_for_push"
+    COMPLETE = "complete"
+    STALE = "stale"
+    FAILED = "failed"
+
+
+class CICheck(BaseModel):
+    name: str
+    status: str  # queued, in_progress, completed
+    conclusion: str | None = None  # success, failure, cancelled, timed_out
+
+
+class QueuedWorkflowJob(BaseModel):
+    name: str
+    status: str
+    labels: list[str] = []
+    queued_at: str | None = None
+    queue_seconds: int | None = None
+    runner_pool: str = "unknown"
+    matching_online_runner_count: int | None = None
+    warning: str | None = None
+
+    @property
+    def queue_age_label(self) -> str:
+        if self.queue_seconds is None:
+            return "unknown"
+        minutes = max(0, self.queue_seconds) // 60
+        seconds = max(0, self.queue_seconds) % 60
+        if minutes >= 60:
+            hours = minutes // 60
+            rem = minutes % 60
+            return f"{hours}h {rem}m"
+        if minutes:
+            return f"{minutes}m {seconds:02d}s"
+        return f"{seconds}s"
+
+
+class RunnerPoolHealth(BaseModel):
+    pool: str
+    total_count: int = 0
+    online_count: int = 0
+    busy_count: int = 0
+
+
+class RunnerExecutionSummary(BaseModel):
+    desktop_count: int = 0
+    github_hosted_count: int = 0
+    unknown_count: int = 0
+    # Wall-clock job runtime (completed_at - started_at) per pool, in seconds.
+    # Counts over-weight trivial/skipped hosted jobs; time shows where compute
+    # actually goes. Pre-#1714 cache files lack these keys and are rejected on
+    # load (see github_api.load_runner_execution_summary_cache) rather than
+    # rendered as a misleading "0m".
+    desktop_seconds: float = 0.0
+    github_hosted_seconds: float = 0.0
+    unknown_seconds: float = 0.0
+
+    @property
+    def total_count(self) -> int:
+        return self.desktop_count + self.github_hosted_count + self.unknown_count
+
+    @property
+    def total_seconds(self) -> float:
+        return self.desktop_seconds + self.github_hosted_seconds + self.unknown_seconds
+
+    @property
+    def local_count(self) -> int:
+        return self.desktop_count
+
+    @property
+    def remote_count(self) -> int:
+        return self.github_hosted_count
+
+    @property
+    def desktop_percent(self) -> int:
+        if self.total_count == 0:
+            return 0
+        return round((self.desktop_count / self.total_count) * 100)
+
+    @property
+    def github_hosted_percent(self) -> int:
+        if self.total_count == 0:
+            return 0
+        return round((self.github_hosted_count / self.total_count) * 100)
+
+    @property
+    def local_percent(self) -> int:
+        return self.desktop_percent
+
+    @property
+    def remote_percent(self) -> int:
+        return self.github_hosted_percent
+
+
+class ReviewComment(BaseModel):
+    id: int
+    author: str
+    body: str
+    path: str | None = None
+    line: int | None = None
+    created_at: str
+    is_inline: bool = True
+    thread_id: str | None = None
+
+
+class MaintenanceState(BaseModel):
+    pr_number: int
+    branch: str
+    worktree_path: str
+    state: MaintenanceStatus = MaintenanceStatus.QUEUED
+    blockers: list[str] = []
+    failing_checks: list[str] = []
+    review_comment_ids: list[int] = []
+    bead_id: str | None = None
+    last_signal_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    last_progress_at: datetime | None = None
+    failure_reason: str | None = None
+    output_tail: list[str] = []
+
+
+class PRData(BaseModel):
+    number: int
+    title: str
+    branch: str
+    base_branch: str = "main"
+    url: str
+    is_draft: bool = False
+    labels: list[str] = []
+    status: PRStatus = PRStatus.CLEAN
+    ci_checks: list[CICheck] = []
+    queued_jobs: list[QueuedWorkflowJob] = []
+    runner_pool_health: list[RunnerPoolHealth] = []
+    runner_execution_summary: RunnerExecutionSummary = RunnerExecutionSummary()
+    failing_checks: list[str] = []
+    review_comments: list[ReviewComment] = []
+    merge_state: str = "unknown"
+    review_decision: str = "none"
+    latest_commit_sha: str = ""
+    latest_commit_date: str = ""
+    worktree_path: str | None = None
+    agent_session_id: str | None = None
+    agent_cli_name: str | None = None
+    activity_message: str | None = None
+    activity_source: str | None = None
+    agent_failure_reason: str | None = None
+    no_push_comment_retry_count: int = 0
+    last_seen_comment_ids: set[int] = set()
+    agent_output: list[str] = []
+    last_polled: datetime | None = None
+    last_agent_dispatch: datetime | None = None
+    maintenance: MaintenanceState | None = None
+
+
+class AgentProcess(BaseModel):
+    pid: int
+    cli_name: str
+    label: str
+    command: str = ""
+
+
+class WorktreeCard(BaseModel):
+    id: str
+    worktree_name: str
+    worktree_path: str | None = None
+    worktree_hidden: bool = False
+    branch: str
+    environment_name: str | None = None
+    backend_port: str | None = None
+    frontend_port: str | None = None
+    slot: str | None = None
+    pr_number: int | None = None
+    pr_title: str | None = None
+    pr_url: str | None = None
+    is_draft: bool = False
+    status: PRStatus = PRStatus.CLEAN
+    ci_checks: list[CICheck] = []
+    queued_jobs: list[QueuedWorkflowJob] = []
+    runner_pool_health: list[RunnerPoolHealth] = []
+    runner_execution_summary: RunnerExecutionSummary = RunnerExecutionSummary()
+    failing_checks: list[str] = []
+    review_comments: list[ReviewComment] = []
+    merge_state: str = "unknown"
+    review_decision: str = "none"
+    latest_commit_sha: str = ""
+    latest_commit_date: str = ""
+    last_updated_label: str | None = None
+    active_agents: list[AgentProcess] = []
+    activity_message: str | None = None
+    activity_source: str | None = None
+    agent_failure_reason: str | None = None
+    agent_session_id: str | None = None
+    agent_output: list[str] = []
+    last_polled: datetime | None = None
+    last_agent_dispatch: datetime | None = None
+    maintenance: MaintenanceState | None = None
+    cleanup_candidate: bool = False
+    runtime_session_id: str | None = None
+    docker_mode: str | None = None
+    docker_daemon_name: str | None = None
+    container_names: list[str] = []
+    runtime_warnings: list[str] = []
+
+    @property
+    def runner_issue_count(self) -> int:
+        return sum(1 for job in self.queued_jobs if job.warning)
+
+    @property
+    def runner_indicator_label(self) -> str | None:
+        if self.queued_jobs:
+            matching_counts = [
+                job.matching_online_runner_count
+                for job in self.queued_jobs
+                if job.matching_online_runner_count is not None
+            ]
+            if matching_counts:
+                return f"Runner: {len(self.queued_jobs)} queued · {min(matching_counts)} match"
+            return f"Runner: {len(self.queued_jobs)} queued"
+        if self.runner_execution_summary.total_count:
+            return (
+                f"Runner: {self.runner_execution_summary.desktop_count} desktop · "
+                f"{self.runner_execution_summary.github_hosted_count} GitHub"
+            )
+        return None
+
+    @property
+    def runner_indicator_status(self) -> str:
+        if self.runner_issue_count:
+            return "warning"
+        if self.queued_jobs:
+            return "pending"
+        return "ok"
+
+    @property
+    def search_text(self) -> str:
+        parts: list[object] = [
+            self.id,
+            self.worktree_name,
+            self.worktree_path,
+            self.branch,
+            self.environment_name,
+            self.backend_port,
+            self.frontend_port,
+            self.slot,
+            self.pr_number,
+            self.pr_title,
+            self.pr_url,
+            self.status.value,
+            self.status.value.replace("_", " "),
+            self.merge_state,
+            self.review_decision,
+            self.latest_commit_sha,
+            self.latest_commit_date,
+            self.last_updated_label,
+            self.activity_message,
+            self.activity_source,
+            self.agent_failure_reason,
+            self.agent_session_id,
+            self.runtime_session_id,
+            self.docker_mode,
+            self.docker_daemon_name,
+                self.runner_indicator_label,
+                self.runner_execution_summary.desktop_count,
+                self.runner_execution_summary.github_hosted_count,
+                self.runner_execution_summary.desktop_percent,
+                self.runner_execution_summary.github_hosted_percent,
+        ]
+        if self.is_draft:
+            parts.append("draft")
+        if self.worktree_hidden:
+            parts.append("agent worktree hidden")
+        if self.cleanup_candidate:
+            parts.append("cleanup candidate")
+        parts.extend(self.failing_checks)
+        parts.extend(self.agent_output)
+        parts.extend(self.container_names)
+        parts.extend(self.runtime_warnings)
+
+        for check in self.ci_checks:
+            parts.extend([check.name, check.status, check.conclusion])
+        for job in self.queued_jobs:
+            parts.extend(
+                [
+                    job.name,
+                    job.status,
+                    job.runner_pool,
+                    job.queue_age_label,
+                    job.matching_online_runner_count,
+                ]
+            )
+        for pool in self.runner_pool_health:
+            parts.extend([pool.pool, pool.total_count, pool.online_count, pool.busy_count])
+        parts.extend(
+            [
+                self.runner_execution_summary.local_percent,
+                self.runner_execution_summary.remote_percent,
+            ]
+        )
+        for comment in self.review_comments:
+            parts.extend([comment.author, comment.body, comment.path, comment.line])
+        for agent in self.active_agents:
+            parts.extend([agent.label, agent.cli_name, agent.pid])
+        if self.maintenance:
+            parts.extend(
+                [
+                    self.maintenance.state.value,
+                    self.maintenance.state.value.replace("_", " "),
+                    self.maintenance.bead_id,
+                    self.maintenance.failure_reason,
+                ]
+            )
+            parts.extend(self.maintenance.blockers)
+            parts.extend(self.maintenance.output_tail)
+
+        return " ".join(str(part) for part in parts if part not in (None, ""))
+
+
+class EventEntry(BaseModel):
+    timestamp: datetime
+    pr_number: int | None = None
+    message: str
+    level: str = "info"  # info, warn, error, success

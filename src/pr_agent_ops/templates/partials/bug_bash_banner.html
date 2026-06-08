@@ -1,0 +1,6 @@
+{% if bug_bash_ready_count | default(0) %}
+<a class="bug-bash-banner" href="?tab=board#col-done"
+   title="Bug-bash PRs validated and waiting in the Clean column">
+    🧹 Bug Bash: {{ bug_bash_ready_count }} PR{{ 's' if bug_bash_ready_count != 1 else '' }} ready for review
+</a>
+{% endif %}
