@@ -19,6 +19,18 @@ jobs:
       - name: Install
         run: pip install -e ".[dev]"
       - name: Compile
-        run: python -m compileall src/pr_agent_ops
+        run: python -m compileall src/agentic_pr_dash
       - name: Test
         run: pytest -q
+      - name: Build wheel (catches packaging/data-file regressions)
+        run: |
+          pip install build
+          python -m build --wheel
+          python - <<'PY'
+          import glob, zipfile
+          w = sorted(glob.glob('dist/agentic_pr_dash-*.whl'))[-1]
+          names = zipfile.ZipFile(w).namelist()
+          assert any(n.endswith('static/app.js') for n in names), 'static data missing from wheel'
+          assert any(n.endswith('templates/dashboard.html') for n in names), 'templates missing from wheel'
+          print('wheel OK:', w)
+          PY

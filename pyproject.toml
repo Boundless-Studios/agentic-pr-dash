@@ -39,11 +39,10 @@ Repository = "https://github.com/Boundless-Studios/agentic-pr-dash"
 agentic-pr-dash = "agentic_pr_dash.cli:main"
 
 [tool.hatch.build.targets.wheel]
+# `packages` maps src/agentic_pr_dash -> agentic_pr_dash and includes ALL files
+# under it (templates/ + static/ data files too) — no force-include needed; a
+# force-include here would double-add those data files and break the wheel build.
 packages = ["src/agentic_pr_dash"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/agentic_pr_dash/templates" = "agentic_pr_dash/templates"
-"src/agentic_pr_dash/static" = "agentic_pr_dash/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
