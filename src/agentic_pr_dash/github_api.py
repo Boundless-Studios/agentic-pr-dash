@@ -149,13 +149,51 @@ def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]
     return parts[0] if parts else "", ""
 
 
+def _local_new_commits(baseline_sha: str, cwd: str | None) -> list[tuple[str, str]]:
+    """Commits after ``baseline_sha`` from the LOCAL git history (oldest first).
+
+    The local repo reflects a just-pushed commit immediately, whereas the GitHub
+    API lags a second or two — so preferring local avoids the race where
+    `complete` runs right after `git push`, sees no qualifying commit, and leaves
+    review threads unresolved (BOU-1479). Returns [] when the range can't be
+    resolved locally (no baseline, baseline not in local history) so the caller
+    falls back to the API.
+    """
+    if not baseline_sha:
+        return []
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "log", "--reverse", "--format=%H%x00%s",
+             f"{baseline_sha}..HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        sha, _, msg = line.partition("\0")
+        if sha.strip():
+            out.append((sha.strip(), msg.strip()))
+    return out
+
+
 def get_new_pr_commits(
     pr_number: int,
     baseline_sha: str,
     latest_sha: str,
     cwd: str | None = None,
 ) -> list[tuple[str, str]]:
-    """Return commits added to a PR after a known baseline SHA."""
+    """Return commits added to a PR after a known baseline SHA.
+
+    Prefers the local git range (immediate after a push); falls back to the
+    GitHub API when the range can't be resolved locally.
+    """
+    local = _local_new_commits(baseline_sha, cwd)
+    if local:
+        return local
+
     r = _run(
         ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/commits", "--jq", "."],
         cwd=cwd,
@@ -287,7 +325,23 @@ def edit_review_comment(comment_id: int, body: str, cwd: str | None = None) -> b
 
 
 def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
-    """Return list of filenames changed by a commit."""
+    """Return list of filenames changed by a commit.
+
+    Prefers local git (immediate, no API-indexing lag — BOU-1479); falls back to
+    the GitHub API when the commit isn't in the local history.
+    """
+    try:
+        lr = subprocess.run(
+            ["git", "-C", cwd or ".", "show", "--name-only", "--format=", sha],
+            capture_output=True, text=True, timeout=10,
+        )
+        if lr.returncode == 0:
+            files = [ln.strip() for ln in lr.stdout.splitlines() if ln.strip()]
+            if files:
+                return files
+    except (OSError, subprocess.SubprocessError):
+        pass
+
     r = _run(
         [
             "gh", "api",
