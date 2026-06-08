@@ -6,13 +6,45 @@ on:
   pull_request:
 
 jobs:
+  # Probe the Boundless-Studios self-hosted desktop fleet and choose where the
+  # test job runs — the fleet (gaia-ci-desktop) when it's online and authorized
+  # for this repo, else ubuntu-latest. Never hangs on an unavailable fleet.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      runs-on: ${{ steps.choose.outputs.runs-on }}
+    steps:
+      - id: choose
+        env:
+          # Fine-grained PAT with Actions/Administration read on this repo (or the
+          # org) so we can list runners. Optional — without it we use ubuntu.
+          PROBE_PAT: ${{ secrets.RUNNERS_PROBE_PAT }}
+          GH_TOKEN: ${{ secrets.RUNNERS_PROBE_PAT }}
+        run: |
+          set -e
+          # Fork PRs never run on our hardware.
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "::notice::Fork PR — using ubuntu-latest."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$PROBE_PAT" ]; then
+            echo "::notice::RUNNERS_PROBE_PAT not set; using ubuntu-latest. Add the secret to route CI to the desktop fleet."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          ONLINE=$(gh api "repos/${{ github.repository }}/actions/runners" \
+            --jq '[.runners[] | select(.status=="online") | select([.labels[].name] | index("gaia-ci-desktop"))] | length' 2>/dev/null || echo 0)
+          if [ "${ONLINE:-0}" -gt 0 ]; then
+            echo "Desktop fleet: ${ONLINE} online runner(s) — routing CI there."
+            echo 'runs-on=["gaia-ci-desktop"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No online gaia-ci-desktop runners authorized for this repo; using ubuntu-latest."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
   test:
-    # Route trusted runs (push, and PRs from THIS repo) to the shared self-hosted
-    # desktop fleet (Boundless-Studios `gaia-ci-desktop`) instead of billing GitHub
-    # Actions minutes. PRs from forks stay on ubuntu-latest — untrusted code must
-    # never run on our hardware. If the fleet is offline, wake it (or re-run on
-    # ubuntu-latest); this light suite has no auto-probe fallback.
-    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'gaia-ci-desktop' || 'ubuntu-latest' }}
+    needs: setup
+    runs-on: ${{ fromJSON(needs.setup.outputs.runs-on) }}
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
