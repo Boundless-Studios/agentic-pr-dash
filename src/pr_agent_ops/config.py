@@ -97,6 +97,14 @@ class Config:
     """Anything else from the ``[project]`` table, for adapters to read."""
 
     # --- derived paths -------------------------------------------------
+    # For the *primary* checkout (config-file root). Use the ``*_for(cwd)``
+    # variants when operating across sibling worktrees: ownership markers are
+    # per-worktree and MUST live under the worktree being checked, not under
+    # the config root.
+    @property
+    def state_dir_name(self) -> str:
+        return self.state_dir.name
+
     @property
     def maintenance_dir(self) -> Path:
         return self.state_dir / "pr-maintenance"
@@ -108,6 +116,18 @@ class Config:
     @property
     def session_marker(self) -> Path:
         return self.state_dir / "pr-watch.session"
+
+    def state_dir_for(self, cwd: str | Path) -> Path:
+        return Path(cwd) / self.state_dir_name
+
+    def watch_marker_for(self, cwd: str | Path) -> Path:
+        return self.state_dir_for(cwd) / "pr-watch.armed"
+
+    def session_marker_for(self, cwd: str | Path) -> Path:
+        return self.state_dir_for(cwd) / "pr-watch.session"
+
+    def maintenance_dir_for(self, cwd: str | Path) -> Path:
+        return self.state_dir_for(cwd) / "pr-maintenance"
 
     def resolved_repo(self, cwd: Path | None = None) -> str | None:
         """Return ``owner/name``, auto-detecting from ``gh``/git remote if unset."""
