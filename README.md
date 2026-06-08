@@ -17,6 +17,16 @@ It is **project-agnostic**: the GitHub repo, on-disk state directory, task
 tracker, agent executor, and CI runner label are all configuration, not
 hardcoded.
 
+## The board
+
+![PR dashboard board](docs/images/dashboard-board.png)
+
+Every open PR, grouped by what it needs — **Needs Attention** (failing CI or
+unaddressed review comments), **Agent Working** (an agent holds the lease and is
+actively fixing it), **CI Pending**, and **Clean** (ready to merge). The board
+polls GitHub in the background; cards update live as CI finishes and agents make
+progress.
+
 ## Install
 
 ```bash
@@ -77,13 +87,45 @@ executor = "codex exec --full-auto {prompt}"
 executor = "aider --message {prompt} --yes"
 ```
 
-## Ownership lease
+## The agentic review loop
 
-When more than one runner is active (e.g. an in-editor session **and** a
-detached `loop`), an `.agentic-pr-dash/pr-watch.armed` marker carries the owning
-session id, pid, a short-lived **heartbeat**, and a longer **fix lease**. A
-runner defers while another owner's heartbeat or fix lease is fresh, so a PR is
-only ever worked by one agent at a time.
+Each tick, the loop walks your open PRs and runs `check` on every one — a
+read-only pass over GitHub that classifies the PR as **clean**, **CI failing**,
+**review comments**, or **merge conflict**. When a PR needs work it does three
+things:
+
+1. **Claims a lease** (`arm`) — writes an ownership marker stamped with the
+   session id, pid, a short **heartbeat**, and a longer **fix lease**.
+2. **Dispatches the fix** — hands a generated prompt (the failing CI logs plus
+   the exact unresolved review comments) to your configured agent.
+3. **Completes** (`complete`) — once the agent commits and pushes, it replies on
+   each review thread it addressed, **resolves** the thread, and closes the
+   tracked task — but only if the PR is genuinely clean again.
+
+```mermaid
+flowchart LR
+    A([open PR]) --> B{check<br/>read-only}
+    B -- clean --> A
+    B -- "CI fail · review comments · conflict" --> C[arm<br/>claim lease]
+    C --> D[dispatch fix prompt<br/>to your agent]
+    D --> E[agent commits<br/>+ pushes]
+    E --> F[complete<br/>reply · resolve threads · close task]
+    F --> A
+```
+
+### One agent per PR
+
+The marker's **heartbeat** proves a runner's loop is alive and ticking; the
+**fix lease** covers the long, tick-less stretch while an agent is mid-fix.
+A second runner — say a detached `loop` running next to your in-editor session —
+**defers** while another owner's heartbeat or fix lease is still fresh, and
+pid-liveness reaps a crashed owner immediately. The result: a PR is only ever
+worked by one agent at a time — no double-fixing, no clobbered commits.
+
+![Agent holding the lease on a PR](docs/images/review-loop-card.png)
+
+*An agent holding the lease on PR #421 — addressing the reviewer's comment and
+the failing unit test, with the heartbeat and progress timestamps ticking.*
 
 ## License
 

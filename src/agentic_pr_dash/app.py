@@ -875,96 +875,140 @@ def _runner_summary_label(summary: RunnerExecutionSummary, issue_count: int) -> 
 
 
 def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
+    """Illustrative demo data for `/proof/pr-dashboard-fixture/<scenario>`.
+
+    Project-agnostic sample PRs used for screenshots and a no-network preview of
+    the dashboard. `baseline` shows a single clean PR; `diagnostic` shows the
+    full review loop in motion across three board columns.
+    """
     if scenario == "baseline":
         return [
             WorktreeCard(
-                id="proof-baseline-clean",
-                worktree_name="Proof baseline",
-                worktree_path="/tmp/gaia-proof/baseline",
-                branch="bou-1189-proof-baseline",
-                environment_name="proof-baseline",
-                frontend_port="3900",
-                backend_port="8900",
-                slot="9",
-                pr_number=1189,
-                pr_title="Proof ready to merge",
-                pr_url="https://github.com/octocat/hello-world/pull/1189",
+                id="demo-clean",
+                worktree_name="checkout-retry",
+                worktree_path="/home/dev/worktrees/checkout-retry",
+                branch="feature/checkout-retry",
+                environment_name="checkout-retry",
+                frontend_port="3001",
+                backend_port="8010",
+                slot="1",
+                pr_number=412,
+                pr_title="Retry failed checkout webhooks",
+                pr_url="https://github.com/octocat/hello-world/pull/412",
                 status=PRStatus.CLEAN,
                 ci_checks=[
-                    CICheck(name="backend-unit", status="completed", conclusion="success"),
-                    CICheck(name="frontend-unit", status="completed", conclusion="success"),
+                    CICheck(name="unit", status="completed", conclusion="success"),
+                    CICheck(name="e2e", status="completed", conclusion="success"),
                 ],
-                latest_commit_sha="abc1189",
+                latest_commit_sha="a1b2c3d",
                 latest_commit_date="2026-05-25T15:00:00Z",
-                last_updated_label="proof fixture",
+                last_updated_label="just now",
             )
         ]
 
     if scenario == "diagnostic":
         return [
+            # Column 1 — Needs Attention: failing CI + an unaddressed review comment.
             WorktreeCard(
-                id="proof-diagnostic-warning",
-                worktree_name="Proof diagnostics",
-                worktree_path="/tmp/gaia-proof/diagnostic",
-                branch="bou-1189-proof-diagnostic",
-                environment_name="proof-diagnostic",
-                frontend_port="3901",
-                backend_port="8901",
-                slot="8",
-                pr_number=1190,
-                pr_title="Expose queue diagnostics",
-                pr_url="https://github.com/octocat/hello-world/pull/1190",
-                status=PRStatus.AGENT_WORKING,
+                id="demo-attention",
+                worktree_name="rate-limiter",
+                worktree_path="/home/dev/worktrees/rate-limiter",
+                branch="feature/rate-limiter",
+                environment_name="rate-limiter",
+                frontend_port="3002",
+                backend_port="8020",
+                slot="2",
+                pr_number=418,
+                pr_title="Add token-bucket rate limiting",
+                pr_url="https://github.com/octocat/hello-world/pull/418",
+                status=PRStatus.CI_AND_COMMENTS,
                 ci_checks=[
-                    CICheck(name="backend-unit", status="completed", conclusion="failure"),
-                    CICheck(name="frontend-unit", status="queued"),
+                    CICheck(name="unit", status="completed", conclusion="failure"),
+                    CICheck(name="lint", status="completed", conclusion="success"),
                 ],
-                queued_jobs=[
-                    QueuedWorkflowJob(
-                        name="frontend-unit",
-                        status="in_progress",
-                        labels=["self-hosted", "linux", "x64", "self-hosted-demo"],
-                        queued_at="2026-05-25T15:14:00Z",
-                        queue_seconds=180,
-                        runner_pool="self-hosted-demo",
-                        matching_online_runner_count=1,
-                    )
-                ],
-                failing_checks=["backend-unit"],
+                failing_checks=["unit"],
                 review_comments=[
                     ReviewComment(
                         id=501,
-                        author="reviewer",
-                        body="Reviewer requested queue visibility for stuck self-hosted CI.",
-                        path="agentic_pr_dash/app.py",
-                        line=501,
+                        author="alice",
+                        body="This races under concurrent refills — guard the bucket with a lock.",
+                        path="src/limiter.py",
+                        line=88,
                         created_at="2026-05-25T15:10:00Z",
                     )
                 ],
-                active_agents=[AgentProcess(pid=4242, cli_name="codex", label="Codex")],
-                activity_message="Codex working on diagnostics",
+                latest_commit_sha="d4e5f6a",
+                latest_commit_date="2026-05-25T15:08:00Z",
+                last_updated_label="2m ago",
+            ),
+            # Column 2 — Agent Working: an agent holds the lease and is fixing it.
+            WorktreeCard(
+                id="demo-working",
+                worktree_name="search-pagination",
+                worktree_path="/home/dev/worktrees/search-pagination",
+                branch="feature/search-pagination",
+                environment_name="search-pagination",
+                frontend_port="3003",
+                backend_port="8030",
+                slot="3",
+                pr_number=421,
+                pr_title="Cursor-based search pagination",
+                pr_url="https://github.com/octocat/hello-world/pull/421",
+                status=PRStatus.AGENT_WORKING,
+                ci_checks=[CICheck(name="unit", status="completed", conclusion="failure")],
+                failing_checks=["unit"],
+                review_comments=[
+                    ReviewComment(
+                        id=512,
+                        author="bob",
+                        body="Off-by-one on the last page — add a test for the empty tail.",
+                        path="src/search.py",
+                        line=140,
+                        created_at="2026-05-25T15:11:00Z",
+                    )
+                ],
+                active_agents=[AgentProcess(pid=4242, cli_name="claude", label="Claude")],
+                activity_message="Addressing review comment + failing unit test",
                 activity_source="dashboard",
                 maintenance=MaintenanceState(
-                    pr_number=1190,
-                    branch="bou-1189-proof-diagnostic",
-                    worktree_path="/tmp/gaia-proof/diagnostic",
+                    pr_number=421,
+                    branch="feature/search-pagination",
+                    worktree_path="/home/dev/worktrees/search-pagination",
                     state=MaintenanceStatus.RUNNING,
                     blockers=["ci failing", "review comments"],
-                    failing_checks=["backend-unit"],
-                    review_comment_ids=[501],
-                    bead_id="demo-1",
+                    failing_checks=["unit"],
+                    review_comment_ids=[512],
                     last_heartbeat_at=datetime(2026, 5, 25, 15, 12, 0),
                     last_progress_at=datetime(2026, 5, 25, 15, 13, 0),
-                    output_tail=["queue depth: 3", "runner idle: false", "remote unavailable"],
+                    output_tail=["reproduced empty-tail bug", "adding regression test", "running unit"],
                 ),
-                runtime_session_id="proof-session-diagnostic",
-                docker_mode="remote",
-                docker_daemon_name="desktop-linux",
-                container_names=["gaia-backend-proof", "gaia-frontend-proof"],
-                runtime_warnings=["remote unavailable"],
-                agent_output=["inspected queue", "waiting for backend-unit"],
-                last_updated_label="proof fixture",
-            )
+                runtime_session_id="sess-search-pagination",
+                latest_commit_sha="b7c8d9e",
+                latest_commit_date="2026-05-25T15:09:00Z",
+                last_updated_label="30s ago",
+            ),
+            # Column 3 — Clean: ready to merge.
+            WorktreeCard(
+                id="demo-clean",
+                worktree_name="checkout-retry",
+                worktree_path="/home/dev/worktrees/checkout-retry",
+                branch="feature/checkout-retry",
+                environment_name="checkout-retry",
+                frontend_port="3001",
+                backend_port="8010",
+                slot="1",
+                pr_number=412,
+                pr_title="Retry failed checkout webhooks",
+                pr_url="https://github.com/octocat/hello-world/pull/412",
+                status=PRStatus.CLEAN,
+                ci_checks=[
+                    CICheck(name="unit", status="completed", conclusion="success"),
+                    CICheck(name="e2e", status="completed", conclusion="success"),
+                ],
+                latest_commit_sha="a1b2c3d",
+                latest_commit_date="2026-05-25T15:00:00Z",
+                last_updated_label="just now",
+            ),
         ]
 
     return []
