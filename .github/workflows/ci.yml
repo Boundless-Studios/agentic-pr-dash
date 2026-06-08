@@ -7,7 +7,12 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Route trusted runs (push, and PRs from THIS repo) to the shared self-hosted
+    # desktop fleet (Boundless-Studios `gaia-ci-desktop`) instead of billing GitHub
+    # Actions minutes. PRs from forks stay on ubuntu-latest — untrusted code must
+    # never run on our hardware. If the fleet is offline, wake it (or re-run on
+    # ubuntu-latest); this light suite has no auto-probe fallback.
+    runs-on: ${{ (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository) && 'gaia-ci-desktop' || 'ubuntu-latest' }}
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
