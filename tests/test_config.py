@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from pr_agent_ops import config
+from agentic_pr_dash import config
 
 
 @pytest.fixture(autouse=True)
@@ -14,7 +14,7 @@ def _clear_cache():
 
 def test_defaults(tmp_path):
     c = config.load(str(tmp_path))
-    assert c.state_dir.name == ".pr-agent-ops"
+    assert c.state_dir.name == ".agentic-pr-dash"
     assert c.tracker == "none"
     assert c.discovery_names == ("claude", "codex")
     assert c.lease_seconds == 1800
@@ -23,9 +23,9 @@ def test_defaults(tmp_path):
 
 
 def test_env_override(tmp_path, monkeypatch):
-    monkeypatch.setenv("PR_AGENT_OPS_TRACKER", "beads")
-    monkeypatch.setenv("PR_AGENT_OPS_STATE_DIR", ".custom")
-    monkeypatch.setenv("PR_AGENT_OPS_LEASE_SECONDS", "42")
+    monkeypatch.setenv("AGENTIC_PR_DASH_TRACKER", "beads")
+    monkeypatch.setenv("AGENTIC_PR_DASH_STATE_DIR", ".custom")
+    monkeypatch.setenv("AGENTIC_PR_DASH_LEASE_SECONDS", "42")
     config.load.cache_clear()
     c = config.load(str(tmp_path))
     assert c.tracker == "beads"
@@ -34,7 +34,7 @@ def test_env_override(tmp_path, monkeypatch):
 
 
 def test_legacy_gaia_env_fallback(tmp_path, monkeypatch):
-    monkeypatch.delenv("PR_AGENT_OPS_TRACKER", raising=False)
+    monkeypatch.delenv("AGENTIC_PR_DASH_TRACKER", raising=False)
     monkeypatch.setenv("GAIA_TRACKER", "github-issues")
     config.load.cache_clear()
     c = config.load(str(tmp_path))
@@ -50,7 +50,7 @@ def test_legacy_gaia_state_dir_adopted(tmp_path):
 
 
 def test_toml_file(tmp_path):
-    (tmp_path / "pr-agent-ops.toml").write_text(
+    (tmp_path / "agentic-pr-dash.toml").write_text(
         '[project]\ntracker = "github-issues"\nrunner_label = "my-fleet"\n'
         'discovery_names = ["claude", "aider"]\n',
         encoding="utf-8",
@@ -64,14 +64,14 @@ def test_toml_file(tmp_path):
 
 def test_per_worktree_marker_paths(tmp_path):
     c = config.load(str(tmp_path))
-    assert c.watch_marker_for("/tmp/wt") == Path("/tmp/wt/.pr-agent-ops/pr-watch.armed")
-    assert c.session_marker_for("/tmp/wt") == Path("/tmp/wt/.pr-agent-ops/pr-watch.session")
-    assert c.maintenance_dir_for("/tmp/wt") == Path("/tmp/wt/.pr-agent-ops/pr-maintenance")
+    assert c.watch_marker_for("/tmp/wt") == Path("/tmp/wt/.agentic-pr-dash/pr-watch.armed")
+    assert c.session_marker_for("/tmp/wt") == Path("/tmp/wt/.agentic-pr-dash/pr-watch.session")
+    assert c.maintenance_dir_for("/tmp/wt") == Path("/tmp/wt/.agentic-pr-dash/pr-maintenance")
 
 
 def test_env_beats_toml(tmp_path, monkeypatch):
-    (tmp_path / "pr-agent-ops.toml").write_text('[project]\ntracker = "beads"\n', encoding="utf-8")
-    monkeypatch.setenv("PR_AGENT_OPS_TRACKER", "none")
+    (tmp_path / "agentic-pr-dash.toml").write_text('[project]\ntracker = "beads"\n', encoding="utf-8")
+    monkeypatch.setenv("AGENTIC_PR_DASH_TRACKER", "none")
     config.load.cache_clear()
     c = config.load(str(tmp_path))
     assert c.tracker == "none"

@@ -1,7 +1,7 @@
-"""Web dashboard runner (``pr-agent-ops serve``).
+"""Web dashboard runner (``agentic-pr-dash serve``).
 
 Boots the FastAPI app under uvicorn. The web stack is an optional dependency —
-install with ``pip install 'pr-agent-ops[serve]'``.
+install with ``pip install 'agentic-pr-dash[serve]'``.
 """
 
 from __future__ import annotations
@@ -22,25 +22,25 @@ def main() -> None:
         import uvicorn
     except ImportError:
         print(
-            "pr-agent-ops serve needs the web extra: pip install 'pr-agent-ops[serve]'",
+            "agentic-pr-dash serve needs the web extra: pip install 'agentic-pr-dash[serve]'",
             file=sys.stderr,
         )
         raise SystemExit(1)
 
-    host = os.environ.get("PR_AGENT_OPS_HOST", "127.0.0.1")
-    port = int(os.environ.get("PR_AGENT_OPS_PORT", os.environ.get("PORT", "9000")))
-    reload_enabled = os.environ.get("PR_AGENT_OPS_RELOAD", "").lower() in {"1", "true", "yes", "on"}
+    host = os.environ.get("AGENTIC_PR_DASH_HOST", "127.0.0.1")
+    port = int(os.environ.get("AGENTIC_PR_DASH_PORT", os.environ.get("PORT", "9000")))
+    reload_enabled = os.environ.get("AGENTIC_PR_DASH_RELOAD", "").lower() in {"1", "true", "yes", "on"}
 
     if _port_in_use(host, port):
         print(
-            f"pr-agent-ops dashboard already running at http://{host}:{port} "
+            f"agentic-pr-dash dashboard already running at http://{host}:{port} "
             f"— port {port} is in use",
             file=sys.stderr,
         )
         raise SystemExit(1)
 
     uvicorn.run(
-        "pr_agent_ops.app:app",
+        "agentic_pr_dash.app:app",
         host=host,
         port=port,
         reload=reload_enabled,

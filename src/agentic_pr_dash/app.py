@@ -936,7 +936,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                         id=501,
                         author="reviewer",
                         body="Reviewer requested queue visibility for stuck self-hosted CI.",
-                        path="pr_agent_ops/app.py",
+                        path="agentic_pr_dash/app.py",
                         line=501,
                         created_at="2026-05-25T15:10:00Z",
                     )

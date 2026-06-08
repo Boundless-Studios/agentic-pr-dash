@@ -6,8 +6,8 @@ Subcommands:
   complete — re-fetch unresolved review threads from GitHub and resolve them
              statelessly (no ledger required). Best-effort close the bead.
 
-Run via the CLI:  pr-agent-ops <subcommand> [args]
-Or as a module:   python -m pr_agent_ops <subcommand> [args]
+Run via the CLI:  agentic-pr-dash <subcommand> [args]
+Or as a module:   python -m agentic_pr_dash <subcommand> [args]
 
 Module-level imports are stdlib only (plus the dependency-free ``config``
 module); heavy deps are deferred into subcommand functions so that ``--help``
@@ -963,7 +963,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="pr-agent-ops",
+        prog="agentic-pr-dash",
         description="PR maintenance check — stateless read-only check and completion.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)

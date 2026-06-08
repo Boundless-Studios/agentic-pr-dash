@@ -16,11 +16,11 @@ from .config import load as load_config
 
 
 def _env(name: str, default: str = "") -> str:
-    """Prefer PR_AGENT_OPS_<name>, fall back to GAIA_<name>."""
-    return os.environ.get("PR_AGENT_OPS_" + name) or os.environ.get("GAIA_" + name) or default
+    """Prefer AGENTIC_PR_DASH_<name>, fall back to GAIA_<name>."""
+    return os.environ.get("AGENTIC_PR_DASH_" + name) or os.environ.get("GAIA_" + name) or default
 
 
-_NEW_DEFAULT_REGISTRY = Path.home() / ".pr-agent-ops" / "sessions" / "events.jsonl"
+_NEW_DEFAULT_REGISTRY = Path.home() / ".agentic-pr-dash" / "sessions" / "events.jsonl"
 _LEGACY_DEFAULT_REGISTRY = Path.home() / ".gaia" / "sessions" / "events.jsonl"
 
 
@@ -43,7 +43,7 @@ DEFAULT_REGISTRY = _NEW_DEFAULT_REGISTRY
 
 # Launch sources that are the dashboard's OWN automation, not an independent
 # session whose worktree we should defer to.
-DASHBOARD_LAUNCH_SOURCES = ("pr-agent-ops", "pr-dashboard")
+DASHBOARD_LAUNCH_SOURCES = ("agentic-pr-dash", "pr-dashboard")
 
 
 @dataclass

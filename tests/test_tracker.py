@@ -1,13 +1,13 @@
 from pathlib import Path
 
-from pr_agent_ops import tracker
-from pr_agent_ops.config import Config
+from agentic_pr_dash import tracker
+from agentic_pr_dash.config import Config
 
 
 def _cfg(name: str) -> Config:
     return Config(
         repo=None,
-        state_dir=Path(".pr-agent-ops"),
+        state_dir=Path(".agentic-pr-dash"),
         tracker=name,
         executor="",
         discovery_names=("claude",),

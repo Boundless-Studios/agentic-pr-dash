@@ -1,7 +1,7 @@
 import pytest
 
-from pr_agent_ops import config, maintenance
-from pr_agent_ops.models import PRData, ReviewComment
+from agentic_pr_dash import config, maintenance
+from agentic_pr_dash.models import PRData, ReviewComment
 
 
 @pytest.fixture(autouse=True)
@@ -55,11 +55,11 @@ def test_prompt_is_tool_neutral_by_default(tmp_path):
     )
     assert "feature-pipeline" not in prompt
     assert "pr_dashboard" not in prompt
-    assert "pr-agent-ops complete" in prompt
+    assert "agentic-pr-dash complete" in prompt
 
 
 def test_prompt_template_override(tmp_path, monkeypatch):
-    monkeypatch.setenv("PR_AGENT_OPS_PROMPT_TEMPLATE", "FOLLOW THE HOUSE RULES.")
+    monkeypatch.setenv("AGENTIC_PR_DASH_PROMPT_TEMPLATE", "FOLLOW THE HOUSE RULES.")
     config.load.cache_clear()
     prompt = maintenance.build_maintenance_prompt(_pr(worktree_path=str(tmp_path)))
     assert "FOLLOW THE HOUSE RULES." in prompt

@@ -239,7 +239,7 @@ def build_maintenance_prompt(
             "",
             "## Review Comments",
             "Address each review comment below, commit, and push.",
-            "After pushing, run `pr-agent-ops complete` "
+            "After pushing, run `agentic-pr-dash complete` "
             "to post completion replies and resolve the threads.",
         ])
         for comment in pr.review_comments:

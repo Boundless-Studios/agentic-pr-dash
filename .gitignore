@@ -7,7 +7,7 @@ dist/
 .venv/
 venv/
 .env
-.pr-agent-ops/
+.agentic-pr-dash/
 .gaia/
 .pytest_cache/
 .ruff_cache/

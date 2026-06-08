@@ -1,12 +1,12 @@
-"""Central configuration for pr-agent-ops.
+"""Central configuration for agentic-pr-dash.
 
 Everything that used to be hardcoded to one project — the GitHub repo, the
 on-disk state directory, the task tracker, the agent executor, the CI runner
 label, the maintenance-prompt wording — is resolved here from (in priority
 order):
 
-    1. explicit environment variables (``PR_AGENT_OPS_*``)
-    2. a project-local ``pr-agent-ops.toml`` (found by walking up from cwd)
+    1. explicit environment variables (``AGENTIC_PR_DASH_*``)
+    2. a project-local ``agentic-pr-dash.toml`` (found by walking up from cwd)
     3. sensible, project-agnostic defaults
 
 Legacy ``GAIA_*`` environment variables and a ``.gaia`` state directory are
@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 
-ENV_PREFIX = "PR_AGENT_OPS_"
+ENV_PREFIX = "AGENTIC_PR_DASH_"
 LEGACY_ENV_PREFIX = "GAIA_"
-CONFIG_FILENAME = "pr-agent-ops.toml"
+CONFIG_FILENAME = "agentic-pr-dash.toml"
 
-DEFAULT_STATE_DIRNAME = ".pr-agent-ops"
+DEFAULT_STATE_DIRNAME = ".agentic-pr-dash"
 LEGACY_STATE_DIRNAME = ".gaia"
 DEFAULT_DISCOVERY_NAMES = ("claude", "codex")
 DEFAULT_LEASE_SECONDS = 1800
@@ -35,7 +35,7 @@ DEFAULT_HEARTBEAT_TTL_SECONDS = 600
 
 
 def _env(name: str) -> str | None:
-    """Read ``PR_AGENT_OPS_<name>``, falling back to the legacy ``GAIA_<name>``."""
+    """Read ``AGENTIC_PR_DASH_<name>``, falling back to the legacy ``GAIA_<name>``."""
     return os.environ.get(ENV_PREFIX + name) or os.environ.get(LEGACY_ENV_PREFIX + name)
 
 

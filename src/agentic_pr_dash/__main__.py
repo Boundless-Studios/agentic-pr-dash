@@ -1,4 +1,4 @@
-"""``python -m pr_agent_ops`` -> the unified CLI."""
+"""``python -m agentic_pr_dash`` -> the unified CLI."""
 
 from .cli import main
 

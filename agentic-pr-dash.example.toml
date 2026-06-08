@@ -1,13 +1,13 @@
-# pr-agent-ops configuration. Copy to `pr-agent-ops.toml` at your repo root.
+# agentic-pr-dash configuration. Copy to `agentic-pr-dash.toml` at your repo root.
 # Every value is optional and has a project-agnostic default. Any value can be
-# overridden by a PR_AGENT_OPS_* environment variable (e.g. PR_AGENT_OPS_TRACKER).
+# overridden by a AGENTIC_PR_DASH_* environment variable (e.g. AGENTIC_PR_DASH_TRACKER).
 
 [project]
 # GitHub repo as "owner/name". Auto-detected from the git remote when omitted.
 # repo = "octocat/hello-world"
 
 # Where ownership markers and per-PR maintenance state are written.
-state_dir = ".pr-agent-ops"
+state_dir = ".agentic-pr-dash"
 
 # Task tracker for blocked PRs: "none" (default) | "beads" | "github-issues".
 tracker = "none"
@@ -30,4 +30,4 @@ heartbeat_ttl_seconds = 600
 # prompt_template = "docs/pr-fix-prompt.md"
 
 # Optional: a session-event log the dashboard reads to show "agent working".
-# session_registry_path = "~/.pr-agent-ops/sessions/events.jsonl"
+# session_registry_path = "~/.agentic-pr-dash/sessions/events.jsonl"

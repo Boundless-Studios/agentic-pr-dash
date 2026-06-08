@@ -1,4 +1,4 @@
-"""Unified ``pr-agent-ops`` command-line entry point.
+"""Unified ``agentic-pr-dash`` command-line entry point.
 
 Subcommands:
 
@@ -10,7 +10,7 @@ Subcommands:
     serve         Run the web dashboard.
 
 ``check/complete/arm/list-owned`` route into the stateless maintenance executor;
-``loop`` and ``serve`` are runtime drivers. Run ``pr-agent-ops <cmd> --help`` for
+``loop`` and ``serve`` are runtime drivers. Run ``agentic-pr-dash <cmd> --help`` for
 per-subcommand options.
 """
 
@@ -43,7 +43,7 @@ def main(argv: list[str] | None = None) -> int:
         serve_main()
         return 0
 
-    print(f"pr-agent-ops: unknown command {cmd!r}\n", file=sys.stderr)
+    print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
     return 2
 

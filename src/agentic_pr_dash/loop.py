@@ -1,11 +1,11 @@
-"""Agent-agnostic maintenance loop (``pr-agent-ops loop``).
+"""Agent-agnostic maintenance loop (``agentic-pr-dash loop``).
 
 Each tick: discover the worktrees to service, run ``check`` on each, and when a
 PR needs work dispatch the fix prompt to a **configurable executor** (any CLI
 that accepts a prompt — Claude Code, Codex, aider, a shell script, …), then run
 ``complete`` to resolve the review threads the fix addressed.
 
-The executor command comes from config (``executor`` / ``PR_AGENT_OPS_EXECUTOR``)
+The executor command comes from config (``executor`` / ``AGENTIC_PR_DASH_EXECUTOR``)
 and uses ``{prompt}`` as the substitution point, e.g.::
 
     executor = "claude --dangerously-skip-permissions -p {prompt}"
@@ -37,7 +37,7 @@ def _discover_cwds(args) -> list[str]:
     if args.session_id:
         # Scope to worktrees this session owns.
         out = subprocess.run(
-            [sys.executable, "-m", "pr_agent_ops", "list-owned",
+            [sys.executable, "-m", "agentic_pr_dash", "list-owned",
              "--session-id", args.session_id, "--pid", str(_loop_pid())],
             capture_output=True, text=True,
         )
@@ -90,7 +90,7 @@ def _tick(args, executor: str) -> None:
         if not Path(cwd).is_dir():
             continue
         check = subprocess.run(
-            [sys.executable, "-m", "pr_agent_ops", "check",
+            [sys.executable, "-m", "agentic_pr_dash", "check",
              "--cwd", cwd, "--session-id", args.session_id or ""],
             capture_output=True, text=True,
         )
@@ -99,12 +99,12 @@ def _tick(args, executor: str) -> None:
         pr = _parse_pr_number(check.stdout)
         prompt = check.stdout
         baseline = _head_sha(cwd)
-        print(f"[pr-agent-ops] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
+        print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
         rc = _run_executor(executor, prompt, cwd)
         if rc != 0:
-            print(f"[pr-agent-ops] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
+            print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
             continue
-        complete_args = [sys.executable, "-m", "pr_agent_ops", "complete", "--cwd", cwd, "--baseline", baseline]
+        complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
         if pr is not None:
             complete_args += ["--pr", str(pr)]
         subprocess.run(complete_args)
@@ -112,7 +112,7 @@ def _tick(args, executor: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
-    parser = argparse.ArgumentParser(prog="pr-agent-ops loop", description=__doc__)
+    parser = argparse.ArgumentParser(prog="agentic-pr-dash loop", description=__doc__)
     parser.add_argument("--interval", type=int, default=600, help="Seconds between ticks (default 600).")
     parser.add_argument("--cwd", action="append", default=None, help="Worktree root (repeatable; default '.').")
     parser.add_argument("--session-id", default="", help="Scope discovery to worktrees this session owns.")
@@ -125,9 +125,9 @@ def main(argv: list[str] | None = None) -> int:
     executor = args.executor or cfg.executor
     if not executor:
         print(
-            "pr-agent-ops loop needs an executor. Set it via:\n"
-            "  pr-agent-ops.toml  ->  executor = \"claude --dangerously-skip-permissions -p {prompt}\"\n"
-            "  env                ->  PR_AGENT_OPS_EXECUTOR=...\n"
+            "agentic-pr-dash loop needs an executor. Set it via:\n"
+            "  agentic-pr-dash.toml  ->  executor = \"claude --dangerously-skip-permissions -p {prompt}\"\n"
+            "  env                ->  AGENTIC_PR_DASH_EXECUTOR=...\n"
             "  flag               ->  --executor '...'",
             file=sys.stderr,
         )

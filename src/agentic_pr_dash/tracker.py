@@ -7,7 +7,7 @@ want nothing at all. So tracking lives behind a small protocol with a **no-op
 default**; nothing in the core depends on any particular tracker.
 
 Select an adapter via config (``tracker = "none" | "beads" | "github-issues"``)
-or ``PR_AGENT_OPS_TRACKER``.
+or ``AGENTIC_PR_DASH_TRACKER``.
 """
 
 from __future__ import annotations
@@ -126,7 +126,7 @@ class GitHubIssuesTracker:
     same issue.
     """
 
-    _MARKER = "<!-- pr-agent-ops:task pr={pr} -->"
+    _MARKER = "<!-- agentic-pr-dash:task pr={pr} -->"
 
     def __init__(self, repo: str | None = None):
         self._repo = repo

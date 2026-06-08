@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "pr-agent-ops"
+name = "agentic-pr-dash"
 version = "0.1.0"
 description = "Watch your open PRs, detect what's blocking each (CI, review comments, conflicts), and let an agent resolve them — with a one-agent-per-PR ownership lease."
 readme = "README.md"
@@ -19,7 +19,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The web dashboard (`pr-agent-ops serve`) pulls in the web stack.
+# The web dashboard (`agentic-pr-dash serve`) pulls in the web stack.
 serve = [
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
@@ -32,18 +32,18 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Boundless-Studios/pr-agent-ops"
-Repository = "https://github.com/Boundless-Studios/pr-agent-ops"
+Homepage = "https://github.com/Boundless-Studios/agentic-pr-dash"
+Repository = "https://github.com/Boundless-Studios/agentic-pr-dash"
 
 [project.scripts]
-pr-agent-ops = "pr_agent_ops.cli:main"
+agentic-pr-dash = "agentic_pr_dash.cli:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pr_agent_ops"]
+packages = ["src/agentic_pr_dash"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"src/pr_agent_ops/templates" = "pr_agent_ops/templates"
-"src/pr_agent_ops/static" = "pr_agent_ops/static"
+"src/agentic_pr_dash/templates" = "agentic_pr_dash/templates"
+"src/agentic_pr_dash/static" = "agentic_pr_dash/static"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -27,14 +27,14 @@ def _runner_label() -> str | None:
 
 INFRA_CHECK_PATTERNS = {"tofu", "terraform", "infrastructure"}
 LOG_TAIL_LINES = 40
-CLAIM_MARKER = "<!-- pr-agent-ops:claimed -->"
-COMPLETE_MARKER = "<!-- pr-agent-ops:completed -->"
-FAILED_MARKER = "<!-- pr-agent-ops:push-failed -->"
+CLAIM_MARKER = "<!-- agentic-pr-dash:claimed -->"
+COMPLETE_MARKER = "<!-- agentic-pr-dash:completed -->"
+FAILED_MARKER = "<!-- agentic-pr-dash:push-failed -->"
 STALE_CLAIM_SECONDS = 60 * 60
 QUEUE_WARNING_SECONDS = 2 * 60
 WEEKLY_RUNNER_JOB_FETCH_WORKERS = 8
 WEEKLY_RUNNER_RUN_QUERY_DAYS = 1
-RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "pr-agent-ops" / "runner-summary.json"
+RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "agentic-pr-dash" / "runner-summary.json"
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/(\d+)(?:[/?#]|$)")
 
 _REVIEW_THREADS_QUERY = """
@@ -551,7 +551,7 @@ def _github_api_get_json(path: str, token: str, timeout_s: int = 10) -> dict | N
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
-            "User-Agent": "pr-agent-ops",
+            "User-Agent": "agentic-pr-dash",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
