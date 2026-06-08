@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from .agents import discover_active_agents
+from .config import load as load_config
 from .iterm import focus_or_open_worktree
 from .models import (
     AgentProcess,
@@ -167,8 +168,8 @@ def _load_babysit_activity() -> tuple[dict[int, str], dict[str, str]]:
     return by_number, by_branch
 
 
-# Turn-lifecycle activity (gaia-free-...): the agent-activity hook stamps
-# .gaia/agent-activity.json with the real turn state. A session counts as
+# Turn-lifecycle activity: the agent-activity hook stamps
+# the state-dir's agent-activity.json with the real turn state. A session counts as
 # actively working only when it's been in a turn past a short debounce — so a
 # few-second `/loop` watch tick doesn't register as work, but real validation /
 # fixing does. CPU% can't make this distinction (idle REPLs + the watch loop's
@@ -189,7 +190,7 @@ def _parse_iso(value: str | None) -> datetime | None:
 
 
 def _agent_activity_state(worktree_path: str | None) -> str:
-    """Aggregate per-session turn state from .gaia/agent-activity.json:
+    """Aggregate per-session turn state from the state-dir's agent-activity.json:
 
       "working" — a session is in a sustained turn: state busy, past the debounce,
                   AND its owning pid is still alive.
@@ -206,7 +207,8 @@ def _agent_activity_state(worktree_path: str | None) -> str:
     """
     if not worktree_path:
         return "none"
-    path = os.path.join(worktree_path, ".gaia", "agent-activity.json")
+    state_dir = load_config(worktree_path).state_dir_for(worktree_path)
+    path = str(state_dir / "agent-activity.json")
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
@@ -886,7 +888,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                 slot="9",
                 pr_number=1189,
                 pr_title="Proof ready to merge",
-                pr_url="https://github.com/Boundless-Studios/gaia-free/pull/1189",
+                pr_url="https://github.com/octocat/hello-world/pull/1189",
                 status=PRStatus.CLEAN,
                 ci_checks=[
                     CICheck(name="backend-unit", status="completed", conclusion="success"),
@@ -911,7 +913,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                 slot="8",
                 pr_number=1190,
                 pr_title="Expose queue diagnostics",
-                pr_url="https://github.com/Boundless-Studios/gaia-free/pull/1190",
+                pr_url="https://github.com/octocat/hello-world/pull/1190",
                 status=PRStatus.AGENT_WORKING,
                 ci_checks=[
                     CICheck(name="backend-unit", status="completed", conclusion="failure"),
@@ -921,10 +923,10 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                     QueuedWorkflowJob(
                         name="frontend-unit",
                         status="in_progress",
-                        labels=["self-hosted", "linux", "x64", "gaia-ci-desktop"],
+                        labels=["self-hosted", "linux", "x64", "self-hosted-demo"],
                         queued_at="2026-05-25T15:14:00Z",
                         queue_seconds=180,
-                        runner_pool="gaia-ci-desktop",
+                        runner_pool="self-hosted-demo",
                         matching_online_runner_count=1,
                     )
                 ],
@@ -934,7 +936,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                         id=501,
                         author="reviewer",
                         body="Reviewer requested queue visibility for stuck self-hosted CI.",
-                        path="pr_dashboard/app.py",
+                        path="pr_agent_ops/app.py",
                         line=501,
                         created_at="2026-05-25T15:10:00Z",
                     )
@@ -950,7 +952,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                     blockers=["ci failing", "review comments"],
                     failing_checks=["backend-unit"],
                     review_comment_ids=[501],
-                    bead_id="gaia-free-86telm",
+                    bead_id="demo-1",
                     last_heartbeat_at=datetime(2026, 5, 25, 15, 12, 0),
                     last_progress_at=datetime(2026, 5, 25, 15, 13, 0),
                     output_tail=["queue depth: 3", "runner idle: false", "remote unavailable"],

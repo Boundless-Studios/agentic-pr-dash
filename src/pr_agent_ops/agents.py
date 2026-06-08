@@ -4,7 +4,7 @@ Attribution rules:
   - Each claude/codex process is assigned to a worktree by its ACTUAL cwd
     (via `lsof -d cwd`), not by substring-matching worktree paths against
     the command line. Command-line matching caused false positives because
-    e.g. `bash /Users/ilya/code/gaia-free/scripts/worktree-console.sh`
+    e.g. `bash <your worktree launcher>`
     mentions the main repo path and would drag any claude it spawned into
     the main worktree's card regardless of where that claude's own cwd is.
   - If a process's own cwd doesn't fall inside any known worktree, we walk
@@ -27,6 +27,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import load as load_config
 from .models import AgentProcess
 
 
@@ -139,7 +140,7 @@ def discover_primary_feature_pipeline_agents(worktree_paths: list[str]) -> dict[
         if not _is_feature_pipeline_invocation(row.command):
             continue
         cli_name = _command_cli_name(row.command)
-        if cli_name not in {"claude", "codex"}:
+        if cli_name not in set(load_config().discovery_names):
             continue
         if _is_noninteractive(row, by_pid):
             continue
@@ -350,13 +351,14 @@ def _command_cli_name(command: str) -> str | None:
     if not tokens:
         return None
 
+    discovery_names = set(load_config().discovery_names)
     executable = Path(tokens[0]).name
-    if executable in {"claude", "codex"}:
+    if executable in discovery_names:
         return executable
 
     if executable == "node" and len(tokens) > 1:
         script_name = Path(tokens[1]).name
-        if script_name in {"claude", "codex"}:
+        if script_name in discovery_names:
             return script_name
 
     return None

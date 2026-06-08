@@ -9,8 +9,12 @@ import subprocess
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from .config import load as load_config
 
-DEFAULT_LABEL = "gaia-ci-desktop"
+
+def _runner_label() -> str | None:
+    """Return the configured self-hosted runner label, or None if the runner panel is disabled."""
+    return load_config().runner_label
 
 
 @dataclass(frozen=True)
@@ -30,7 +34,7 @@ class RunnerFleetLoad:
     idle: int = 0
     offline: int = 0
     utilization_percent: int = 0
-    recommendation: str = "Desktop CI runner load is unavailable."
+    recommendation: str = "Self-hosted CI runner load is unavailable."
     busy_runners: list[RunnerInfo] = field(default_factory=list)
     idle_runners: list[RunnerInfo] = field(default_factory=list)
     offline_runners: list[RunnerInfo] = field(default_factory=list)
@@ -60,8 +64,11 @@ def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.Complete
 def parse_runner_inventory(
     payload: dict[str, Any],
     *,
-    label: str = DEFAULT_LABEL,
+    label: str | None = None,
 ) -> RunnerFleetLoad:
+    label = label or _runner_label()
+    if label is None:
+        return RunnerFleetLoad()
     runners = [
         _runner_from_payload(item)
         for item in payload.get("runners", [])
@@ -100,10 +107,13 @@ def parse_runner_inventory(
 def get_runner_fleet_load(
     *,
     repo: str | None = None,
-    label: str = DEFAULT_LABEL,
+    label: str | None = None,
     cwd: str | None = None,
     run: RunCommand = _run,
 ) -> RunnerFleetLoad:
+    label = label or _runner_label()
+    if label is None:
+        return RunnerFleetLoad()
     repo_name = repo or _get_repo_full_name(cwd=cwd, run=run)
     if not repo_name:
         return _degraded_load("Runner probe failed: could not determine active GitHub repository.")
@@ -205,19 +215,19 @@ def _recommendation(
     if total == 0:
         return f"No {label} runners were found. Check runner labels or registration."
     if online == 0:
-        return "Desktop CI is offline; heavy jobs will fall back to ubuntu-latest."
+        return "Self-hosted CI is offline; heavy jobs will fall back to ubuntu-latest."
     if idle > 0:
         suffix = "s" if idle != 1 else ""
-        return f"Desktop CI has spare capacity for {idle} more concurrent job{suffix}."
+        return f"Self-hosted CI has spare capacity for {idle} more concurrent job{suffix}."
     if busy >= online and offline > 0:
-        return "Desktop CI is saturated, and offline runners could restore more parallel capacity."
+        return "Self-hosted CI is saturated, and offline runners could restore more parallel capacity."
     if busy >= online:
-        return "Desktop CI is saturated. Add runners or raise concurrency if queues persist."
-    return "Desktop CI load is available."
+        return "Self-hosted CI is saturated. Add runners or raise concurrency if queues persist."
+    return "Self-hosted CI load is available."
 
 
 def _degraded_load(error: str) -> RunnerFleetLoad:
     return RunnerFleetLoad(
-        recommendation="Desktop CI runner load is unavailable.",
+        recommendation="Self-hosted CI runner load is unavailable.",
         error=error,
     )

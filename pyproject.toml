@@ -29,7 +29,6 @@ serve = [
 ]
 dev = [
     "pytest>=8.0",
-    "pytest-asyncio>=0.23",
 ]
 
 [project.urls]
@@ -48,4 +47,3 @@ packages = ["src/pr_agent_ops"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-asyncio_mode = "auto"

@@ -6,10 +6,12 @@ Subcommands:
   complete — re-fetch unresolved review threads from GitHub and resolve them
              statelessly (no ledger required). Best-effort close the bead.
 
-Run as a module:  python -m pr_dashboard.maintenance_check <subcommand> [args]
+Run via the CLI:  pr-agent-ops <subcommand> [args]
+Or as a module:   python -m pr_agent_ops <subcommand> [args]
 
-Module-level imports are stdlib only; heavy deps are deferred into subcommand
-functions so that ``--help`` works without the project venv's heavy deps.
+Module-level imports are stdlib only (plus the dependency-free ``config``
+module); heavy deps are deferred into subcommand functions so that ``--help``
+works without the optional web extras installed.
 """
 
 from __future__ import annotations
@@ -18,6 +20,8 @@ import argparse
 import os
 import subprocess
 import sys
+
+from .config import load as load_config
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +161,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str):
 # tens of minutes. So the lease MUST comfortably exceed the maximum expected
 # maintenance runtime, or the detached loop would treat a still-busy owner as
 # stale mid-fix and dispatch a competing runtime — the exact double-fix race this
-# coordination prevents (gaia-free-q03si4 review).
+# coordination prevents (ownership-coordination review).
 #
 # A generous lease is safe because it is NOT the dead-session signal: pid-liveness
 # (`_pid_alive`) is, and it reaps a crashed/exited owner immediately regardless of
@@ -178,14 +182,15 @@ _DEFAULT_FIX_LEASE_SECONDS = 1800  # 30 min — covers a long fix phase; overrid
 
 
 def _fix_lease_seconds() -> int:
+    # Legacy override kept as a fallback so existing installs keep working.
     raw = os.environ.get("GAIA_PR_WATCH_LEASE_SECONDS", "")
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
-    return _DEFAULT_FIX_LEASE_SECONDS
+    return load_config().lease_seconds
 
 
 def _marker_path(cwd: str) -> str:
-    return os.path.join(cwd, ".gaia", "pr-watch.armed")
+    return str(load_config(cwd).watch_marker_for(cwd))
 
 
 def _read_marker(cwd: str) -> dict[str, str] | None:
@@ -328,10 +333,10 @@ def _fix_lease_active(lease_until: str) -> bool:
 def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     """Session id of a live, ACTIVELY-LOOPING in-session owner, else None.
 
-    Coordination (gaia-free-q03si4): the detached pr-maintenance loop must not
+    Coordination (ownership-coordination): the detached pr-maintenance loop must not
     service a worktree that a live in-session `/pr-maintenance-check` loop is
     already working, or they apply simultaneous conflicting fixes. Ownership is
-    the `.gaia/pr-watch.armed` marker. Defers ONLY when the owner is (a) a
+    the `pr-watch.armed` marker. Defers ONLY when the owner is (a) a
     different session, (b) its pid is alive, AND (c) its loop `heartbeat=` is
     fresh — proof a loop is actually running, not merely armed. So a dead owner,
     a stale/absent heartbeat (armed-but-never-looped, or an ignored advisory
@@ -403,7 +408,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     # Write atomically (temp file in the same dir + os.replace) so a concurrent
     # detached-loop reader never observes a truncated/partial marker — a torn read
     # would make _live_foreign_owner return None and let it dispatch a second
-    # fixer for the same PR (gaia-free-q03si4 review).
+    # fixer for the same PR (ownership-coordination review).
     import tempfile  # noqa: PLC0415
 
     content = "".join(f"{k}={v}\n" for k, v in fields.items())
@@ -423,20 +428,21 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
 
 
 def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bool:
-    """Write the `.gaia/pr-watch.armed` ownership marker (the single writer).
+    """Write the `pr-watch.armed` ownership marker (the single writer).
 
     Produces the EXACT same marker `.claude/hooks/arm-pr-watch.sh` writes
     (pr=/armed_at=/session_id=/pid=), atomically (tempfile + os.replace) so a
-    concurrent reader never sees a torn marker. Also writes `.gaia/pr-watch.session`
+    concurrent reader never sees a torn marker. Also writes `pr-watch.session`
     so the worktree self-identifies. Reused by both the explicit `arm` subcommand
     and `list-owned` reconciliation (BOU-1442). Returns True on success.
     """
     import tempfile  # noqa: PLC0415
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    gaia = os.path.join(cwd, ".gaia")
+    cfg = load_config(cwd)
+    state_dir = str(cfg.state_dir_for(cwd))
     try:
-        os.makedirs(gaia, exist_ok=True)
+        os.makedirs(state_dir, exist_ok=True)
     except OSError:
         return False
 
@@ -448,10 +454,10 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
         "pid": str(pid),
     }
     content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = os.path.join(gaia, "pr-watch.armed")
+    target = os.path.join(state_dir, "pr-watch.armed")
     tmp = None
     try:
-        fd, tmp = tempfile.mkstemp(dir=gaia, prefix=".pr-watch.armed.")
+        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(content)
         os.replace(tmp, target)  # atomic on POSIX (same filesystem)
@@ -465,7 +471,7 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
 
     # Self-identify so the in-session loop / a later list-owned can read the owner.
     try:
-        with open(os.path.join(gaia, "pr-watch.session"), "w", encoding="utf-8") as fh:
+        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
             fh.write(session_id + "\n")
     except OSError:
         pass
@@ -685,7 +691,7 @@ def _marker_session_id(worktree_path: str) -> str | None:
     Returns None when the marker is absent/unreadable or carries no session_id
     line (legacy markers written before session stamping count as unowned).
     """
-    marker = os.path.join(worktree_path, ".gaia", "pr-watch.armed")
+    marker = _marker_path(worktree_path)
     try:
         with open(marker, encoding="utf-8") as fh:
             for raw in fh:
@@ -807,7 +813,7 @@ def _completion_reply_body(
     Instead of a generic "addressed", name the commit(s) that touched the
     thread's file (falling back to all of this round's commits for non-inline
     threads) with their subject lines, so a reviewer can see WHAT addressed the
-    comment, not merely that the thread was closed (gaia-free-q03si4).
+    comment, not merely that the thread was closed (ownership-coordination).
     """
     cites = commits_by_file.get(path, []) if path else []
     if not cites:
@@ -935,45 +941,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         print(f"completed (bead left open; blockers remain: {', '.join(remaining)})")
         return 0
 
-    # Best-effort close the open maintenance bead
+    # Best-effort close the open tracked task via the configured tracker.
     branch = pr.branch
     if branch:
-        label = maintenance._branch_label(branch)
-        title = f"Address PR #{resolved_pr_number} maintenance blockers"
-        try:
-            proc = subprocess.run(
-                ["bd", "list", "--label", label, "--json"],
-                cwd=cwd,
-                capture_output=True,
-                text=True,
-                timeout=15,
-                check=False,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                import json  # noqa: PLC0415
-                payload = json.loads(proc.stdout)
-                if isinstance(payload, list):
-                    for item in payload:
-                        if (
-                            isinstance(item, dict)
-                            and item.get("title") == title
-                            and item.get("status") in {"open", "in_progress"}
-                        ):
-                            bead_id = item.get("id")
-                            if bead_id:
-                                subprocess.run(
-                                    ["bd", "close", bead_id],
-                                    cwd=cwd,
-                                    capture_output=True,
-                                    text=True,
-                                    timeout=15,
-                                    check=False,
-                                )
-                            break
-        except (OSError, subprocess.TimeoutExpired, Exception):  # noqa: BLE001
-            pass
+        from .config import load as _load_config  # noqa: PLC0415
+        from .tracker import get_tracker  # noqa: PLC0415
 
-    print("completed (bead closed; no blockers remain)")
+        tracker = get_tracker(_load_config(cwd))
+        task_id = tracker.find_task(pr=resolved_pr_number, branch=branch, cwd=cwd)
+        if task_id:
+            tracker.close_task(task_id, cwd=cwd)
+
+    print("completed (task closed; no blockers remain)")
     return 0
 
 
@@ -984,7 +963,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m pr_dashboard.maintenance_check",
+        prog="pr-agent-ops",
         description="PR maintenance check — stateless read-only check and completion.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1002,7 +981,7 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         metavar="ID",
         help="Caller's session id (for the ownership gate). check DEFERS (exit 0) "
-        "when the worktree's .gaia/pr-watch.armed marker names a live session OTHER "
+        "when the worktree's pr-watch.armed marker names a live session OTHER "
         "than this one — so a detached loop never fights a live in-session owner. "
         "Pass your own id to exclude yourself; omit to defer to any live owner.",
     )
@@ -1033,7 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
     # --- list-owned ---
     list_owned_p = subparsers.add_parser(
         "list-owned",
-        help="Print worktree paths whose .gaia/pr-watch.armed marker matches --session-id.",
+        help="Print worktree paths whose pr-watch.armed marker matches --session-id.",
     )
     list_owned_p.add_argument(
         "--session-id",

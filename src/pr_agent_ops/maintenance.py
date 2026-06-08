@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import session_registry
 from .agents import discover_primary_feature_pipeline_agents
-from .models import AgentProcess, MaintenanceState, MaintenanceStatus, PRData, ReviewComment
+from .config import load as load_config
+from .models import AgentProcess, MaintenanceState, MaintenanceStatus, PRData
+from .tracker import get_tracker
+
+HANDOFF_FILENAME = "MAINTENANCE_HANDOFF.md"
 
 
 def now_utc() -> datetime:
@@ -17,15 +20,18 @@ def now_utc() -> datetime:
 
 
 def state_path(worktree_path: str, pr_number: int) -> Path:
-    return Path(worktree_path) / ".gaia" / "pr-maintenance" / f"pr-{pr_number}.json"
+    return load_config(worktree_path).maintenance_dir_for(worktree_path) / f"pr-{pr_number}.json"
 
 
 def handoff_path(worktree_path: str) -> Path:
-    return Path(worktree_path) / "PIPELINE_HANDOFF.md"
+    return Path(worktree_path) / HANDOFF_FILENAME
 
 
-def pr_url(pr_number: int | str, fallback_url: str | None = None) -> str:
-    return fallback_url or f"https://github.com/Boundless-Studios/gaia-free/pull/{pr_number}"
+def pr_url(pr_number: int | str, fallback_url: str | None = None, *, cwd: str | None = None) -> str:
+    if fallback_url:
+        return fallback_url
+    repo = load_config(cwd).resolved_repo(Path(cwd) if cwd else None) if cwd else load_config().resolved_repo()
+    return f"https://github.com/{repo}/pull/{pr_number}" if repo else f"#{pr_number}"
 
 
 def pr_markdown_link(pr_number: int | str, fallback_url: str | None = None) -> str:
@@ -121,8 +127,8 @@ def write_pipeline_handoff(state: MaintenanceState, prompt: str) -> None:
         f"State: `{state.state.value}`\n"
         f"Blockers: {', '.join(state.blockers) or 'none'}\n\n"
         "## Resume Instructions\n"
-        f"Run `bd ready --label {_branch_label(state.branch)}` and handle the PR maintenance bead.\n"
-        "Resolve review comments, CI failures, and merge conflicts before pushing.\n\n"
+        "Handle this PR's maintenance: resolve review comments, CI failures, and "
+        "merge conflicts before pushing.\n\n"
         "## Dashboard Prompt\n"
         f"{prompt}\n"
     )
@@ -168,8 +174,9 @@ def discover_active_primary_feature_pipeline_agents(worktree_path: str) -> list[
         agent.pid: agent
         for agent in discover_primary_feature_pipeline_agents([worktree_path]).get(worktree_path, [])
     }
+    discovery_names = set(load_config(worktree_path).discovery_names)
     for state in session_registry.active_sessions_for_worktree(worktree_path):
-        if state.cli not in {"claude", "codex"}:
+        if state.cli not in discovery_names:
             continue
         if state.pid is None or state.pid in by_pid:
             continue
@@ -196,7 +203,7 @@ def build_maintenance_prompt(
     sections = [
         f"{pr_markdown_link(pr.number, pr.url)} ({pr.branch}) needs PR maintenance.",
         "",
-        "Use the project feature-pipeline conventions for PR maintenance, but do not start a new feature pipeline.",
+        _conventions_preamble(pr.worktree_path),
         "This is delegated focused work on an existing PR.",
         "Do NOT create a new branch or PR. Commit and push to the existing branch.",
     ]
@@ -232,7 +239,7 @@ def build_maintenance_prompt(
             "",
             "## Review Comments",
             "Address each review comment below, commit, and push.",
-            f"After pushing, run `python3 -m pr_dashboard.maintenance_check complete` "
+            "After pushing, run `pr-agent-ops complete` "
             "to post completion replies and resolve the threads.",
         ])
         for comment in pr.review_comments:
@@ -253,102 +260,52 @@ def build_maintenance_prompt(
     return "\n".join(sections).strip() + "\n"
 
 
+def _conventions_preamble(cwd: str | None = None) -> str:
+    """Opening line(s) of the maintenance prompt.
+
+    Projects override the wording via ``prompt_template`` (an inline string or a
+    file path) in config. The default is tool-neutral — it does not assume any
+    particular workflow ("feature-pipeline", etc.).
+    """
+    cfg = load_config(cwd) if cwd else load_config()
+    if cfg.prompt_template:
+        candidate = Path(cfg.prompt_template)
+        try:
+            if candidate.is_file():
+                return candidate.read_text(encoding="utf-8").strip()
+        except OSError:
+            pass
+        return cfg.prompt_template.strip()
+    return (
+        "Follow this project's contribution conventions for PR maintenance, but "
+        "do not start new feature work."
+    )
+
+
 def ensure_maintenance_bead(state: MaintenanceState, pr: PRData, prompt: str) -> str | None:
+    """Open (or find) a tracked task for this PR via the configured tracker.
+
+    With the default ``none`` tracker this is a no-op and returns ``None`` — the
+    maintenance flow works purely off PR state. A project that wants a durable
+    work-ledger configures ``tracker = "beads" | "github-issues"``.
+    """
     if state.bead_id:
         return state.bead_id
 
+    tracker = get_tracker(load_config(state.worktree_path))
     title = f"Address PR #{pr.number} maintenance blockers"
-    label = _branch_label(pr.branch)
-    existing = _find_existing_bead(label, title, state.worktree_path)
-    if existing:
-        return existing
-
-    description = (
+    body = (
         f"Handle maintenance blockers for {pr_markdown_link(pr.number, pr.url)} "
         f"on branch `{pr.branch}`.\n\n"
         "## Acceptance Criteria\n"
-        "- [ ] Review comments listed in the dashboard prompt are addressed\n"
-        "- [ ] Failing CI checks listed in the dashboard prompt pass after a pushed commit\n"
+        "- [ ] Review comments in the maintenance prompt are addressed\n"
+        "- [ ] Failing CI checks pass after a pushed commit\n"
         "- [ ] Merge conflicts are resolved when present\n"
-        "- [ ] Existing branch is pushed; no new PR is created\n"
+        "- [ ] Existing branch is pushed; no new PR is created\n\n"
+        f"Latest commit: {pr.latest_commit_sha or 'unknown'}\n\n"
+        f"{prompt}"
     )
-    design = (
-        f"Dashboard handoff: {state_path(state.worktree_path, pr.number)}\n"
-        f"Pipeline handoff: {handoff_path(state.worktree_path)}\n"
-        "Use the dashboard prompt embedded in PIPELINE_HANDOFF.md."
-    )
-    notes = (
-        "Plan: PR dashboard maintenance handoff\n"
-        f"Branch: {pr.branch}\n"
-        f"PR: {pr_markdown_link(pr.number, pr.url)}\n"
-        f"Latest commit: {pr.latest_commit_sha or 'unknown'}\n"
-        f"Prompt:\n{prompt}"
-    )
-    cmd = [
-        "bd",
-        "create",
-        title,
-        "--type",
-        "task",
-        "--priority",
-        "1",
-        "--labels",
-        label,
-        "--description",
-        description,
-        "--design",
-        design,
-        "--notes",
-        notes,
-        "--json",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=state.worktree_path,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return None
-    return payload.get("id") if isinstance(payload, dict) else None
-
-
-def _find_existing_bead(label: str, title: str, cwd: str) -> str | None:
-    try:
-        proc = subprocess.run(
-            ["bd", "list", "--label", label, "--json"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    try:
-        payload = json.loads(proc.stdout)
-    except ValueError:
-        return None
-    if not isinstance(payload, list):
-        return None
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        if item.get("title") == title and item.get("status") in {"open", "in_progress"}:
-            bead_id = item.get("id")
-            return bead_id if isinstance(bead_id, str) else None
-    return None
+    return tracker.open_task(pr=pr.number, branch=pr.branch, title=title, body=body, cwd=state.worktree_path)
 
 
 def _branch_label(branch: str) -> str:

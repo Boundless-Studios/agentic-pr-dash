@@ -17,19 +17,24 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from .config import load as load_config
 from .models import CICheck, QueuedWorkflowJob, ReviewComment, RunnerExecutionSummary, RunnerPoolHealth
+
+
+def _runner_label() -> str | None:
+    """Return the configured self-hosted runner label, or None if the runner panel is disabled."""
+    return load_config().runner_label
 
 INFRA_CHECK_PATTERNS = {"tofu", "terraform", "infrastructure"}
 LOG_TAIL_LINES = 40
-CLAIM_MARKER = "<!-- gaia-pr-dashboard:claimed -->"
-COMPLETE_MARKER = "<!-- gaia-pr-dashboard:completed -->"
-FAILED_MARKER = "<!-- gaia-pr-dashboard:push-failed -->"
+CLAIM_MARKER = "<!-- pr-agent-ops:claimed -->"
+COMPLETE_MARKER = "<!-- pr-agent-ops:completed -->"
+FAILED_MARKER = "<!-- pr-agent-ops:push-failed -->"
 STALE_CLAIM_SECONDS = 60 * 60
 QUEUE_WARNING_SECONDS = 2 * 60
-DESKTOP_RUNNER_LABEL = "gaia-ci-desktop"
 WEEKLY_RUNNER_JOB_FETCH_WORKERS = 8
 WEEKLY_RUNNER_RUN_QUERY_DAYS = 1
-RUNNER_SUMMARY_CACHE = Path.home() / ".claude" / "daemons" / "pr-dashboard-runner-summary.json"
+RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "pr-agent-ops" / "runner-summary.json"
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/(\d+)(?:[/?#]|$)")
 
 _REVIEW_THREADS_QUERY = """
@@ -546,7 +551,7 @@ def _github_api_get_json(path: str, token: str, timeout_s: int = 10) -> dict | N
         headers={
             "Accept": "application/vnd.github+json",
             "Authorization": f"Bearer {token}",
-            "User-Agent": "gaia-pr-dashboard",
+            "User-Agent": "pr-agent-ops",
             "X-GitHub-Api-Version": "2022-11-28",
         },
     )
@@ -819,8 +824,9 @@ def _runner_labels(runner: dict) -> set[str]:
 
 def _runner_pool_for_labels(labels: list[str]) -> str:
     lowered = {label.lower() for label in labels}
-    if DESKTOP_RUNNER_LABEL in lowered:
-        return DESKTOP_RUNNER_LABEL
+    configured_label = _runner_label()
+    if configured_label and configured_label in lowered:
+        return configured_label
     if "self-hosted" in lowered:
         custom = [
             label
@@ -833,7 +839,8 @@ def _runner_pool_for_labels(labels: list[str]) -> str:
 
 def _uses_self_hosted_runner(labels: list[str]) -> bool:
     lowered = {label.lower() for label in labels}
-    if "self-hosted" in lowered or DESKTOP_RUNNER_LABEL in lowered:
+    configured_label = _runner_label()
+    if "self-hosted" in lowered or (configured_label and configured_label in lowered):
         return True
     return False
 
@@ -867,8 +874,9 @@ def _count_runner_execution(
     duration_seconds: float = 0.0,
 ) -> None:
     lowered = {label.lower() for label in labels}
+    configured_label = _runner_label()
     uses_self_hosted_runner = (
-        DESKTOP_RUNNER_LABEL in lowered
+        (configured_label is not None and configured_label in lowered)
         or "self-hosted" in lowered
         or (runners is not None and _matches_self_hosted_runner(labels, runners))
     )
@@ -926,8 +934,9 @@ def _queue_warning(
     pool_health: RunnerPoolHealth,
 ) -> str | None:
     lowered = {label.lower() for label in labels}
-    if DESKTOP_RUNNER_LABEL in lowered and pool_health.online_count == 0:
-        return "gaia-ci-desktop fleet offline"
+    configured_label = _runner_label()
+    if configured_label and configured_label in lowered and pool_health.online_count == 0:
+        return f"{configured_label} fleet offline"
     if (
         matching_online_runner_count is not None
         and matching_online_runner_count == 0

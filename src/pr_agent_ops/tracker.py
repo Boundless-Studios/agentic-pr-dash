@@ -12,6 +12,7 @@ or ``PR_AGENT_OPS_TRACKER``.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from typing import Protocol, runtime_checkable
 
@@ -20,17 +21,21 @@ from .config import Config
 
 @runtime_checkable
 class TaskTracker(Protocol):
-    """Minimal contract: open a task for a blocked PR, find it, close it."""
+    """Minimal contract: open a task for a blocked PR, find it, close it.
 
-    def open_task(self, *, pr: int, branch: str, title: str, body: str) -> str | None:
+    ``cwd`` is the worktree the PR lives in — relevant for per-worktree trackers
+    like beads; ignored by trackers that address the repo globally.
+    """
+
+    def open_task(self, *, pr: int, branch: str, title: str, body: str, cwd: str | None = None) -> str | None:
         """Create (or return the existing) task for this PR. Returns an opaque id."""
         ...
 
-    def find_task(self, *, pr: int, branch: str) -> str | None:
+    def find_task(self, *, pr: int, branch: str, cwd: str | None = None) -> str | None:
         """Return an existing open task id for this PR, or ``None``."""
         ...
 
-    def close_task(self, task_id: str) -> None:
+    def close_task(self, task_id: str, *, cwd: str | None = None) -> None:
         """Close the task. Best-effort; must not raise on a missing task."""
         ...
 
@@ -38,13 +43,13 @@ class TaskTracker(Protocol):
 class NoOpTracker:
     """Default: track nothing. The maintenance flow works purely off PR state."""
 
-    def open_task(self, *, pr: int, branch: str, title: str, body: str) -> str | None:
+    def open_task(self, *, pr: int, branch: str, title: str, body: str, cwd: str | None = None) -> str | None:
         return None
 
-    def find_task(self, *, pr: int, branch: str) -> str | None:
+    def find_task(self, *, pr: int, branch: str, cwd: str | None = None) -> str | None:
         return None
 
-    def close_task(self, task_id: str) -> None:
+    def close_task(self, task_id: str, *, cwd: str | None = None) -> None:
         return None
 
 
@@ -61,48 +66,57 @@ class BeadsTracker:
     def _label(self, branch: str) -> str:
         for p in self._strip:
             if branch.startswith(p):
-                return branch[len(p):]
-        return branch
+                branch = branch[len(p):]
+                break
+        return branch.replace("/", "-")
 
-    def _run(self, args: list[str]) -> subprocess.CompletedProcess:
-        return subprocess.run(["bd", *args], capture_output=True, text=True, timeout=30)
-
-    def find_task(self, *, pr: int, branch: str) -> str | None:
+    def _run(self, args: list[str], cwd: str | None = None) -> subprocess.CompletedProcess | None:
         try:
-            out = self._run(["list", "--label", self._label(branch), "--status", "open"])
+            return subprocess.run(["bd", *args], cwd=cwd, capture_output=True, text=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             return None
-        marker = f"PR #{pr} maintenance"
-        for line in out.stdout.splitlines():
-            if marker in line:
-                tok = line.strip().split()
-                for t in tok:
-                    if "-" in t and any(c.isdigit() for c in t):
-                        return t.strip("[]")
+
+    def find_task(self, *, pr: int, branch: str, cwd: str | None = None) -> str | None:
+        out = self._run(["list", "--label", self._label(branch), "--json"], cwd=cwd)
+        if out is None or out.returncode != 0:
+            return None
+        try:
+            payload = json.loads(out.stdout)
+        except ValueError:
+            return None
+        if not isinstance(payload, list):
+            return None
+        title = f"Address PR #{pr} maintenance blockers"
+        for item in payload:
+            if (
+                isinstance(item, dict)
+                and item.get("title") == title
+                and item.get("status") in {"open", "in_progress"}
+                and isinstance(item.get("id"), str)
+            ):
+                return item["id"]
         return None
 
-    def open_task(self, *, pr: int, branch: str, title: str, body: str) -> str | None:
-        existing = self.find_task(pr=pr, branch=branch)
+    def open_task(self, *, pr: int, branch: str, title: str, body: str, cwd: str | None = None) -> str | None:
+        existing = self.find_task(pr=pr, branch=branch, cwd=cwd)
         if existing:
             return existing
-        try:
-            out = self._run([
-                "create", "--title", title, "--type", "task", "--priority", "2",
-                "--labels", self._label(branch),
-                "--description", body, "--design", body, "--notes", f"Auto-opened for PR #{pr}.",
-            ])
-        except (OSError, subprocess.SubprocessError):
+        out = self._run([
+            "create", title, "--type", "task", "--priority", "1",
+            "--labels", self._label(branch),
+            "--description", body, "--design", body, "--notes", f"Auto-opened for PR #{pr}.",
+            "--json",
+        ], cwd=cwd)
+        if out is None or out.returncode != 0:
             return None
-        for line in out.stdout.splitlines():
-            if "Created issue" in line:
-                return line.split(":", 1)[-1].strip()
-        return None
-
-    def close_task(self, task_id: str) -> None:
         try:
-            self._run(["close", task_id])
-        except (OSError, subprocess.SubprocessError):
-            pass
+            payload = json.loads(out.stdout)
+        except ValueError:
+            return None
+        return payload.get("id") if isinstance(payload, dict) else None
+
+    def close_task(self, task_id: str, *, cwd: str | None = None) -> None:
+        self._run(["close", task_id], cwd=cwd)
 
 
 class GitHubIssuesTracker:
@@ -123,7 +137,7 @@ class GitHubIssuesTracker:
             full += ["--repo", self._repo]
         return subprocess.run(full, capture_output=True, text=True, timeout=30)
 
-    def find_task(self, *, pr: int, branch: str) -> str | None:
+    def find_task(self, *, pr: int, branch: str, cwd: str | None = None) -> str | None:
         marker = self._MARKER.format(pr=pr)
         try:
             out = self._gh([
@@ -135,7 +149,7 @@ class GitHubIssuesTracker:
         num = out.stdout.strip()
         return num or None
 
-    def open_task(self, *, pr: int, branch: str, title: str, body: str) -> str | None:
+    def open_task(self, *, pr: int, branch: str, title: str, body: str, cwd: str | None = None) -> str | None:
         existing = self.find_task(pr=pr, branch=branch)
         if existing:
             return existing
@@ -150,7 +164,7 @@ class GitHubIssuesTracker:
         url = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
         return url.rsplit("/", 1)[-1] if url else None
 
-    def close_task(self, task_id: str) -> None:
+    def close_task(self, task_id: str, *, cwd: str | None = None) -> None:
         try:
             self._gh(["issue", "close", task_id])
         except (OSError, subprocess.SubprocessError):

@@ -12,12 +12,38 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .config import load as load_config
 
-DEFAULT_REGISTRY = Path.home() / ".gaia" / "sessions" / "events.jsonl"
+
+def _env(name: str, default: str = "") -> str:
+    """Prefer PR_AGENT_OPS_<name>, fall back to GAIA_<name>."""
+    return os.environ.get("PR_AGENT_OPS_" + name) or os.environ.get("GAIA_" + name) or default
+
+
+_NEW_DEFAULT_REGISTRY = Path.home() / ".pr-agent-ops" / "sessions" / "events.jsonl"
+_LEGACY_DEFAULT_REGISTRY = Path.home() / ".gaia" / "sessions" / "events.jsonl"
+
+
+def _default_registry() -> Path:
+    """Return the default registry path, preferring legacy if it already exists."""
+    override = _env("SESSION_REGISTRY")
+    if override:
+        return Path(override).expanduser()
+    # Honor a configured session_registry_path from config (if set)
+    cfg_path = load_config().session_registry_path
+    if cfg_path is not None:
+        return cfg_path
+    # Prefer legacy path if it exists so existing installs keep working
+    if _LEGACY_DEFAULT_REGISTRY.exists():
+        return _LEGACY_DEFAULT_REGISTRY
+    return _NEW_DEFAULT_REGISTRY
+
+
+DEFAULT_REGISTRY = _NEW_DEFAULT_REGISTRY
 
 # Launch sources that are the dashboard's OWN automation, not an independent
 # session whose worktree we should defer to.
-DASHBOARD_LAUNCH_SOURCES = ("pr-dashboard",)
+DASHBOARD_LAUNCH_SOURCES = ("pr-agent-ops", "pr-dashboard")
 
 
 @dataclass
@@ -67,10 +93,7 @@ class SessionSummary:
 
 
 def registry_path() -> Path:
-    override = os.environ.get("GAIA_SESSION_REGISTRY")
-    if override:
-        return Path(override).expanduser()
-    return DEFAULT_REGISTRY
+    return _default_registry()
 
 
 def new_session_id(prefix: str = "gaia") -> str:
@@ -156,17 +179,17 @@ def record_event(
     """Append a session event to the registry and return the serialized event."""
     target = path or registry_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    resolved_worktree = worktree_path or os.environ.get("GAIA_PROJECT_DIR") or os.getcwd()
+    resolved_worktree = worktree_path or _env("PROJECT_DIR") or os.getcwd()
     resolved_branch = branch or _git_branch(resolved_worktree)
     payload = _clean_payload(
         {
             "event_id": uuid.uuid4().hex,
-            "session_id": session_id or os.environ.get("GAIA_SESSION_ID") or new_session_id(),
+            "session_id": session_id or _env("SESSION_ID") or new_session_id(),
             "event": event,
             "timestamp": _utc_now(),
-            "cli": cli or os.environ.get("GAIA_SESSION_CLI") or "unknown",
+            "cli": cli or _env("SESSION_CLI") or "unknown",
             "launch_source": launch_source
-            or os.environ.get("GAIA_SESSION_LAUNCH_SOURCE")
+            or _env("SESSION_LAUNCH_SOURCE")
             or "unknown",
             "pid": pid,
             "ppid": ppid,
@@ -174,10 +197,10 @@ def record_event(
             "branch": resolved_branch,
             "pr_number": pr_number,
             "bead_id": bead_id,
-            "docker_mode": docker_mode or os.environ.get("GAIA_DOCKER_MODE") or "unknown",
-            "docker_host": docker_host or os.environ.get("GAIA_DOCKER_SELECTED_HOST") or None,
+            "docker_mode": docker_mode or _env("DOCKER_MODE") or "unknown",
+            "docker_host": docker_host or _env("DOCKER_SELECTED_HOST") or None,
             "docker_daemon_name": docker_daemon_name
-            or os.environ.get("GAIA_DOCKER_DAEMON_NAME")
+            or _env("DOCKER_DAEMON_NAME")
             or None,
             "docker_context": docker_context or os.environ.get("DOCKER_CONTEXT") or None,
             "container_names": _coerce_list(container_names),
@@ -187,7 +210,7 @@ def record_event(
             "feature_pipeline": (
                 feature_pipeline
                 if feature_pipeline is not None
-                else (os.environ.get("GAIA_SESSION_FEATURE_PIPELINE") == "1")
+                else (_env("SESSION_FEATURE_PIPELINE") == "1")
             )
             or None,
         }
@@ -202,12 +225,12 @@ def record_event_from_env(event: str, **kwargs: Any) -> dict[str, Any]:
     ppid = kwargs.pop("ppid", None)
     return record_event(
         event=event,
-        session_id=os.environ.get("GAIA_SESSION_ID"),
-        cli=os.environ.get("GAIA_SESSION_CLI"),
-        launch_source=os.environ.get("GAIA_SESSION_LAUNCH_SOURCE"),
+        session_id=_env("SESSION_ID") or None,
+        cli=_env("SESSION_CLI") or None,
+        launch_source=_env("SESSION_LAUNCH_SOURCE") or None,
         pid=int(pid or os.getpid()),
         ppid=int(ppid or os.getppid()),
-        worktree_path=os.environ.get("GAIA_PROJECT_DIR") or os.getcwd(),
+        worktree_path=_env("PROJECT_DIR") or os.getcwd(),
         **kwargs,
     )
 

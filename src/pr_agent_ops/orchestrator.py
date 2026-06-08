@@ -234,20 +234,14 @@ class Orchestrator:
             # display state so the card stops showing "Delegated". The worker
             # no longer writes a COMPLETE state; the dashboard owns this lifecycle.
             if pr.status == PRStatus.CLEAN and pr.maintenance is not None:
-                # Best-effort close the bead if we know its id.
+                # Best-effort close the tracked task if we know its id.
                 if pr.maintenance.bead_id and pr.worktree_path:
-                    try:
-                        import subprocess as _sp  # noqa: PLC0415
-                        _sp.run(
-                            ["bd", "close", pr.maintenance.bead_id],
-                            cwd=pr.worktree_path,
-                            capture_output=True,
-                            text=True,
-                            timeout=10,
-                            check=False,
-                        )
-                    except Exception:  # noqa: BLE001
-                        pass
+                    from .config import load as _load_config  # noqa: PLC0415
+                    from .tracker import get_tracker  # noqa: PLC0415
+
+                    get_tracker(_load_config(pr.worktree_path)).close_task(
+                        pr.maintenance.bead_id, cwd=pr.worktree_path
+                    )
                 pr.maintenance = None
                 pr.activity_message = None
                 pr.activity_source = None

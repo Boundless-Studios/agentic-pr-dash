@@ -7,6 +7,11 @@ import subprocess
 from pathlib import Path
 
 
+def _env(name: str, default: str = "") -> str:
+    """Prefer PR_AGENT_OPS_<name>, fall back to GAIA_<name>."""
+    return os.environ.get("PR_AGENT_OPS_" + name) or os.environ.get("GAIA_" + name) or default
+
+
 def _run(cmd: list[str], timeout_s: int = 10) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
@@ -93,6 +98,7 @@ def _parse_env(env_path: Path) -> dict:
         "FRONTEND_PORT": "frontend_port",
         "ENVIRONMENT_NAME": "environment_name",
         "GAIA_SLOT": "slot",
+        "PR_AGENT_OPS_SLOT": "slot",
     }
     for line in text.split("\n"):
         line = line.strip()
