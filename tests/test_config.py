@@ -75,3 +75,16 @@ def test_env_beats_toml(tmp_path, monkeypatch):
     config.load.cache_clear()
     c = config.load(str(tmp_path))
     assert c.tracker == "none"
+
+
+def test_explicit_config_path_env(tmp_path, monkeypatch):
+    # AGENTIC_PR_DASH_CONFIG points at a config file outside the cwd tree.
+    cfg = tmp_path / "elsewhere.toml"
+    cfg.write_text('[project]\ntracker = "github-issues"\nrunner_label = "fleet"\n', encoding="utf-8")
+    other = tmp_path / "work"
+    other.mkdir()
+    monkeypatch.setenv("AGENTIC_PR_DASH_CONFIG", str(cfg))
+    config.load.cache_clear()
+    c = config.load(str(other))
+    assert c.tracker == "github-issues"
+    assert c.runner_label == "fleet"

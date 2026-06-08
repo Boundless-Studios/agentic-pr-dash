@@ -56,6 +56,11 @@ Drop a `agentic-pr-dash.toml` at your repo root (see `agentic-pr-dash.example.to
 Everything is optional and has a project-agnostic default; any value can be
 overridden with a `AGENTIC_PR_DASH_*` environment variable.
 
+The config file is resolved in priority order: the `AGENTIC_PR_DASH_CONFIG` env
+var (an explicit path), then a repo-local `agentic-pr-dash.toml` (walking up from
+the cwd), then a global `~/.config/agentic-pr-dash/config.toml`. The global
+fallback is handy for `serve`, which runs from an arbitrary cwd.
+
 ```toml
 [project]
 # repo = "owner/name"          # auto-detected from the git remote if omitted

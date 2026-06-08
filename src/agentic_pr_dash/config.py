@@ -40,11 +40,27 @@ def _env(name: str) -> str | None:
 
 
 def _find_config_file(start: Path) -> Path | None:
+    """Locate the config file, in priority order:
+
+    1. ``AGENTIC_PR_DASH_CONFIG`` env var (explicit path) — wins everywhere.
+    2. a repo-local ``agentic-pr-dash.toml`` (walking up from ``start``).
+    3. a global ``~/.config/agentic-pr-dash/config.toml``.
+
+    The global fallback matters because the dashboard (``serve``) runs from an
+    arbitrary cwd that may not contain the project config — without it, the
+    dashboard would silently fall back to defaults (no tracker, no runner label).
+    """
+    explicit = os.environ.get(ENV_PREFIX + "CONFIG") or os.environ.get(LEGACY_ENV_PREFIX + "PR_DASH_CONFIG")
+    if explicit and Path(explicit).is_file():
+        return Path(explicit)
     cur = start.resolve()
     for parent in (cur, *cur.parents):
         candidate = parent / CONFIG_FILENAME
         if candidate.is_file():
             return candidate
+    global_cfg = Path.home() / ".config" / "agentic-pr-dash" / "config.toml"
+    if global_cfg.is_file():
+        return global_cfg
     return None
 
 
