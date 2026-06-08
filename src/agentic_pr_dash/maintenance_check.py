@@ -305,6 +305,16 @@ def _parse_iso(value: str):
     return ts
 
 
+def _heartbeat_ttl_seconds() -> int:
+    """How long an owner's heartbeat counts as 'fresh'. Configurable so the
+    recovery latency can be tuned for the turn-driven era (BOU-1478)."""
+    # Legacy override kept as a fallback so existing installs keep working.
+    raw = os.environ.get("GAIA_PR_WATCH_HEARTBEAT_TTL", "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return load_config().heartbeat_ttl_seconds
+
+
 def _heartbeat_fresh(heartbeat: str) -> bool:
     """True if the owner's loop heartbeat is within the short alive-TTL of now —
     proof the in-session loop is still ticking, not merely armed or stopped.
@@ -314,7 +324,7 @@ def _heartbeat_fresh(heartbeat: str) -> bool:
         return False
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    return (datetime.now(timezone.utc) - ts).total_seconds() <= _HEARTBEAT_TTL_SECONDS
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= _heartbeat_ttl_seconds()
 
 
 def _fix_lease_active(lease_until: str) -> bool:
