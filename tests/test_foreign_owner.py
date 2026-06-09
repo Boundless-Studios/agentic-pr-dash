@@ -71,6 +71,15 @@ def test_ttl_honors_per_worktree_config(tmp_path):
     assert mc._heartbeat_ttl_seconds() == 600  # process cwd -> default
 
 
+def test_worktree_toml_ttl_beats_legacy_env(tmp_path, monkeypatch):
+    # A per-repo toml setting must win over stale legacy shell state.
+    monkeypatch.setenv("GAIA_PR_WATCH_HEARTBEAT_TTL", "60")
+    (tmp_path / "agentic-pr-dash.toml").write_text(
+        "[project]\nheartbeat_ttl_seconds = 42\n", encoding="utf-8")
+    config.load.cache_clear()
+    assert mc._heartbeat_ttl_seconds(str(tmp_path)) == 42
+
+
 def test_heartbeat_ttl_is_configurable(tmp_path, monkeypatch):
     # A heartbeat 5 min old is stale at the 60s TTL...
     monkeypatch.setenv("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "60")

@@ -314,15 +314,23 @@ def _heartbeat_ttl_seconds(cwd: str | None = None) -> int:
     modern setting exists does the legacy GAIA_PR_WATCH_HEARTBEAT_TTL apply — so
     setting the new knob always takes effect even with stale legacy env around.
     """
+    cfg = load_config(cwd) if cwd else load_config()
+    # 1. Modern env wins.
     modern = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "")
     if modern.isdigit() and int(modern) > 0:
         return int(modern)
+    # 2. The CHECKED worktree's config (agentic-pr-dash.toml) beats the legacy
+    #    env — a per-repo setting must not be overridden by stale shell state.
+    #    The loop runs `check --cwd <worktree>` without changing subprocess cwd,
+    #    so cfg is loaded for the target worktree.
+    toml_ttl = cfg.extra.get("heartbeat_ttl_seconds")
+    if isinstance(toml_ttl, int) and toml_ttl > 0:
+        return toml_ttl
+    # 3. Legacy env fallback, then the config default.
     legacy = os.environ.get("GAIA_PR_WATCH_HEARTBEAT_TTL", "")
     if legacy.isdigit() and int(legacy) > 0:
         return int(legacy)
-    # Honor the CHECKED worktree's config (the loop runs `check --cwd <worktree>`
-    # without changing the subprocess cwd), not the launch dir's.
-    return (load_config(cwd) if cwd else load_config()).heartbeat_ttl_seconds
+    return cfg.heartbeat_ttl_seconds
 
 
 def _heartbeat_fresh(heartbeat: str, cwd: str | None = None) -> bool:
