@@ -68,7 +68,13 @@ def _parse_pr_number(check_stdout: str) -> int | None:
 
 
 def _head_sha(cwd: str) -> str:
-    out = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"], capture_output=True, text=True)
+    try:
+        out = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return out.stdout.strip()
 
 
@@ -87,7 +93,13 @@ def _baseline_sha(cwd: str, pr: int | None) -> str:
     if pr is not None:
         cmd.append(str(pr))
     cmd += ["--json", "headRefOid", "-q", ".headRefOid"]
-    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    try:
+        # Bounded + guarded: a broken/missing gh on PATH raises OSError and an
+        # interactive auth prompt would otherwise hang the whole loop before it
+        # ever dispatches the executor. Either way, fall back to the local HEAD.
+        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return _head_sha(cwd)
     sha = out.stdout.strip()
     if out.returncode == 0 and sha:
         return sha

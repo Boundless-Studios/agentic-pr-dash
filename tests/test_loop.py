@@ -48,6 +48,18 @@ def test_baseline_falls_back_to_local_head_when_gh_fails(tmp_path, monkeypatch):
     assert loop._baseline_sha(str(tmp_path), None) == local_head
 
 
+def test_baseline_falls_back_when_gh_missing(tmp_path, monkeypatch):
+    # A PATH with NO gh at all -> subprocess raises OSError -> must fall back to
+    # the local HEAD, never propagate the error or hang the loop.
+    local_head = _make_repo(tmp_path)
+    only_git = tmp_path / "only-git"
+    only_git.mkdir()
+    real_git = subprocess.run(["which", "git"], capture_output=True, text=True).stdout.strip()
+    (only_git / "git").symlink_to(real_git)
+    monkeypatch.setenv("PATH", str(only_git))
+    assert loop._baseline_sha(str(tmp_path), 7) == local_head
+
+
 def test_parse_pr_number_reads_trailer():
     out = "some prompt text\nPR_NUMBER=123\nmore\n"
     assert loop._parse_pr_number(out) == 123
