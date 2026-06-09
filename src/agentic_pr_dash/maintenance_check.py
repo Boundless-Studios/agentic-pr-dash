@@ -916,6 +916,30 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     resolved_pr_number = pr.number
     head_sha = pr.latest_commit_sha
     head_date = pr.latest_commit_date
+    # The API's view of the head, captured BEFORE the local override below, so
+    # the local-range helper can detect a stale origin/<branch> ref (one that
+    # doesn't yet contain a commit the API already knows) and fall back (BOU-1479).
+    api_head_sha = pr.latest_commit_sha
+
+    # Prefer the LOCAL PR-branch head (origin/<branch>, updated on push) over the
+    # GitHub API's lagging view, so resolving works the instant after a push
+    # instead of waiting for the API to index the new head (BOU-1479). The
+    # per-thread `head_date > created_at` guard below otherwise stays false in
+    # that race even when the fix is already pushed.
+    local_head_sha, local_head_date = github_api.get_local_pr_head(pr.branch, cwd)
+    # Adopt the local head only when origin/<branch> is FRESH — i.e. it already
+    # contains the API's reported head (the just-pushed case BOU-1479 targets). A
+    # stale local ref (behind a push made elsewhere / not fetched here) would drag
+    # head_date BACKWARDS, leaving threads created after the stale ref but before
+    # the true API head open; in that case keep the API head/date.
+    local_is_fresh = bool(local_head_sha) and (
+        not api_head_sha
+        or github_api._is_ancestor(api_head_sha, local_head_sha, cwd)
+    )
+    if local_is_fresh:
+        head_sha = local_head_sha
+        if local_head_date:
+            head_date = local_head_date
 
     # Verify a fixing push actually landed before resolving anything. The loop
     # passes --baseline = the PR head SHA captured BEFORE the agent ran, so
@@ -924,7 +948,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # worker stateless (no stored ledger) while refusing to resolve threads when
     # the runtime exited 0 without pushing a fix (or pushed an unrelated change).
     baseline = args.baseline or ""
-    new_commits = github_api.get_new_pr_commits(resolved_pr_number, baseline, head_sha, cwd)
+    new_commits = github_api.get_new_pr_commits(
+        resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch,
+        api_head_sha=api_head_sha)
     touched: set[str] = set()
     # file path -> fixing commits that touched it, so the completion reply can
     # cite the actual commit(s) that addressed each thread (not just a generic

@@ -149,13 +149,143 @@ def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]
     return parts[0] if parts else "", ""
 
 
+def get_local_pr_head(pr_branch: str, cwd: str | None) -> tuple[str, str]:
+    """Local (sha, committer-date-UTC-ISO) of the PR branch's remote-tracking ref.
+
+    ``origin/<pr_branch>`` is updated the instant ``git push`` returns, so this
+    reflects a just-pushed fix immediately — unlike the GitHub API, which lags a
+    second or two (BOU-1479). The date is normalized to a UTC ``...Z`` stamp so
+    the caller can compare it lexicographically against GitHub ``createdAt``
+    strings: ``%cI`` emits the committer's local offset (e.g. ``...-07:00``),
+    which would sort wrongly against ``...Z``. Returns ("", "") when the ref
+    can't be resolved.
+    """
+    if not pr_branch:
+        return "", ""
+    ref = f"origin/{pr_branch}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "log", "-1", "--format=%H%x00%cI", ref],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    if r.returncode != 0 or not r.stdout.strip():
+        return "", ""
+    sha, _, date = r.stdout.strip().partition("\0")
+    parsed = _parse_github_time(date.strip())
+    normalized = _format_github_time(parsed) if parsed else date.strip()
+    return sha.strip(), normalized
+
+
+def _rev_parse(ref: str, cwd: str | None) -> str:
+    """Resolve ``ref`` to a concrete commit SHA locally, or "" if it doesn't exist."""
+    if not ref:
+        return ""
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _is_ancestor(ancestor: str, descendant: str, cwd: str | None) -> bool:
+    """True iff ``ancestor`` is an ancestor of (or equal to) ``descendant`` locally."""
+    if not ancestor or not descendant:
+        return False
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "merge-base", "--is-ancestor", ancestor, descendant],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def _local_new_commits(
+    baseline_sha: str,
+    cwd: str | None,
+    upper_ref: str = "HEAD",
+    must_contain_sha: str = "",
+) -> list[tuple[str, str]]:
+    """Commits in ``baseline_sha..<upper_ref>`` from LOCAL git history (oldest first).
+
+    The local repo reflects a just-pushed commit immediately, whereas the GitHub
+    API lags a second or two — so preferring local avoids the race where
+    `complete` runs right after `git push`, sees no qualifying commit, and leaves
+    review threads unresolved (BOU-1479). ``upper_ref`` should be the PR branch's
+    remote-tracking ref (``origin/<branch>``) so the range stays scoped to what
+    was actually pushed to THIS PR — not arbitrary local/unpushed commits on
+    whatever HEAD happens to be.
+
+    Returns [] (so the caller falls back to the API) when the local range can't
+    be trusted:
+
+    - **No baseline / unresolvable upper ref** — nothing to scope against.
+    - **Baseline is not an ancestor of the tip** — after a rebase or force-push
+      the saved baseline no longer sits on the branch, so ``baseline..tip`` would
+      enumerate every replayed commit reachable from the new tip rather than only
+      what was pushed after the maintenance run.
+    - **A known-newer head isn't contained in the local ref** — when
+      ``must_contain_sha`` (the API's view of the PR head) is set but absent from
+      ``origin/<branch>``, this checkout's remote-tracking ref is stale (it never
+      fetched the latest push, or the branch advanced elsewhere); trusting it
+      would miss commits the API already knows.
+    """
+    if not baseline_sha:
+        return []
+    upper_sha = _rev_parse(upper_ref, cwd)
+    if not upper_sha:
+        return []
+    if not _is_ancestor(baseline_sha, upper_sha, cwd):
+        return []
+    if must_contain_sha and not _is_ancestor(must_contain_sha, upper_sha, cwd):
+        return []
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "log", "--reverse", "--format=%H%x00%s",
+             f"{baseline_sha}..{upper_sha}"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if r.returncode != 0:
+        return []
+    out: list[tuple[str, str]] = []
+    for line in r.stdout.splitlines():
+        sha, _, msg = line.partition("\0")
+        if sha.strip():
+            out.append((sha.strip(), msg.strip()))
+    return out
+
+
 def get_new_pr_commits(
     pr_number: int,
     baseline_sha: str,
     latest_sha: str,
     cwd: str | None = None,
+    pr_branch: str | None = None,
+    api_head_sha: str = "",
 ) -> list[tuple[str, str]]:
-    """Return commits added to a PR after a known baseline SHA."""
+    """Return commits added to a PR after a known baseline SHA.
+
+    Prefers the local git range scoped to the PR branch's remote-tracking ref
+    (immediate after a push, and not polluted by unrelated HEAD commits); falls
+    back to the GitHub API when the range can't be resolved or trusted locally.
+
+    ``api_head_sha`` is the GitHub API's view of the PR head: when it is set but
+    absent from the local ``origin/<branch>`` ref, that ref is stale and the
+    local range is rejected in favor of the API (see ``_local_new_commits``).
+    """
+    upper_ref = f"origin/{pr_branch}" if pr_branch else "HEAD"
+    local = _local_new_commits(baseline_sha, cwd, upper_ref, must_contain_sha=api_head_sha)
+    if local:
+        return local
+
     r = _run(
         ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/commits", "--jq", "."],
         cwd=cwd,
@@ -287,7 +417,28 @@ def edit_review_comment(comment_id: int, body: str, cwd: str | None = None) -> b
 
 
 def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
-    """Return list of filenames changed by a commit."""
+    """Return list of filenames changed by a commit.
+
+    Prefers local git (immediate, no API-indexing lag — BOU-1479); falls back to
+    the GitHub API when the commit isn't in the local history.
+    """
+    try:
+        # `-c core.quotePath=false` so non-ASCII paths come back as their literal
+        # decoded names (e.g. `café.py`, not `"caf\303\251.py"`); otherwise they
+        # never match GitHub's decoded review-thread `path` and addressed inline
+        # threads on those files stay open after a just-pushed fix.
+        lr = subprocess.run(
+            ["git", "-C", cwd or ".", "-c", "core.quotePath=false",
+             "show", "--name-only", "--format=", sha],
+            capture_output=True, text=True, timeout=10,
+        )
+        if lr.returncode == 0:
+            files = [ln.strip() for ln in lr.stdout.splitlines() if ln.strip()]
+            if files:
+                return files
+    except (OSError, subprocess.SubprocessError):
+        pass
+
     r = _run(
         [
             "gh", "api",
