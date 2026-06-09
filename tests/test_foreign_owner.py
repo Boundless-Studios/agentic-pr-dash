@@ -49,6 +49,28 @@ def test_dead_pid_takes_over(tmp_path):
     assert mc._live_foreign_owner(str(tmp_path), "me") is None
 
 
+def test_modern_ttl_env_beats_legacy(monkeypatch):
+    # New AGENTIC_PR_DASH_* must win even when the legacy var is still exported.
+    monkeypatch.setenv("GAIA_PR_WATCH_HEARTBEAT_TTL", "60")
+    monkeypatch.setenv("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "3600")
+    config.load.cache_clear()
+    assert mc._heartbeat_ttl_seconds() == 3600
+    # Legacy still applies as a fallback when no modern value is set.
+    monkeypatch.delenv("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS")
+    config.load.cache_clear()
+    assert mc._heartbeat_ttl_seconds() == 60
+
+
+def test_ttl_honors_per_worktree_config(tmp_path):
+    # heartbeat_ttl_seconds in the CHECKED worktree's toml is honored when cwd is
+    # threaded through (the loop runs `check --cwd <worktree>`).
+    (tmp_path / "agentic-pr-dash.toml").write_text(
+        "[project]\nheartbeat_ttl_seconds = 42\n", encoding="utf-8")
+    config.load.cache_clear()
+    assert mc._heartbeat_ttl_seconds(str(tmp_path)) == 42
+    assert mc._heartbeat_ttl_seconds() == 600  # process cwd -> default
+
+
 def test_heartbeat_ttl_is_configurable(tmp_path, monkeypatch):
     # A heartbeat 5 min old is stale at the 60s TTL...
     monkeypatch.setenv("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "60")
