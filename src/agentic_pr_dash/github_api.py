@@ -149,22 +149,47 @@ def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]
     return parts[0] if parts else "", ""
 
 
-def _local_new_commits(baseline_sha: str, cwd: str | None) -> list[tuple[str, str]]:
-    """Commits after ``baseline_sha`` from the LOCAL git history (oldest first).
+def get_local_pr_head(pr_branch: str, cwd: str | None) -> tuple[str, str]:
+    """Local (sha, committer-date-ISO) of the PR branch's remote-tracking ref.
+
+    ``origin/<pr_branch>`` is updated the instant ``git push`` returns, so this
+    reflects a just-pushed fix immediately — unlike the GitHub API, which lags a
+    second or two (BOU-1479). Returns ("", "") when the ref can't be resolved.
+    """
+    if not pr_branch:
+        return "", ""
+    ref = f"origin/{pr_branch}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "log", "-1", "--format=%H%x00%cI", ref],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    if r.returncode != 0 or not r.stdout.strip():
+        return "", ""
+    sha, _, date = r.stdout.strip().partition("\0")
+    return sha.strip(), date.strip()
+
+
+def _local_new_commits(baseline_sha: str, cwd: str | None, upper_ref: str = "HEAD") -> list[tuple[str, str]]:
+    """Commits in ``baseline_sha..<upper_ref>`` from LOCAL git history (oldest first).
 
     The local repo reflects a just-pushed commit immediately, whereas the GitHub
     API lags a second or two — so preferring local avoids the race where
     `complete` runs right after `git push`, sees no qualifying commit, and leaves
-    review threads unresolved (BOU-1479). Returns [] when the range can't be
-    resolved locally (no baseline, baseline not in local history) so the caller
-    falls back to the API.
+    review threads unresolved (BOU-1479). ``upper_ref`` should be the PR branch's
+    remote-tracking ref (``origin/<branch>``) so the range stays scoped to what
+    was actually pushed to THIS PR — not arbitrary local/unpushed commits on
+    whatever HEAD happens to be. Returns [] when the range can't be resolved
+    (no baseline, baseline/ref absent locally) so the caller falls back to the API.
     """
     if not baseline_sha:
         return []
     try:
         r = subprocess.run(
             ["git", "-C", cwd or ".", "log", "--reverse", "--format=%H%x00%s",
-             f"{baseline_sha}..HEAD"],
+             f"{baseline_sha}..{upper_ref}"],
             capture_output=True, text=True, timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -184,13 +209,16 @@ def get_new_pr_commits(
     baseline_sha: str,
     latest_sha: str,
     cwd: str | None = None,
+    pr_branch: str | None = None,
 ) -> list[tuple[str, str]]:
     """Return commits added to a PR after a known baseline SHA.
 
-    Prefers the local git range (immediate after a push); falls back to the
-    GitHub API when the range can't be resolved locally.
+    Prefers the local git range scoped to the PR branch's remote-tracking ref
+    (immediate after a push, and not polluted by unrelated HEAD commits); falls
+    back to the GitHub API when the range can't be resolved locally.
     """
-    local = _local_new_commits(baseline_sha, cwd)
+    upper_ref = f"origin/{pr_branch}" if pr_branch else "HEAD"
+    local = _local_new_commits(baseline_sha, cwd, upper_ref)
     if local:
         return local
 
