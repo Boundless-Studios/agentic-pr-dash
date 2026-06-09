@@ -423,8 +423,13 @@ def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
     the GitHub API when the commit isn't in the local history.
     """
     try:
+        # `-c core.quotePath=false` so non-ASCII paths come back as their literal
+        # decoded names (e.g. `café.py`, not `"caf\303\251.py"`); otherwise they
+        # never match GitHub's decoded review-thread `path` and addressed inline
+        # threads on those files stay open after a just-pushed fix.
         lr = subprocess.run(
-            ["git", "-C", cwd or ".", "show", "--name-only", "--format=", sha],
+            ["git", "-C", cwd or ".", "-c", "core.quotePath=false",
+             "show", "--name-only", "--format=", sha],
             capture_output=True, text=True, timeout=10,
         )
         if lr.returncode == 0:

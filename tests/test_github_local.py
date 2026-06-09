@@ -80,6 +80,19 @@ def test_get_local_pr_head(tmp_path):
     assert github_api.get_local_pr_head("nonexistent", str(tmp_path)) == ("", "")
 
 
+def test_changed_files_non_ascii_path_decoded(tmp_path):
+    # With core.quotePath=true (git default) a non-ASCII path would come back
+    # C-escaped ("caf\303\251.py") and never match GitHub's decoded thread path.
+    # The local fast path must return the literal decoded name.
+    _make_repo(tmp_path)
+    (tmp_path / "café.py").write_text("x\n")
+    _git(tmp_path, "add", "café.py")
+    _git(tmp_path, "commit", "-q", "-m", "add cafe")
+    head = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    assert github_api.get_commit_changed_files(head, str(tmp_path)) == ["café.py"]
+
+
 def test_local_head_date_normalized_to_utc(tmp_path):
     # A committer date with a non-UTC offset must come back as a UTC `...Z`
     # stamp, else it sorts wrongly against GitHub's `...Z` createdAt strings.

@@ -899,10 +899,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # per-thread `head_date > created_at` guard below otherwise stays false in
     # that race even when the fix is already pushed.
     local_head_sha, local_head_date = github_api.get_local_pr_head(pr.branch, cwd)
-    if local_head_sha:
+    # Adopt the local head only when origin/<branch> is FRESH — i.e. it already
+    # contains the API's reported head (the just-pushed case BOU-1479 targets). A
+    # stale local ref (behind a push made elsewhere / not fetched here) would drag
+    # head_date BACKWARDS, leaving threads created after the stale ref but before
+    # the true API head open; in that case keep the API head/date.
+    local_is_fresh = bool(local_head_sha) and (
+        not api_head_sha
+        or github_api._is_ancestor(api_head_sha, local_head_sha, cwd)
+    )
+    if local_is_fresh:
         head_sha = local_head_sha
-    if local_head_date:
-        head_date = local_head_date
+        if local_head_date:
+            head_date = local_head_date
 
     # Verify a fixing push actually landed before resolving anything. The loop
     # passes --baseline = the PR head SHA captured BEFORE the agent ran, so
