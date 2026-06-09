@@ -888,6 +888,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     resolved_pr_number = pr.number
     head_sha = pr.latest_commit_sha
     head_date = pr.latest_commit_date
+    # The API's view of the head, captured BEFORE the local override below, so
+    # the local-range helper can detect a stale origin/<branch> ref (one that
+    # doesn't yet contain a commit the API already knows) and fall back (BOU-1479).
+    api_head_sha = pr.latest_commit_sha
 
     # Prefer the LOCAL PR-branch head (origin/<branch>, updated on push) over the
     # GitHub API's lagging view, so resolving works the instant after a push
@@ -908,7 +912,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # the runtime exited 0 without pushing a fix (or pushed an unrelated change).
     baseline = args.baseline or ""
     new_commits = github_api.get_new_pr_commits(
-        resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch)
+        resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch,
+        api_head_sha=api_head_sha)
     touched: set[str] = set()
     # file path -> fixing commits that touched it, so the completion reply can
     # cite the actual commit(s) that addressed each thread (not just a generic
