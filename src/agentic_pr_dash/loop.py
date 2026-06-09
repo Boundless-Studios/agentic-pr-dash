@@ -72,6 +72,28 @@ def _head_sha(cwd: str) -> str:
     return out.stdout.strip()
 
 
+def _baseline_sha(cwd: str, pr: int | None) -> str:
+    """The PR branch's PUBLISHED head BEFORE the executor runs.
+
+    ``complete --baseline`` counts only commits pushed *after* this point as the
+    fix, so an executor that exits 0 without pushing can't resolve review
+    threads. The authoritative "before" reference is the PR's remote head
+    (``gh pr view --json headRefOid``), not the local ``HEAD`` — a worktree with
+    unpushed local commits ahead of the PR would otherwise yield an empty fix
+    range and leave addressed threads open. Falls back to the local HEAD when gh
+    can't answer (offline / no PR resolved).
+    """
+    cmd = ["gh", "pr", "view"]
+    if pr is not None:
+        cmd.append(str(pr))
+    cmd += ["--json", "headRefOid", "-q", ".headRefOid"]
+    out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    sha = out.stdout.strip()
+    if out.returncode == 0 and sha:
+        return sha
+    return _head_sha(cwd)
+
+
 def _run_executor(executor: str, prompt: str, cwd: str) -> int:
     """Run the configured executor with the prompt, in the worktree dir."""
     if "{prompt}" in executor:
@@ -98,7 +120,7 @@ def _tick(args, executor: str) -> None:
             continue  # 0 = clean/deferred, 2 = gh unavailable
         pr = _parse_pr_number(check.stdout)
         prompt = check.stdout
-        baseline = _head_sha(cwd)
+        baseline = _baseline_sha(cwd, pr)
         print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
         rc = _run_executor(executor, prompt, cwd)
         if rc != 0:
