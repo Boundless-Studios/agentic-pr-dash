@@ -6,8 +6,54 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # Probe the Boundless-Studios self-hosted desktop fleet and choose where the
+  # test job runs — the fleet (gaia-ci-desktop) when it's online and authorized
+  # for this repo, else ubuntu-latest. Never hangs on an unavailable fleet.
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      runs-on: ${{ steps.choose.outputs.runs-on }}
+    steps:
+      - id: choose
+        env:
+          # Fine-grained PAT with Actions/Administration read on this repo (or the
+          # org) so we can list runners. Optional — without it we use ubuntu.
+          PROBE_PAT: ${{ secrets.RUNNERS_PROBE_PAT }}
+          GH_TOKEN: ${{ secrets.RUNNERS_PROBE_PAT }}
+        run: |
+          set -e
+          # Fork PRs never run on our hardware.
+          if [ "${{ github.event_name }}" = "pull_request" ] && \
+             [ "${{ github.event.pull_request.head.repo.full_name }}" != "${{ github.repository }}" ]; then
+            echo "::notice::Fork PR — using ubuntu-latest."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ -z "$PROBE_PAT" ]; then
+            echo "::notice::RUNNERS_PROBE_PAT not set; using ubuntu-latest. Add the secret to route CI to the desktop fleet."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          # Count online runners authorized for THIS repo (the repo endpoint
+          # includes org runners in groups this repo can access; needs the PAT's
+          # repo Administration:read). --paginate so a match on a later page
+          # isn't missed. Require BOTH gaia-ci-desktop AND Linux so we only route
+          # to the Linux fleet (this job has POSIX-only steps; a Windows runner
+          # sharing the label must never pick it up).
+          ONLINE=$(gh api --paginate "repos/${{ github.repository }}/actions/runners" \
+            --jq '.runners[]
+                  | select(.status=="online")
+                  | select(([.labels[].name] | index("gaia-ci-desktop")) and ([.labels[].name] | index("Linux")))
+                  | .id' 2>/dev/null | awk 'END{print NR+0}')
+          if [ "${ONLINE:-0}" -gt 0 ]; then
+            echo "Desktop fleet: ${ONLINE} online Linux runner(s) — routing CI there."
+            echo 'runs-on=["gaia-ci-desktop","Linux"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::No online gaia-ci-desktop Linux runners authorized for this repo; using ubuntu-latest."
+            echo 'runs-on=["ubuntu-latest"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  test:
+    needs: setup
+    runs-on: ${{ fromJSON(needs.setup.outputs.runs-on) }}
     strategy:
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
