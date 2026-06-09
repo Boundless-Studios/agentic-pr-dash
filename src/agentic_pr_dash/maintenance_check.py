@@ -305,7 +305,35 @@ def _parse_iso(value: str):
     return ts
 
 
-def _heartbeat_fresh(heartbeat: str) -> bool:
+def _heartbeat_ttl_seconds(cwd: str | None = None) -> int:
+    """How long an owner's heartbeat counts as 'fresh'. Configurable so the
+    recovery latency can be tuned for the turn-driven era (BOU-1478).
+
+    Precedence: the modern AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS env wins, then
+    the per-worktree config (agentic-pr-dash.toml at ``cwd``), and only when no
+    modern setting exists does the legacy GAIA_PR_WATCH_HEARTBEAT_TTL apply — so
+    setting the new knob always takes effect even with stale legacy env around.
+    """
+    cfg = load_config(cwd) if cwd else load_config()
+    # 1. Modern env wins.
+    modern = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "")
+    if modern.isdigit() and int(modern) > 0:
+        return int(modern)
+    # 2. The CHECKED worktree's config (agentic-pr-dash.toml) beats the legacy
+    #    env — a per-repo setting must not be overridden by stale shell state.
+    #    The loop runs `check --cwd <worktree>` without changing subprocess cwd,
+    #    so cfg is loaded for the target worktree.
+    toml_ttl = cfg.extra.get("heartbeat_ttl_seconds")
+    if isinstance(toml_ttl, int) and toml_ttl > 0:
+        return toml_ttl
+    # 3. Legacy env fallback, then the config default.
+    legacy = os.environ.get("GAIA_PR_WATCH_HEARTBEAT_TTL", "")
+    if legacy.isdigit() and int(legacy) > 0:
+        return int(legacy)
+    return cfg.heartbeat_ttl_seconds
+
+
+def _heartbeat_fresh(heartbeat: str, cwd: str | None = None) -> bool:
     """True if the owner's loop heartbeat is within the short alive-TTL of now —
     proof the in-session loop is still ticking, not merely armed or stopped.
     """
@@ -314,7 +342,7 @@ def _heartbeat_fresh(heartbeat: str) -> bool:
         return False
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    return (datetime.now(timezone.utc) - ts).total_seconds() <= _HEARTBEAT_TTL_SECONDS
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= _heartbeat_ttl_seconds(cwd)
 
 
 def _fix_lease_active(lease_until: str) -> bool:
@@ -354,7 +382,7 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     # Defer while the loop is provably engaged: actively ticking (heartbeat) OR
     # mid-fix (fix lease). A merely-armed marker (no heartbeat, no lease) or a
     # stopped loop does NOT block the detached fallback.
-    if _heartbeat_fresh(fields.get("heartbeat", "")) or _fix_lease_active(fields.get("fix_lease_until", "")):
+    if _heartbeat_fresh(fields.get("heartbeat", ""), cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
         return owner
     return None
 
