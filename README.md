@@ -132,6 +132,48 @@ worked by one agent at a time — no double-fixing, no clobbered commits.
 *An agent holding the lease on PR #421 — addressing the reviewer's comment and
 the failing unit test, with the heartbeat and progress timestamps ticking.*
 
+### Durable PR ledger — surviving worktree teardown (BOU-1587)
+
+Ownership markers live *inside* a worktree (`<state_dir>/pr-watch.armed`). When a
+worktree is torn down (a bug-bash session finishes a lane and reclaims the disk),
+its marker disappears and the PR would silently drop out of `list-owned` even
+though it still has unresolved review threads. To prevent that, every `arm` also
+appends to a **durable, worktree-independent ledger**:
+
+```
+~/.gaia/pr-watch/ledger/session-<id>.jsonl   # {pr, branch, worktree, opened_at, baseline_sha}
+```
+
+The ledger is keyed by session, lives under `$HOME` (outside any worktree), and is
+the source of truth for "PRs this session opened." Override its location with
+`GAIA_PR_LEDGER_DIR` (and the orphan-claim dir with `GAIA_PR_CLAIM_DIR`).
+
+**`reconcile-prs`** unions live-worktree PRs with detached ledger PRs (worktree
+gone) and fetches each one's live review-thread + CI state directly from GitHub,
+emitting one JSON record per line, **severity-first** (P1 review threads, then
+thread count). Merged/closed PRs are pruned from the ledger as it runs:
+
+```bash
+agentic-pr-dash reconcile-prs --session-id <id> --cwd . [--adopt-orphans]
+# {"pr":2064,"url":".../pull/2064","worktree_present":false,"unresolved_threads":5,"ci_failing":false,"p1":true,...}
+```
+
+A record with `worktree_present:false` and `unresolved_threads>0` is the
+`No worktree / Awaiting Fixes` state: recreate the worktree to fix, or hand it
+off — never report it ready-to-merge. The **stop-gate** now blocks idle (exit 2)
+on any such detached owned PR, naming the PR URL and the required work.
+
+`pr_has_unresolved_review_threads(pr, cwd)` keeps a PR out of any ready-to-merge
+batch when it has a non-outdated unresolved review thread, even if CI is green.
+
+**Orphan recovery.** `reconcile-prs --adopt-orphans` lets a *running* session
+claim PRs whose owning session has **died** (worktree gone *and* the session is
+terminal / its pid dead). Claims are arbitrated by an exclusive
+`~/.gaia/pr-watch/claims/pr-<N>.json` file: exactly one live session wins, and a
+claim held by a dead pid is taken over. The claimed PR is appended to the live
+session's ledger and surfaced as blocked work — so abandoned PRs get reclaimed
+instead of lingering unmonitored.
+
 ## License
 
 MIT
