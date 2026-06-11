@@ -803,10 +803,17 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     # "owns nothing" — and the loop, which now treats rc-0-empty as authoritative,
     # would service nothing for that repo instead of falling back to its root
     # (PR #7 review, P2).
-    probe = subprocess.run(
-        ["git", "-C", args.cwd, "worktree", "list", "--porcelain"],
-        capture_output=True, text=True,
-    )
+    try:
+        probe = subprocess.run(
+            ["git", "-C", args.cwd, "worktree", "list", "--porcelain"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        # A hung/unresponsive git invocation is itself a discovery failure — match
+        # the 10s bound `_iter_worktrees_with_branch` uses and signal failure
+        # rather than stalling the loop forever (PR #7 review, P2).
+        print(f"list-owned: worktree probe failed/timed out: {args.cwd}", file=sys.stderr)
+        return 3
     if probe.returncode != 0:
         print(f"list-owned: not a git worktree: {args.cwd}", file=sys.stderr)
         return 3

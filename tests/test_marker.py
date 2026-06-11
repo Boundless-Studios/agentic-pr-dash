@@ -146,6 +146,19 @@ def test_cmd_list_owned_nonzero_when_cwd_not_a_worktree(tmp_path):
     assert mc._cmd_list_owned(args) == 3  # tmp_path is not a git repo
 
 
+def test_cmd_list_owned_nonzero_when_probe_times_out(tmp_path, monkeypatch):
+    """A hung git probe is a discovery failure (exit 3), not an infinite stall
+    (PR #7 P2)."""
+    import subprocess as _sp
+
+    def boom(*a, **k):
+        raise _sp.TimeoutExpired(cmd="git", timeout=10)
+
+    monkeypatch.setattr(mc.subprocess, "run", boom)
+    args = types.SimpleNamespace(session_id="sess", cwd=str(tmp_path), pid=123)
+    assert mc._cmd_list_owned(args) == 3
+
+
 def test_command_cli_name_honors_supplied_discovery_names():
     """_command_cli_name recognizes a custom CLI when the target allow-list is
     supplied, not only the process-cwd default (PR #7 P2)."""
