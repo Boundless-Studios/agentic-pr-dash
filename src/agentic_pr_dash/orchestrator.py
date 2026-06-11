@@ -206,6 +206,7 @@ class Orchestrator:
             pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
             pr.review_decision = raw.get("reviewDecision", "") or "none"
             pr.merge_state = raw.get("mergeStateStatus", "") or "unknown"
+            pr.mergeable = raw.get("mergeable", "") or "unknown"
             pr.labels = [
                 label.get("name", "")
                 for label in raw.get("labels", [])
@@ -214,6 +215,20 @@ class Orchestrator:
 
             # Find worktree
             pr.worktree_path = find_worktree_for_branch(pr.branch)
+
+            # GitHub computes mergeability lazily: a bulk `gh pr list` often
+            # returns UNKNOWN for both signals right after a push or a base-branch
+            # move. Force a per-PR re-fetch (which also triggers the computation)
+            # so a genuinely-conflicting PR doesn't sit in Clean until GitHub
+            # eventually flips mergeStateStatus to DIRTY.
+            if pr.merge_state == "UNKNOWN" or pr.mergeable == "UNKNOWN":
+                refetched_state, refetched_mergeable = await asyncio.to_thread(
+                    github_api.get_mergeability, num, self.repo_cwd
+                )
+                if refetched_state:
+                    pr.merge_state = refetched_state
+                if refetched_mergeable:
+                    pr.mergeable = refetched_mergeable
 
             # Get latest commit info
             previous_commit_sha = pr.latest_commit_sha
@@ -370,15 +385,28 @@ class Orchestrator:
 
         return list(self.prs.values())
 
+    @staticmethod
+    def _has_merge_conflict(pr: PRData) -> bool:
+        """A conflict is signalled by EITHER GitHub field.
+
+        `mergeStateStatus == DIRTY` and `mergeable == CONFLICTING` are computed
+        from the same async pipeline but surface independently and at slightly
+        different times; relying on DIRTY alone (the old behaviour) let a
+        freshly-conflicting PR — whose mergeStateStatus was still UNKNOWN/UNSTABLE
+        — slip into the Clean column.
+        """
+        return pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING"
+
     def _compute_status(self, pr: PRData) -> PRStatus:
         has_ci_failure = bool(pr.failing_checks)
         has_comments = bool(pr.review_comments)
         ci_pending = any(c.status in ("queued", "in_progress") for c in pr.ci_checks)
-        has_blocking_issue = pr.merge_state == "DIRTY" or has_ci_failure or has_comments
+        has_conflict = self._has_merge_conflict(pr)
+        has_blocking_issue = has_conflict or has_ci_failure or has_comments
 
         if pr.agent_failure_reason and has_blocking_issue:
             return PRStatus.AGENT_FAILED
-        if pr.merge_state == "DIRTY":
+        if has_conflict:
             return PRStatus.MERGE_CONFLICT
 
         if has_ci_failure and has_comments:
@@ -457,7 +485,7 @@ class Orchestrator:
         if not pr.worktree_path:
             self.log(f"No worktree for {pr.branch}", pr_number=pr_number, level="warn")
             return
-        if not pr.review_comments and not pr.failing_checks and pr.merge_state != "DIRTY":
+        if not pr.review_comments and not pr.failing_checks and not self._has_merge_conflict(pr):
             self.log(f"No PR maintenance blockers on PR #{pr_number}", pr_number=pr_number)
             return
         await self.dispatch_pr_maintenance(pr, guidance=guidance)

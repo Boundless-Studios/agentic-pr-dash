@@ -122,7 +122,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     """
     r = _run(
         ["gh", "pr", "list", "--author", "@me", "--state", "open",
-         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,labels,createdAt"],
+         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt"],
         cwd=cwd, timeout_s=30,
     )
     if r.returncode != 0:
@@ -147,6 +147,30 @@ def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]
     if len(parts) >= 2:
         return parts[0], parts[1]
     return parts[0] if parts else "", ""
+
+
+def get_mergeability(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
+    """Return (mergeStateStatus, mergeable) for a single PR.
+
+    GitHub computes mergeability lazily and asynchronously: a bulk ``gh pr list``
+    frequently returns ``UNKNOWN`` for a freshly-pushed PR (or right after the
+    base branch moves) because the value isn't computed yet. A per-PR query both
+    *triggers* that background computation and returns the freshest available
+    value — so the dashboard isn't stuck showing a stale/clean state for a PR
+    that actually conflicts. Returns ("", "") on failure so callers keep the
+    last-known value rather than clobbering it.
+    """
+    r = _run(
+        ["gh", "pr", "view", str(pr_number), "--json", "mergeStateStatus,mergeable",
+         "--jq", "[.mergeStateStatus, .mergeable] | @tsv"],
+        cwd=cwd,
+    )
+    if r.returncode != 0 or not r.stdout.strip():
+        return "", ""
+    parts = r.stdout.strip().split("\t")
+    if len(parts) >= 2:
+        return parts[0], parts[1]
+    return (parts[0] if parts else ""), ""
 
 
 def get_local_pr_head(pr_branch: str, cwd: str | None) -> tuple[str, str]:
