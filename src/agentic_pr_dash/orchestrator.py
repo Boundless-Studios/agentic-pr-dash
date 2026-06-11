@@ -89,7 +89,9 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
         if _has_process_owner(pr):
             return True
         if dead_nonterminal_owner:
-            return False
+            if queued_at is None or latest_matched_at is None or queued_at <= latest_matched_at:
+                return False
+            return None
         if queued_at is None or latest_matched_at is None or queued_at <= latest_matched_at:
             return False
     return None

@@ -1,4 +1,6 @@
 import asyncio
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from agentic_pr_dash import app as dashboard_app
@@ -198,6 +200,7 @@ def test_refresh_requeues_when_prequeue_owner_session_is_dead(monkeypatch, tmp_p
         state=MaintenanceStatus.QUEUED,
         review_comment_ids=[55],
     )
+    queued_state.last_signal_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
     maintenance.save_state(queued_state)
 
     monkeypatch.setattr(
@@ -234,6 +237,39 @@ def test_refresh_requeues_when_prequeue_owner_session_is_dead(monkeypatch, tmp_p
     asyncio.run(orch.refresh_prs())
 
     assert len(created_tasks) == 1
+
+
+def test_matching_session_owner_ignores_dead_owner_before_fresh_queue(monkeypatch, tmp_path: Path):
+    worktree = tmp_path / "feature-one"
+    worktree.mkdir()
+    registry = tmp_path / "sessions.jsonl"
+    session_registry.record_event(
+        event="started",
+        session_id="s1",
+        cli="codex",
+        launch_source="launch-worktree-cli",
+        pid=123,
+        worktree_path=str(worktree),
+        branch="feature/one",
+        pr_number=123,
+        feature_pipeline=True,
+        path=registry,
+    )
+    monkeypatch.setenv("AGENTIC_PR_DASH_SESSION_REGISTRY", str(registry))
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: False)
+    monkeypatch.setattr(orchestrator, "_has_process_owner", lambda pr: False)
+
+    pr = PRData(
+        number=123,
+        title="Queued after dead owner",
+        branch="feature/one",
+        url="https://example.com/pr/123",
+        worktree_path=str(worktree),
+        status=PRStatus.HAS_COMMENTS,
+    )
+    queued_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    assert orchestrator._has_matching_session_owner(pr, queued_at=queued_at) is None
 
 
 def test_refresh_keeps_matching_active_state_when_owner_session_is_live(monkeypatch, tmp_path: Path):
@@ -564,6 +600,74 @@ def test_build_cards_keeps_live_agent_when_different_session_is_terminal(monkeyp
 
     assert card.status == PRStatus.AGENT_WORKING
     assert card.activity_message == "Codex working"
+
+
+def test_build_cards_keeps_activity_only_agent_when_terminal_session_has_no_agent_match(monkeypatch, tmp_path: Path):
+    worktree = tmp_path / "feature-one"
+    worktree.mkdir()
+    state_dir = worktree / ".agentic-pr-dash"
+    state_dir.mkdir()
+    runtime_session = session_registry.RuntimeSessionState(
+        session_id="s1",
+        event="completed",
+        timestamp="2026-06-11T12:00:00Z",
+        cli="codex",
+        launch_source="launch-worktree-cli",
+        pid=123,
+        worktree_path=str(worktree),
+        branch="feature/one",
+        pr_number=123,
+        is_feature_pipeline=True,
+    )
+    busy_since = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+    (state_dir / "agent-activity.json").write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    "s2": {
+                        "state": "busy",
+                        "busy_since": busy_since,
+                        "updated": busy_since,
+                        "pid": 999,
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        dashboard_app,
+        "discover_worktrees",
+        lambda: [{"path": str(worktree), "branch": "feature/one", "environment_name": "feature-one"}],
+    )
+    monkeypatch.setattr(dashboard_app, "discover_active_agents", lambda paths: {})
+    monkeypatch.setattr(
+        dashboard_app.session_registry,
+        "summarize_sessions",
+        lambda path=None: session_registry.SessionSummary(
+            sessions={"s1": runtime_session},
+            by_worktree={str(worktree): runtime_session},
+        ),
+    )
+    monkeypatch.setattr(dashboard_app.session_registry, "pid_is_live", lambda pid: pid == 999)
+    monkeypatch.setattr(dashboard_app, "_load_babysit_activity", lambda: ({}, {}))
+
+    orch = orchestrator.Orchestrator(repo_cwd=None)
+    orch.prs = {
+        123: PRData(
+            number=123,
+            title="Ready",
+            branch="feature/one",
+            url="https://example.com/pr/123",
+            worktree_path=str(worktree),
+            status=PRStatus.CLEAN,
+        )
+    }
+    monkeypatch.setattr(dashboard_app, "orchestrator", orch)
+
+    card = dashboard_app.build_worktree_cards()[0][0]
+
+    assert card.status == PRStatus.AGENT_WORKING
 
 
 def test_build_cards_terminal_hidden_agent_worktree_does_not_leave_clean_pr_working(monkeypatch, tmp_path: Path):
