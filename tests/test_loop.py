@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import types
 
 from agentic_pr_dash import loop
 
@@ -64,3 +65,68 @@ def test_parse_pr_number_reads_trailer():
     out = "some prompt text\nPR_NUMBER=123\nmore\n"
     assert loop._parse_pr_number(out) == 123
     assert loop._parse_pr_number("no trailer here") is None
+
+
+def _args(**kw):
+    base = dict(no_discover_worktrees=False, session_id="sess", cwd=["/fallback"])
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def _stub_list_owned(monkeypatch, *, stdout, returncode):
+    def fake_run(cmd, *a, **k):
+        return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+
+
+def test_discover_empty_owned_set_does_not_fall_back_to_cwd(monkeypatch):
+    # rc 0 + no paths = "owns nothing this tick" — authoritative. Falling back to
+    # cwd here would route the loop to service a foreign worktree (BOU-1540 #5).
+    _stub_list_owned(monkeypatch, stdout="", returncode=0)
+    assert loop._discover_cwds(_args()) == []
+
+
+def test_discover_falls_back_to_cwd_on_command_failure(monkeypatch):
+    # Non-zero rc = genuine discovery failure → fall back to the explicit --cwd.
+    _stub_list_owned(monkeypatch, stdout="", returncode=1)
+    assert loop._discover_cwds(_args()) == ["/fallback"]
+
+
+def test_discover_returns_owned_paths(monkeypatch):
+    _stub_list_owned(monkeypatch, stdout="/wt/a\n/wt/b\n", returncode=0)
+    assert loop._discover_cwds(_args()) == ["/wt/a", "/wt/b"]
+
+
+def test_discover_passes_cwd_to_list_owned(monkeypatch):
+    # list-owned must run `git worktree list` in the configured --cwd, not the
+    # loop process's cwd, or rc-0-empty could mean "wrong dir" (BOU-1540 #Z).
+    captured = {}
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    loop._discover_cwds(_args(cwd=["/repo/root"]))
+    assert "--cwd" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--cwd") + 1] == "/repo/root"
+
+
+def test_discover_iterates_all_configured_cwds(monkeypatch):
+    # Repeatable --cwd: list-owned runs once per configured repo and the owned
+    # paths are merged; a repo whose discovery fails falls back to its own root
+    # (BOU-1540 #6).
+    def fake_run(cmd, *a, **k):
+        cwd = cmd[cmd.index("--cwd") + 1]
+        if cwd == "/repo/a":
+            return types.SimpleNamespace(stdout="/repo/a/wt1\n", stderr="", returncode=0)
+        if cwd == "/repo/b":
+            return types.SimpleNamespace(stdout="", stderr="", returncode=1)  # failed
+        if cwd == "/repo/c":
+            return types.SimpleNamespace(stdout="/repo/c/wt2\n/repo/a/wt1\n", stderr="", returncode=0)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    result = loop._discover_cwds(_args(cwd=["/repo/a", "/repo/b", "/repo/c"]))
+    # a's owned path, b's fallback-to-root (failed), c's owned path; deduped.
+    assert result == ["/repo/a/wt1", "/repo/b", "/repo/c/wt2"]

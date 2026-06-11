@@ -35,14 +35,38 @@ def _discover_cwds(args) -> list[str]:
     if args.no_discover_worktrees:
         return list(args.cwd)
     if args.session_id:
-        # Scope to worktrees this session owns.
-        out = subprocess.run(
-            [sys.executable, "-m", "agentic_pr_dash", "list-owned",
-             "--session-id", args.session_id, "--pid", str(_loop_pid())],
-            capture_output=True, text=True,
-        )
-        paths = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
-        return paths or list(args.cwd)
+        # Scope to worktrees this session owns, across EVERY configured --cwd
+        # (the flag is repeatable, one per repo worktree-pool). Run list-owned
+        # per cwd and merge: each scan runs `git worktree list` in its own dir,
+        # so a session owning PRs under several repos discovers them all rather
+        # than only the first (PR #7 review, P2).
+        discovered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(path: str) -> None:
+            if path and path not in seen:
+                seen.add(path)
+                discovered.append(path)
+
+        for cwd in args.cwd:
+            out = subprocess.run(
+                [sys.executable, "-m", "agentic_pr_dash", "list-owned",
+                 "--session-id", args.session_id, "--pid", str(_loop_pid()),
+                 "--cwd", cwd],
+                capture_output=True, text=True,
+            )
+            if out.returncode != 0:
+                # Discovery FAILED for this repo — fall back to servicing the
+                # configured root itself, so its PRs aren't dropped on an error.
+                _add(cwd)
+                continue
+            # rc 0: the owned set is authoritative for this repo (an EMPTY result
+            # means "owns nothing here" — do NOT fall back to cwd, or the
+            # live-owner gate's exclusions would be undone by servicing a foreign
+            # worktree, BOU-1540 P1).
+            for ln in out.stdout.splitlines():
+                _add(ln.strip())
+        return discovered
     # Every worktree on the machine.
     out = subprocess.run(
         ["git", "worktree", "list", "--porcelain"], cwd=args.cwd[0],

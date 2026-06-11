@@ -24,13 +24,19 @@ _NEW_DEFAULT_REGISTRY = Path.home() / ".agentic-pr-dash" / "sessions" / "events.
 _LEGACY_DEFAULT_REGISTRY = Path.home() / ".gaia" / "sessions" / "events.jsonl"
 
 
-def _default_registry() -> Path:
-    """Return the default registry path, preferring legacy if it already exists."""
+def _default_registry(cwd: str | None = None) -> Path:
+    """Return the default registry path, preferring legacy if it already exists.
+
+    ``cwd`` selects which ``agentic-pr-dash.toml`` provides a configured
+    ``session_registry_path``. Pass the TARGET worktree's dir when resolving the
+    registry on its behalf — reading the process cwd's config instead would miss
+    a repo that points its registry elsewhere (PR #7 review, P2).
+    """
     override = _env("SESSION_REGISTRY")
     if override:
         return Path(override).expanduser()
     # Honor a configured session_registry_path from config (if set)
-    cfg_path = load_config().session_registry_path
+    cfg_path = load_config(cwd).session_registry_path
     if cfg_path is not None:
         return cfg_path
     # Prefer legacy path if it exists so existing installs keep working
@@ -92,8 +98,8 @@ class SessionSummary:
         return sorted(self.sessions.values(), key=lambda item: item.timestamp, reverse=True)
 
 
-def registry_path() -> Path:
-    return _default_registry()
+def registry_path(cwd: str | None = None) -> Path:
+    return _default_registry(cwd)
 
 
 def new_session_id(prefix: str = "gaia") -> str:

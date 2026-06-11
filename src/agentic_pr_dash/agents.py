@@ -116,11 +116,30 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
     return result
 
 
-def discover_primary_feature_pipeline_agents(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
-    """Return active interactive feature-pipeline sessions by worktree."""
+def discover_primary_feature_pipeline_agents(
+    worktree_paths: list[str], *, min_cpu: float = _ACTIVE_CPU_THRESHOLD,
+    discovery_names: set[str] | None = None,
+) -> dict[str, list[AgentProcess]]:
+    """Return interactive feature-pipeline sessions by worktree.
+
+    ``min_cpu`` is the CPU% floor for counting a process as actively working.
+    The default keeps the dashboard's "who's busy now" semantics. Pass
+    ``min_cpu=0.0`` for an OWNERSHIP/liveness check, where an idle session
+    sitting at a prompt still owns its worktree (its `%cpu` decays to ~0 but it
+    is very much alive) — the dashboard's activity gate would otherwise miss it
+    and let another session adopt and service the worktree (BOU-1540).
+
+    ``discovery_names`` is the recognized-CLI allow-list. Pass the TARGET repo's
+    list (or, for a mixed candidate set, the UNION across candidates) — resolving
+    it from the process cwd would miss a custom-CLI owner a target repo
+    recognizes, or count one it excludes (PR #7 review, P2). Each returned
+    ``AgentProcess`` carries ``cli_name``, so a caller with per-candidate
+    allow-lists can filter precisely. Defaults to the process cwd config.
+    """
     sorted_paths = sorted({path for path in worktree_paths if path}, key=len, reverse=True)
     if not sorted_paths:
         return {}
+    allowed_clis = discovery_names if discovery_names is not None else set(load_config().discovery_names)
 
     rows = _parse_process_rows(_run_process_table())
     if not rows:
@@ -139,12 +158,12 @@ def discover_primary_feature_pipeline_agents(worktree_paths: list[str]) -> dict[
     for row in rows:
         if not _is_feature_pipeline_invocation(row.command):
             continue
-        cli_name = _command_cli_name(row.command)
-        if cli_name not in set(load_config().discovery_names):
+        cli_name = _command_cli_name(row.command, allowed_clis)
+        if cli_name not in allowed_clis:
             continue
         if _is_noninteractive(row, by_pid):
             continue
-        if _effective_cpu_for_cli(row, cli_name, children_by_pid) < _ACTIVE_CPU_THRESHOLD:
+        if _effective_cpu_for_cli(row, cli_name, children_by_pid) < min_cpu:
             continue
 
         worktree_path = _resolve_worktree(row, by_pid, sorted_paths)
@@ -341,7 +360,7 @@ def _agent_cli_name(command: str) -> str | None:
     return _command_cli_name(command)
 
 
-def _command_cli_name(command: str) -> str | None:
+def _command_cli_name(command: str, discovery_names: set[str] | None = None) -> str | None:
 
     try:
         tokens = shlex.split(command)
@@ -351,7 +370,11 @@ def _command_cli_name(command: str) -> str | None:
     if not tokens:
         return None
 
-    discovery_names = set(load_config().discovery_names)
+    # Caller may supply the TARGET repo's allow-list; otherwise fall back to the
+    # process cwd config. Resolving it here (not only after this returns) is what
+    # lets a custom-CLI owner from another repo be recognized (PR #7 review, P2).
+    if discovery_names is None:
+        discovery_names = set(load_config().discovery_names)
     executable = Path(tokens[0]).name
     if executable in discovery_names:
         return executable
