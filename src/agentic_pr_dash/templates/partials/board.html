@@ -6,82 +6,27 @@
     </div>
     <div class="column-cards">
         {% for card in col.cards %}
-        <div class="card status-{{ card.status.value }}{% if card.worktree_path %} card-navigable{% endif %}"
+        <div class="card status-{{ card.status.value }} state-{{ card.agent_state }}{% if card.worktree_path %} card-navigable{% endif %}"
              data-search-text="{{ card.search_text }}"
              {% if card.worktree_path %}data-worktree-path="{{ card.worktree_path }}"{% endif %}
              {% if card.worktree_path %}tabindex="0" role="button" aria-label="Focus {{ card.worktree_name }} in iTerm"{% endif %}>
+
+            {# ── Card header: name + branch + single state badge ── #}
             <div class="card-top">
                 <div>
                     <div class="card-worktree-name">{{ card.worktree_name }}</div>
                     <div class="card-branch">{{ card.branch }}</div>
                 </div>
-                <span class="card-badge badge-{{ card.status.value }}">{{ card.status | status_label }}</span>
+                <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
             </div>
 
-            <div class="card-meta">
-                {% if card.environment_name %}<span>{{ card.environment_name }}</span>{% endif %}
-                {% if card.frontend_port %}<code>fe:{{ card.frontend_port }}</code>{% endif %}
-                {% if card.backend_port %}<code>be:{{ card.backend_port }}</code>{% endif %}
-                {% if card.slot %}<code>slot:{{ card.slot }}</code>{% endif %}
-            </div>
-
-            {% if card.docker_mode or card.runtime_session_id or card.container_names %}
-            <div class="card-runtime">
-                <div class="runtime-meta">
-                    {% if card.docker_mode %}
-                    <span class="runtime-pill runtime-{{ card.docker_mode | replace('-', '_') }}">{{ card.docker_mode | replace('-', ' ') }}</span>
-                    {% endif %}
-                    {% if card.docker_daemon_name %}<code>{{ card.docker_daemon_name }}</code>{% endif %}
-                    {% if card.container_names %}<span>{{ card.container_names | length }} containers</span>{% endif %}
-                </div>
-                {% if card.runtime_session_id %}
-                <div class="runtime-session"><code>{{ card.runtime_session_id }}</code></div>
-                {% endif %}
-                {% for warning in card.runtime_warnings %}
-                <div class="runtime-warning">{{ warning }}</div>
-                {% endfor %}
-            </div>
+            {# ── Ordered field rows ── #}
+            {% if card.started_at_label %}
+            <div class="card-started">Started {{ card.started_at_label }}</div>
             {% endif %}
 
-            {% if card.active_agents %}
-            <div class="card-agents">
-                {% for agent in card.active_agents %}
-                <span class="agent-pill agent-{{ agent.cli_name }}">{{ agent.label }}</span>
-                {% endfor %}
-            </div>
-            {% endif %}
-
-            {% if card.activity_message %}
-            <div class="card-activity card-activity-{{ card.activity_source or 'local' }}">
-                {{ card.activity_message }}
-            </div>
-            {% endif %}
-
-            {% if card.maintenance %}
-            <div class="card-maintenance card-maintenance-{{ card.maintenance.state.value }}">
-                <div class="maintenance-top">
-                    <span class="maintenance-state">{{ card.maintenance.state.value | replace('_', ' ') }}</span>
-                    {% if card.maintenance.bead_id %}<code>{{ card.maintenance.bead_id }}</code>{% endif %}
-                </div>
-                <div class="maintenance-meta">
-                    {% if card.maintenance.blockers %}{{ card.maintenance.blockers | join(' · ') }}{% else %}no blockers{% endif %}
-                </div>
-                <div class="maintenance-meta">
-                    {% if card.maintenance.last_heartbeat_at %}heartbeat {{ card.maintenance.last_heartbeat_at.strftime('%H:%M:%S') }}{% endif %}
-                    {% if card.maintenance.last_progress_at %} · progress {{ card.maintenance.last_progress_at.strftime('%H:%M:%S') }}{% endif %}
-                </div>
-                {% if card.maintenance.failure_reason %}
-                <div class="maintenance-failure">{{ card.maintenance.failure_reason }}</div>
-                {% endif %}
-                {% if card.maintenance.output_tail %}
-                <details class="card-agent-output">
-                    <summary>Maintenance output ({{ card.maintenance.output_tail | length }})</summary>
-                    {% for line in card.maintenance.output_tail[-3:] %}
-                    <pre>{{ line }}</pre>
-                    {% endfor %}
-                </details>
-                {% endif %}
-            </div>
+            {% if card.last_updated_label %}
+            <div class="card-updated">Updated {{ card.last_updated_label }}</div>
             {% endif %}
 
             {% if card.pr_number %}
@@ -89,84 +34,127 @@
                 PR #{{ card.pr_number }}{% if card.is_draft %} · Draft{% endif %}: {{ card.pr_title }}
             </a>
             {% else %}
-            <div class="card-no-pr">No active PR yet</div>
+            <div class="card-no-pr">No PR</div>
             {% endif %}
 
-            {% if card.latest_commit_sha %}
-            <div class="card-meta">
-                <span>head</span> <code>{{ card.latest_commit_sha[:7] }}</code>
-                {% if card.last_updated_label %}<span>updated {{ card.last_updated_label }}</span>{% endif %}
+            {% if card.worktree_path %}
+            <div class="card-worktree-link">
+                {{ card.worktree_name }}
+                <span class="card-iterm-hint">Click card to focus iTerm</span>
             </div>
-            {% elif card.last_updated_label %}
-            <div class="card-meta">
-                <span>updated {{ card.last_updated_label }}</span>
-            </div>
+            {% elif card.worktree_hidden %}
+            <div class="card-worktree-link">No worktree</div>
+            {% else %}
+            <div class="card-worktree-link">No worktree</div>
             {% endif %}
 
-            {% if card.ci_checks %}
-            <div class="card-ci">
+            {# ── Compact meta row ── #}
+            <div class="card-meta">
+                {% if card.review_comments %}
+                <span class="card-comment-count">{{ card.review_comments | length }} comments</span>
+                {% endif %}
+                {% if card.ci_checks %}
                 {% set passed = card.ci_checks | selectattr("conclusion", "eq", "success") | list | length %}
                 {% set failed = card.failing_checks | length %}
                 {% set pending = card.ci_checks | selectattr("status", "in", ["queued", "in_progress"]) | list | length %}
                 {% if passed %}<span class="ci-dot ci-pass"></span> {{ passed }}{% endif %}
                 {% if failed %}<span class="ci-dot ci-fail"></span> {{ failed }}{% endif %}
                 {% if pending %}<span class="ci-dot ci-pend"></span> {{ pending }}{% endif %}
-            </div>
-            {% endif %}
-
-            {% if card.runner_indicator_label %}
-            <div class="runner-indicator runner-indicator-{{ card.runner_indicator_status }}">
-                <span>{{ card.runner_indicator_label }}</span>
-                {% if card.runner_issue_count %}
-                <span>{{ card.runner_issue_count }} issue{{ 's' if card.runner_issue_count != 1 }}</span>
                 {% endif %}
+                {% if card.environment_name %}<span>{{ card.environment_name }}</span>{% endif %}
+                {% if card.frontend_port %}<code>fe:{{ card.frontend_port }}</code>{% endif %}
+                {% if card.backend_port %}<code>be:{{ card.backend_port }}</code>{% endif %}
+                {% if card.slot %}<code>slot:{{ card.slot }}</code>{% endif %}
             </div>
-            {% endif %}
 
-            {% if card.failing_checks %}
-            <div class="card-checks">
-                {% for name in card.failing_checks %}
-                <code>{{ name }}</code>
-                {% endfor %}
-            </div>
-            {% endif %}
+            {# ── Single collapsed diagnostics expander ── #}
+            {% set has_maintenance_detail = card.maintenance and (
+                card.maintenance.bead_id or
+                card.maintenance.blockers or
+                card.maintenance.last_heartbeat_at or
+                card.maintenance.last_progress_at or
+                card.maintenance.failure_reason or
+                card.maintenance.output_tail
+            ) %}
+            {% set has_runtime_detail = card.docker_mode or card.runtime_session_id or card.container_names or card.runtime_warnings %}
+            {% set has_diag = has_maintenance_detail or has_runtime_detail or card.failing_checks or card.agent_output or card.runner_indicator_label or card.agent_failure_reason or card.latest_commit_sha %}
+            {% if has_diag %}
+            <details class="card-details">
+                <summary>Details</summary>
 
-            {% if card.review_comments %}
-            <div class="card-comments">
-                <div class="comments-header">{{ card.review_comments | length }} comment{{ 's' if card.review_comments | length != 1 }}</div>
-                {% for c in card.review_comments[:2] %}
-                <div class="comment-item">
-                    <strong>@{{ c.author }}</strong>{% if c.path %} on <code>{{ c.path }}</code>{% endif %}
-                    <p>{{ c.body[:120] }}{% if c.body | length > 120 %}...{% endif %}</p>
+                {% if card.maintenance %}
+                <div class="detail-maintenance">
+                    <div>State: {{ card.maintenance.state.value | replace('_', ' ') }}</div>
+                    {% if card.maintenance.bead_id %}<div><code>{{ card.maintenance.bead_id }}</code></div>{% endif %}
+                    {% if card.maintenance.blockers %}<div>Blockers: {{ card.maintenance.blockers | join(' · ') }}</div>{% endif %}
+                    {% if card.maintenance.last_heartbeat_at %}<div>Heartbeat {{ card.maintenance.last_heartbeat_at.strftime('%H:%M:%S') }}</div>{% endif %}
+                    {% if card.maintenance.last_progress_at %}<div>Progress {{ card.maintenance.last_progress_at.strftime('%H:%M:%S') }}</div>{% endif %}
+                    {% if card.maintenance.failure_reason %}<div class="maintenance-failure">{{ card.maintenance.failure_reason }}</div>{% endif %}
+                    {% if card.maintenance.output_tail %}
+                    <div class="detail-output-tail">
+                        {% for line in card.maintenance.output_tail[-3:] %}
+                        <pre>{{ line }}</pre>
+                        {% endfor %}
+                    </div>
+                    {% endif %}
                 </div>
-                {% endfor %}
-                {% if card.review_comments | length > 2 %}
-                <div class="comments-more">+ {{ card.review_comments | length - 2 }} more</div>
                 {% endif %}
-            </div>
-            {% endif %}
 
-            {% if card.agent_output %}
-            <details class="card-agent-output">
-                <summary>Agent output ({{ card.agent_output | length }})</summary>
-                {% for line in card.agent_output[-3:] %}
-                <pre>{{ line }}</pre>
-                {% endfor %}
+                {% if has_runtime_detail %}
+                <div class="detail-runtime">
+                    {% if card.docker_mode %}
+                    <span class="runtime-pill runtime-{{ card.docker_mode | replace('-', '_') }}">{{ card.docker_mode | replace('-', ' ') }}</span>
+                    {% endif %}
+                    {% if card.docker_daemon_name %}<code>{{ card.docker_daemon_name }}</code>{% endif %}
+                    {% if card.container_names %}<span>{{ card.container_names | length }} containers</span>{% endif %}
+                    {% if card.runtime_session_id %}
+                    <div class="runtime-session"><code>{{ card.runtime_session_id }}</code></div>
+                    {% endif %}
+                    {% for warning in card.runtime_warnings %}
+                    <div class="runtime-warning">{{ warning }}</div>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if card.failing_checks %}
+                <div class="detail-failing-checks">
+                    {% for name in card.failing_checks %}
+                    <code>{{ name }}</code>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if card.agent_output %}
+                <div class="detail-agent-output">
+                    {% for line in card.agent_output[-3:] %}
+                    <pre>{{ line }}</pre>
+                    {% endfor %}
+                </div>
+                {% endif %}
+
+                {% if card.runner_indicator_label %}
+                <div class="detail-runner runner-indicator-{{ card.runner_indicator_status }}">
+                    <span>{{ card.runner_indicator_label }}</span>
+                    {% if card.runner_issue_count %}
+                    <span>{{ card.runner_issue_count }} issue{{ 's' if card.runner_issue_count != 1 }}</span>
+                    {% endif %}
+                </div>
+                {% endif %}
+
+                {% if card.agent_failure_reason %}
+                <div class="detail-agent-failure">{{ card.agent_failure_reason }}</div>
+                {% endif %}
+
+                {% if card.latest_commit_sha %}
+                <div class="detail-commit">
+                    <span>head</span> <code>{{ card.latest_commit_sha[:7] }}</code>
+                </div>
+                {% endif %}
+
             </details>
             {% endif %}
 
-            {% if card.agent_failure_reason %}
-            <div class="card-warning">{{ card.agent_failure_reason }}</div>
-            {% endif %}
-
-            {% if card.worktree_hidden %}
-            <div class="card-warning">Agent worktree hidden by filter</div>
-            {% elif not card.worktree_path %}
-            <div class="card-warning">No worktree found for this PR</div>
-            {% elif card.worktree_path %}
-            <div class="card-iterm-hint">Click card to focus iTerm</div>
-            {% endif %}
-
+            {# ── Action forms ── #}
             <div class="card-actions">
                 {% if card.pr_number and card.review_comments and card.status.value in ['has_comments', 'ci_and_comments', 'agent_failed'] %}
                 <form method="post" action="/api/fix-comments/{{ card.pr_number }}" hx-post="/api/fix-comments/{{ card.pr_number }}" hx-swap="outerHTML" class="action-form">
@@ -184,22 +172,6 @@
                         {% if card.status.value == 'agent_failed' %}Retry{% else %}Fix CI{% endif %}
                     </button>
                 </form>
-                {% endif %}
-
-                {% if card.status.value == 'agent_working' %}
-                <span class="card-agent-status">
-                    WIP · Validation/follow-up still running{% if card.active_agents %} · {% for agent in card.active_agents %}{{ agent.label }}{% if not loop.last %}, {% endif %}{% endfor %}{% endif %}
-                </span>
-                {% endif %}
-
-                {% if card.status.value == 'ci_pending' %}
-                <span class="card-pending-status">
-                    Validation pending
-                </span>
-                {% endif %}
-
-                {% if card.status.value == 'clean' and card.pr_number %}
-                <span class="card-clean-status">All clear</span>
                 {% endif %}
 
                 {% if card.cleanup_candidate and card.worktree_path %}

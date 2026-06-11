@@ -332,6 +332,11 @@ class WorktreeCard(BaseModel):
 
     @property
     def search_text(self) -> str:
+        # Identity/state fields only. The live filter (static/app.js) matches
+        # this attribute PLUS the card's textContent — which already includes
+        # the collapsed <details> diagnostics — so diagnostic noise (comment
+        # bodies, session ids, output tails) must NOT be duplicated here or it
+        # leaks into the DOM outside the details region (BOU-1551).
         parts: list[object] = [
             self.id,
             self.worktree_name,
@@ -352,20 +357,9 @@ class WorktreeCard(BaseModel):
             self.merge_state,
             self.review_decision,
             self.latest_commit_sha,
-            self.latest_commit_date,
             self.last_updated_label,
-            self.activity_message,
-            self.activity_source,
-            self.agent_failure_reason,
-            self.agent_session_id,
-            self.runtime_session_id,
             self.docker_mode,
             self.docker_daemon_name,
-                self.runner_indicator_label,
-                self.runner_execution_summary.desktop_count,
-                self.runner_execution_summary.github_hosted_count,
-                self.runner_execution_summary.desktop_percent,
-                self.runner_execution_summary.github_hosted_percent,
         ]
         if self.is_draft:
             parts.append("draft")
@@ -373,46 +367,6 @@ class WorktreeCard(BaseModel):
             parts.append("agent worktree hidden")
         if self.cleanup_candidate:
             parts.append("cleanup candidate")
-        parts.extend(self.failing_checks)
-        parts.extend(self.agent_output)
-        parts.extend(self.container_names)
-        parts.extend(self.runtime_warnings)
-
-        for check in self.ci_checks:
-            parts.extend([check.name, check.status, check.conclusion])
-        for job in self.queued_jobs:
-            parts.extend(
-                [
-                    job.name,
-                    job.status,
-                    job.runner_pool,
-                    job.queue_age_label,
-                    job.matching_online_runner_count,
-                ]
-            )
-        for pool in self.runner_pool_health:
-            parts.extend([pool.pool, pool.total_count, pool.online_count, pool.busy_count])
-        parts.extend(
-            [
-                self.runner_execution_summary.local_percent,
-                self.runner_execution_summary.remote_percent,
-            ]
-        )
-        for comment in self.review_comments:
-            parts.extend([comment.author, comment.body, comment.path, comment.line])
-        for agent in self.active_agents:
-            parts.extend([agent.label, agent.cli_name, agent.pid])
-        if self.maintenance:
-            parts.extend(
-                [
-                    self.maintenance.state.value,
-                    self.maintenance.state.value.replace("_", " "),
-                    self.maintenance.bead_id,
-                    self.maintenance.failure_reason,
-                ]
-            )
-            parts.extend(self.maintenance.blockers)
-            parts.extend(self.maintenance.output_tail)
 
         return " ".join(str(part) for part in parts if part not in (None, ""))
 
