@@ -679,7 +679,7 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     # pinning the PR every tick (PR #7 review, P2). The ps/lsof scan runs only on
     # this work-found path; the owner set excludes us, so our own worktree falls
     # through and IS serviced.
-    if _live_independent_owner_paths([cwd], self_session_id):
+    if _live_independent_owner_paths([cwd], self_session_id, config_cwd=cwd):
         return 0, "deferring to live independent owner of this worktree"
 
     # We will service: refresh the heartbeat and set the long fix lease (a
@@ -833,7 +833,7 @@ def _self_pid_chain(max_depth: int = 16) -> set[int]:
     return pids
 
 
-def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
+def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) -> set[str]:
     """Subset of ``paths`` where a LIVE INDEPENDENT session is present.
 
     This is the liveness signal the marker gates MISS: an independent session
@@ -874,8 +874,13 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     # 1) a registry-recorded live feature-pipeline session, idle-inclusive (pid
     #    liveness, NOT CPU), that isn't us. Build the session summary ONCE and
     #    index it by worktree_path, so this stays O(registry) instead of
-    #    O(worktrees × registry) parsing (PR #7 review, P2).
-    summary = session_registry.summarize_sessions()
+    #    O(worktrees × registry) parsing (PR #7 review, P2). Resolve the registry
+    #    path from the TARGET worktree's config (config_cwd), not the process
+    #    cwd, so a repo that points session_registry_path elsewhere is still
+    #    seen (PR #7 review, P2).
+    summary = session_registry.summarize_sessions(
+        path=session_registry.registry_path(config_cwd)
+    )
     live_by_worktree: set[str] = set()
     for state in summary.sessions.values():
         if state.is_terminal:
@@ -947,7 +952,7 @@ def _collect_owned_worktrees(
     # per-path) so a large worktree pool doesn't multiply the ps/lsof scan
     # (BOU-1540, PR #7 review, P2).
     independent = _live_independent_owner_paths(
-        [path for path, _branch in candidates], session_id
+        [path for path, _branch in candidates], session_id, config_cwd=cwd
     )
 
     for worktree_path, branch in candidates:

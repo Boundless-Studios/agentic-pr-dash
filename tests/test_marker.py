@@ -84,7 +84,7 @@ def _summary(*states):
 
 
 def _no_registry(monkeypatch):
-    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary())
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary())
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
 
 
@@ -103,7 +103,7 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
     _no_process(monkeypatch)
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
-    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary(_state(999, str(owned))))
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary(_state(999, str(owned))))
 
     result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
     assert str(owned) in result
@@ -118,8 +118,27 @@ def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555, 42})
     _no_process(monkeypatch)
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
-    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary(_state(42, str(owned))))
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary(_state(42, str(owned))))
     assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
+
+
+def test_live_independent_owner_paths_uses_target_config_registry(tmp_path, monkeypatch):
+    """The registry path is resolved from the TARGET worktree config (config_cwd),
+    not the process cwd, so a repo pointing session_registry_path elsewhere is
+    still consulted (PR #7 P2)."""
+    captured = {}
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
+    _no_process(monkeypatch)
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    monkeypatch.setattr(session_registry, "registry_path", lambda cwd=None: f"REG::{cwd}")
+
+    def fake_summary(path=None):
+        captured["path"] = path
+        return _summary()
+
+    monkeypatch.setattr(session_registry, "summarize_sessions", fake_summary)
+    mc._live_independent_owner_paths([str(tmp_path)], "sess-self", config_cwd="/target/repo")
+    assert captured["path"] == "REG::/target/repo"
 
 
 def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
@@ -184,7 +203,7 @@ def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mc,
         "_live_independent_owner_paths",
-        lambda paths, sid: {os.path.abspath(str(stolen))},
+        lambda paths, sid, config_cwd=None: {os.path.abspath(str(stolen))},
     )
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
@@ -201,7 +220,7 @@ def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeyp
         mc, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
     )
     monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
     assert str(orphan) in result
@@ -226,14 +245,14 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
 
     # Foreign owner present → defer, and DO NOT refresh the heartbeat/lease (else a
     # stolen marker would pin the PR; PR #7 review, P2).
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: {os.path.abspath(str(tmp_path))})
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "independent owner" in text
     assert heartbeats == []  # no heartbeat/lease write while deferring
 
     # No foreign owner → work is surfaced AND the fix lease is stamped.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 10
@@ -256,14 +275,14 @@ def test_check_worktree_clean_tick_does_not_refresh_stolen_marker(tmp_path, monk
     monkeypatch.setattr(mc, "_marker_session_id", lambda cwd: "sess-self")  # marker is ours
 
     # Stolen: a live independent owner is present → defer, no heartbeat refresh.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: {os.path.abspath(str(tmp_path))})
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "stale stolen marker" in text
     assert heartbeats == []
 
     # Genuinely ours (no independent owner) → refresh the alive heartbeat.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 0
     assert text2 == "nothing pending"
