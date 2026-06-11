@@ -622,7 +622,7 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     extraction). ``check`` prints ``text`` and returns the code; ``stop-gate``
     aggregates the exit-10 texts across owned worktrees.
     """
-    from . import github_api, maintenance  # noqa: PLC0415
+    from . import coordinator, github_api, maintenance  # noqa: PLC0415
 
     cwd = os.path.abspath(cwd)
 
@@ -682,6 +682,21 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     if _live_independent_owner_paths([cwd], self_session_id):
         return 0, "deferring to live independent owner of this worktree"
 
+    owner_session_id = self_session_id or f"pid:{_resolve_owner_pid()}"
+    coord_decision = coordinator.dispatch_decision_for_pr(pr)
+    if not coord_decision.should_dispatch:
+        return 0, f"deferring to agent-coordinator {coord_decision.state}: {coord_decision.reason}"
+
+    claim = coordinator.claim_pr(
+        pr,
+        session_id=owner_session_id,
+        pid=_resolve_owner_pid(),
+        agent="agentic-pr-dash-check",
+        lease_seconds=_fix_lease_seconds(),
+    )
+    if claim is None:
+        return 0, "deferring to active agent-coordinator claim"
+
     # We will service: refresh the heartbeat and set the long fix lease (a
     # tick-less fix phase is about to start).
     _touch_owner_heartbeat(cwd, self_session_id, True)
@@ -692,7 +707,12 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
         logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
 
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    return 10, f"{prompt}\nPR_NUMBER={pr.number}"
+    return 10, (
+        f"{prompt}\n"
+        f"PR_NUMBER={pr.number}\n"
+        f"COORDINATOR_CLAIM_ID={claim.claim_id}\n"
+        f"COORDINATOR_TASK_FINGERPRINT={claim.task.fingerprint}"
+    )
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
