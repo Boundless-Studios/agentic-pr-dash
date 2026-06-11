@@ -127,6 +127,25 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     assert str(free) not in result
 
 
+def test_live_independent_owner_paths_real_registry_path_smoke(tmp_path, monkeypatch):
+    """End-to-end through the REAL registry-path resolution (no summarize stub):
+    an empty registry must not raise (guards the str-vs-Path regression)."""
+    cand = tmp_path / "cand"
+    cand.mkdir()
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
+    _no_process(monkeypatch)
+    # HOME is a temp dir (conftest), so the registry file does not exist.
+    assert mc._live_independent_owner_paths([str(cand)], "sess-self") == set()
+
+
+def test_cmd_list_owned_nonzero_when_cwd_not_a_worktree(tmp_path):
+    """list-owned exits non-zero on a real discovery failure (cwd not a git
+    worktree), so the loop falls back instead of treating empty as authoritative
+    (PR #7 P2)."""
+    args = types.SimpleNamespace(session_id="sess", cwd=str(tmp_path), pid=123)
+    assert mc._cmd_list_owned(args) == 3  # tmp_path is not a git repo
+
+
 def test_command_cli_name_honors_supplied_discovery_names():
     """_command_cli_name recognizes a custom CLI when the target allow-list is
     supplied, not only the process-cwd default (PR #7 P2)."""
@@ -163,10 +182,12 @@ def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
     assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
 
 
-def test_live_independent_owner_paths_uses_target_config_registry(tmp_path, monkeypatch):
-    """The registry path is resolved from the TARGET worktree config (config_cwd),
-    not the process cwd, so a repo pointing session_registry_path elsewhere is
-    still consulted (PR #7 P2)."""
+def test_live_independent_owner_paths_uses_per_candidate_config_registry(tmp_path, monkeypatch):
+    """The registry path is resolved from EACH CANDIDATE worktree's own config,
+    not the caller's cwd, so a sibling that points session_registry_path elsewhere
+    is still consulted (PR #7 P2)."""
+    cand = tmp_path / "cand"
+    cand.mkdir()
     captured = {}
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
     _no_process(monkeypatch)
@@ -178,8 +199,8 @@ def test_live_independent_owner_paths_uses_target_config_registry(tmp_path, monk
         return _summary()
 
     monkeypatch.setattr(session_registry, "summarize_sessions", fake_summary)
-    mc._live_independent_owner_paths([str(tmp_path)], "sess-self", config_cwd="/target/repo")
-    assert captured["path"] == "REG::/target/repo"
+    mc._live_independent_owner_paths([str(cand)], "sess-self")
+    assert captured["path"] == f"REG::{cand}"
 
 
 def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
@@ -189,10 +210,9 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
     owned.mkdir()
     captured = {}
 
-    def fake_discover(paths, *, min_cpu=1.0, config_cwd=None):
+    def fake_discover(paths, *, min_cpu=1.0, discovery_names=None):
         captured["min_cpu"] = min_cpu
-        captured["config_cwd"] = config_cwd
-        return {str(owned): [types.SimpleNamespace(pid=999)]}
+        return {str(owned): [types.SimpleNamespace(pid=999, cli_name="claude")]}
 
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
     _no_registry(monkeypatch)

@@ -661,7 +661,7 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
         # `_touch_owner_heartbeat` would write), so a clean tick on someone
         # else's worktree stays cheap.
         if _marker_session_id(cwd) == self_session_id and _live_independent_owner_paths(
-            [cwd], self_session_id, config_cwd=cwd
+            [cwd], self_session_id
         ):
             return 0, "stale stolen marker; deferring to live independent owner"
         _touch_owner_heartbeat(cwd, self_session_id, False)
@@ -679,7 +679,7 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     # pinning the PR every tick (PR #7 review, P2). The ps/lsof scan runs only on
     # this work-found path; the owner set excludes us, so our own worktree falls
     # through and IS serviced.
-    if _live_independent_owner_paths([cwd], self_session_id, config_cwd=cwd):
+    if _live_independent_owner_paths([cwd], self_session_id):
         return 0, "deferring to live independent owner of this worktree"
 
     # We will service: refresh the heartbeat and set the long fix lease (a
@@ -797,6 +797,20 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     to decide it may service one), so the pid/heartbeat ownership gate still
     yields exactly one executor per PR — no cross-session double-servicing.
     """
+    # Surface a REAL discovery failure (cwd is missing / not a git worktree) as a
+    # non-zero exit. Otherwise `_iter_worktrees_with_branch` swallows the git
+    # error and yields nothing, so an empty result here is indistinguishable from
+    # "owns nothing" — and the loop, which now treats rc-0-empty as authoritative,
+    # would service nothing for that repo instead of falling back to its root
+    # (PR #7 review, P2).
+    probe = subprocess.run(
+        ["git", "-C", args.cwd, "worktree", "list", "--porcelain"],
+        capture_output=True, text=True,
+    )
+    if probe.returncode != 0:
+        print(f"list-owned: not a git worktree: {args.cwd}", file=sys.stderr)
+        return 3
+
     paths = _collect_owned_worktrees(args.session_id, args.cwd, args.pid)
     for path in paths:
         print(path)
@@ -833,7 +847,7 @@ def _self_pid_chain(max_depth: int = 16) -> set[int]:
     return pids
 
 
-def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) -> set[str]:
+def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     """Subset of ``paths`` where a LIVE INDEPENDENT session is present.
 
     This is the liveness signal the marker gates MISS: an independent session
@@ -848,17 +862,20 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
         _takes_over) — treating it as owned here would let an armed-but-not-
         looping editor session pin its blockers forever (PR #7 review, P2).
 
-    Two signals, correlated by ``worktree_path`` (the only key shared across the
-    disjoint marker/registry id namespaces):
+    Two signals, correlated by ``worktree_path``:
 
       1. a registry session for the path, non-terminal + pid-alive (NOT CPU-gated,
-         so an idle owner still counts) whose pid isn't ours;
+         so an idle owner still counts) whose pid/session isn't ours;
       2. an interactive feature-pipeline process whose cwd is the path, alive but
          possibly idle (`min_cpu=0.0`) — catches a session that never registered.
 
-    Both scans run ONCE for the whole candidate set (not per-path) so a large
-    worktree pool doesn't multiply the registry parse / `ps`/`lsof` cost (PR #7
-    review, P2). Our own session is excluded via the ancestor-pid chain, so a
+    Config (registry path + CLI ``discovery_names``) is resolved from EACH
+    CANDIDATE worktree's own ``agentic-pr-dash.toml``, not the caller's cwd, so a
+    sibling worktree that points its registry elsewhere or recognizes a custom
+    CLI is still checked correctly (PR #7 review, P2). To keep this O(registry)
+    rather than O(worktrees × registry), registry summaries are cached per
+    distinct registry path and indexed by worktree_path. Our own session is
+    excluded via the ancestor-pid chain AND an exact session-id match, so a
     genuinely-orphaned worktree (sub-agent PR / crashed session) is never treated
     as owned — preserving BOU-1442 pickup and crash recovery.
     """
@@ -869,63 +886,60 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
         return set()
 
     self_pids = _self_pid_chain()
+    # Per-candidate config (load_config is lru-cached): registry path + allow-list.
+    reg_of = {c: session_registry.registry_path(c) for c in candidates}  # Path objects
+    clis_of = {c: set(load_config(c).discovery_names) for c in candidates}
     owned: set[str] = set()
 
-    # 1) a registry-recorded live feature-pipeline session, idle-inclusive (pid
-    #    liveness, NOT CPU), that isn't us. Build the session summary ONCE and
-    #    index it by worktree_path, so this stays O(registry) instead of
-    #    O(worktrees × registry) parsing (PR #7 review, P2). Resolve the registry
-    #    path from the TARGET worktree's config (config_cwd), not the process
-    #    cwd, so a repo that points session_registry_path elsewhere is still
-    #    seen (PR #7 review, P2).
-    # Honor the TARGET repo's configured CLI allow-list (discovery_names) for both
-    # signals, matching `discover_active_primary_feature_pipeline_agents` — a repo
-    # that only treats e.g. `claude` as a live agent must not have a live
-    # `codex`/`aider` session count as an owner, and vice-versa (PR #7 review, P2).
-    discovery_names = set(load_config(config_cwd).discovery_names)
-
-    summary = session_registry.summarize_sessions(
-        path=session_registry.registry_path(config_cwd)
-    )
-    live_by_worktree: set[str] = set()
-    for state in summary.sessions.values():
-        if state.is_terminal:
-            continue
-        if state.launch_source in session_registry.DASHBOARD_LAUNCH_SOURCES:
-            continue
-        if not state.is_feature_pipeline:
-            continue
-        if state.cli not in discovery_names:
-            continue
-        # Our OWN session by exact id is never an independent owner — even when a
-        # supervisor restarted this session-scoped loop with the same
-        # --session-id but a pid that is no longer a descendant of the original
-        # launcher (so the ancestor-pid check below wouldn't catch it). Else we'd
-        # defer to our own registry entry and stop servicing our own PR until that
-        # pid exits (PR #7 review, P2).
-        if self_session_id and state.session_id == self_session_id:
-            continue
-        if state.pid in self_pids:
-            continue
-        if not session_registry.pid_is_live(state.pid):
-            continue
-        if state.worktree_path:
-            live_by_worktree.add(os.path.abspath(state.worktree_path))
-    owned.update(p for p in candidates if p in live_by_worktree)
+    # 1) registry — summarize each DISTINCT registry path once (dedupe by string,
+    #    pass the Path), index live candidate-eligible states by worktree_path
+    #    (path-independent filters only), then apply the per-candidate CLI
+    #    allow-list at lookup.
+    distinct_regs = {str(reg_of[c]): reg_of[c] for c in candidates}
+    index_by_reg: dict[str, dict[str, list]] = {}
+    for reg_str, reg_path in distinct_regs.items():
+        summary = session_registry.summarize_sessions(path=reg_path)
+        idx: dict[str, list] = {}
+        for state in summary.sessions.values():
+            if state.is_terminal:
+                continue
+            if state.launch_source in session_registry.DASHBOARD_LAUNCH_SOURCES:
+                continue
+            if not state.is_feature_pipeline:
+                continue
+            if self_session_id and state.session_id == self_session_id:
+                continue
+            if state.pid in self_pids:
+                continue
+            if not session_registry.pid_is_live(state.pid):
+                continue
+            if state.worktree_path:
+                idx.setdefault(os.path.abspath(state.worktree_path), []).append(state)
+        index_by_reg[reg_str] = idx
+    for c in candidates:
+        states = index_by_reg[str(reg_of[c])].get(c, [])
+        if any(s.cli in clis_of[c] for s in states):
+            owned.add(c)
 
     # 2) a live interactive feature-pipeline PROCESS sitting on the worktree —
     #    catches a session that never registered. Liveness, not activity
-    #    (min_cpu=0.0), so an idle owner still counts. ONE batched ps/lsof scan
-    #    for all remaining candidates, resolving discovery_names from the TARGET
-    #    config so a custom-CLI owner isn't missed (PR #7 review, P2).
+    #    (min_cpu=0.0). ONE batched ps/lsof scan with the UNION of candidate
+    #    allow-lists, then filter the returned agents by EACH candidate's own
+    #    allow-list (AgentProcess carries cli_name) so a custom-CLI owner isn't
+    #    missed and an excluded one isn't counted (PR #7 review, P2).
     remaining = [p for p in candidates if p not in owned]
     if remaining:
+        union_clis: set[str] = set()
+        for c in remaining:
+            union_clis |= clis_of[c]
         by_path = agents.discover_primary_feature_pipeline_agents(
-            remaining, min_cpu=0.0, config_cwd=config_cwd
+            remaining, min_cpu=0.0, discovery_names=union_clis
         )
         for path, agent_list in by_path.items():
-            if any(agent.pid not in self_pids for agent in agent_list):
-                owned.add(os.path.abspath(path))
+            abs_path = os.path.abspath(path)
+            allow = clis_of.get(abs_path, union_clis)
+            if any(a.pid not in self_pids and a.cli_name in allow for a in agent_list):
+                owned.add(abs_path)
 
     return owned
 
@@ -971,7 +985,7 @@ def _collect_owned_worktrees(
     # per-path) so a large worktree pool doesn't multiply the ps/lsof scan
     # (BOU-1540, PR #7 review, P2).
     independent = _live_independent_owner_paths(
-        [path for path, _branch in candidates], session_id, config_cwd=cwd
+        [path for path, _branch in candidates], session_id
     )
 
     for worktree_path, branch in candidates:
