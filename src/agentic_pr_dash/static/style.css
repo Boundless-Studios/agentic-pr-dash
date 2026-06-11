@@ -435,44 +435,48 @@ header h1 {
     line-height: 1.4;
 }
 
+/* Scoped to .card-state — the card div also carries a state-* class for
+   search/JS hooks, and must NOT inherit the badge tint (BOU-1551: status
+   color appears only on the badge itself). */
+
 /* State → danger */
-.state-failed,
-.state-ci_failing,
-.state-ci_and_comments {
+.card-state.state-failed,
+.card-state.state-ci_failing,
+.card-state.state-ci_and_comments {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
     color: var(--danger);
 }
 
 /* State → warn */
-.state-awaiting_fixes,
-.state-queued,
-.state-has_comments {
+.card-state.state-awaiting_fixes,
+.card-state.state-queued,
+.card-state.state-has_comments {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
 }
 
 /* State → info (in-progress / pending) */
-.state-working,
-.state-ci_pending,
-.state-agent_working {
+.card-state.state-working,
+.card-state.state-ci_pending,
+.card-state.state-agent_working {
     background: color-mix(in srgb, var(--info) 14%, transparent);
     color: var(--info);
 }
 
 /* State → ok */
-.state-clean {
+.card-state.state-clean {
     background: color-mix(in srgb, var(--ok) 14%, transparent);
     color: var(--ok);
 }
 
 /* State → neutral */
-.state-no_pr {
+.card-state.state-no_pr {
     background: color-mix(in srgb, var(--neutral) 14%, transparent);
     color: var(--neutral);
 }
 
 /* State → danger-ish for merge conflict */
-.state-merge_conflict {
+.card-state.state-merge_conflict {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
     color: var(--danger);
 }

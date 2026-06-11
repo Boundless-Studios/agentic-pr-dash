@@ -15,7 +15,9 @@
             <div class="card-top">
                 <div>
                     <div class="card-worktree-name">{{ card.worktree_name }}</div>
+                    {% if card.branch != card.worktree_name %}
                     <div class="card-branch">{{ card.branch }}</div>
+                    {% endif %}
                 </div>
                 <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
             </div>
@@ -51,7 +53,7 @@
             {# ── Compact meta row ── #}
             <div class="card-meta">
                 {% if card.review_comments %}
-                <span class="card-comment-count">{{ card.review_comments | length }} comments</span>
+                <span class="card-comment-count">{{ card.review_comments | length }} comment{{ 's' if card.review_comments | length != 1 }}</span>
                 {% endif %}
                 {% if card.ci_checks %}
                 {% set passed = card.ci_checks | selectattr("conclusion", "eq", "success") | list | length %}
