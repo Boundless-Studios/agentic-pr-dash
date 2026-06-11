@@ -561,6 +561,19 @@ def _list_my_open_prs(cwd: str) -> dict[str, tuple[int, bool]]:
     return out
 
 
+def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
+    """True if the PR has at least one non-outdated, unresolved review thread.
+
+    Used to keep a PR out of any ready-to-merge batch even when CI is green
+    (BOU-1587 AC #4). Outdated threads (the code they pointed at changed) and
+    resolved threads do not count.
+    """
+    from . import github_api  # noqa: PLC0415
+
+    threads = github_api.get_review_threads(pr_number, cwd)
+    return any(not t.is_resolved and not t.is_outdated for t in threads)
+
+
 def _cmd_arm(args: argparse.Namespace) -> int:
     """Explicitly register a worktree's open non-draft PR under a session.
 
