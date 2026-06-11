@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from . import github_api, maintenance
+from . import agents, github_api, maintenance, session_registry
+from .config import load as load_config
 from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
@@ -31,6 +32,69 @@ ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SI
 # steady-state burn well under budget while staying responsive enough for a
 # PR babysitter.
 POLL_INTERVAL_SECONDS = 60
+
+
+def _parse_session_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _has_process_owner(pr: PRData) -> bool:
+    if not pr.worktree_path:
+        return False
+    discovery_names = set(load_config(pr.worktree_path).discovery_names)
+    by_path = agents.discover_primary_feature_pipeline_agents(
+        [pr.worktree_path],
+        min_cpu=0.0,
+        discovery_names=discovery_names,
+    )
+    return any(agent.cli_name in discovery_names for agent in by_path.get(pr.worktree_path, []))
+
+
+def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -> bool | None:
+    """Return live owner state for this PR when the session registry knows it."""
+    if not pr.worktree_path:
+        return None
+
+    summary = session_registry.summarize_sessions(
+        path=session_registry.registry_path(pr.worktree_path)
+    )
+    matched = False
+    latest_matched_at: datetime | None = None
+    dead_nonterminal_owner = False
+    for state in summary.sessions.values():
+        if state.worktree_path != pr.worktree_path:
+            continue
+        if state.pr_number not in (None, pr.number):
+            continue
+        if state.pr_number is None and state.branch not in (None, "", pr.branch):
+            continue
+        if not state.is_feature_pipeline:
+            continue
+
+        matched = True
+        timestamp = _parse_session_timestamp(state.timestamp)
+        if timestamp and (latest_matched_at is None or timestamp > latest_matched_at):
+            latest_matched_at = timestamp
+        if not state.is_terminal:
+            if session_registry.pid_is_live(state.pid):
+                return True
+            dead_nonterminal_owner = True
+
+    if matched:
+        if _has_process_owner(pr):
+            return True
+        if dead_nonterminal_owner:
+            if queued_at is None or latest_matched_at is None or queued_at <= latest_matched_at:
+                return False
+            return None
+        if queued_at is None or latest_matched_at is None or queued_at <= latest_matched_at:
+            return False
+    return None
 
 
 class Orchestrator:
@@ -295,6 +359,12 @@ class Orchestrator:
                         and set(pr.maintenance.failing_checks) == current_failing
                         and set(pr.maintenance.review_comment_ids) == current_comment_ids
                     )
+                    owner_live = _has_matching_session_owner(
+                        pr,
+                        queued_at=pr.maintenance.last_signal_at if pr.maintenance else None,
+                    )
+                    if already_queued and owner_live is False:
+                        already_queued = False
                     if not already_queued:
                         asyncio.create_task(self.dispatch_pr_maintenance(pr))
 

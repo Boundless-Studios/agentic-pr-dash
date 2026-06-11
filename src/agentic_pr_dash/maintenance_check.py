@@ -1029,6 +1029,37 @@ def _collect_owned_worktrees(
     return result
 
 
+def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
+    """Return marker-owned worktrees for passive Stop-hook gating.
+
+    Unlike `_collect_owned_worktrees`, this does NOT reconcile/adopt unmarked
+    open `@me` PR worktrees. Adoption is an explicit orchestration/recovery
+    action for `list-owned`; a Stop hook runs when a session is trying to go
+    idle and must only block on PRs already armed by that same session.
+    """
+    cwd = os.path.abspath(cwd)
+    if not session_id:
+        return []
+
+    candidates = list(_iter_worktrees_with_branch(cwd))
+    independent = _live_independent_owner_paths(
+        [path for path, _branch in candidates], session_id
+    )
+
+    result: list[str] = []
+    seen: set[str] = set()
+    for worktree_path, _branch in candidates:
+        abs_path = os.path.abspath(worktree_path)
+        if abs_path in independent:
+            continue
+        if _marker_session_id(worktree_path) != session_id:
+            continue
+        if worktree_path not in seen:
+            seen.add(worktree_path)
+            result.append(worktree_path)
+    return result
+
+
 def _mark_maintenance_complete(maintenance, cwd: str, pr_number: int) -> None:  # type: ignore[no-untyped-def]
     """Best-effort: write COMPLETE to the on-disk maintenance state.
 
@@ -1385,7 +1416,7 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     # when ownership is genuinely unknown (no session identity at all).
     session_id = args.session_id or _read_session_marker(cwd)
     if session_id:
-        owned = _collect_owned_worktrees(session_id, cwd, args.pid)
+        owned = _collect_stop_gate_worktrees(session_id, cwd)
     else:
         owned = [cwd]
 
