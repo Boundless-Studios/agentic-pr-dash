@@ -31,6 +31,7 @@ from .models import (
     ReviewComment,
     RunnerExecutionSummary,
     WorktreeCard,
+    worktree_started_at,
 )
 from .orchestrator import Orchestrator
 from .runner_monitor import get_runner_fleet_load
@@ -493,6 +494,14 @@ def _build_card_for_worktree(
     if pr is None:
         cleanup_candidate, _ = _selected_worktree_cleanup_reason(worktree, fallback_agents)
 
+    # Prefer the PR's creation timestamp as "started_at"; fall back to the
+    # worktree directory's birth/ctime when no PR (or PR has no created_at).
+    _pr_created_at = (pr.created_at if pr else "") or ""
+    if not _pr_created_at:
+        _wt_dt = worktree_started_at(worktree.get("path") or "")
+        if _wt_dt is not None:
+            _pr_created_at = _wt_dt.isoformat().replace("+00:00", "Z")
+
     return WorktreeCard(
         id=f"worktree:{worktree['path']}",
         worktree_name=Path(worktree["path"]).name,
@@ -533,6 +542,7 @@ def _build_card_for_worktree(
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
         container_names=runtime_session.container_names if runtime_session else [],
         runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
+        pr_created_at=_pr_created_at,
     )
 
 
@@ -579,6 +589,7 @@ def _build_unassigned_pr_card(
         last_polled=pr.last_polled,
         last_agent_dispatch=pr.last_agent_dispatch,
         maintenance=pr.maintenance,
+        pr_created_at=pr.created_at,
     )
 
 

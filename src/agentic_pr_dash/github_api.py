@@ -122,7 +122,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     """
     r = _run(
         ["gh", "pr", "list", "--author", "@me", "--state", "open",
-         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,labels"],
+         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,labels,createdAt"],
         cwd=cwd, timeout_s=30,
     )
     if r.returncode != 0:

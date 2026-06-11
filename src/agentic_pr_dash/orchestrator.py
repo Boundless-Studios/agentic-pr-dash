@@ -132,6 +132,7 @@ class Orchestrator:
                     base_branch=raw.get("baseRefName", "") or "main",
                     url=raw.get("url", ""),
                     is_draft=raw.get("isDraft", False),
+                    created_at=raw.get("createdAt", ""),
                 )
                 self.prs[num] = pr
                 self.log(f"Discovered PR #{num}: {pr.title}", pr_number=num)

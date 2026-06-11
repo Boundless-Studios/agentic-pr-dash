@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel
@@ -152,6 +153,7 @@ class PRData(BaseModel):
     base_branch: str = "main"
     url: str
     is_draft: bool = False
+    created_at: str = ""
     labels: list[str] = []
     status: PRStatus = PRStatus.CLEAN
     ci_checks: list[CICheck] = []
@@ -226,6 +228,77 @@ class WorktreeCard(BaseModel):
     docker_daemon_name: str | None = None
     container_names: list[str] = []
     runtime_warnings: list[str] = []
+    pr_created_at: str = ""
+
+    @property
+    def started_at(self) -> datetime | None:
+        """Parse pr_created_at (GitHub ISO8601) into a UTC datetime, or None."""
+        if not self.pr_created_at:
+            return None
+        try:
+            return datetime.fromisoformat(self.pr_created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @property
+    def started_at_label(self) -> str:
+        """Human-readable started_at, e.g. '2026-06-10 12:00', or '' when unset."""
+        dt = self.started_at
+        if dt is None:
+            return ""
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    @property
+    def agent_state(self) -> str:
+        """Single canonical state string for the card, in priority order:
+        failed > working > queued > awaiting_fixes > ci_failing > ci_pending
+        > merge_conflict > no_pr > clean.
+        """
+        # --- failed ---
+        if (
+            self.agent_failure_reason
+            or self.status == PRStatus.AGENT_FAILED
+            or (self.maintenance is not None and self.maintenance.state == MaintenanceStatus.FAILED)
+        ):
+            return "failed"
+
+        # --- maintenance signals override status-based states ---
+        if self.maintenance is not None:
+            m = self.maintenance.state
+            if m in (MaintenanceStatus.QUEUED, MaintenanceStatus.SIGNALED):
+                return "queued"
+            if m in (MaintenanceStatus.RUNNING, MaintenanceStatus.WAITING_FOR_PUSH):
+                return "working"
+
+        # --- status-based ---
+        if self.status == PRStatus.AGENT_WORKING:
+            return "working"
+        if self.status in (PRStatus.HAS_COMMENTS, PRStatus.CI_AND_COMMENTS):
+            return "awaiting_fixes"
+        if self.status == PRStatus.CI_FAILING:
+            return "ci_failing"
+        if self.status == PRStatus.CI_PENDING:
+            return "ci_pending"
+        if self.status == PRStatus.MERGE_CONFLICT:
+            return "merge_conflict"
+        if self.status == PRStatus.NO_PR:
+            return "no_pr"
+        return "clean"
+
+    @property
+    def agent_state_label(self) -> str:
+        """Human-readable label for agent_state."""
+        return {
+            "failed": "Failed",
+            "working": "Agent Working",
+            "queued": "Queued",
+            "awaiting_fixes": "Awaiting Fixes",
+            "ci_failing": "CI Failing",
+            "ci_pending": "CI Pending",
+            "merge_conflict": "Merge Conflict",
+            "no_pr": "No PR",
+            "clean": "Clean",
+        }.get(self.agent_state, "Unknown")
 
     @property
     def runner_issue_count(self) -> int:
@@ -273,6 +346,9 @@ class WorktreeCard(BaseModel):
             self.pr_url,
             self.status.value,
             self.status.value.replace("_", " "),
+            self.agent_state,
+            self.agent_state_label,
+            self.started_at_label,
             self.merge_state,
             self.review_decision,
             self.latest_commit_sha,
@@ -346,3 +422,26 @@ class EventEntry(BaseModel):
     pr_number: int | None = None
     message: str
     level: str = "info"  # info, warn, error, success
+
+
+def worktree_started_at(path: str) -> datetime | None:
+    """Return the creation time of a worktree directory as a UTC datetime.
+
+    Prefers st_birthtime (macOS/BSD) when available; falls back to st_ctime.
+    Returns None when the path is missing or stat raises.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    try:
+        # macOS / BSD: st_birthtime is the true creation time.
+        birth = getattr(stat, "st_birthtime", None)
+        if birth:
+            return datetime.fromtimestamp(birth, tz=timezone.utc)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        return datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+    except (OSError, ValueError):
+        return None
