@@ -191,3 +191,37 @@ def test_maintenance_blockers_detect_mergeable_conflict():
     from agentic_pr_dash.maintenance import blockers_for_pr
     pr = _pr(merge_state="UNSTABLE", mergeable="CONFLICTING")
     assert "merge_conflict" in blockers_for_pr(pr)
+
+
+def test_known_conflict_preserved_when_bulk_unknown_and_refetch_fails(monkeypatch):
+    """A CONFLICTING PR must not slide back to Clean when the next bulk poll
+    returns UNKNOWN and the per-PR refetch then fails."""
+    import asyncio
+    from agentic_pr_dash import orchestrator, github_api
+
+    bulk = {
+        "number": 1, "title": "t", "headRefName": "b", "baseRefName": "main",
+        "url": "u", "isDraft": False, "labels": [],
+        "mergeStateStatus": "UNSTABLE", "mergeable": "CONFLICTING",
+    }
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [bulk])
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: None)
+    monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
+    monkeypatch.setattr(github_api, "get_latest_commit", lambda n, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
+    monkeypatch.setattr(github_api, "get_ci_checks", lambda n, cwd=None: [])
+    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda n, d, cwd=None: [])
+    monkeypatch.setattr(github_api, "get_mergeability", lambda n, cwd=None: ("", ""))
+    monkeypatch.setattr(asyncio, "create_task", lambda coro: coro.close())
+
+    orch = orchestrator.Orchestrator(repo_cwd=None)
+
+    asyncio.run(orch.refresh_prs())
+    assert orch.prs[1].mergeable == "CONFLICTING"
+    assert orch.prs[1].status is PRStatus.MERGE_CONFLICT
+
+    # Next poll: bulk now reports UNKNOWN, and the per-PR refetch fails ("","").
+    bulk["mergeStateStatus"] = "UNKNOWN"
+    bulk["mergeable"] = "UNKNOWN"
+    asyncio.run(orch.refresh_prs())
+    assert orch.prs[1].mergeable == "CONFLICTING"  # preserved, not erased
+    assert orch.prs[1].status is PRStatus.MERGE_CONFLICT

@@ -205,26 +205,37 @@ class Orchestrator:
             pr.title = raw.get("title", pr.title)
             pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
             pr.review_decision = raw.get("reviewDecision", "") or "none"
-            pr.merge_state = raw.get("mergeStateStatus", "") or "unknown"
-            pr.mergeable = raw.get("mergeable", "") or "unknown"
             pr.labels = [
                 label.get("name", "")
                 for label in raw.get("labels", [])
                 if isinstance(label, dict) and label.get("name")
             ]
 
+            # GitHub computes mergeability lazily: a bulk `gh pr list` often
+            # returns UNKNOWN/blank for both signals right after a push or a
+            # base-branch move. A definite bulk value is authoritative; an
+            # UNKNOWN/blank one is that async-compute window — keep the last-known
+            # value rather than erasing a known conflict, then force a per-PR
+            # re-fetch below (which also triggers the computation). Without this,
+            # a CONFLICTING PR whose next bulk poll returns UNKNOWN would be reset
+            # to "unknown" and, if the refetch then failed, slide back to Clean.
+            bulk_merge_state = raw.get("mergeStateStatus") or ""
+            bulk_mergeable = raw.get("mergeable") or ""
+            if bulk_merge_state and bulk_merge_state != "UNKNOWN":
+                pr.merge_state = bulk_merge_state
+            if bulk_mergeable and bulk_mergeable != "UNKNOWN":
+                pr.mergeable = bulk_mergeable
+
             # Find worktree
             pr.worktree_path = find_worktree_for_branch(pr.branch)
 
-            # GitHub computes mergeability lazily: a bulk `gh pr list` often
-            # returns UNKNOWN for both signals right after a push or a base-branch
-            # move. Force a per-PR re-fetch (which also triggers the computation)
-            # so a genuinely-conflicting PR doesn't sit in Clean until GitHub
-            # eventually flips mergeStateStatus to DIRTY.
-            if pr.merge_state == "UNKNOWN" or pr.mergeable == "UNKNOWN":
+            if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
                 refetched_state, refetched_mergeable = await asyncio.to_thread(
                     github_api.get_mergeability, num, self.repo_cwd
                 )
+                # A successful refetch is authoritative — it also picks up a
+                # conflict that has since been resolved. A failed refetch returns
+                # ("","") and leaves the preserved last-known value intact.
                 if refetched_state:
                     pr.merge_state = refetched_state
                 if refetched_mergeable:
