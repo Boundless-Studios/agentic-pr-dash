@@ -31,6 +31,8 @@ from .models import (
     ReviewComment,
     RunnerExecutionSummary,
     WorktreeCard,
+    humanize_relative,
+    worktree_started_at,
 )
 from .orchestrator import Orchestrator
 from .runner_monitor import get_runner_fleet_load
@@ -279,7 +281,7 @@ def _format_last_updated(value: str | None) -> str | None:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return value
-    return parsed.strftime("%Y-%m-%d %H:%M")
+    return humanize_relative(parsed)
 
 
 def _now_epoch() -> int:
@@ -526,6 +528,14 @@ def _build_card_for_worktree(
     if pr is None:
         cleanup_candidate, _ = _selected_worktree_cleanup_reason(worktree, fallback_agents)
 
+    # Prefer the PR's creation timestamp as "started_at"; fall back to the
+    # worktree directory's birth/ctime when no PR (or PR has no created_at).
+    _pr_created_at = (pr.created_at if pr else "") or ""
+    if not _pr_created_at:
+        _wt_dt = worktree_started_at(worktree.get("path") or "")
+        if _wt_dt is not None:
+            _pr_created_at = _wt_dt.isoformat().replace("+00:00", "Z")
+
     return WorktreeCard(
         id=f"worktree:{worktree['path']}",
         worktree_name=Path(worktree["path"]).name,
@@ -566,6 +576,7 @@ def _build_card_for_worktree(
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
         container_names=runtime_session.container_names if runtime_session else [],
         runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
+        pr_created_at=_pr_created_at,
     )
 
 
@@ -616,6 +627,7 @@ def _build_unassigned_pr_card(
         last_polled=pr.last_polled,
         last_agent_dispatch=pr.last_agent_dispatch,
         maintenance=pr.maintenance,
+        pr_created_at=pr.created_at,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
         docker_mode=runtime_session.docker_mode if runtime_session else None,
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
@@ -1232,11 +1244,11 @@ async def fix_comments(pr_number: int, request: Request):
     import asyncio
     pr = orchestrator.prs.get(pr_number)
     if not pr:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">PR not found</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">No worktree</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">No worktree</span>')
     if not pr.review_comments:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--orange)">No comments to address</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--warn)">No comments to address</span>')
     if pr.number in orchestrator._inflight_prs:
         return _dispatch_response(request, '<span class="card-agent-status">Agent already working...</span>')
 
@@ -1251,9 +1263,9 @@ async def retry_ci(pr_number: int, request: Request):
     import asyncio
     pr = orchestrator.prs.get(pr_number)
     if not pr:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">PR not found</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">No worktree</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">No worktree</span>')
     if pr.number in orchestrator._inflight_prs:
         return _dispatch_response(request, '<span class="card-agent-status">Agent already working...</span>')
 

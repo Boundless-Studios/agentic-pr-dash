@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+import os
+from datetime import datetime, timezone
 from enum import Enum
 
 from pydantic import BaseModel
@@ -152,6 +153,7 @@ class PRData(BaseModel):
     base_branch: str = "main"
     url: str
     is_draft: bool = False
+    created_at: str = ""
     labels: list[str] = []
     status: PRStatus = PRStatus.CLEAN
     ci_checks: list[CICheck] = []
@@ -226,6 +228,77 @@ class WorktreeCard(BaseModel):
     docker_daemon_name: str | None = None
     container_names: list[str] = []
     runtime_warnings: list[str] = []
+    pr_created_at: str = ""
+
+    @property
+    def started_at(self) -> datetime | None:
+        """Parse pr_created_at (GitHub ISO8601) into a UTC datetime, or None."""
+        if not self.pr_created_at:
+            return None
+        try:
+            return datetime.fromisoformat(self.pr_created_at.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @property
+    def started_at_label(self) -> str:
+        """Relative started_at, e.g. '1d 5h ago', or '' when unset."""
+        dt = self.started_at
+        if dt is None:
+            return ""
+        return humanize_relative(dt)
+
+    @property
+    def agent_state(self) -> str:
+        """Single canonical state string for the card, in priority order:
+        failed > working > queued > awaiting_fixes > ci_failing > ci_pending
+        > merge_conflict > no_pr > clean.
+        """
+        # --- failed ---
+        if (
+            self.agent_failure_reason
+            or self.status == PRStatus.AGENT_FAILED
+            or (self.maintenance is not None and self.maintenance.state == MaintenanceStatus.FAILED)
+        ):
+            return "failed"
+
+        # --- maintenance signals override status-based states ---
+        if self.maintenance is not None:
+            m = self.maintenance.state
+            if m in (MaintenanceStatus.QUEUED, MaintenanceStatus.SIGNALED):
+                return "queued"
+            if m in (MaintenanceStatus.RUNNING, MaintenanceStatus.WAITING_FOR_PUSH):
+                return "working"
+
+        # --- status-based ---
+        if self.status == PRStatus.AGENT_WORKING:
+            return "working"
+        if self.status in (PRStatus.HAS_COMMENTS, PRStatus.CI_AND_COMMENTS):
+            return "awaiting_fixes"
+        if self.status == PRStatus.CI_FAILING:
+            return "ci_failing"
+        if self.status == PRStatus.CI_PENDING:
+            return "ci_pending"
+        if self.status == PRStatus.MERGE_CONFLICT:
+            return "merge_conflict"
+        if self.status == PRStatus.NO_PR:
+            return "no_pr"
+        return "clean"
+
+    @property
+    def agent_state_label(self) -> str:
+        """Human-readable label for agent_state."""
+        return {
+            "failed": "Failed",
+            "working": "Agent Working",
+            "queued": "Queued",
+            "awaiting_fixes": "Awaiting Fixes",
+            "ci_failing": "CI Failing",
+            "ci_pending": "CI Pending",
+            "merge_conflict": "Merge Conflict",
+            "no_pr": "No PR",
+            "clean": "Clean",
+        }.get(self.agent_state, "Unknown")
 
     @property
     def runner_issue_count(self) -> int:
@@ -259,6 +332,11 @@ class WorktreeCard(BaseModel):
 
     @property
     def search_text(self) -> str:
+        # Identity/state fields only. The live filter (static/app.js) matches
+        # this attribute PLUS the card's textContent — which already includes
+        # the collapsed <details> diagnostics — so diagnostic noise (comment
+        # bodies, session ids, output tails) must NOT be duplicated here or it
+        # leaks into the DOM outside the details region (BOU-1551).
         parts: list[object] = [
             self.id,
             self.worktree_name,
@@ -273,23 +351,15 @@ class WorktreeCard(BaseModel):
             self.pr_url,
             self.status.value,
             self.status.value.replace("_", " "),
+            self.agent_state,
+            self.agent_state_label,
+            self.started_at_label,
             self.merge_state,
             self.review_decision,
             self.latest_commit_sha,
-            self.latest_commit_date,
             self.last_updated_label,
-            self.activity_message,
-            self.activity_source,
-            self.agent_failure_reason,
-            self.agent_session_id,
-            self.runtime_session_id,
             self.docker_mode,
             self.docker_daemon_name,
-                self.runner_indicator_label,
-                self.runner_execution_summary.desktop_count,
-                self.runner_execution_summary.github_hosted_count,
-                self.runner_execution_summary.desktop_percent,
-                self.runner_execution_summary.github_hosted_percent,
         ]
         if self.is_draft:
             parts.append("draft")
@@ -297,46 +367,6 @@ class WorktreeCard(BaseModel):
             parts.append("agent worktree hidden")
         if self.cleanup_candidate:
             parts.append("cleanup candidate")
-        parts.extend(self.failing_checks)
-        parts.extend(self.agent_output)
-        parts.extend(self.container_names)
-        parts.extend(self.runtime_warnings)
-
-        for check in self.ci_checks:
-            parts.extend([check.name, check.status, check.conclusion])
-        for job in self.queued_jobs:
-            parts.extend(
-                [
-                    job.name,
-                    job.status,
-                    job.runner_pool,
-                    job.queue_age_label,
-                    job.matching_online_runner_count,
-                ]
-            )
-        for pool in self.runner_pool_health:
-            parts.extend([pool.pool, pool.total_count, pool.online_count, pool.busy_count])
-        parts.extend(
-            [
-                self.runner_execution_summary.local_percent,
-                self.runner_execution_summary.remote_percent,
-            ]
-        )
-        for comment in self.review_comments:
-            parts.extend([comment.author, comment.body, comment.path, comment.line])
-        for agent in self.active_agents:
-            parts.extend([agent.label, agent.cli_name, agent.pid])
-        if self.maintenance:
-            parts.extend(
-                [
-                    self.maintenance.state.value,
-                    self.maintenance.state.value.replace("_", " "),
-                    self.maintenance.bead_id,
-                    self.maintenance.failure_reason,
-                ]
-            )
-            parts.extend(self.maintenance.blockers)
-            parts.extend(self.maintenance.output_tail)
 
         return " ".join(str(part) for part in parts if part not in (None, ""))
 
@@ -346,3 +376,56 @@ class EventEntry(BaseModel):
     pr_number: int | None = None
     message: str
     level: str = "info"  # info, warn, error, success
+
+
+def worktree_started_at(path: str) -> datetime | None:
+    """Return the creation time of a worktree directory as a UTC datetime.
+
+    Prefers st_birthtime (macOS/BSD) when available; falls back to st_ctime.
+    Returns None when the path is missing or stat raises.
+    """
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    try:
+        # macOS / BSD: st_birthtime is the true creation time.
+        birth = getattr(stat, "st_birthtime", None)
+        if birth:
+            return datetime.fromtimestamp(birth, tz=timezone.utc)
+    except (AttributeError, OSError, ValueError):
+        pass
+    try:
+        return datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
+    except (OSError, ValueError):
+        return None
+
+
+def humanize_relative(dt: datetime, now: datetime | None = None) -> str:
+    """Compact relative age of ``dt``, e.g. '1d 5h ago', '1m 30s ago', '12s ago'.
+
+    Shows the two largest non-zero units (day+hour, hour+minute, minute+second)
+    so the label stays scannable. Future or sub-second deltas render 'just now'.
+    A naive ``dt`` is assumed to be UTC. Pass ``now`` for deterministic tests.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+
+    seconds = int((reference - dt).total_seconds())
+    if seconds < 1:
+        return "just now"
+
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if days:
+        return f"{days}d {hours}h ago"
+    if hours:
+        return f"{hours}h {minutes}m ago"
+    if minutes:
+        return f"{minutes}m {secs}s ago"
+    return f"{secs}s ago"
