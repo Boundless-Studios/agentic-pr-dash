@@ -1457,6 +1457,30 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         if code == 10:
             pending.append((worktree, text))
 
+    # BOU-1587: owned PRs whose worktree was torn down are STILL mandatory work.
+    # They have no worktree to _check_worktree, so reconcile them from the durable
+    # ledger and block on any with unresolved review threads or failing CI. P1-first.
+    if session_id:
+        detached = [r for r in _detached_pr_records(session_id, cwd)
+                    if r["unresolved_threads"] or r["ci_failing"]]
+        detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
+        for r in detached:
+            why = []
+            if r["unresolved_threads"]:
+                why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
+            if r["ci_failing"]:
+                why.append("failing CI")
+            tag = " [P1]" if r["p1"] else ""
+            text = (
+                f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
+                f"  needs: {', '.join(why)}\n"
+                f"  This PR's worktree was torn down. Recreate it from the branch "
+                f"({r['branch'] or '<branch>'}) to fix, or explicitly hand it off — "
+                f"do NOT leave it unmonitored.\n"
+                f"PR_NUMBER={r['pr']}"
+            )
+            pending.append((f"(no worktree) PR #{r['pr']}", text))
+
     if not pending:
         # Clear the loop counter but KEEP the timestamp so a clean idle session
         # does not re-run gh on every single turn.
@@ -1543,18 +1567,15 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
     return []
 
 
-def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool):
-    """Union of live-worktree PRs and detached ledger PRs, each with live state.
-
-    Returns a list of dict records sorted severity-first (P1 -> thread count).
-    Side effect: prunes merged/closed PRs from this session's ledger.
+def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
+    """Records for this session's ledger PRs whose worktree is GONE, with live
+    GitHub state. Does NO worktree adoption, so it is safe for the Stop hook
+    (which must never adopt unmarked worktrees). Prunes merged/closed PRs.
     """
     from . import session_ledger, github_api  # noqa: PLC0415
 
-    records: dict[int, dict] = {}
     present_worktrees = set(_iter_worktree_paths(cwd))
-
-    # 1) Detached ledger PRs (worktree gone).
+    records: list[dict] = []
     prune: set[int] = set()
     for e in session_ledger.read(session_id):
         if e.worktree and os.path.abspath(e.worktree) in present_worktrees:
@@ -1565,14 +1586,30 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
             continue
         threads = github_api.get_review_threads(e.pr, cwd)
         unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
-        records[e.pr] = {
+        records.append({
             "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
             "worktree_present": False, "unresolved_threads": len(unresolved),
             "ci_failing": has_fail, "failing_checks": failing,
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
-        }
+        })
     if prune:
         session_ledger.prune(session_id, prune)
+    return records
+
+
+def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool):
+    """Union of live-worktree PRs and detached ledger PRs, each with live state.
+
+    Returns a list of dict records sorted severity-first (P1 -> thread count).
+    Side effect: prunes merged/closed PRs from this session's ledger.
+    """
+    from . import github_api  # noqa: PLC0415
+
+    records: dict[int, dict] = {}
+
+    # 1) Detached ledger PRs (worktree gone).
+    for rec in _detached_pr_records(session_id, cwd):
+        records[rec["pr"]] = rec
 
     # 2) Live worktree-owned PRs (unchanged ownership semantics).
     for wt in _collect_owned_worktrees(session_id, cwd, pid):
