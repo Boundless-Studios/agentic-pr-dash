@@ -486,7 +486,10 @@ def _build_card_for_worktree(
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
     # has an activity stamp; fall back to CPU-discovered active_agents otherwise.
-    agent_working = _resolve_agent_working(worktree.get("path"), bool(fallback_agents))
+    if runtime_session and runtime_session.is_terminal:
+        agent_working = False
+    else:
+        agent_working = _resolve_agent_working(worktree.get("path"), bool(fallback_agents))
     status = _card_status(pr, agent_working)
     activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
     cleanup_candidate = False

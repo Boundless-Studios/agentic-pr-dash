@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from . import github_api, maintenance
+from . import github_api, maintenance, session_registry
 from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
@@ -31,6 +31,32 @@ ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SI
 # steady-state burn well under budget while staying responsive enough for a
 # PR babysitter.
 POLL_INTERVAL_SECONDS = 60
+
+
+def _has_matching_session_owner(pr: PRData) -> bool | None:
+    """Return live owner state for this PR when the session registry knows it."""
+    if not pr.worktree_path:
+        return None
+
+    summary = session_registry.summarize_sessions()
+    matched = False
+    for state in summary.sessions.values():
+        if state.worktree_path != pr.worktree_path:
+            continue
+        if state.pr_number not in (None, pr.number):
+            continue
+        if state.pr_number is None and state.branch not in (None, "", pr.branch):
+            continue
+        if not state.is_feature_pipeline:
+            continue
+
+        matched = True
+        if not state.is_terminal and session_registry.pid_is_live(state.pid):
+            return True
+
+    if matched:
+        return False
+    return None
 
 
 class Orchestrator:
@@ -294,6 +320,9 @@ class Orchestrator:
                         and set(pr.maintenance.failing_checks) == current_failing
                         and set(pr.maintenance.review_comment_ids) == current_comment_ids
                     )
+                    owner_live = _has_matching_session_owner(pr)
+                    if already_queued and owner_live is False:
+                        already_queued = False
                     if not already_queued:
                         asyncio.create_task(self.dispatch_pr_maintenance(pr))
 
