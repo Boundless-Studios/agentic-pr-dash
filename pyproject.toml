@@ -52,6 +52,10 @@ packages = ["src/agentic_pr_dash"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Always test the checkout's src, never a previously installed snapshot of the
+# package — a stale site-packages copy can silently win the import race and
+# produce false greens (caught during BOU-1551 review).
+pythonpath = ["src"]
 
 [tool.hatch.metadata]
 allow-direct-references = true
