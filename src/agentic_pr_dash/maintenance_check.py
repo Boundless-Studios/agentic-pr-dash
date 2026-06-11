@@ -502,6 +502,24 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
             fh.write(session_id + "\n")
     except OSError:
         pass
+
+    # Durably record the session->PR membership OUTSIDE the worktree so teardown
+    # never drops it from monitoring (BOU-1587). Non-fatal: the marker remains the
+    # live source of truth if this fails.
+    try:
+        from . import session_ledger  # noqa: PLC0415
+        baseline = None
+        try:
+            rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=10)
+            if rev.returncode == 0:
+                baseline = rev.stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            baseline = None
+        branch = _current_branch(cwd)
+        session_ledger.append(session_id, pr_number, branch, cwd, baseline)
+    except Exception:  # noqa: BLE001 — ledger is best-effort
+        pass
     return True
 
 
