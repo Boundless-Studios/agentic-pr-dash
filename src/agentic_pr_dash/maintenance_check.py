@@ -661,7 +661,7 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
         # `_touch_owner_heartbeat` would write), so a clean tick on someone
         # else's worktree stays cheap.
         if _marker_session_id(cwd) == self_session_id and _live_independent_owner_paths(
-            [cwd], self_session_id
+            [cwd], self_session_id, config_cwd=cwd
         ):
             return 0, "stale stolen marker; deferring to live independent owner"
         _touch_owner_heartbeat(cwd, self_session_id, False)
@@ -878,6 +878,12 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
     #    path from the TARGET worktree's config (config_cwd), not the process
     #    cwd, so a repo that points session_registry_path elsewhere is still
     #    seen (PR #7 review, P2).
+    # Honor the TARGET repo's configured CLI allow-list (discovery_names) for both
+    # signals, matching `discover_active_primary_feature_pipeline_agents` — a repo
+    # that only treats e.g. `claude` as a live agent must not have a live
+    # `codex`/`aider` session count as an owner, and vice-versa (PR #7 review, P2).
+    discovery_names = set(load_config(config_cwd).discovery_names)
+
     summary = session_registry.summarize_sessions(
         path=session_registry.registry_path(config_cwd)
     )
@@ -888,6 +894,8 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
         if state.launch_source in session_registry.DASHBOARD_LAUNCH_SOURCES:
             continue
         if not state.is_feature_pipeline:
+            continue
+        if state.cli not in discovery_names:
             continue
         if state.pid in self_pids:
             continue
@@ -900,10 +908,13 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
     # 2) a live interactive feature-pipeline PROCESS sitting on the worktree —
     #    catches a session that never registered. Liveness, not activity
     #    (min_cpu=0.0), so an idle owner still counts. ONE batched ps/lsof scan
-    #    for all remaining candidates (PR #7 review, P2).
+    #    for all remaining candidates, resolving discovery_names from the TARGET
+    #    config so a custom-CLI owner isn't missed (PR #7 review, P2).
     remaining = [p for p in candidates if p not in owned]
     if remaining:
-        by_path = agents.discover_primary_feature_pipeline_agents(remaining, min_cpu=0.0)
+        by_path = agents.discover_primary_feature_pipeline_agents(
+            remaining, min_cpu=0.0, config_cwd=config_cwd
+        )
         for path, agent_list in by_path.items():
             if any(agent.pid not in self_pids for agent in agent_list):
                 owned.add(os.path.abspath(path))

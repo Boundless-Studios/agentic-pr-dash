@@ -117,7 +117,8 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
 
 
 def discover_primary_feature_pipeline_agents(
-    worktree_paths: list[str], *, min_cpu: float = _ACTIVE_CPU_THRESHOLD
+    worktree_paths: list[str], *, min_cpu: float = _ACTIVE_CPU_THRESHOLD,
+    config_cwd: str | None = None,
 ) -> dict[str, list[AgentProcess]]:
     """Return interactive feature-pipeline sessions by worktree.
 
@@ -127,10 +128,17 @@ def discover_primary_feature_pipeline_agents(
     sitting at a prompt still owns its worktree (its `%cpu` decays to ~0 but it
     is very much alive) — the dashboard's activity gate would otherwise miss it
     and let another session adopt and service the worktree (BOU-1540).
+
+    ``config_cwd`` selects which repo config supplies ``discovery_names`` (the
+    recognized CLI allow-list). Pass the TARGET worktree's dir when checking on
+    its behalf — resolving the allow-list from the process cwd instead would miss
+    a custom-CLI owner the target repo recognizes, or count one it excludes
+    (PR #7 review, P2).
     """
     sorted_paths = sorted({path for path in worktree_paths if path}, key=len, reverse=True)
     if not sorted_paths:
         return {}
+    allowed_clis = set(load_config(config_cwd).discovery_names)
 
     rows = _parse_process_rows(_run_process_table())
     if not rows:
@@ -150,7 +158,7 @@ def discover_primary_feature_pipeline_agents(
         if not _is_feature_pipeline_invocation(row.command):
             continue
         cli_name = _command_cli_name(row.command)
-        if cli_name not in set(load_config().discovery_names):
+        if cli_name not in allowed_clis:
             continue
         if _is_noninteractive(row, by_pid):
             continue

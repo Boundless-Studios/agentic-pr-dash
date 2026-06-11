@@ -72,10 +72,10 @@ def test_lease_legacy_env_still_wins(tmp_path, monkeypatch):
     assert mc._fix_lease_seconds() == 777
 
 
-def _state(pid, worktree_path, *, terminal=False, fp=True, src="launch-worktree-cli"):
+def _state(pid, worktree_path, *, terminal=False, fp=True, src="launch-worktree-cli", cli="claude"):
     return types.SimpleNamespace(
         pid=pid, worktree_path=worktree_path, is_terminal=terminal,
-        is_feature_pipeline=fp, launch_source=src,
+        is_feature_pipeline=fp, launch_source=src, cli=cli,
     )
 
 
@@ -108,6 +108,21 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
     assert str(owned) in result
     assert str(free) not in result
+
+
+def test_live_independent_owner_paths_registry_honors_discovery_names(tmp_path, monkeypatch):
+    """A live registry session whose cli is NOT in the target repo's discovery_names
+    (default: claude, codex) is not treated as an owner (PR #7 P2)."""
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
+    _no_process(monkeypatch)
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    monkeypatch.setattr(
+        session_registry, "summarize_sessions",
+        lambda path=None: _summary(_state(999, str(owned), cli="aider")),  # not allowed
+    )
+    assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
 
 
 def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
@@ -148,8 +163,9 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
     owned.mkdir()
     captured = {}
 
-    def fake_discover(paths, *, min_cpu=1.0):
+    def fake_discover(paths, *, min_cpu=1.0, config_cwd=None):
         captured["min_cpu"] = min_cpu
+        captured["config_cwd"] = config_cwd
         return {str(owned): [types.SimpleNamespace(pid=999)]}
 
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
