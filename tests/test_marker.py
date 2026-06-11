@@ -1,10 +1,12 @@
 """Ownership-marker round-trip + lease wiring (the one-agent-per-PR mechanism)."""
 
 import os
+import types
 
 import pytest
 
 from agentic_pr_dash import config
+from agentic_pr_dash import maintenance as maint
 from agentic_pr_dash import maintenance_check as mc
 
 
@@ -67,3 +69,74 @@ def test_lease_legacy_env_still_wins(tmp_path, monkeypatch):
     monkeypatch.setenv("GAIA_PR_WATCH_LEASE_SECONDS", "777")
     config.load.cache_clear()
     assert mc._fix_lease_seconds() == 777
+
+
+def test_collect_owned_skips_worktree_with_live_independent_owner(tmp_path, monkeypatch):
+    """Reconciliation must NOT adopt a sibling worktree that an INDEPENDENT live
+    session already owns, even when that worktree carries no pr-watch marker
+    (arming is opt-in/off, and the marker session_id namespace is disjoint from
+    the registry's). Adopting it makes one session service another ticket's PR
+    (BOU-1540). Only the genuinely-orphaned worktree is adopted.
+    """
+    orphan = tmp_path / "wt-orphan"
+    owned = tmp_path / "wt-owned"
+    orphan.mkdir()
+    owned.mkdir()
+
+    self_pid = 555
+
+    # Both branches have an open, non-draft @me PR; neither carries a marker.
+    monkeypatch.setattr(
+        mc,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(orphan), "br-orphan"), (str(owned), "br-owned")],
+    )
+    monkeypatch.setattr(
+        mc,
+        "_list_my_open_prs",
+        lambda cwd: {"br-orphan": (101, False), "br-owned": (102, False)},
+    )
+
+    # The owned worktree has a LIVE independent session (different pid); the
+    # orphan has none. discover_*_agents is the canonical "defer to live owner"
+    # signal, keyed by worktree_path.
+    def fake_agents(worktree_path):
+        if worktree_path == str(owned):
+            return [types.SimpleNamespace(pid=999)]  # a foreign live owner
+        return []
+
+    monkeypatch.setattr(maint, "discover_active_primary_feature_pipeline_agents", fake_agents)
+
+    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), self_pid)
+
+    # Orphan is adopted (stamped with our id); the independently-owned sibling is not.
+    assert str(orphan) in result
+    assert str(owned) not in result
+    assert mc._marker_session_id(str(orphan)) == "claude-uuid-X"
+    assert mc._marker_session_id(str(owned)) is None
+
+
+def test_collect_owned_still_adopts_when_only_self_is_live(tmp_path, monkeypatch):
+    """A live session matching OUR own pid is not a foreign owner — adoption of a
+    genuinely-orphaned worktree (no other live session) still proceeds, so
+    BOU-1442 sub-agent pickup / crash recovery is preserved.
+    """
+    orphan = tmp_path / "wt-orphan"
+    orphan.mkdir()
+    self_pid = 555
+
+    monkeypatch.setattr(
+        mc, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
+    )
+    monkeypatch.setattr(
+        mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)}
+    )
+    # Only our own pid shows as "live" for the worktree — not a foreign owner.
+    monkeypatch.setattr(
+        maint,
+        "discover_active_primary_feature_pipeline_agents",
+        lambda worktree_path: [types.SimpleNamespace(pid=self_pid)],
+    )
+
+    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), self_pid)
+    assert str(orphan) in result

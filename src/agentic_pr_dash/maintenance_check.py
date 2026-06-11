@@ -774,6 +774,33 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     return 0
 
 
+def _has_live_independent_owner(worktree_path: str, self_pid: int) -> bool:
+    """True if a live, independently-launched session (other than ``self_pid``)
+    already owns this worktree — even with no/stale pr-watch marker.
+
+    The marker gate (`_marker_live_foreign_pid`) alone misses a sibling ticket's
+    live session whose worktree was never armed (PR-watch arming is opt-in and
+    off by default) or whose marker carries a `session_id` in a namespace
+    disjoint from the registry's (the marker stamps the agent's own session id,
+    e.g. a Claude UUID, while the registry keys on `GAIA_SESSION_ID`). Adoption
+    would then stamp our id onto that live worktree and service its PR — one
+    session addressing another ticket's review comments (BOU-1540).
+
+    Reuse the package's canonical "defer to a live owner" signal
+    (`maintenance.discover_active_primary_feature_pipeline_agents`: process-table
+    + session registry), correlated by ``worktree_path`` — the only key shared
+    across the two id namespaces. A session matching our own pid is NOT a foreign
+    owner, so a genuinely-orphaned worktree (sub-agent PR / crashed session) is
+    still adopted, preserving BOU-1442.
+    """
+    from . import maintenance  # noqa: PLC0415
+
+    for agent in maintenance.discover_active_primary_feature_pipeline_agents(worktree_path):
+        if agent.pid != self_pid:
+            return True
+    return False
+
+
 def _collect_owned_worktrees(
     session_id: str, cwd: str, pid: int | None
 ) -> list[str]:
@@ -829,6 +856,13 @@ def _collect_owned_worktrees(
         # (PR #1949 review, P1). A dead pid (crashed session) or no marker at all
         # (sub-agent PR) is still adopted.
         if _marker_live_foreign_pid(worktree_path, session_id):
+            continue
+        # Second ownership gate (BOU-1540): a live INDEPENDENT session may own
+        # this worktree without a current marker (arming is opt-in, and the
+        # marker/registry id namespaces are disjoint). Correlate by path and
+        # never adopt such a worktree — that's how a feature-pipeline session
+        # grabbed a sibling ticket's PR and serviced its review comments.
+        if _has_live_independent_owner(worktree_path, int(eff_pid)):
             continue
         if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)
