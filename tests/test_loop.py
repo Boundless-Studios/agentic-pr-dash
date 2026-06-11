@@ -95,3 +95,18 @@ def test_discover_falls_back_to_cwd_on_command_failure(monkeypatch):
 def test_discover_returns_owned_paths(monkeypatch):
     _stub_list_owned(monkeypatch, stdout="/wt/a\n/wt/b\n", returncode=0)
     assert loop._discover_cwds(_args()) == ["/wt/a", "/wt/b"]
+
+
+def test_discover_passes_cwd_to_list_owned(monkeypatch):
+    # list-owned must run `git worktree list` in the configured --cwd, not the
+    # loop process's cwd, or rc-0-empty could mean "wrong dir" (BOU-1540 #Z).
+    captured = {}
+
+    def fake_run(cmd, *a, **k):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    loop._discover_cwds(_args(cwd=["/repo/root"]))
+    assert "--cwd" in captured["cmd"]
+    assert captured["cmd"][captured["cmd"].index("--cwd") + 1] == "/repo/root"

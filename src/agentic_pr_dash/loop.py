@@ -36,9 +36,16 @@ def _discover_cwds(args) -> list[str]:
         return list(args.cwd)
     if args.session_id:
         # Scope to worktrees this session owns.
+        # Pass --cwd so list-owned enumerates THIS repo's worktree pool (it runs
+        # `git worktree list` in that dir). Without it the scan ran in the loop
+        # process's cwd, so an rc-0 EMPTY result — now authoritative (service
+        # nothing) rather than a fall-back trigger — could mean "wrong dir", and a
+        # loop launched from elsewhere would stop servicing its real worktrees
+        # (PR #7 review, P2).
         out = subprocess.run(
             [sys.executable, "-m", "agentic_pr_dash", "list-owned",
-             "--session-id", args.session_id, "--pid", str(_loop_pid())],
+             "--session-id", args.session_id, "--pid", str(_loop_pid()),
+             "--cwd", args.cwd[0]],
             capture_output=True, text=True,
         )
         paths = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]

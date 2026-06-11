@@ -142,26 +142,20 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
     assert captured["min_cpu"] == 0.0  # liveness, not activity
 
 
-def test_live_independent_owner_paths_marker_pid_gates_not_session_id(tmp_path, monkeypatch):
-    """The marker gate keys on the marker PID, not session_id: our own worktree
-    (marker stamped with the agent's id while --session-id is the gaia id, pid in
-    our ancestor chain) is NOT flagged foreign; a foreign live pid IS (PR #7 P2)."""
-    mine = tmp_path / "mine"
-    theirs = tmp_path / "theirs"
-    mine.mkdir()
-    theirs.mkdir()
-    # Both markers carry a session id different from the caller's --session-id.
-    mc._write_arm_marker(str(mine), "agent-uuid", 4242, 1)     # pid 4242 ∈ self chain
-    mc._write_arm_marker(str(theirs), "agent-uuid", 9999, 2)   # pid 9999 ∉ self chain
+def test_live_independent_owner_paths_ignores_marker_only(tmp_path, monkeypatch):
+    """A pr-watch marker alone (live pid, but no registry/process session) is NOT
+    treated as an owner here: an armed-but-not-looping marker is intentionally
+    takeover-able, and an armed-and-looping one is already handled by
+    `_live_foreign_owner` / `_marker_live_foreign_pid` elsewhere (PR #7 P2 #Y)."""
+    armed = tmp_path / "armed"
+    armed.mkdir()
+    mc._write_arm_marker(str(armed), "some-foreign-id", 9999, 2)  # live-ish marker only
 
-    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {4242})
-    monkeypatch.setattr(mc, "_pid_alive", lambda raw: True)
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
     _no_registry(monkeypatch)
     _no_process(monkeypatch)
 
-    result = mc._live_independent_owner_paths([str(mine), str(theirs)], "gaia-self-id")
-    assert str(mine) not in result      # our own worktree, namespace-mismatched id
-    assert str(theirs) in result        # genuinely foreign live pid
+    assert mc._live_independent_owner_paths([str(armed)], "sess-self") == set()
 
 
 def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
@@ -245,3 +239,32 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     assert code2 == 10
     assert "PR_NUMBER=7" in text2
     assert heartbeats == [True]  # heartbeat refreshed with work=True before servicing
+
+
+def test_check_worktree_clean_tick_does_not_refresh_stolen_marker(tmp_path, monkeypatch):
+    """On a CLEAN tick, a marker that is ours but has a live independent owner is
+    stolen — we must NOT refresh its heartbeat (which would pin it via
+    `_live_foreign_owner` until TTL); we defer and let it go stale (PR #7 P2 #X).
+    A clean tick on a marker that is genuinely ours still refreshes."""
+    pr = types.SimpleNamespace(number=7, is_draft=False, failing_checks=[], latest_commit_sha="abc")
+    heartbeats = []
+    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work))
+    from agentic_pr_dash import maintenance as _maint
+    monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: [])  # CLEAN
+    monkeypatch.setattr(mc, "_marker_session_id", lambda cwd: "sess-self")  # marker is ours
+
+    # Stolen: a live independent owner is present → defer, no heartbeat refresh.
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: {os.path.abspath(str(tmp_path))})
+    code, text = mc._check_worktree(str(tmp_path), "sess-self")
+    assert code == 0
+    assert "stale stolen marker" in text
+    assert heartbeats == []
+
+    # Genuinely ours (no independent owner) → refresh the alive heartbeat.
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
+    code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
+    assert code2 == 0
+    assert text2 == "nothing pending"
+    assert heartbeats == [False]
