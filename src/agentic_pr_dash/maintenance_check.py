@@ -650,25 +650,29 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     # Check for blockers — no state written, purely read
     blockers = maintenance.blockers_for_pr(pr)
 
-    # If we ARE the owner, refresh ownership stamps: heartbeat always (loop is
-    # alive), and the long fix lease ONLY when there's work (we're about to fix).
-    _touch_owner_heartbeat(cwd, self_session_id, bool(blockers))
-
     if not blockers:
+        # Clean check: refresh the alive heartbeat and clear any stale fix lease.
+        _touch_owner_heartbeat(cwd, self_session_id, False)
         return 0, "nothing pending"
 
-    # Final ownership gate before we declare work (BOU-1540): a live INDEPENDENT
-    # session may own this worktree without a fresh pr-watch marker — arming is
-    # opt-in (often off) and the marker/registry id namespaces are disjoint, so
-    # `_live_foreign_owner` above (marker-only) misses it. Servicing it anyway is
-    # how one session ends up addressing another ticket's PR. This also HEALS an
-    # already-stolen marker (our id wrongly on a sibling worktree) and makes a
-    # mistaken loop fallback to a foreign cwd safe: both defer here instead of
-    # being serviced (PR #7 review, P1). Run only on the work-found path so the
-    # ps/lsof scan never costs a clean tick. The owner set excludes us, so our
-    # own worktree is still serviced.
+    # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
+    # heartbeat/lease (BOU-1540). A live independent session may own this
+    # worktree without a fresh marker (arming is opt-in, and the marker/registry
+    # id namespaces are disjoint), so `_live_foreign_owner` above (marker-only)
+    # misses it. This also HEALS an already-stolen marker (our id wrongly on a
+    # sibling) and makes a mistaken loop fallback to a foreign cwd safe — both
+    # defer here. Crucially this runs BEFORE the heartbeat/lease write: stamping
+    # a fresh heartbeat on a stolen marker and THEN deferring would make the real
+    # owner / detached loop defer to the session that just declined to work,
+    # pinning the PR every tick (PR #7 review, P2). The ps/lsof scan runs only on
+    # this work-found path; the owner set excludes us, so our own worktree falls
+    # through and IS serviced.
     if _live_independent_owner_paths([cwd], self_session_id):
         return 0, "deferring to live independent owner of this worktree"
+
+    # We will service: refresh the heartbeat and set the long fix lease (a
+    # tick-less fix phase is about to start).
+    _touch_owner_heartbeat(cwd, self_session_id, True)
 
     # Fetch failed CI logs
     logs: dict[str, str] = {}
@@ -846,22 +850,48 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     self_pids = _self_pid_chain()
     owned: set[str] = set()
 
-    # 1) armed independent owner (marker with a live foreign pid)
+    # 1) a pr-watch marker naming a LIVE owner that isn't us. Gate PURELY on the
+    #    marker pid — alive AND not in our ancestor chain — not on session_id:
+    #    the marker stamps the agent's own session id, while the caller's
+    #    --session-id may be the registry/GAIA id, so a session_id compare would
+    #    flag our OWN worktree as foreign in that namespace-mismatch case and the
+    #    later pid exclusions never get to clear it (PR #7 review, P2).
     for path in candidates:
-        if _marker_live_foreign_pid(path, self_session_id):
+        fields = _read_marker(path)
+        if not fields:
+            continue
+        pid_raw = fields.get("pid", "")
+        if _pid_alive(pid_raw) and int(pid_raw) not in self_pids:
             owned.add(path)
 
-    # 2) registry-recorded live session (idle-inclusive), not us
-    for path in candidates:
-        if path in owned:
-            continue
-        for state in session_registry.active_sessions_for_worktree(path):
-            if state.pid and state.pid not in self_pids:
-                owned.add(path)
-                break
+    # 2) a registry-recorded live feature-pipeline session, idle-inclusive (pid
+    #    liveness, NOT CPU), that isn't us. Build the session summary ONCE and
+    #    index it by worktree_path, so this stays O(registry) instead of
+    #    O(worktrees × registry) parsing (PR #7 review, P2).
+    remaining = [p for p in candidates if p not in owned]
+    if remaining:
+        summary = session_registry.summarize_sessions()
+        live_by_worktree: set[str] = set()
+        for state in summary.sessions.values():
+            if state.is_terminal:
+                continue
+            if state.launch_source in session_registry.DASHBOARD_LAUNCH_SOURCES:
+                continue
+            if not state.is_feature_pipeline:
+                continue
+            if state.pid in self_pids:
+                continue
+            if not session_registry.pid_is_live(state.pid):
+                continue
+            if state.worktree_path:
+                live_by_worktree.add(os.path.abspath(state.worktree_path))
+        owned.update(p for p in remaining if p in live_by_worktree)
 
-    # 3) liveness-only process scan (batched), not us
-    remaining = [path for path in candidates if path not in owned]
+    # 3) a live interactive feature-pipeline PROCESS sitting on the worktree —
+    #    catches a session that never registered. Liveness, not activity
+    #    (min_cpu=0.0), so an idle owner still counts. ONE batched ps/lsof scan
+    #    for all remaining candidates (PR #7 review, P2).
+    remaining = [p for p in candidates if p not in owned]
     if remaining:
         by_path = agents.discover_primary_feature_pipeline_agents(remaining, min_cpu=0.0)
         for path, agent_list in by_path.items():

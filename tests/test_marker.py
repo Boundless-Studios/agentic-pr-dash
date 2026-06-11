@@ -72,8 +72,24 @@ def test_lease_legacy_env_still_wins(tmp_path, monkeypatch):
     assert mc._fix_lease_seconds() == 777
 
 
-def _state(pid, worktree_path):
-    return types.SimpleNamespace(pid=pid, worktree_path=worktree_path)
+def _state(pid, worktree_path, *, terminal=False, fp=True, src="launch-worktree-cli"):
+    return types.SimpleNamespace(
+        pid=pid, worktree_path=worktree_path, is_terminal=terminal,
+        is_feature_pipeline=fp, launch_source=src,
+    )
+
+
+def _summary(*states):
+    return types.SimpleNamespace(sessions={i: s for i, s in enumerate(states)})
+
+
+def _no_registry(monkeypatch):
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary())
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+
+
+def _no_process(monkeypatch):
+    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", lambda paths, **kw: {})
 
 
 def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatch):
@@ -85,12 +101,9 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     free.mkdir()
 
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
-    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", lambda paths, **kw: {})
-    monkeypatch.setattr(
-        session_registry,
-        "active_sessions_for_worktree",
-        lambda path: [_state(999, str(owned))] if path == str(owned) else [],
-    )
+    _no_process(monkeypatch)
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary(_state(999, str(owned))))
 
     result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
     assert str(owned) in result
@@ -103,12 +116,9 @@ def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
     owned.mkdir()
 
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555, 42})
-    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", lambda paths, **kw: {})
-    monkeypatch.setattr(
-        session_registry,
-        "active_sessions_for_worktree",
-        lambda path: [_state(42, str(owned))],  # 42 ∈ self chain
-    )
+    _no_process(monkeypatch)
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    monkeypatch.setattr(session_registry, "summarize_sessions", lambda: _summary(_state(42, str(owned))))
     assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
 
 
@@ -124,12 +134,34 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
         return {str(owned): [types.SimpleNamespace(pid=999)]}
 
     monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
-    monkeypatch.setattr(session_registry, "active_sessions_for_worktree", lambda path: [])
+    _no_registry(monkeypatch)
     monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", fake_discover)
 
     result = mc._live_independent_owner_paths([str(owned)], "sess-self")
     assert str(owned) in result
     assert captured["min_cpu"] == 0.0  # liveness, not activity
+
+
+def test_live_independent_owner_paths_marker_pid_gates_not_session_id(tmp_path, monkeypatch):
+    """The marker gate keys on the marker PID, not session_id: our own worktree
+    (marker stamped with the agent's id while --session-id is the gaia id, pid in
+    our ancestor chain) is NOT flagged foreign; a foreign live pid IS (PR #7 P2)."""
+    mine = tmp_path / "mine"
+    theirs = tmp_path / "theirs"
+    mine.mkdir()
+    theirs.mkdir()
+    # Both markers carry a session id different from the caller's --session-id.
+    mc._write_arm_marker(str(mine), "agent-uuid", 4242, 1)     # pid 4242 ∈ self chain
+    mc._write_arm_marker(str(theirs), "agent-uuid", 9999, 2)   # pid 9999 ∉ self chain
+
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {4242})
+    monkeypatch.setattr(mc, "_pid_alive", lambda raw: True)
+    _no_registry(monkeypatch)
+    _no_process(monkeypatch)
+
+    result = mc._live_independent_owner_paths([str(mine), str(theirs)], "gaia-self-id")
+    assert str(mine) not in result      # our own worktree, namespace-mismatched id
+    assert str(theirs) in result        # genuinely foreign live pid
 
 
 def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
@@ -189,21 +221,27 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     pr = types.SimpleNamespace(
         number=7, is_draft=False, failing_checks=[], latest_commit_sha="abc",
     )
+    heartbeats = []
     monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
     monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr)
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(
+        mc, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work)
+    )
     from agentic_pr_dash import maintenance as _maint
     monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: ["review_comments"])
 
-    # Foreign owner present → defer.
+    # Foreign owner present → defer, and DO NOT refresh the heartbeat/lease (else a
+    # stolen marker would pin the PR; PR #7 review, P2).
     monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: {os.path.abspath(str(tmp_path))})
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "independent owner" in text
+    assert heartbeats == []  # no heartbeat/lease write while deferring
 
-    # No foreign owner → work is surfaced.
+    # No foreign owner → work is surfaced AND the fix lease is stamped.
     monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 10
     assert "PR_NUMBER=7" in text2
+    assert heartbeats == [True]  # heartbeat refreshed with work=True before servicing
