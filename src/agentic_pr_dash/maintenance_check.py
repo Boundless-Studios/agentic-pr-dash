@@ -83,6 +83,7 @@ def _resolve_pr_for_branch(cwd: str):
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
     merge_state = raw.get("mergeStateStatus", "unknown")
+    mergeable = raw.get("mergeable", "unknown")
 
     return PRData(
         number=pr_number,
@@ -92,6 +93,7 @@ def _resolve_pr_for_branch(cwd: str):
         url=raw.get("url", ""),
         is_draft=bool(raw.get("isDraft", False)),
         merge_state=merge_state,
+        mergeable=mergeable,
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,
@@ -130,6 +132,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str):
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
+    mergeable = (raw or {}).get("mergeable", "unknown")
 
     return PRData(
         number=pr_number,
@@ -139,6 +142,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str):
         url=(raw or {}).get("url", ""),
         is_draft=bool((raw or {}).get("isDraft", False)),
         merge_state=merge_state,
+        mergeable=mergeable,
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,

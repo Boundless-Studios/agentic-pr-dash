@@ -40,7 +40,7 @@ def pr_markdown_link(pr_number: int | str, fallback_url: str | None = None) -> s
 
 def blockers_for_pr(pr: PRData) -> list[str]:
     blockers: list[str] = []
-    if pr.merge_state == "DIRTY" or pr.status.value == "merge_conflict":
+    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
         blockers.append("merge_conflict")
     if pr.failing_checks:
         blockers.append("ci_failure")
@@ -208,7 +208,7 @@ def build_maintenance_prompt(
         "Do NOT create a new branch or PR. Commit and push to the existing branch.",
     ]
 
-    if pr.merge_state == "DIRTY" or pr.status.value == "merge_conflict":
+    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
         base_branch = pr.base_branch or "main"
         sections.extend([
             "",

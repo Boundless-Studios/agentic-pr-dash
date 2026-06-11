@@ -133,3 +133,61 @@ def test_unassigned_pr_card_without_session_says_no_worktree(monkeypatch):
     card = app._build_unassigned_pr_card(_pr(), active_agents=[])
     assert card.worktree_name == "No worktree"
     assert card.agent_name is None
+
+
+def test_live_session_for_branch_scopes_to_allowed_worktrees(monkeypatch):
+    """A same-named branch in an unrelated repo must not hijack the card."""
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    summary = session_registry.SessionSummary(
+        sessions={"gaia-1": _session(branch="feature/x", pid=4242,
+                                      worktree_path="/other/repo/wt", agent_name="brave-otter")}
+    )
+    # The session's worktree isn't in this repo's allowed set -> no match.
+    assert app._live_session_for_branch(
+        "feature/x", summary, allowed_worktree_paths={"/this/repo/wt"}
+    ) is None
+    # ...but it matches when its worktree is allowed.
+    assert app._live_session_for_branch(
+        "feature/x", summary, allowed_worktree_paths={"/other/repo/wt"}
+    ) is not None
+
+
+def test_hidden_agent_worktree_card_is_non_navigable(monkeypatch):
+    """A hidden agent worktree keeps worktree_path None so the card can't be focused."""
+    monkeypatch.setattr(app.orchestrator, "_inflight_prs", set(), raising=False)
+    session = _session(cli="claude", agent_name="brave-otter",
+                       worktree_path="/w/agent-hidden", branch="b", pid=4242)
+    card = app._build_unassigned_pr_card(
+        _pr(),
+        active_agents=[],
+        worktree_hidden=True,
+        runtime_session=session,
+        session_worktree_path="/w/agent-hidden",
+    )
+    assert card.worktree_path is None
+    assert card.worktree_name == "Agent worktree hidden"
+
+
+def test_repo_session_summary_unions_custom_registries(tmp_path, monkeypatch):
+    """A worktree with a custom registry contributes its sessions to attribution."""
+    default = session_registry.SessionSummary(
+        sessions={"gaia-default": _session(session_id="gaia-default", branch="a")}
+    )
+    custom_reg = tmp_path / "custom.jsonl"
+    session_registry.record_event(
+        event="started", session_id="gaia-custom", cli="codex",
+        agent_name="silver-lynx", branch="b", worktree_path="/w/custom", path=custom_reg,
+    )
+    # Worktree /w/custom resolves its registry to custom_reg; default resolves elsewhere.
+    def fake_registry_path(cwd=None):
+        return custom_reg if cwd == "/w/custom" else (tmp_path / "default.jsonl")
+    monkeypatch.setattr(session_registry, "registry_path", fake_registry_path)
+    merged = app._repo_session_summary([{"path": "/w/custom"}], default)
+    assert "gaia-default" in merged.sessions
+    assert merged.sessions["gaia-custom"].agent_name == "silver-lynx"
+
+
+def test_maintenance_blockers_detect_mergeable_conflict():
+    from agentic_pr_dash.maintenance import blockers_for_pr
+    pr = _pr(merge_state="UNSTABLE", mergeable="CONFLICTING")
+    assert "merge_conflict" in blockers_for_pr(pr)
