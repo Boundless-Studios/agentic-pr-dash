@@ -897,6 +897,14 @@ def _live_independent_owner_paths(paths, self_session_id: str, config_cwd=None) 
             continue
         if state.cli not in discovery_names:
             continue
+        # Our OWN session by exact id is never an independent owner — even when a
+        # supervisor restarted this session-scoped loop with the same
+        # --session-id but a pid that is no longer a descendant of the original
+        # launcher (so the ancestor-pid check below wouldn't catch it). Else we'd
+        # defer to our own registry entry and stop servicing our own PR until that
+        # pid exits (PR #7 review, P2).
+        if self_session_id and state.session_id == self_session_id:
+            continue
         if state.pid in self_pids:
             continue
         if not session_registry.pid_is_live(state.pid):

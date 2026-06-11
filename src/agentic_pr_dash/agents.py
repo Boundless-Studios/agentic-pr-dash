@@ -157,7 +157,7 @@ def discover_primary_feature_pipeline_agents(
     for row in rows:
         if not _is_feature_pipeline_invocation(row.command):
             continue
-        cli_name = _command_cli_name(row.command)
+        cli_name = _command_cli_name(row.command, allowed_clis)
         if cli_name not in allowed_clis:
             continue
         if _is_noninteractive(row, by_pid):
@@ -359,7 +359,7 @@ def _agent_cli_name(command: str) -> str | None:
     return _command_cli_name(command)
 
 
-def _command_cli_name(command: str) -> str | None:
+def _command_cli_name(command: str, discovery_names: set[str] | None = None) -> str | None:
 
     try:
         tokens = shlex.split(command)
@@ -369,7 +369,11 @@ def _command_cli_name(command: str) -> str | None:
     if not tokens:
         return None
 
-    discovery_names = set(load_config().discovery_names)
+    # Caller may supply the TARGET repo's allow-list; otherwise fall back to the
+    # process cwd config. Resolving it here (not only after this returns) is what
+    # lets a custom-CLI owner from another repo be recognized (PR #7 review, P2).
+    if discovery_names is None:
+        discovery_names = set(load_config().discovery_names)
     executable = Path(tokens[0]).name
     if executable in discovery_names:
         return executable

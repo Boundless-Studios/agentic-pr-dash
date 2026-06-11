@@ -72,11 +72,28 @@ def test_lease_legacy_env_still_wins(tmp_path, monkeypatch):
     assert mc._fix_lease_seconds() == 777
 
 
-def _state(pid, worktree_path, *, terminal=False, fp=True, src="launch-worktree-cli", cli="claude"):
+def _state(pid, worktree_path, *, terminal=False, fp=True, src="launch-worktree-cli",
+           cli="claude", session_id="gaia-other"):
     return types.SimpleNamespace(
         pid=pid, worktree_path=worktree_path, is_terminal=terminal,
-        is_feature_pipeline=fp, launch_source=src, cli=cli,
+        is_feature_pipeline=fp, launch_source=src, cli=cli, session_id=session_id,
     )
+
+
+def test_live_independent_owner_paths_excludes_matching_session_id(tmp_path, monkeypatch):
+    """A registry entry whose session_id equals ours is never an independent owner,
+    even if its pid is not in our ancestor chain (supervisor-restarted same-id
+    loop) — else we'd defer to our own PR (PR #7 P2)."""
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})  # 999 NOT in chain
+    _no_process(monkeypatch)
+    monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
+    monkeypatch.setattr(
+        session_registry, "summarize_sessions",
+        lambda path=None: _summary(_state(999, str(owned), session_id="sess-self")),
+    )
+    assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
 
 
 def _summary(*states):
@@ -108,6 +125,15 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
     assert str(owned) in result
     assert str(free) not in result
+
+
+def test_command_cli_name_honors_supplied_discovery_names():
+    """_command_cli_name recognizes a custom CLI when the target allow-list is
+    supplied, not only the process-cwd default (PR #7 P2)."""
+    # Default config doesn't include 'aider'.
+    assert agents._command_cli_name("/usr/bin/aider --message x") is None
+    # With the target repo's allow-list it is recognized.
+    assert agents._command_cli_name("/usr/bin/aider --message x", {"aider"}) == "aider"
 
 
 def test_live_independent_owner_paths_registry_honors_discovery_names(tmp_path, monkeypatch):

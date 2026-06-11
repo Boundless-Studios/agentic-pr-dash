@@ -110,3 +110,23 @@ def test_discover_passes_cwd_to_list_owned(monkeypatch):
     loop._discover_cwds(_args(cwd=["/repo/root"]))
     assert "--cwd" in captured["cmd"]
     assert captured["cmd"][captured["cmd"].index("--cwd") + 1] == "/repo/root"
+
+
+def test_discover_iterates_all_configured_cwds(monkeypatch):
+    # Repeatable --cwd: list-owned runs once per configured repo and the owned
+    # paths are merged; a repo whose discovery fails falls back to its own root
+    # (BOU-1540 #6).
+    def fake_run(cmd, *a, **k):
+        cwd = cmd[cmd.index("--cwd") + 1]
+        if cwd == "/repo/a":
+            return types.SimpleNamespace(stdout="/repo/a/wt1\n", stderr="", returncode=0)
+        if cwd == "/repo/b":
+            return types.SimpleNamespace(stdout="", stderr="", returncode=1)  # failed
+        if cwd == "/repo/c":
+            return types.SimpleNamespace(stdout="/repo/c/wt2\n/repo/a/wt1\n", stderr="", returncode=0)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    result = loop._discover_cwds(_args(cwd=["/repo/a", "/repo/b", "/repo/c"]))
+    # a's owned path, b's fallback-to-root (failed), c's owned path; deduped.
+    assert result == ["/repo/a/wt1", "/repo/b", "/repo/c/wt2"]
