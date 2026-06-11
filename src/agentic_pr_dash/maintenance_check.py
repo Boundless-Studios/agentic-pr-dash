@@ -657,6 +657,19 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     if not blockers:
         return 0, "nothing pending"
 
+    # Final ownership gate before we declare work (BOU-1540): a live INDEPENDENT
+    # session may own this worktree without a fresh pr-watch marker — arming is
+    # opt-in (often off) and the marker/registry id namespaces are disjoint, so
+    # `_live_foreign_owner` above (marker-only) misses it. Servicing it anyway is
+    # how one session ends up addressing another ticket's PR. This also HEALS an
+    # already-stolen marker (our id wrongly on a sibling worktree) and makes a
+    # mistaken loop fallback to a foreign cwd safe: both defer here instead of
+    # being serviced (PR #7 review, P1). Run only on the work-found path so the
+    # ps/lsof scan never costs a clean tick. The owner set excludes us, so our
+    # own worktree is still serviced.
+    if _live_independent_owner_paths([cwd], self_session_id):
+        return 0, "deferring to live independent owner of this worktree"
+
     # Fetch failed CI logs
     logs: dict[str, str] = {}
     if pr.failing_checks:
@@ -774,31 +787,88 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     return 0
 
 
-def _has_live_independent_owner(worktree_path: str, self_pid: int) -> bool:
-    """True if a live, independently-launched session (other than ``self_pid``)
-    already owns this worktree — even with no/stale pr-watch marker.
+def _self_pid_chain(max_depth: int = 16) -> set[int]:
+    """PIDs of this process and its ancestors (toward init).
 
-    The marker gate (`_marker_live_foreign_pid`) alone misses a sibling ticket's
-    live session whose worktree was never armed (PR-watch arming is opt-in and
-    off by default) or whose marker carries a `session_id` in a namespace
-    disjoint from the registry's (the marker stamps the agent's own session id,
-    e.g. a Claude UUID, while the registry keys on `GAIA_SESSION_ID`). Adoption
-    would then stamp our id onto that live worktree and service its PR — one
-    session addressing another ticket's review comments (BOU-1540).
-
-    Reuse the package's canonical "defer to a live owner" signal
-    (`maintenance.discover_active_primary_feature_pipeline_agents`: process-table
-    + session registry), correlated by ``worktree_path`` — the only key shared
-    across the two id namespaces. A session matching our own pid is NOT a foreign
-    owner, so a genuinely-orphaned worktree (sub-agent PR / crashed session) is
-    still adopted, preserving BOU-1442.
+    Used to recognize OUR OWN session among discovered worktree owners,
+    independent of session-id namespace or process `comm`: the in-session
+    stop-gate / loop runs `check` as a descendant of the very Claude/Codex
+    session that owns the worktree, so that session's pid is in this chain.
+    Comparing against a single resolved owner pid is unreliable — the wrapper
+    (`node …/claude`) and `comm`-walk pid sources disagree (PR #7 review, P2).
     """
-    from . import maintenance  # noqa: PLC0415
+    pids: set[int] = set()
+    pid = os.getpid()
+    for _ in range(max_depth):
+        if pid <= 1 or pid in pids:
+            break
+        pids.add(pid)
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            break
+        parent = out.stdout.strip()
+        if not parent.isdigit():
+            break
+        pid = int(parent)
+    return pids
 
-    for agent in maintenance.discover_active_primary_feature_pipeline_agents(worktree_path):
-        if agent.pid != self_pid:
-            return True
-    return False
+
+def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
+    """Subset of ``paths`` owned by a LIVE session other than this one.
+
+    Three liveness signals, correlated by ``worktree_path`` (the only key shared
+    across the disjoint marker/registry id namespaces — markers carry the agent's
+    own session id, the registry keys on ``GAIA_SESSION_ID``):
+
+      1. a pr-watch marker with a live pid and a different session id
+         (`_marker_live_foreign_pid`) — an armed independent session;
+      2. a registry session for the path, non-terminal + pid-alive (NOT CPU-gated,
+         so an idle owner still counts) whose pid isn't ours;
+      3. an interactive feature-pipeline process whose cwd is the path, alive but
+         possibly idle (`min_cpu=0.0`) — catches a session that never registered.
+
+    All scans run ONCE for the whole candidate set (not per-path) so a large
+    worktree pool doesn't multiply the `ps`/`lsof` cost (PR #7 review, P2). Our
+    own session is excluded via the ancestor-pid chain, so a genuinely-orphaned
+    worktree (sub-agent PR / crashed session) is never treated as owned —
+    preserving BOU-1442 pickup and crash recovery.
+    """
+    from . import agents, session_registry  # noqa: PLC0415
+
+    candidates = list(dict.fromkeys(os.path.abspath(p) for p in paths if p))
+    if not candidates:
+        return set()
+
+    self_pids = _self_pid_chain()
+    owned: set[str] = set()
+
+    # 1) armed independent owner (marker with a live foreign pid)
+    for path in candidates:
+        if _marker_live_foreign_pid(path, self_session_id):
+            owned.add(path)
+
+    # 2) registry-recorded live session (idle-inclusive), not us
+    for path in candidates:
+        if path in owned:
+            continue
+        for state in session_registry.active_sessions_for_worktree(path):
+            if state.pid and state.pid not in self_pids:
+                owned.add(path)
+                break
+
+    # 3) liveness-only process scan (batched), not us
+    remaining = [path for path in candidates if path not in owned]
+    if remaining:
+        by_path = agents.discover_primary_feature_pipeline_agents(remaining, min_cpu=0.0)
+        for path, agent_list in by_path.items():
+            if any(agent.pid not in self_pids for agent in agent_list):
+                owned.add(os.path.abspath(path))
+
+    return owned
 
 
 def _collect_owned_worktrees(
@@ -835,9 +905,26 @@ def _collect_owned_worktrees(
     # parent directory: bug-bash runs this from the MAIN repo while its sub-agent
     # worktrees live under `<repo>-worktrees/`, so a dirname filter would silently
     # skip exactly the PRs we must adopt. Cross-session safety comes from the
-    # UNOWNED gate below (a live foreign owner is never stolen), not from paths.
-    for worktree_path, branch in _iter_worktrees_with_branch(cwd):
-        # 1) already ours
+    # live-independent-owner gate below, not from paths.
+    candidates = list(_iter_worktrees_with_branch(cwd))
+
+    # Compute the live-independent-owner set ONCE for every candidate path (not
+    # per-path) so a large worktree pool doesn't multiply the ps/lsof scan
+    # (BOU-1540, PR #7 review, P2).
+    independent = _live_independent_owner_paths(
+        [path for path, _branch in candidates], session_id
+    )
+
+    for worktree_path, branch in candidates:
+        abs_path = os.path.abspath(worktree_path)
+        # A live INDEPENDENT session owns this worktree (registry/process/marker,
+        # path-correlated). Never list it — even when our own marker is on it:
+        # that marker is a prior bad adoption (the observed stuck state), and
+        # emitting it here would keep us servicing a sibling ticket's PR
+        # (BOU-1540, PR #7 review, P1). The owner set already excludes us.
+        if abs_path in independent:
+            continue
+        # 1) already ours (and not contested above)
         if _marker_session_id(worktree_path) == session_id:
             _emit(worktree_path)
             continue
@@ -856,13 +943,6 @@ def _collect_owned_worktrees(
         # (PR #1949 review, P1). A dead pid (crashed session) or no marker at all
         # (sub-agent PR) is still adopted.
         if _marker_live_foreign_pid(worktree_path, session_id):
-            continue
-        # Second ownership gate (BOU-1540): a live INDEPENDENT session may own
-        # this worktree without a current marker (arming is opt-in, and the
-        # marker/registry id namespaces are disjoint). Correlate by path and
-        # never adopt such a worktree — that's how a feature-pipeline session
-        # grabbed a sibling ticket's PR and serviced its review comments.
-        if _has_live_independent_owner(worktree_path, int(eff_pid)):
             continue
         if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)

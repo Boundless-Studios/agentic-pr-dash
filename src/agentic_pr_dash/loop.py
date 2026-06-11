@@ -42,7 +42,15 @@ def _discover_cwds(args) -> list[str]:
             capture_output=True, text=True,
         )
         paths = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
-        return paths or list(args.cwd)
+        # Distinguish "owns nothing this tick" (rc 0, empty) from "discovery
+        # failed" (non-zero rc). An EMPTY owned set is authoritative — service
+        # nothing — and must NOT fall back to args.cwd: when the live-owner gate
+        # legitimately excludes the only candidate, falling back would route the
+        # loop to service a foreign worktree by cwd (BOU-1540, PR #7 review, P1).
+        # Only a genuine command failure falls back to the explicit --cwd values.
+        if out.returncode != 0:
+            return list(args.cwd)
+        return paths
     # Every worktree on the machine.
     out = subprocess.run(
         ["git", "worktree", "list", "--porcelain"], cwd=args.cwd[0],

@@ -5,9 +5,10 @@ import types
 
 import pytest
 
+from agentic_pr_dash import agents
 from agentic_pr_dash import config
-from agentic_pr_dash import maintenance as maint
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash import session_registry
 
 
 @pytest.fixture(autouse=True)
@@ -71,72 +72,138 @@ def test_lease_legacy_env_still_wins(tmp_path, monkeypatch):
     assert mc._fix_lease_seconds() == 777
 
 
-def test_collect_owned_skips_worktree_with_live_independent_owner(tmp_path, monkeypatch):
-    """Reconciliation must NOT adopt a sibling worktree that an INDEPENDENT live
-    session already owns, even when that worktree carries no pr-watch marker
-    (arming is opt-in/off, and the marker session_id namespace is disjoint from
-    the registry's). Adopting it makes one session service another ticket's PR
-    (BOU-1540). Only the genuinely-orphaned worktree is adopted.
-    """
-    orphan = tmp_path / "wt-orphan"
-    owned = tmp_path / "wt-owned"
-    orphan.mkdir()
+def _state(pid, worktree_path):
+    return types.SimpleNamespace(pid=pid, worktree_path=worktree_path)
+
+
+def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatch):
+    """A registry session that is alive (even idle, no CPU gate) and not us marks
+    its worktree as independently owned; a path with no signal does not."""
+    owned = tmp_path / "owned"
+    free = tmp_path / "free"
+    owned.mkdir()
+    free.mkdir()
+
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
+    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", lambda paths, **kw: {})
+    monkeypatch.setattr(
+        session_registry,
+        "active_sessions_for_worktree",
+        lambda path: [_state(999, str(owned))] if path == str(owned) else [],
+    )
+
+    result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
+    assert str(owned) in result
+    assert str(free) not in result
+
+
+def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
+    """A live owner whose pid is in our ancestor chain is US, not a foreign owner."""
+    owned = tmp_path / "owned"
     owned.mkdir()
 
-    self_pid = 555
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555, 42})
+    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", lambda paths, **kw: {})
+    monkeypatch.setattr(
+        session_registry,
+        "active_sessions_for_worktree",
+        lambda path: [_state(42, str(owned))],  # 42 ∈ self chain
+    )
+    assert mc._live_independent_owner_paths([str(owned)], "sess-self") == set()
 
-    # Both branches have an open, non-draft @me PR; neither carries a marker.
+
+def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
+    """The process scan runs with min_cpu=0.0 so an idle-but-alive session counts,
+    and a foreign pid marks the path owned."""
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    captured = {}
+
+    def fake_discover(paths, *, min_cpu=1.0):
+        captured["min_cpu"] = min_cpu
+        return {str(owned): [types.SimpleNamespace(pid=999)]}
+
+    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555})
+    monkeypatch.setattr(session_registry, "active_sessions_for_worktree", lambda path: [])
+    monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", fake_discover)
+
+    result = mc._live_independent_owner_paths([str(owned)], "sess-self")
+    assert str(owned) in result
+    assert captured["min_cpu"] == 0.0  # liveness, not activity
+
+
+def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
+    """Reconciliation does not adopt an independently-owned sibling, AND an
+    already-stolen worktree (our marker on it) is not re-emitted — it is healed
+    because the live-independent-owner gate runs before the 'already ours' emit
+    (PR #7 review, P1 #4)."""
+    orphan = tmp_path / "orphan"
+    stolen = tmp_path / "stolen"
+    orphan.mkdir()
+    stolen.mkdir()
+
+    # 'stolen' already carries OUR id from a prior bad adoption.
+    mc._write_arm_marker(str(stolen), "claude-uuid-X", 555, 102)
+    assert mc._marker_session_id(str(stolen)) == "claude-uuid-X"
+
     monkeypatch.setattr(
         mc,
         "_iter_worktrees_with_branch",
-        lambda cwd: [(str(orphan), "br-orphan"), (str(owned), "br-owned")],
+        lambda cwd: [(str(orphan), "br-orphan"), (str(stolen), "br-stolen")],
     )
     monkeypatch.setattr(
+        mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
+    )
+    # The stolen worktree has a live INDEPENDENT owner now; the orphan has none.
+    monkeypatch.setattr(
         mc,
-        "_list_my_open_prs",
-        lambda cwd: {"br-orphan": (101, False), "br-owned": (102, False)},
+        "_live_independent_owner_paths",
+        lambda paths, sid: {os.path.abspath(str(stolen))},
     )
 
-    # The owned worktree has a LIVE independent session (different pid); the
-    # orphan has none. discover_*_agents is the canonical "defer to live owner"
-    # signal, keyed by worktree_path.
-    def fake_agents(worktree_path):
-        if worktree_path == str(owned):
-            return [types.SimpleNamespace(pid=999)]  # a foreign live owner
-        return []
-
-    monkeypatch.setattr(maint, "discover_active_primary_feature_pipeline_agents", fake_agents)
-
-    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), self_pid)
-
-    # Orphan is adopted (stamped with our id); the independently-owned sibling is not.
-    assert str(orphan) in result
-    assert str(owned) not in result
-    assert mc._marker_session_id(str(orphan)) == "claude-uuid-X"
-    assert mc._marker_session_id(str(owned)) is None
+    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
+    assert str(orphan) in result          # genuinely orphaned → adopted (BOU-1442)
+    assert str(stolen) not in result      # contested/stolen → not serviced (healed)
 
 
-def test_collect_owned_still_adopts_when_only_self_is_live(tmp_path, monkeypatch):
-    """A live session matching OUR own pid is not a foreign owner — adoption of a
-    genuinely-orphaned worktree (no other live session) still proceeds, so
-    BOU-1442 sub-agent pickup / crash recovery is preserved.
-    """
-    orphan = tmp_path / "wt-orphan"
+def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeypatch):
+    """No independent owner → a genuinely-orphaned PR worktree is still adopted,
+    preserving BOU-1442 sub-agent pickup / crash recovery."""
+    orphan = tmp_path / "orphan"
     orphan.mkdir()
-    self_pid = 555
-
     monkeypatch.setattr(
         mc, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
     )
-    monkeypatch.setattr(
-        mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)}
-    )
-    # Only our own pid shows as "live" for the worktree — not a foreign owner.
-    monkeypatch.setattr(
-        maint,
-        "discover_active_primary_feature_pipeline_agents",
-        lambda worktree_path: [types.SimpleNamespace(pid=self_pid)],
-    )
+    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
 
-    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), self_pid)
+    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
     assert str(orphan) in result
+    assert mc._marker_session_id(str(orphan)) == "claude-uuid-X"
+
+
+def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
+    """When work exists but a live independent session owns the worktree, check
+    DEFERS (exit 0) instead of declaring work (exit 10) — the heal/safety net for
+    stolen markers and unsafe loop fallbacks (PR #7 review, P1 #4/#5)."""
+    pr = types.SimpleNamespace(
+        number=7, is_draft=False, failing_checks=[], latest_commit_sha="abc",
+    )
+    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    from agentic_pr_dash import maintenance as _maint
+    monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: ["review_comments"])
+
+    # Foreign owner present → defer.
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: {os.path.abspath(str(tmp_path))})
+    code, text = mc._check_worktree(str(tmp_path), "sess-self")
+    assert code == 0
+    assert "independent owner" in text
+
+    # No foreign owner → work is surfaced.
+    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
+    code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
+    assert code2 == 10
+    assert "PR_NUMBER=7" in text2

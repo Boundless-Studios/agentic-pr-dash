@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import types
 
 from agentic_pr_dash import loop
 
@@ -64,3 +65,33 @@ def test_parse_pr_number_reads_trailer():
     out = "some prompt text\nPR_NUMBER=123\nmore\n"
     assert loop._parse_pr_number(out) == 123
     assert loop._parse_pr_number("no trailer here") is None
+
+
+def _args(**kw):
+    base = dict(no_discover_worktrees=False, session_id="sess", cwd=["/fallback"])
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def _stub_list_owned(monkeypatch, *, stdout, returncode):
+    def fake_run(cmd, *a, **k):
+        return types.SimpleNamespace(stdout=stdout, stderr="", returncode=returncode)
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+
+
+def test_discover_empty_owned_set_does_not_fall_back_to_cwd(monkeypatch):
+    # rc 0 + no paths = "owns nothing this tick" — authoritative. Falling back to
+    # cwd here would route the loop to service a foreign worktree (BOU-1540 #5).
+    _stub_list_owned(monkeypatch, stdout="", returncode=0)
+    assert loop._discover_cwds(_args()) == []
+
+
+def test_discover_falls_back_to_cwd_on_command_failure(monkeypatch):
+    # Non-zero rc = genuine discovery failure → fall back to the explicit --cwd.
+    _stub_list_owned(monkeypatch, stdout="", returncode=1)
+    assert loop._discover_cwds(_args()) == ["/fallback"]
+
+
+def test_discover_returns_owned_paths(monkeypatch):
+    _stub_list_owned(monkeypatch, stdout="/wt/a\n/wt/b\n", returncode=0)
+    assert loop._discover_cwds(_args()) == ["/wt/a", "/wt/b"]

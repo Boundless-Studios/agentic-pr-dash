@@ -116,8 +116,18 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
     return result
 
 
-def discover_primary_feature_pipeline_agents(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
-    """Return active interactive feature-pipeline sessions by worktree."""
+def discover_primary_feature_pipeline_agents(
+    worktree_paths: list[str], *, min_cpu: float = _ACTIVE_CPU_THRESHOLD
+) -> dict[str, list[AgentProcess]]:
+    """Return interactive feature-pipeline sessions by worktree.
+
+    ``min_cpu`` is the CPU% floor for counting a process as actively working.
+    The default keeps the dashboard's "who's busy now" semantics. Pass
+    ``min_cpu=0.0`` for an OWNERSHIP/liveness check, where an idle session
+    sitting at a prompt still owns its worktree (its `%cpu` decays to ~0 but it
+    is very much alive) — the dashboard's activity gate would otherwise miss it
+    and let another session adopt and service the worktree (BOU-1540).
+    """
     sorted_paths = sorted({path for path in worktree_paths if path}, key=len, reverse=True)
     if not sorted_paths:
         return {}
@@ -144,7 +154,7 @@ def discover_primary_feature_pipeline_agents(worktree_paths: list[str]) -> dict[
             continue
         if _is_noninteractive(row, by_pid):
             continue
-        if _effective_cpu_for_cli(row, cli_name, children_by_pid) < _ACTIVE_CPU_THRESHOLD:
+        if _effective_cpu_for_cli(row, cli_name, children_by_pid) < min_cpu:
             continue
 
         worktree_path = _resolve_worktree(row, by_pid, sorted_paths)
