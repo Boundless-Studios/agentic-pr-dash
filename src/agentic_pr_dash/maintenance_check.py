@@ -1490,6 +1490,131 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     return 2
 
 
+def _iter_worktree_paths(cwd: str):
+    """Yield abspaths of every worktree in this repo's pool (porcelain)."""
+    try:
+        out = subprocess.run(["git", "-C", cwd, "worktree", "list", "--porcelain"],
+                             capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if out.returncode != 0:
+        return
+    for line in out.stdout.splitlines():
+        if line.startswith("worktree "):
+            yield os.path.abspath(line[len("worktree "):].strip())
+
+
+def _pr_open_state(pr_number: int, cwd: str):
+    """(state, url, has_failing_ci, failing_checks) for a PR.
+
+    state is 'open' | 'merged' | 'closed' | 'unknown'. Detached-PR live state for
+    reconcile-prs / stop-gate (BOU-1587). gh-unavailable -> ('unknown', '', False, []).
+    """
+    from . import github_api  # noqa: PLC0415
+    import json as _json  # noqa: PLC0415
+
+    try:
+        res = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "state,url,isDraft"],
+            cwd=cwd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return ("unknown", "", False, [])
+    if res.returncode != 0:
+        return ("unknown", "", False, [])
+    try:
+        d = _json.loads(res.stdout or "{}")
+    except ValueError:
+        return ("unknown", "", False, [])
+    state = str(d.get("state", "unknown")).lower()  # OPEN/MERGED/CLOSED
+    url = str(d.get("url", ""))
+    checks = github_api.get_ci_checks(pr_number, cwd)
+    failing = [c.name for c in checks
+               if c.conclusion == "failure" and not github_api._is_infra_check(c.name)]
+    return (state, url, bool(failing), failing)
+
+
+def _thread_is_p1(thread) -> bool:
+    bodies = [thread.top.body] + [r.body for r in getattr(thread, "replies", [])]
+    return any("p1" in (b or "").lower() for b in bodies)
+
+
+def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
+    """Stub replaced by the orphan-recovery task (BOU-1587 Component G)."""
+    return []
+
+
+def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool):
+    """Union of live-worktree PRs and detached ledger PRs, each with live state.
+
+    Returns a list of dict records sorted severity-first (P1 -> thread count).
+    Side effect: prunes merged/closed PRs from this session's ledger.
+    """
+    from . import session_ledger, github_api  # noqa: PLC0415
+
+    records: dict[int, dict] = {}
+    present_worktrees = set(_iter_worktree_paths(cwd))
+
+    # 1) Detached ledger PRs (worktree gone).
+    prune: set[int] = set()
+    for e in session_ledger.read(session_id):
+        if e.worktree and os.path.abspath(e.worktree) in present_worktrees:
+            continue  # still has a live worktree; handled by the worktree pass
+        state, url, has_fail, failing = _pr_open_state(e.pr, cwd)
+        if state in ("merged", "closed"):
+            prune.add(e.pr)
+            continue
+        threads = github_api.get_review_threads(e.pr, cwd)
+        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        records[e.pr] = {
+            "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
+            "worktree_present": False, "unresolved_threads": len(unresolved),
+            "ci_failing": has_fail, "failing_checks": failing,
+            "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
+        }
+    if prune:
+        session_ledger.prune(session_id, prune)
+
+    # 2) Live worktree-owned PRs (unchanged ownership semantics).
+    for wt in _collect_owned_worktrees(session_id, cwd, pid):
+        marker = _read_marker(wt) or {}
+        pr_raw = marker.get("pr")
+        if not pr_raw or not str(pr_raw).isdigit():
+            continue
+        pr = int(pr_raw)
+        if pr in records:
+            records[pr]["worktree_present"] = True
+            continue
+        state, url, has_fail, failing = _pr_open_state(pr, wt)
+        if state in ("merged", "closed"):
+            continue
+        threads = github_api.get_review_threads(pr, wt)
+        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        records[pr] = {
+            "pr": pr, "url": url or f"(pr {pr})", "branch": _current_branch(wt),
+            "worktree_present": True, "unresolved_threads": len(unresolved),
+            "ci_failing": has_fail, "failing_checks": failing,
+            "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
+        }
+
+    # 3) Orphan recovery (Component G) — claim PRs from dead sessions.
+    if adopt_orphans:
+        for rec in _adopt_orphan_prs(session_id, cwd, pid):
+            records.setdefault(rec["pr"], rec)
+
+    ordered = sorted(records.values(),
+                     key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
+    return ordered
+
+
+def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
+    import json as _json  # noqa: PLC0415
+    records = _owned_pr_records(args.session_id, os.path.abspath(args.cwd),
+                                args.pid, adopt_orphans=args.adopt_orphans)
+    for r in records:
+        print(_json.dumps(r))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agentic-pr-dash",
@@ -1619,6 +1744,19 @@ def main(argv: list[str] | None = None) -> int:
         help="Owner pid for marker adoption (default: os.getppid()).",
     )
 
+    # --- reconcile-prs ---
+    reconcile_p = subparsers.add_parser(
+        "reconcile-prs",
+        help="List every PR this session owns — live-worktree AND detached (ledger) "
+             "PRs whose worktree was removed — with live review-thread/CI state, "
+             "severity-first. Prunes merged/closed PRs (BOU-1587).",
+    )
+    reconcile_p.add_argument("--session-id", required=True, metavar="ID")
+    reconcile_p.add_argument("--cwd", default=".")
+    reconcile_p.add_argument("--pid", type=int, default=None, metavar="PID")
+    reconcile_p.add_argument("--adopt-orphans", action="store_true",
+                             help="Also claim PRs orphaned by DEAD sessions (Component G).")
+
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -1631,6 +1769,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_arm(args)
     if args.command == "stop-gate":
         return _cmd_stop_gate(args)
+    if args.command == "reconcile-prs":
+        return _cmd_reconcile_prs(args)
     # Unreachable (subparsers required=True)
     return 1
 
