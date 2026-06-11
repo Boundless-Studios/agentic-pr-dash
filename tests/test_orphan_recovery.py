@@ -23,7 +23,7 @@ def _setup_orphan(tmp_path, monkeypatch):
                         lambda pr, cwd: ("open", "https://x/pull/555", False, []))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
     # sess-DEAD is not live; everything else is.
-    monkeypatch.setattr(mc, "_session_is_live", lambda sid: sid != "sess-DEAD")
+    monkeypatch.setattr(mc, "_session_is_live", lambda sid, cwd=None: sid != "sess-DEAD")
 
 
 def test_running_session_claims_orphan(tmp_path, monkeypatch, capsys):
@@ -38,7 +38,7 @@ def test_running_session_claims_orphan(tmp_path, monkeypatch, capsys):
 
 def test_orphan_not_claimed_when_owner_still_live(tmp_path, monkeypatch, capsys):
     _setup_orphan(tmp_path, monkeypatch)
-    monkeypatch.setattr(mc, "_session_is_live", lambda sid: True)  # owner alive
+    monkeypatch.setattr(mc, "_session_is_live", lambda sid, cwd=None: True)  # owner alive
     mc.main(["reconcile-prs", "--session-id", "sess-LIVE", "--cwd",
              str(tmp_path), "--adopt-orphans"])
     assert 555 not in {e.pr for e in sl.read("sess-LIVE")}  # not stolen from a live owner

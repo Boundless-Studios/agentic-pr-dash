@@ -8,15 +8,37 @@ teardown. Pure file I/O -- no git, no gh.
 """
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 _DEFAULT_DIR = os.path.expanduser("~/.gaia/pr-watch/ledger")
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+@contextmanager
+def _flock(lock_path: str):
+    """Hold an exclusive advisory lock for the duration of a read-modify-write.
+
+    Serializes concurrent `append`/`prune`/claim operations so two sub-agents
+    arming different PRs for the same session can't both read the old file and
+    clobber each other's entry (PR #16 review, P1).
+    """
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 @dataclass(frozen=True)
@@ -92,16 +114,27 @@ def _write_all(session_id: str, entries: list[LedgerEntry]) -> None:
 
 def append(session_id: str, pr: int, branch: str, worktree: str,
            baseline_sha: str | None = None) -> None:
-    """Idempotent on ``pr`` -- re-arming the same PR overwrites its entry (last wins)."""
-    entries = [e for e in read(session_id) if e.pr != int(pr)]
-    entries.append(LedgerEntry(int(pr), branch, worktree, _now(), baseline_sha))
-    _write_all(session_id, entries)
+    """Idempotent on ``pr`` -- re-arming the same PR overwrites its entry (last wins).
+
+    The read-modify-write is serialized under an exclusive lock so concurrent
+    appends from parallel sub-agents never drop each other's PR (PR #16 review).
+    """
+    with _flock(ledger_path(session_id) + ".lock"):
+        entries = [e for e in read(session_id) if e.pr != int(pr)]
+        entries.append(LedgerEntry(int(pr), branch, worktree, _now(), baseline_sha))
+        _write_all(session_id, entries)
 
 
 def prune(session_id: str, drop_prs: set[int]) -> None:
     drop = {int(p) for p in drop_prs}
-    entries = [e for e in read(session_id) if e.pr not in drop]
-    _write_all(session_id, entries)
+    with _flock(ledger_path(session_id) + ".lock"):
+        entries = [e for e in read(session_id) if e.pr not in drop]
+        _write_all(session_id, entries)
+
+
+def claim_lock(pr: int):
+    """Exclusive lock for the read-decide-write of a PR claim (PR #16 review, P1)."""
+    return _flock(claim_path(pr) + ".lock")
 
 
 def _claim_dir() -> str:
