@@ -501,7 +501,7 @@ def _terminal_session_matches_active_agents(
     if not runtime_session or not runtime_session.is_terminal:
         return False
     if not active_agents:
-        return True
+        return False
     if runtime_session.pid is None:
         return False
     return any(agent.pid == runtime_session.pid for agent in active_agents)
