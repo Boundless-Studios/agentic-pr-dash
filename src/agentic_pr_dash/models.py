@@ -163,6 +163,7 @@ class PRData(BaseModel):
     failing_checks: list[str] = []
     review_comments: list[ReviewComment] = []
     merge_state: str = "unknown"
+    mergeable: str = "unknown"
     review_decision: str = "none"
     latest_commit_sha: str = ""
     latest_commit_date: str = ""
@@ -224,6 +225,7 @@ class WorktreeCard(BaseModel):
     maintenance: MaintenanceState | None = None
     cleanup_candidate: bool = False
     runtime_session_id: str | None = None
+    agent_name: str | None = None
     docker_mode: str | None = None
     docker_daemon_name: str | None = None
     container_names: list[str] = []
@@ -351,6 +353,7 @@ class WorktreeCard(BaseModel):
             self.pr_url,
             self.status.value,
             self.status.value.replace("_", " "),
+            self.agent_name,
             self.agent_state,
             self.agent_state_label,
             self.started_at_label,

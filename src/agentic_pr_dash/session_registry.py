@@ -58,6 +58,7 @@ class RuntimeSessionState:
     event: str
     timestamp: str
     cli: str = "unknown"
+    agent_name: str | None = None
     launch_source: str = "unknown"
     pid: int | None = None
     ppid: int | None = None
@@ -164,6 +165,7 @@ def record_event(
     event: str,
     session_id: str | None = None,
     cli: str | None = None,
+    agent_name: str | None = None,
     launch_source: str | None = None,
     pid: int | None = None,
     ppid: int | None = None,
@@ -194,6 +196,7 @@ def record_event(
             "event": event,
             "timestamp": _utc_now(),
             "cli": cli or _env("SESSION_CLI") or "unknown",
+            "agent_name": agent_name or _env("AGENT_NAME") or None,
             "launch_source": launch_source
             or _env("SESSION_LAUNCH_SOURCE")
             or "unknown",
@@ -270,6 +273,7 @@ def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> Ru
     state.timestamp = str(event.get("timestamp") or state.timestamp)
     for field_name in (
         "cli",
+        "agent_name",
         "launch_source",
         "worktree_path",
         "branch",
@@ -385,6 +389,7 @@ def _record_from_args(args: argparse.Namespace) -> int:
         event=args.event,
         session_id=args.session_id,
         cli=args.cli,
+        agent_name=args.agent_name,
         launch_source=args.launch_source,
         pid=args.pid,
         ppid=args.ppid,
@@ -413,6 +418,7 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--event", required=True)
     record.add_argument("--session-id")
     record.add_argument("--cli")
+    record.add_argument("--agent-name")
     record.add_argument("--launch-source")
     record.add_argument("--pid", type=int)
     record.add_argument("--ppid", type=int)

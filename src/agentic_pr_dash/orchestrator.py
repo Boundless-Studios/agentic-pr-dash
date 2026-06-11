@@ -205,15 +205,41 @@ class Orchestrator:
             pr.title = raw.get("title", pr.title)
             pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
             pr.review_decision = raw.get("reviewDecision", "") or "none"
-            pr.merge_state = raw.get("mergeStateStatus", "") or "unknown"
             pr.labels = [
                 label.get("name", "")
                 for label in raw.get("labels", [])
                 if isinstance(label, dict) and label.get("name")
             ]
 
+            # GitHub computes mergeability lazily: a bulk `gh pr list` often
+            # returns UNKNOWN/blank for both signals right after a push or a
+            # base-branch move. A definite bulk value is authoritative; an
+            # UNKNOWN/blank one is that async-compute window — keep the last-known
+            # value rather than erasing a known conflict, then force a per-PR
+            # re-fetch below (which also triggers the computation). Without this,
+            # a CONFLICTING PR whose next bulk poll returns UNKNOWN would be reset
+            # to "unknown" and, if the refetch then failed, slide back to Clean.
+            bulk_merge_state = raw.get("mergeStateStatus") or ""
+            bulk_mergeable = raw.get("mergeable") or ""
+            if bulk_merge_state and bulk_merge_state != "UNKNOWN":
+                pr.merge_state = bulk_merge_state
+            if bulk_mergeable and bulk_mergeable != "UNKNOWN":
+                pr.mergeable = bulk_mergeable
+
             # Find worktree
             pr.worktree_path = find_worktree_for_branch(pr.branch)
+
+            if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
+                refetched_state, refetched_mergeable = await asyncio.to_thread(
+                    github_api.get_mergeability, num, self.repo_cwd
+                )
+                # A successful refetch is authoritative — it also picks up a
+                # conflict that has since been resolved. A failed refetch returns
+                # ("","") and leaves the preserved last-known value intact.
+                if refetched_state:
+                    pr.merge_state = refetched_state
+                if refetched_mergeable:
+                    pr.mergeable = refetched_mergeable
 
             # Get latest commit info
             previous_commit_sha = pr.latest_commit_sha
@@ -370,15 +396,28 @@ class Orchestrator:
 
         return list(self.prs.values())
 
+    @staticmethod
+    def _has_merge_conflict(pr: PRData) -> bool:
+        """A conflict is signalled by EITHER GitHub field.
+
+        `mergeStateStatus == DIRTY` and `mergeable == CONFLICTING` are computed
+        from the same async pipeline but surface independently and at slightly
+        different times; relying on DIRTY alone (the old behaviour) let a
+        freshly-conflicting PR — whose mergeStateStatus was still UNKNOWN/UNSTABLE
+        — slip into the Clean column.
+        """
+        return pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING"
+
     def _compute_status(self, pr: PRData) -> PRStatus:
         has_ci_failure = bool(pr.failing_checks)
         has_comments = bool(pr.review_comments)
         ci_pending = any(c.status in ("queued", "in_progress") for c in pr.ci_checks)
-        has_blocking_issue = pr.merge_state == "DIRTY" or has_ci_failure or has_comments
+        has_conflict = self._has_merge_conflict(pr)
+        has_blocking_issue = has_conflict or has_ci_failure or has_comments
 
         if pr.agent_failure_reason and has_blocking_issue:
             return PRStatus.AGENT_FAILED
-        if pr.merge_state == "DIRTY":
+        if has_conflict:
             return PRStatus.MERGE_CONFLICT
 
         if has_ci_failure and has_comments:
@@ -457,7 +496,7 @@ class Orchestrator:
         if not pr.worktree_path:
             self.log(f"No worktree for {pr.branch}", pr_number=pr_number, level="warn")
             return
-        if not pr.review_comments and not pr.failing_checks and pr.merge_state != "DIRTY":
+        if not pr.review_comments and not pr.failing_checks and not self._has_merge_conflict(pr):
             self.log(f"No PR maintenance blockers on PR #{pr_number}", pr_number=pr_number)
             return
         await self.dispatch_pr_maintenance(pr, guidance=guidance)

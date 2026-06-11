@@ -403,6 +403,11 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
     worktrees = discover_worktrees()
     active_agents_by_path = discover_active_agents([wt["path"] for wt in worktrees])
     runtime_summary = session_registry.summarize_sessions()
+    # Branch attribution (below) is scoped to THIS repo's worktrees and reads
+    # their custom registries, so a same-named branch elsewhere can't hijack a
+    # card and a custom-registry repo's session is still found.
+    repo_worktree_paths = {wt["path"] for wt in worktrees}
+    branch_session_summary = _repo_session_summary(worktrees, runtime_summary)
     prs = sorted(orchestrator.prs.values(), key=lambda pr: (pr.number, pr.title), reverse=True)
     hidden_worktree_paths = {
         wt["path"]
@@ -435,20 +440,32 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
     for pr in prs:
         if pr.number in seen_pr_numbers:
             continue
-        active_agents = active_agents_by_path.get(pr.worktree_path or "", [])
-        # Every open PR gets a card, even a clean one whose head branch isn't
-        # the currently-checked-out branch of any worktree. This is the common
-        # case when several PRs are spun off a single shared parent worktree:
-        # only one branch can be checked out at a time, so the others have no
-        # worktree match and would otherwise vanish from the board entirely
-        # (a clean open PR is "ready to merge" — exactly what should stay
-        # visible). Closed/merged PRs are already pruned in refresh_prs.
+        # A PR whose head branch isn't checked out in any discovered worktree
+        # still gets a card. Before falling back to "No worktree", consult the
+        # session registry for a LIVE session on this branch — that's the agent
+        # actively working a PR spun off a shared parent worktree (the common
+        # "No worktree despite active agent" case). When found, the card is
+        # attributed to that session's worktree + agent name.
+        branch_session = _live_session_for_branch(
+            pr.branch, branch_session_summary, allowed_worktree_paths=repo_worktree_paths
+        )
+        runtime_session = branch_session or _runtime_session_for_worktree(
+            pr.worktree_path, runtime_summary
+        )
+        resolved_worktree_path = pr.worktree_path or (
+            branch_session.worktree_path if branch_session else None
+        )
+        # A resolved path that is itself a hidden agent worktree keeps the card
+        # hidden/non-navigable (the branch session may live in one).
+        worktree_hidden = bool(resolved_worktree_path and resolved_worktree_path in hidden_worktree_paths)
+        active_agents = active_agents_by_path.get(resolved_worktree_path or "", [])
         cards.append(
             _build_unassigned_pr_card(
                 pr,
                 active_agents=active_agents,
-                worktree_hidden=bool(pr.worktree_path and pr.worktree_path in hidden_worktree_paths),
-                runtime_session=_runtime_session_for_worktree(pr.worktree_path, runtime_summary),
+                worktree_hidden=worktree_hidden,
+                runtime_session=runtime_session,
+                session_worktree_path=resolved_worktree_path if branch_session else None,
             )
         )
 
@@ -494,6 +511,72 @@ def _runtime_session_for_worktree(
         target_summary = session_registry.summarize_sessions(path=worktree_registry)
         runtime_session = target_summary.by_worktree.get(worktree_path) or runtime_session
     return runtime_session
+
+
+def _repo_session_summary(
+    worktrees: list[dict],
+    default_summary: session_registry.SessionSummary,
+) -> session_registry.SessionSummary:
+    """Union of session state across THIS dashboard's registries.
+
+    A worktree can point ``session_registry_path`` elsewhere (per-worktree
+    config), so the default registry alone misses its sessions. Merge the
+    default summary with each distinct per-worktree registry; the most recent
+    event wins per session id. Used for branch attribution so a custom-registry
+    repo's live session is still found.
+    """
+    merged = dict(default_summary.sessions)
+    seen_registries = {session_registry.registry_path()}
+    for worktree in worktrees:
+        registry = session_registry.registry_path(worktree.get("path"))
+        if registry in seen_registries:
+            continue
+        seen_registries.add(registry)
+        for sid, state in session_registry.summarize_sessions(path=registry).sessions.items():
+            current = merged.get(sid)
+            if current is None or state.timestamp >= current.timestamp:
+                merged[sid] = state
+    return session_registry.SessionSummary(sessions=merged)
+
+
+def _live_session_for_branch(
+    branch: str | None,
+    summary: session_registry.SessionSummary,
+    allowed_worktree_paths: set[str] | None = None,
+) -> session_registry.RuntimeSessionState | None:
+    """Most-recent live, non-terminal session whose recorded branch == ``branch``.
+
+    The PR→worktree link in build_worktree_cards is keyed on a branch being the
+    *currently checked-out* branch of a discovered worktree (find_worktree_for_branch).
+    A PR worked from a shared parent worktree — or whose branch was swapped out
+    after the agent started — has no such live checkout, so it falls through to
+    an "unassigned" card and reads as "No worktree" even though an agent is
+    actively on it. The session registry already knows which session is on which
+    branch; consult it so the card shows the owning agent + its worktree.
+
+    ``allowed_worktree_paths`` restricts candidates to sessions whose worktree
+    belongs to THIS dashboard's repo, so a same-named branch in an unrelated
+    repository can't hijack the card (and focus the wrong path).
+
+    Display-only: unlike active_sessions_for_worktree (which gates PR-maintenance
+    deferral on the feature-pipeline marker), we surface ANY live agent on the
+    branch — a developer's own Claude session on the branch is still useful to
+    show. Liveness is the launcher pid, consistent with the rest of the registry.
+    """
+    if not branch:
+        return None
+    candidates = [
+        state
+        for state in summary.sessions.values()
+        if state.branch == branch
+        and not state.is_terminal
+        and state.launch_source not in session_registry.DASHBOARD_LAUNCH_SOURCES
+        and (allowed_worktree_paths is None or state.worktree_path in allowed_worktree_paths)
+        and session_registry.pid_is_live(state.pid)
+    ]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda state: state.timestamp, reverse=True)[0]
 
 
 def _terminal_session_matches_active_agents(
@@ -572,6 +655,7 @@ def _build_card_for_worktree(
         maintenance=pr.maintenance if pr else None,
         cleanup_candidate=cleanup_candidate,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
+        agent_name=runtime_session.agent_name if runtime_session else None,
         docker_mode=runtime_session.docker_mode if runtime_session else None,
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
         container_names=runtime_session.container_names if runtime_session else [],
@@ -585,21 +669,47 @@ def _build_unassigned_pr_card(
     active_agents: list[AgentProcess] | None = None,
     worktree_hidden: bool = False,
     runtime_session: session_registry.RuntimeSessionState | None = None,
+    session_worktree_path: str | None = None,
 ) -> WorktreeCard:
+    # When a live branch-matched session attributes this PR to a worktree
+    # (session_worktree_path), synthesize an agent from it so a PR worked from a
+    # shared parent worktree reads as agent-working instead of "No worktree".
+    if not active_agents and session_worktree_path and runtime_session:
+        active_agents = [
+            AgentProcess(
+                pid=runtime_session.pid or 0,
+                cli_name=runtime_session.cli,
+                label=(runtime_session.agent_name or runtime_session.cli.capitalize()),
+            )
+        ]
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
-    # Hidden agent worktrees surface as unassigned cards — use the PR's own
-    # worktree_path for the turn-activity signal (fallback to CPU active_agents).
+    # Turn-activity signal is keyed on the worktree the agent is actually in —
+    # the session's worktree when branch-matched, else the PR's own.
+    activity_worktree_path = session_worktree_path or pr.worktree_path
     if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
         agent_working = False
     else:
-        agent_working = _resolve_agent_working(pr.worktree_path, bool(fallback_agents))
+        agent_working = _resolve_agent_working(activity_worktree_path, bool(fallback_agents))
     status = _card_status(pr, agent_working)
     activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
 
+    if worktree_hidden:
+        worktree_name = "Agent worktree hidden"
+    elif session_worktree_path:
+        worktree_name = Path(session_worktree_path).name
+    else:
+        worktree_name = "No worktree"
+
+    # A hidden agent worktree must stay non-navigable: the board template gates
+    # click/focus on card.worktree_path *before* worktree_hidden, so exposing the
+    # path here would make a supposedly-hidden card focusable. The session path
+    # is still used above (activity_worktree_path) for the working/idle signal.
+    card_worktree_path = None if worktree_hidden else session_worktree_path
+
     return WorktreeCard(
         id=f"pr:{pr.number}",
-        worktree_name="Agent worktree hidden" if worktree_hidden else "No worktree",
-        worktree_path=None,
+        worktree_name=worktree_name,
+        worktree_path=card_worktree_path,
         worktree_hidden=worktree_hidden,
         branch=pr.branch,
         pr_number=pr.number,
@@ -629,6 +739,7 @@ def _build_unassigned_pr_card(
         maintenance=pr.maintenance,
         pr_created_at=pr.created_at,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
+        agent_name=runtime_session.agent_name if runtime_session else None,
         docker_mode=runtime_session.docker_mode if runtime_session else None,
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
         container_names=runtime_session.container_names if runtime_session else [],
@@ -1022,6 +1133,7 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                     )
                 ],
                 active_agents=[AgentProcess(pid=4242, cli_name="claude", label="Claude")],
+                agent_name="cobalt-fox",
                 activity_message="Addressing review comment + failing unit test",
                 activity_source="dashboard",
                 maintenance=MaintenanceState(

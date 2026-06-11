@@ -18,6 +18,9 @@
                     {% if card.branch != card.worktree_name %}
                     <div class="card-branch">{{ card.branch }}</div>
                     {% endif %}
+                    {% if card.agent_name %}
+                    <div class="card-agent-name" title="Agent session name">🤖 {{ card.agent_name }}</div>
+                    {% endif %}
                 </div>
                 <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
             </div>
