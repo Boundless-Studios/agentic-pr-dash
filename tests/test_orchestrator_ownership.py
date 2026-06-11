@@ -200,6 +200,7 @@ def test_refresh_requeues_when_prequeue_owner_session_is_dead(monkeypatch, tmp_p
         state=MaintenanceStatus.QUEUED,
         review_comment_ids=[55],
     )
+    queued_state.last_signal_at = datetime(2000, 1, 1, tzinfo=timezone.utc)
     maintenance.save_state(queued_state)
 
     monkeypatch.setattr(
