@@ -65,6 +65,7 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
     )
     matched = False
     latest_matched_at: datetime | None = None
+    dead_nonterminal_owner = False
     for state in summary.sessions.values():
         if state.worktree_path != pr.worktree_path:
             continue
@@ -79,12 +80,16 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
         timestamp = _parse_session_timestamp(state.timestamp)
         if timestamp and (latest_matched_at is None or timestamp > latest_matched_at):
             latest_matched_at = timestamp
-        if not state.is_terminal and session_registry.pid_is_live(state.pid):
-            return True
+        if not state.is_terminal:
+            if session_registry.pid_is_live(state.pid):
+                return True
+            dead_nonterminal_owner = True
 
     if matched:
         if _has_process_owner(pr):
             return True
+        if dead_nonterminal_owner:
+            return False
         if queued_at is None or latest_matched_at is None or queued_at <= latest_matched_at:
             return False
     return None

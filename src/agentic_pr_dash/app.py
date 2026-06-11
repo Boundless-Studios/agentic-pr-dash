@@ -426,7 +426,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 worktree,
                 pr,
                 active_agents_by_path.get(worktree["path"], []),
-                runtime_summary.by_worktree.get(worktree["path"]),
+                _runtime_session_for_worktree(worktree["path"], runtime_summary),
             )
         )
 
@@ -446,7 +446,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 pr,
                 active_agents=active_agents,
                 worktree_hidden=bool(pr.worktree_path and pr.worktree_path in hidden_worktree_paths),
-                runtime_session=runtime_summary.by_worktree.get(pr.worktree_path or ""),
+                runtime_session=_runtime_session_for_worktree(pr.worktree_path, runtime_summary),
             )
         )
 
@@ -478,6 +478,35 @@ def _card_status(pr: PRData | None, has_active_agents: bool) -> PRStatus:
     return PRStatus.NO_PR
 
 
+def _runtime_session_for_worktree(
+    worktree_path: str | None,
+    default_summary: session_registry.SessionSummary,
+) -> session_registry.RuntimeSessionState | None:
+    if not worktree_path:
+        return None
+
+    runtime_session = default_summary.by_worktree.get(worktree_path)
+    default_registry = session_registry.registry_path()
+    worktree_registry = session_registry.registry_path(worktree_path)
+    if worktree_registry != default_registry:
+        target_summary = session_registry.summarize_sessions(path=worktree_registry)
+        runtime_session = target_summary.by_worktree.get(worktree_path) or runtime_session
+    return runtime_session
+
+
+def _terminal_session_matches_active_agents(
+    runtime_session: session_registry.RuntimeSessionState | None,
+    active_agents: list[AgentProcess],
+) -> bool:
+    if not runtime_session or not runtime_session.is_terminal:
+        return False
+    if not active_agents:
+        return True
+    if runtime_session.pid is None:
+        return False
+    return any(agent.pid == runtime_session.pid for agent in active_agents)
+
+
 def _build_card_for_worktree(
     worktree: dict,
     pr: PRData | None,
@@ -487,7 +516,7 @@ def _build_card_for_worktree(
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
     # has an activity stamp; fall back to CPU-discovered active_agents otherwise.
-    if runtime_session and runtime_session.is_terminal:
+    if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
         agent_working = False
     else:
         agent_working = _resolve_agent_working(worktree.get("path"), bool(fallback_agents))
@@ -549,7 +578,7 @@ def _build_unassigned_pr_card(
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Hidden agent worktrees surface as unassigned cards — use the PR's own
     # worktree_path for the turn-activity signal (fallback to CPU active_agents).
-    if runtime_session and runtime_session.is_terminal:
+    if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
         agent_working = False
     else:
         agent_working = _resolve_agent_working(pr.worktree_path, bool(fallback_agents))
