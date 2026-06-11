@@ -1562,9 +1562,76 @@ def _thread_is_p1(thread) -> bool:
     return any("p1" in (b or "").lower() for b in bodies)
 
 
+def _session_is_live(session_id: str) -> bool:
+    """True if `session_id` has a non-terminal, pid-live registry entry."""
+    from . import session_registry  # noqa: PLC0415
+    try:
+        summary = session_registry.summarize_sessions()
+    except Exception:  # noqa: BLE001
+        return False
+    state = summary.sessions.get(session_id)
+    if state is None or state.is_terminal:
+        return False
+    return session_registry.pid_is_live(state.pid)
+
+
+def _claim_pr(pr_number: int, session_id: str, pid: int) -> bool:
+    """Win an exclusive claim on an orphan PR. One live claimant wins; a claim
+    held by a dead pid is taken over. Returns True on win (BOU-1587 Component G)."""
+    from . import session_ledger, session_registry  # noqa: PLC0415
+    existing = session_ledger.read_claim(pr_number)
+    if existing:
+        if existing.get("session_id") == session_id:
+            return True
+        holder_pid = existing.get("pid")
+        try:
+            holder_pid = int(holder_pid)
+        except (TypeError, ValueError):
+            holder_pid = None
+        if session_registry.pid_is_live(holder_pid):
+            return False  # a live session owns it
+    session_ledger.write_claim(pr_number, session_id, pid)
+    return True
+
+
 def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
-    """Stub replaced by the orphan-recovery task (BOU-1587 Component G)."""
-    return []
+    """Claim PRs orphaned by DEAD sessions and adopt them into THIS session's ledger.
+
+    Orphan = ledger entry of another session that is no longer live, whose worktree
+    is gone and whose PR is still open with unresolved work. Exactly one live session
+    wins each PR via an exclusive claim file (BOU-1587 Component G).
+    """
+    from . import session_ledger, github_api  # noqa: PLC0415
+
+    eff_pid = pid if pid is not None else _resolve_owner_pid()
+    present = set(_iter_worktree_paths(cwd))
+    adopted = []
+    for other in session_ledger.list_session_ids():
+        if other == session_id:
+            continue
+        if _session_is_live(other):
+            continue  # owner still alive — its own loop handles it
+        for e in session_ledger.read(other):
+            if e.worktree and os.path.abspath(e.worktree) in present:
+                continue  # has a live worktree → not orphaned
+            state, url, has_fail, failing = _pr_open_state(e.pr, cwd)
+            if state in ("merged", "closed", "unknown"):
+                continue
+            threads = github_api.get_review_threads(e.pr, cwd)
+            unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+            if not unresolved and not has_fail:
+                continue  # nothing to do
+            if not _claim_pr(e.pr, session_id, int(eff_pid)):
+                continue  # another live session won it
+            session_ledger.append(session_id, e.pr, e.branch, e.worktree, e.baseline_sha)
+            adopted.append({
+                "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
+                "worktree_present": False, "unresolved_threads": len(unresolved),
+                "ci_failing": has_fail, "failing_checks": failing,
+                "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
+                "adopted_from": other,
+            })
+    return adopted
 
 
 def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:

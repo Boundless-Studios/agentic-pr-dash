@@ -104,6 +104,42 @@ def prune(session_id: str, drop_prs: set[int]) -> None:
     _write_all(session_id, entries)
 
 
+def _claim_dir() -> str:
+    return os.environ.get(
+        "GAIA_PR_CLAIM_DIR",
+        os.path.join(os.path.dirname(_dir().rstrip("/")), "claims"))
+
+
+def claim_path(pr: int) -> str:
+    return os.path.join(_claim_dir(), f"pr-{int(pr)}.json")
+
+
+def read_claim(pr: int) -> dict | None:
+    try:
+        with open(claim_path(pr), encoding="utf-8") as fh:
+            return json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def write_claim(pr: int, session_id: str, pid: int) -> None:
+    path = claim_path(pr)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = json.dumps({"pr": int(pr), "session_id": session_id,
+                          "pid": int(pid), "claimed_at": _now()})
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".claim.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(payload)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def list_session_ids() -> list[str]:
     try:
         names = os.listdir(_dir())
