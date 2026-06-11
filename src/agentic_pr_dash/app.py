@@ -31,6 +31,7 @@ from .models import (
     ReviewComment,
     RunnerExecutionSummary,
     WorktreeCard,
+    humanize_relative,
     worktree_started_at,
 )
 from .orchestrator import Orchestrator
@@ -280,7 +281,7 @@ def _format_last_updated(value: str | None) -> str | None:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return value
-    return parsed.strftime("%Y-%m-%d %H:%M")
+    return humanize_relative(parsed)
 
 
 def _now_epoch() -> int:

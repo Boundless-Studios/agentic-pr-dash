@@ -13,12 +13,15 @@ from pathlib import Path
 
 import pytest
 
+from datetime import timedelta
+
 from agentic_pr_dash.models import (
     MaintenanceState,
     MaintenanceStatus,
     PRStatus,
     ReviewComment,
     WorktreeCard,
+    humanize_relative,
 )
 
 
@@ -240,6 +243,46 @@ def test_worktree_started_at_missing_dir():
 
     result = worktree_started_at("/tmp/__nonexistent_path_bou1551__")
     assert result is None, f"Expected None for missing path, got {result!r}"
+
+
+# ---------------------------------------------------------------------------
+# 2b. Relative-age labels ("1d 5h ago", "1m 30s ago")
+# ---------------------------------------------------------------------------
+
+def test_humanize_relative_days_and_hours():
+    now = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+    dt = now - timedelta(days=1, hours=5, minutes=40)
+    assert humanize_relative(dt, now=now) == "1d 5h ago"
+
+
+def test_humanize_relative_minutes_and_seconds():
+    now = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+    dt = now - timedelta(minutes=1, seconds=30)
+    assert humanize_relative(dt, now=now) == "1m 30s ago"
+
+
+def test_humanize_relative_hours_and_minutes():
+    now = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+    dt = now - timedelta(hours=3, minutes=8, seconds=12)
+    assert humanize_relative(dt, now=now) == "3h 8m ago"
+
+
+def test_humanize_relative_seconds_only():
+    now = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+    assert humanize_relative(now - timedelta(seconds=12), now=now) == "12s ago"
+
+
+def test_humanize_relative_future_is_just_now():
+    now = datetime(2026, 6, 11, 12, 0, 0, tzinfo=timezone.utc)
+    assert humanize_relative(now + timedelta(minutes=5), now=now) == "just now"
+
+
+def test_started_at_label_is_relative():
+    """started_at_label renders the relative form, not an absolute timestamp."""
+    card = _minimal_card(pr_created_at="2026-06-10T12:00:00Z")  # type: ignore[call-arg]
+    label = card.started_at_label  # type: ignore[attr-defined]
+    assert label.endswith("ago") or label == "just now"
+    assert "2026-" not in label  # no absolute date leaking through
 
 
 # ---------------------------------------------------------------------------

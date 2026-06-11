@@ -242,11 +242,11 @@ class WorktreeCard(BaseModel):
 
     @property
     def started_at_label(self) -> str:
-        """Human-readable started_at, e.g. '2026-06-10 12:00', or '' when unset."""
+        """Relative started_at, e.g. '1d 5h ago', or '' when unset."""
         dt = self.started_at
         if dt is None:
             return ""
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M")
+        return humanize_relative(dt)
 
     @property
     def agent_state(self) -> str:
@@ -399,3 +399,33 @@ def worktree_started_at(path: str) -> datetime | None:
         return datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc)
     except (OSError, ValueError):
         return None
+
+
+def humanize_relative(dt: datetime, now: datetime | None = None) -> str:
+    """Compact relative age of ``dt``, e.g. '1d 5h ago', '1m 30s ago', '12s ago'.
+
+    Shows the two largest non-zero units (day+hour, hour+minute, minute+second)
+    so the label stays scannable. Future or sub-second deltas render 'just now'.
+    A naive ``dt`` is assumed to be UTC. Pass ``now`` for deterministic tests.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    reference = now or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=timezone.utc)
+
+    seconds = int((reference - dt).total_seconds())
+    if seconds < 1:
+        return "just now"
+
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, secs = divmod(rem, 60)
+
+    if days:
+        return f"{days}d {hours}h ago"
+    if hours:
+        return f"{hours}h {minutes}m ago"
+    if minutes:
+        return f"{minutes}m {secs}s ago"
+    return f"{secs}s ago"
