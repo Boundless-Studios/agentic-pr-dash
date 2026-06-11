@@ -15,6 +15,11 @@ Linear: [BOU-1551](https://linear.app/boundless-studios/issue/BOU-1551) — Too 
 
 - `tests/test_card_presentation.py`: 19/19 passed (was 19 failed at RED baseline)
 - Full suite `python3 -m pytest tests/ -q`: **89 passed, 0 failed**
+- Import-path note: an intermediate green run was polluted by a stale installed
+  snapshot of the package winning the import race over the checkout's `src/`.
+  Caught in code review; `pythonpath = ["src"]` added to `[tool.pytest.ini_options]`
+  and the final 89-pass run verified to import from the checkout
+  (`agentic_pr_dash.__file__` → this worktree's `src/`).
 
 ### E2E Verification (live data, port 9311, branch code via PYTHONPATH)
 
@@ -36,6 +41,18 @@ Linear: [BOU-1551](https://linear.app/boundless-studios/issue/BOU-1551) — Too 
 - Unscoped `.state-*` CSS rules tinted entire cards (card div carries `state-*` for JS hooks) — scoped to `.card-state`.
 - "1 comments" → "1 comment" pluralization.
 - Branch line duplicated worktree name when identical — now suppressed.
+
+### Issues caught during code review and fixed
+
+- `test_template_field_order_and_classes` card lacked `pr_created_at`, so the
+  conditional `card-started` row never rendered (masked by the stale-snapshot
+  import issue above) — card now carries a PR creation time.
+- `app.py` htmx dispatch error snippets referenced the removed `var(--red)` /
+  `var(--orange)` tokens → invisible error feedback; now `--danger` / `--warn`.
+- `.card-warning` (cleanup error snippets) had no rule in the rewritten CSS —
+  re-added with `--danger`.
+- Removed dead badge selectors for states `agent_state` never emits
+  (`state-has_comments`, `state-ci_and_comments`, `state-agent_working`).
 
 ### Screenshots
 

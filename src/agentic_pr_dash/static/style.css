@@ -441,24 +441,21 @@ header h1 {
 
 /* State → danger */
 .card-state.state-failed,
-.card-state.state-ci_failing,
-.card-state.state-ci_and_comments {
+.card-state.state-ci_failing {
     background: color-mix(in srgb, var(--danger) 14%, transparent);
     color: var(--danger);
 }
 
 /* State → warn */
 .card-state.state-awaiting_fixes,
-.card-state.state-queued,
-.card-state.state-has_comments {
+.card-state.state-queued {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
 }
 
 /* State → info (in-progress / pending) */
 .card-state.state-working,
-.card-state.state-ci_pending,
-.card-state.state-agent_working {
+.card-state.state-ci_pending {
     background: color-mix(in srgb, var(--info) 14%, transparent);
     color: var(--info);
 }
@@ -796,6 +793,13 @@ header h1 {
 .card-pending-status {
     font-size: 11px;
     color: var(--warn);
+    font-weight: 500;
+}
+
+/* Cleanup/error feedback snippets returned by htmx action endpoints */
+.card-warning {
+    font-size: 11px;
+    color: var(--danger);
     font-weight: 500;
 }
 

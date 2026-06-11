@@ -318,8 +318,9 @@ def test_template_field_order_and_classes():
         worktree_name="foo",
         branch="bou-1551-test",
         last_updated_label="2026-06-11 12:00",
-        # started_at requires pr_created_at which doesn't exist yet — use the
-        # field directly once the contract lands; for now test class presence
+        # The Started row only renders when a start time is known — give the
+        # card a PR creation time so the card-started contract is exercised.
+        pr_created_at="2026-06-10T09:00:00Z",
         status=PRStatus.CLEAN,
     )
     html = _render_board([card])

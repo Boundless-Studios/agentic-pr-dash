@@ -1201,11 +1201,11 @@ async def fix_comments(pr_number: int, request: Request):
     import asyncio
     pr = orchestrator.prs.get(pr_number)
     if not pr:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">PR not found</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">No worktree</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">No worktree</span>')
     if not pr.review_comments:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--orange)">No comments to address</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--warn)">No comments to address</span>')
     if pr.number in orchestrator._inflight_prs:
         return _dispatch_response(request, '<span class="card-agent-status">Agent already working...</span>')
 
@@ -1220,9 +1220,9 @@ async def retry_ci(pr_number: int, request: Request):
     import asyncio
     pr = orchestrator.prs.get(pr_number)
     if not pr:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">PR not found</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:
-        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--red)">No worktree</span>')
+        return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">No worktree</span>')
     if pr.number in orchestrator._inflight_prs:
         return _dispatch_response(request, '<span class="card-agent-status">Agent already working...</span>')
 
