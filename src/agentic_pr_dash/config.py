@@ -109,6 +109,10 @@ class Config:
     session_registry_path: Path | None
     """Optional session-event log consumed by the dashboard's "agent working" view."""
 
+    await_command: str = "agentic-pr-dash await --cwd {cwd} --session-id {session_id}"
+    """Shell command template the stop-gate surfaces when spawning the in-session
+    feedback waiter; ``{cwd}`` and ``{session_id}`` are substituted at render time."""
+
     extra: dict = field(default_factory=dict)
     """Anything else from the ``[project]`` table, for adapters to read."""
 
@@ -216,11 +220,19 @@ def load(cwd: str | None = None) -> Config:
 
     sess = _env("SESSION_REGISTRY") or proj.get("session_registry_path")
 
+    _default_await_cmd = "agentic-pr-dash await --cwd {cwd} --session-id {session_id}"
+    await_command = (
+        _env("AWAIT_COMMAND")
+        or proj.get("await_command")
+        or _default_await_cmd
+    )
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
         tracker=(_env("TRACKER") or proj.get("tracker") or "none").lower(),
         executor=_env("EXECUTOR") or proj.get("executor") or "",
+        await_command=await_command,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,

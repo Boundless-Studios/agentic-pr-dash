@@ -1590,25 +1590,7 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
                     if _record_has_blockers(r)]
         detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
         for r in detached:
-            why = []
-            if r["unresolved_threads"]:
-                why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
-            if r["ci_failing"]:
-                why.append("failing CI")
-            if r.get("changes_requested"):
-                why.append("review-level CHANGES_REQUESTED")
-            if r.get("merge_conflict"):
-                why.append("merge conflict")
-            tag = " [P1]" if r["p1"] else ""
-            text = (
-                f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
-                f"  needs: {', '.join(why)}\n"
-                f"  This PR's worktree was torn down. Recreate it from the branch "
-                f"({r['branch'] or '<branch>'}) to fix, or explicitly hand it off — "
-                f"do NOT leave it unmonitored.\n"
-                f"PR_NUMBER={r['pr']}"
-            )
-            pending.append((f"(no worktree) PR #{r['pr']}", text))
+            pending.append(_detached_pending_entry(r))
 
     if not pending:
         # Clear the loop counter but KEEP the timestamp so a clean idle session
@@ -1971,6 +1953,171 @@ def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------
+# await — in-session background feedback waiter (BOU-1632)
+# ---------------------------------------------------------------------------
+#
+# Spawned by the stop-gate when it has no pending work but the session owns at
+# least one open non-draft PR. Polls owned worktrees for pending feedback and
+# stamps the ownership heartbeat each tick (keeps the detached loop deferring
+# while the waiter is alive). On finding work it exits 10 with the same
+# stop-block the interactive stop-gate renders — the harness wakes the
+# owning session so it can address the feedback in-context.
+#
+# Single-instance per session: pidfile ``pr-watch.await.pid`` in the state dir.
+# A live same-session pidfile → exit 3. Dead pidfile → proceed (stale).
+# Pidfile written on entry, removed on every exit path.
+
+
+def _await_pidfile(cwd: str) -> str:
+    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.await.pid")
+
+
+def _read_await_pidfile(cwd: str) -> dict:
+    """Return the pidfile contents as a dict, or {} on missing/corrupt."""
+    try:
+        with open(_await_pidfile(cwd), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_await_pidfile(cwd: str, data: dict) -> None:
+    """Write the await pidfile atomically (best-effort)."""
+    path = _await_pidfile(cwd)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+
+
+def _remove_await_pidfile(cwd: str) -> None:
+    """Remove the await pidfile (best-effort)."""
+    try:
+        os.remove(_await_pidfile(cwd))
+    except OSError:
+        pass
+
+
+def _await_alive(cwd: str, session_id: str) -> bool:
+    """True if a live waiter pidfile exists with a matching session_id."""
+    data = _read_await_pidfile(cwd)
+    if not data:
+        return False
+    return (
+        data.get("session_id") == session_id
+        and _pid_alive(str(data.get("pid", "")))
+    )
+
+
+def _detached_pending_entry(r: dict) -> tuple[str, str]:
+    """Build the (label, text) pending entry for a detached PR record.
+
+    Extracted from _stop_gate_impl so both stop-gate and await render
+    detached-PR entries identically (DRY).
+    """
+    why = []
+    if r["unresolved_threads"]:
+        why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
+    if r["ci_failing"]:
+        why.append("failing CI")
+    if r.get("changes_requested"):
+        why.append("review-level CHANGES_REQUESTED")
+    if r.get("merge_conflict"):
+        why.append("merge conflict")
+    tag = " [P1]" if r["p1"] else ""
+    text = (
+        f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
+        f"  needs: {', '.join(why)}\n"
+        f"  This PR's worktree was torn down. Recreate it from the branch "
+        f"({r['branch'] or '<branch>'}) to fix, or explicitly hand it off — "
+        f"do NOT leave it unmonitored.\n"
+        f"PR_NUMBER={r['pr']}"
+    )
+    return (f"(no worktree) PR #{r['pr']}", text)
+
+
+def _cmd_await(args: argparse.Namespace) -> int:
+    """Background feedback waiter — poll owned PRs, exit 10 when work arrives."""
+    cwd = os.path.abspath(args.cwd)
+    session_id = args.session_id or _read_session_marker(cwd)
+    owner_pid = args.owner_pid if args.owner_pid else _resolve_owner_pid()
+
+    # Single-instance guard: abort if a live waiter for this session already exists.
+    existing = _read_await_pidfile(cwd)
+    if (
+        existing
+        and _pid_alive(str(existing.get("pid", "")))
+        and existing.get("session_id") == session_id
+    ):
+        print("[pr-watch] waiter already running for this session", file=sys.stderr)
+        return 3
+
+    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id})
+    # max_wait == 0 means "one tick then exit" — set deadline to now so the
+    # expiry check fires immediately after the first tick.
+    now = time.time()
+    if args.max_wait == 0:
+        deadline: float | None = now  # expire immediately after the first tick
+    elif args.max_wait > 0:
+        deadline = now + args.max_wait
+    else:
+        deadline = None  # run forever until work found or pid dead
+    try:
+        while True:
+            # Exit if the owning session pid is dead.
+            if not _pid_alive(str(owner_pid)):
+                return 0
+
+            owned = _collect_stop_gate_worktrees(session_id, cwd) if session_id else [cwd]
+
+            pending: list[tuple[str, str]] = []
+            for worktree in owned:
+                code, text = _check_worktree(worktree, session_id, claim=False)
+                if code == 10:
+                    pending.append((worktree, text))
+                # Stamp the heartbeat for each owned worktree on every tick,
+                # regardless of whether work was found — this is the coordination
+                # contract that keeps the detached loop deferring while the waiter
+                # is alive. _check_worktree already stamps it when claim=False and
+                # the marker is ours, but stamp explicitly here too so that worktrees
+                # where _check_worktree exits early (no PR, draft, etc.) are still
+                # covered.
+                _touch_owner_heartbeat(worktree, session_id, code == 10)
+
+            # Include detached-ledger PRs (parity with stop-gate).
+            if session_id:
+                for r in _detached_pr_records(session_id, cwd):
+                    if _record_has_blockers(r):
+                        pending.append(_detached_pending_entry(r))
+
+            if pending:
+                print(_build_stop_block(pending))
+                print(
+                    "[pr-watch] Feedback arrived on PR(s) you own — address it now "
+                    "(commit + push to the EXISTING branch, then run the per-worktree "
+                    "complete command above)."
+                )
+                return 10
+
+            if not owned and not getattr(args, "keep_alive_without_prs", False):
+                return 0
+
+            if deadline is not None and time.time() >= deadline:
+                print(
+                    "[pr-watch] waiter max-wait reached with no feedback; "
+                    "will re-arm on next stop."
+                )
+                return 0
+
+            time.sleep(max(args.interval, 1))
+    finally:
+        _remove_await_pidfile(cwd)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="agentic-pr-dash",
@@ -2113,6 +2260,49 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_p.add_argument("--adopt-orphans", action="store_true",
                              help="Also claim PRs orphaned by DEAD sessions (Component G).")
 
+    # --- await ---
+    await_p = subparsers.add_parser(
+        "await",
+        help="Background feedback waiter: poll owned PRs and exit 10 when work arrives.",
+    )
+    await_p.add_argument(
+        "--cwd", default=".", help="Launch cwd — state dir is resolved from here."
+    )
+    await_p.add_argument(
+        "--session-id",
+        default="",
+        metavar="ID",
+        help="Owning session id (falls back to pr-watch.session).",
+    )
+    await_p.add_argument(
+        "--owner-pid",
+        type=int,
+        default=0,
+        metavar="PID",
+        help="Owning session pid; waiter exits 0 when it dies (default: "
+        "walk ancestors for nearest claude/codex process).",
+    )
+    await_p.add_argument(
+        "--interval",
+        type=int,
+        default=150,
+        metavar="SECONDS",
+        help="Poll interval in seconds (default: 150).",
+    )
+    await_p.add_argument(
+        "--max-wait",
+        type=int,
+        default=21600,
+        metavar="SECONDS",
+        help="Maximum total wait seconds; 0 = one tick then exit (default: 21600).",
+    )
+    await_p.add_argument(
+        "--keep-alive-without-prs",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
+
     args = parser.parse_args(argv)
 
     if args.command == "check":
@@ -2127,6 +2317,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_stop_gate(args)
     if args.command == "reconcile-prs":
         return _cmd_reconcile_prs(args)
+    if args.command == "await":
+        return _cmd_await(args)
     # Unreachable (subparsers required=True)
     return 1
 
