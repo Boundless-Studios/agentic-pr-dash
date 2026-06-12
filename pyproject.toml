@@ -16,7 +16,7 @@ keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review
 # arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
 dependencies = [
     "pydantic>=2.0",
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@8fa2034eafc009dc5e65e40b289397f66cc35a5e",
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@main",
 ]
 
 [project.optional-dependencies]
