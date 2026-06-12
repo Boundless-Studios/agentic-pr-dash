@@ -103,6 +103,10 @@ def test_detached_pr_clean_does_not_block(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
         "open", "https://x/pull/778", False, []))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+    # A clean detached open PR does not trigger the pending-work block. The waiter
+    # enforcement is a separate concern (tested in test_codex_p2_fixes.py) — suppress
+    # it here to isolate the pending-work assertion (BOU-1632 codex P2 #3).
+    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: True)
 
     rc = mc.main(["stop-gate", "--session-id", "sess-X", "--cwd", str(tmp_path)])
     assert rc == 0

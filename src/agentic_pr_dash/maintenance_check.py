@@ -270,7 +270,8 @@ def _resolve_owner_pid() -> int:
         if not line:
             break
         ppid_str, _sep, comm = line.partition(" ")
-        if "claude" in os.path.basename(comm.strip()).lower():
+        comm_base = os.path.basename(comm.strip()).lower()
+        if "claude" in comm_base or "codex" in comm_base:
             return pid
         if not ppid_str.isdigit():
             break
@@ -1654,6 +1655,13 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
             pending.append((worktree, text))
+        elif code == 0 and session_id:
+            # gh answered authoritatively: no open PR for this branch. Prune any
+            # stale armed marker so _owned_open_pr_numbers doesn't demand a waiter
+            # for a merged/closed PR (BOU-1632 codex P2 finding 1).
+            marker = _read_marker(worktree) or {}
+            if str(marker.get("pr", "")).isdigit():
+                _prune_stale_marker(worktree, marker, session_id)
 
     # BOU-1587/1612: owned PRs whose worktree was torn down are STILL mandatory
     # work. They have no worktree to _check_worktree, so reconcile them from the
@@ -1672,6 +1680,11 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         # so 3 identical no-progress states release the gate.
         if (not getattr(args, "no_waiter", False)) and session_id:
             open_prs = _owned_open_pr_numbers(owned)
+            # Also count detached ledger PRs that are still open (worktree gone
+            # but PR live) — those need a waiter too (BOU-1632 codex P2 #3).
+            for _dr in _detached_pr_records(session_id, cwd):
+                if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
+                    open_prs = open_prs | {_dr["pr"]}
             if open_prs and not _await_alive(cwd, session_id):
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -2058,23 +2071,28 @@ def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
 # Pidfile written on entry, removed on every exit path.
 
 
-def _await_pidfile(cwd: str) -> str:
-    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.await.pid")
+def _await_pidfile(cwd: str, session_id: str = "") -> str:
+    """Per-session pidfile path. Each session gets its own file so two sessions
+    sharing a cwd don't clobber each other's waiter record (BOU-1632 codex P2 #2).
+    """
+    from . import session_ledger as _sl  # noqa: PLC0415
+    safe = _sl._safe_session(session_id) if session_id else "unknown"
+    return str(load_config(cwd).state_dir_for(cwd) / f"pr-watch.await.{safe}.pid")
 
 
-def _read_await_pidfile(cwd: str) -> dict:
+def _read_await_pidfile(cwd: str, session_id: str = "") -> dict:
     """Return the pidfile contents as a dict, or {} on missing/corrupt."""
     try:
-        with open(_await_pidfile(cwd), encoding="utf-8") as fh:
+        with open(_await_pidfile(cwd, session_id), encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def _write_await_pidfile(cwd: str, data: dict) -> None:
+def _write_await_pidfile(cwd: str, data: dict, session_id: str = "") -> None:
     """Write the await pidfile atomically (best-effort)."""
-    path = _await_pidfile(cwd)
+    path = _await_pidfile(cwd, session_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -2083,17 +2101,17 @@ def _write_await_pidfile(cwd: str, data: dict) -> None:
         pass
 
 
-def _remove_await_pidfile(cwd: str) -> None:
+def _remove_await_pidfile(cwd: str, session_id: str = "") -> None:
     """Remove the await pidfile (best-effort)."""
     try:
-        os.remove(_await_pidfile(cwd))
+        os.remove(_await_pidfile(cwd, session_id))
     except OSError:
         pass
 
 
 def _await_alive(cwd: str, session_id: str) -> bool:
     """True if a live waiter pidfile exists with a matching session_id."""
-    data = _read_await_pidfile(cwd)
+    data = _read_await_pidfile(cwd, session_id)
     if not data:
         return False
     return (
@@ -2136,7 +2154,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
     owner_pid = args.owner_pid if args.owner_pid else _resolve_owner_pid()
 
     # Single-instance guard: abort if a live waiter for this session already exists.
-    existing = _read_await_pidfile(cwd)
+    existing = _read_await_pidfile(cwd, session_id)
     if (
         existing
         and _pid_alive(str(existing.get("pid", "")))
@@ -2145,7 +2163,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
 
-    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id})
+    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id}, session_id)
     # max_wait == 0 means "one tick then exit" — set deadline to now so the
     # expiry check fires immediately after the first tick.
     now = time.time()
@@ -2178,8 +2196,10 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             # Include detached-ledger PRs (parity with stop-gate).
+            _detached_this_tick: list[dict] = []
             if session_id:
-                for r in _detached_pr_records(session_id, cwd):
+                _detached_this_tick = _detached_pr_records(session_id, cwd)
+                for r in _detached_this_tick:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))
 
@@ -2192,7 +2212,13 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 )
                 return 10
 
-            if not owned and not getattr(args, "keep_alive_without_prs", False):
+            # Keep ticking when owned is empty but the session has open detached
+            # ledger PRs that may develop blockers (BOU-1632 codex P2 #3).
+            has_open_detached = any(
+                r.get("state") not in ("merged", "closed", "draft", "unknown")
+                for r in _detached_this_tick
+            )
+            if not owned and not has_open_detached and not getattr(args, "keep_alive_without_prs", False):
                 return 0
 
             if deadline is not None and time.time() >= deadline:
@@ -2204,7 +2230,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
 
             time.sleep(max(args.interval, 1))
     finally:
-        _remove_await_pidfile(cwd)
+        _remove_await_pidfile(cwd, session_id)
 
 
 def main(argv: list[str] | None = None) -> int:

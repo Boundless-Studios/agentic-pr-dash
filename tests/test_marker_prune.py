@@ -128,3 +128,36 @@ def test_check_subcommand_prunes_stale_marker_via_stop_gate(tmp_path, monkeypatc
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     # stop-gate should exit 0 (no pending work)
     assert rc == 0
+
+
+def test_stop_gate_prunes_stale_marker_for_merged_pr_and_exits_0(
+    tmp_path, monkeypatch, capsys
+):
+    """stop-gate: armed marker for a merged PR → marker pruned → gate exits 0
+    without demanding a waiter (regression for BOU-1632 Codex P2 finding 1).
+    """
+    wt = _make_worktree(tmp_path, SID, 101)
+    sl.append(SID, pr=101, branch="bou-101", worktree=str(wt))
+    marker_path = Path(mc._marker_path(str(wt)))
+    assert marker_path.exists()
+
+    # gh returns 'no open PR' for this worktree's branch (PR 101 was merged)
+    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    # _check_worktree is NOT stubbed — it will call _resolve_pr_for_branch
+    # Stub _resolve_pr_for_branch to return None (no open PR, gh answered)
+    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: None)
+    # _live_foreign_owner returns None (no foreign owner)
+    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    # _pr_open_state returns 'merged' so _prune_stale_marker fires
+    monkeypatch.setattr(
+        mc, "_pr_open_state",
+        lambda pr, cwd: ("merged", "https://x/pull/101", False, [], "", "", "")
+    )
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID,
+                  "--no-waiter"])
+    assert rc == 0
+    assert not marker_path.exists(), "Stale marker should be pruned by stop-gate"
+    entries = sl.read(SID)
+    assert not any(e.pr == 101 for e in entries), "Ledger entry should be pruned"
