@@ -73,6 +73,28 @@ def test_detached_pr_with_dirty_merge_state_is_surfaced(tmp_path, monkeypatch, c
     assert records[0]["merge_state"] == "DIRTY"
 
 
+def test_detached_pr_with_conflicting_mergeable_is_surfaced(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=782, branch="bou-conflicting", worktree=str(tmp_path / "gone"))
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+        "open", "https://github.com/o/r/pull/782", False, [],
+        "", "UNKNOWN", "CONFLICTING",
+    ))
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["pr"] == 782
+    assert records[0]["merge_conflict"] is True
+    assert records[0]["merge_state"] == "UNKNOWN"
+    assert records[0]["mergeable"] == "CONFLICTING"
+
+
 def test_markerless_recreated_worktree_is_not_skipped(tmp_path, monkeypatch, capsys):
     reused = tmp_path / "reused-wt"
     reused.mkdir()
