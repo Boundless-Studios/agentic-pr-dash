@@ -1533,6 +1533,48 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
+    """Remove stale ownership artifacts when a marker's PR is authoritatively closed/merged.
+
+    Removes:
+    - The .armed marker file
+    - The pr-watch.stop-loop.json state file
+    - The session ledger entry for this PR
+
+    ONLY fires when gh answered authoritatively (state in 'merged'|'closed').
+    A network blip (state 'unknown') must NOT prune — that would destroy ownership
+    during a transient gh outage.
+    """
+    pr_raw = marker.get("pr", "")
+    if not str(pr_raw).isdigit():
+        return
+    pr_number = int(pr_raw)
+
+    state, *_ = _pr_open_state(pr_number, cwd)
+    if state not in ("merged", "closed"):
+        return  # open, draft, unknown — do not prune
+
+    # Remove the armed marker (best-effort).
+    try:
+        os.remove(_marker_path(cwd))
+    except OSError:
+        pass
+
+    # Remove the stop-loop state file (best-effort).
+    try:
+        os.remove(_stop_state_path(cwd))
+    except OSError:
+        pass
+
+    # Prune the ledger entry for this PR (best-effort).
+    try:
+        from . import session_ledger  # noqa: PLC0415
+        target_repo = _repo_slug(cwd)
+        session_ledger.prune(session_id, {pr_number}, repo=target_repo)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _owned_open_pr_numbers(owned: list[str]) -> set[int]:
     """Collect PR numbers from the armed markers of owned worktrees.
 
