@@ -613,7 +613,7 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     return 1
 
 
-def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
+def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tuple[int, str]:
     """Read-only blocker check for ONE worktree. Returns ``(exit_code, text)``.
 
     The single shared core of the ``check`` CLI and the ``stop-gate`` Stop hook:
@@ -625,8 +625,17 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     READ-ONLY except for the owner heartbeat/lease stamp (same as before the
     extraction). ``check`` prints ``text`` and returns the code; ``stop-gate``
     aggregates the exit-10 texts across owned worktrees.
+
+    ``claim`` controls whether a found-work path creates an agent-coordinator
+    claim. The ``check`` CLI (loop dispatch) claims so the loop owns the fix and
+    later heartbeats/releases it. The Stop-hook ``stop-gate`` path is PASSIVE —
+    it only prints a prompt to the interactive session and never releases — so it
+    passes ``claim=False``; a stop-gate-created claim would survive the idle
+    session and suppress the very work it just surfaced on the next Stop attempt
+    (codex P1). When ``claim=False`` the active-claim suppression check below is
+    also skipped so the passive probe always reports the pending work.
     """
-    from . import github_api, maintenance  # noqa: PLC0415
+    from . import coordinator, github_api, maintenance  # noqa: PLC0415
 
     cwd = os.path.abspath(cwd)
 
@@ -686,9 +695,30 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     if _live_independent_owner_paths([cwd], self_session_id):
         return 0, "deferring to live independent owner of this worktree"
 
-    # We will service: refresh the heartbeat and set the long fix lease (a
-    # tick-less fix phase is about to start).
-    _touch_owner_heartbeat(cwd, self_session_id, True)
+    owner_session_id = self_session_id or f"pid:{_resolve_owner_pid()}"
+
+    coordinator_claim_id: str | None = None
+    coordinator_fingerprint: str | None = None
+    if claim:
+        coord_decision = coordinator.dispatch_decision_for_pr(pr)
+        if not coord_decision.should_dispatch:
+            return 0, f"deferring to agent-coordinator {coord_decision.state}: {coord_decision.reason}"
+
+        claimed = coordinator.claim_pr(
+            pr,
+            session_id=owner_session_id,
+            pid=_resolve_owner_pid(),
+            agent="agentic-pr-dash-check",
+            lease_seconds=_fix_lease_seconds(),
+        )
+        if claimed is None:
+            return 0, "deferring to active agent-coordinator claim"
+        coordinator_claim_id = claimed.claim_id
+        coordinator_fingerprint = claimed.task.fingerprint
+
+        # We will service: refresh the heartbeat and set the long fix lease (a
+        # tick-less fix phase is about to start).
+        _touch_owner_heartbeat(cwd, self_session_id, True)
 
     # Fetch failed CI logs
     logs: dict[str, str] = {}
@@ -696,7 +726,13 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
         logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
 
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    return 10, f"{prompt}\nPR_NUMBER={pr.number}"
+    text = f"{prompt}\nPR_NUMBER={pr.number}"
+    if coordinator_claim_id is not None:
+        text += (
+            f"\nCOORDINATOR_CLAIM_ID={coordinator_claim_id}"
+            f"\nCOORDINATOR_TASK_FINGERPRINT={coordinator_fingerprint}"
+        )
+    return 10, text
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -1426,7 +1462,11 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
 
     pending: list[tuple[str, str]] = []
     for worktree in owned:
-        code, text = _check_worktree(worktree, session_id)
+        # Passive probe: the stop-gate only prints a prompt back to the
+        # interactive session and never releases a claim, so it must NOT create
+        # an agent-coordinator claim (codex P1) — that claim would outlive the
+        # idle session and suppress this same work on the next Stop attempt.
+        code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
             pending.append((worktree, text))
 

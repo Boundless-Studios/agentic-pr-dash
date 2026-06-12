@@ -67,6 +67,12 @@ def test_parse_pr_number_reads_trailer():
     assert loop._parse_pr_number("no trailer here") is None
 
 
+def test_parse_coordinator_claim_id_reads_trailer():
+    out = "some prompt text\nCOORDINATOR_CLAIM_ID=abc123\nmore\n"
+    assert loop._parse_coordinator_claim_id(out) == "abc123"
+    assert loop._parse_coordinator_claim_id("no trailer here") is None
+
+
 def _args(**kw):
     base = dict(no_discover_worktrees=False, session_id="sess", cwd=["/fallback"])
     base.update(kw)
@@ -130,3 +136,70 @@ def test_discover_iterates_all_configured_cwds(monkeypatch):
     result = loop._discover_cwds(_args(cwd=["/repo/a", "/repo/b", "/repo/c"]))
     # a's owned path, b's fallback-to-root (failed), c's owned path; deduped.
     assert result == ["/repo/a/wt1", "/repo/b", "/repo/c/wt2"]
+
+
+def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
+    calls = []
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    def fake_discover(args):
+        return [str(worktree)]
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            return types.SimpleNamespace(
+                returncode=loop.CHECK_WORK_FOUND,
+                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stderr="",
+            )
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "complete" in cmd:
+            calls.append(("complete", cmd))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(loop, "_discover_cwds", fake_discover)
+    monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: calls.append(("heartbeat", claim_id, session_id)))
+    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda claim_id, session_id, reason: calls.append(("release", claim_id, session_id, reason)))
+
+    loop._tick(_args(cwd=["/repo/root"], session_id="sess-1"), "codex {prompt}")
+
+    assert ("heartbeat", "claim-1", "sess-1") in calls
+    assert ("executor", str(worktree)) in calls
+    assert ("release", "claim-1", "sess-1", "completed") in calls
+
+
+def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
+    """If the executor cannot be spawned (e.g. binary missing → OSError), the
+    coordinator claim must be released so the PR is not left wrongly owned until
+    the lease expires."""
+    calls = []
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            return types.SimpleNamespace(
+                returncode=loop.CHECK_WORK_FOUND,
+                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    def boom(executor, prompt, cwd):
+        raise FileNotFoundError("codex: command not found")
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
+    monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    monkeypatch.setattr(loop, "_run_executor", boom)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: calls.append(("heartbeat", claim_id, session_id)))
+    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda claim_id, session_id, reason: calls.append(("release", claim_id, session_id, reason)))
+
+    loop._tick(_args(cwd=["/repo/root"], session_id="sess-1"), "codex {prompt}")
+
+    assert ("heartbeat", "claim-1", "sess-1") in calls
+    assert ("release", "claim-1", "sess-1", "executor_failed") in calls

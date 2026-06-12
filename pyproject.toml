@@ -16,6 +16,7 @@ keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review
 # arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
 dependencies = [
     "pydantic>=2.0",
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@main",
 ]
 
 [project.optional-dependencies]
@@ -55,3 +56,6 @@ testpaths = ["tests"]
 # package — a stale site-packages copy can silently win the import race and
 # produce false greens (caught during BOU-1551 review).
 pythonpath = ["src"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from . import agents, github_api, maintenance, session_registry
+from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
 from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
 from .worktrees import discover_worktrees, find_worktree_for_branch
@@ -26,6 +26,12 @@ RUNNER_SUMMARY_REFRESH_SECONDS = 6 * 60 * 60
 # Statuses that mean a dispatch is already in flight — don't re-queue for the
 # same blocker set every poll cycle.
 ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SIGNALED})
+
+# Stable owner id for the agent-coordinator claim the dashboard takes when it
+# hands maintenance off to the local agent. The claim suppresses the dashboard
+# from re-queuing the same maintenance every poll cycle (the old queued-state
+# guard was removed; suppression now rides entirely on coordinator claims).
+DASHBOARD_OWNER_SESSION_ID = "agentic-pr-dash-dashboard"
 # Each poll enriches every open PR with several REST + GraphQL calls. At 15s
 # this comfortably exceeded GitHub's hourly API limit for even a handful of
 # PRs, starving the API to zero and causing refresh failures. 60s keeps the
@@ -333,6 +339,20 @@ class Orchestrator:
                     get_tracker(_load_config(pr.worktree_path)).close_task(
                         pr.maintenance.bead_id, cwd=pr.worktree_path
                     )
+                # Release any dashboard-held coordinator claim now that the work
+                # is done (a stale claim would otherwise sit until lease expiry).
+                if pr.coordinator_claim_id:
+                    try:
+                        coordinator.release_claim_id(
+                            pr.coordinator_claim_id, DASHBOARD_OWNER_SESSION_ID, "completed"
+                        )
+                    except Exception as exc:  # best-effort; lease bounds it anyway
+                        self.log(
+                            f"Could not release coordinator claim for #{num}: {exc}",
+                            pr_number=num,
+                            level="warn",
+                        )
+                    pr.coordinator_claim_id = None
                 pr.maintenance = None
                 pr.activity_message = None
                 pr.activity_source = None
@@ -368,30 +388,11 @@ class Orchestrator:
                         if reloaded is not None:
                             pr.maintenance = reloaded
 
-                    # Skip re-dispatch only when state is actively QUEUED/SIGNALED
-                    # (in-flight) for the exact same blocker DETAILS — not just
-                    # the same blocker categories. A new review thread or a
-                    # different failing check keeps the same category set
-                    # (review_comments / ci_failure) but must still re-dispatch so
-                    # PIPELINE_HANDOFF.md / the bead notes are rewritten with the
-                    # newly-arrived feedback instead of stale instructions.
-                    current_blockers = set(maintenance.blockers_for_pr(pr))
-                    current_failing = set(pr.failing_checks)
-                    current_comment_ids = {c.id for c in pr.review_comments}
-                    already_queued = (
-                        pr.maintenance is not None
-                        and pr.maintenance.state in ACTIVE_QUEUED_STATES
-                        and set(pr.maintenance.blockers) == current_blockers
-                        and set(pr.maintenance.failing_checks) == current_failing
-                        and set(pr.maintenance.review_comment_ids) == current_comment_ids
-                    )
-                    owner_live = _has_matching_session_owner(
-                        pr,
-                        queued_at=pr.maintenance.last_signal_at if pr.maintenance else None,
-                    )
-                    if already_queued and owner_live is False:
-                        already_queued = False
-                    if not already_queued:
+                    coord_decision = coordinator.dispatch_decision_for_pr(pr)
+                    if coord_decision.state == "manual_intervention":
+                        pr.activity_message = coord_decision.reason
+                        pr.activity_source = "agent-coordinator"
+                    if coord_decision.should_dispatch:
                         asyncio.create_task(self.dispatch_pr_maintenance(pr))
 
         return list(self.prs.values())
@@ -480,6 +481,19 @@ class Orchestrator:
             pr.activity_message = "Delegated to local agent"
             pr.activity_source = "dashboard"
             pr.agent_failure_reason = None
+            # Claim the PR in agent-coordinator so the next poll with unchanged
+            # blockers sees an active claim and does NOT re-queue this same
+            # maintenance every cycle (codex P1). The fingerprint is blocker-
+            # derived, so when the blockers change the new work is unsuppressed;
+            # the lease bounds a stale claim if the handed-off agent never runs.
+            claim = coordinator.claim_pr(
+                pr,
+                session_id=DASHBOARD_OWNER_SESSION_ID,
+                pid=None,
+                agent="agentic-pr-dash-dashboard",
+                lease_seconds=load_config(pr.worktree_path).lease_seconds,
+            )
+            pr.coordinator_claim_id = claim.claim_id if claim else None
             self.log(
                 f"Queued PR maintenance for local agent: {', '.join(blockers)}",
                 pr_number=pr.number,

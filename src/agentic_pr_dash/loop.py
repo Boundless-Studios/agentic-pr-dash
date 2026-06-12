@@ -25,6 +25,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import coordinator
 from .config import load as load_config
 
 CHECK_WORK_FOUND = 10
@@ -88,6 +89,14 @@ def _parse_pr_number(check_stdout: str) -> int | None:
                 return int(line.split("=", 1)[1].strip())
             except ValueError:
                 return None
+    return None
+
+
+def _parse_coordinator_claim_id(check_stdout: str) -> str | None:
+    for line in reversed(check_stdout.splitlines()):
+        if line.startswith("COORDINATOR_CLAIM_ID="):
+            claim_id = line.split("=", 1)[1].strip()
+            return claim_id or None
     return None
 
 
@@ -155,17 +164,36 @@ def _tick(args, executor: str) -> None:
         if check.returncode != CHECK_WORK_FOUND:
             continue  # 0 = clean/deferred, 2 = gh unavailable
         pr = _parse_pr_number(check.stdout)
+        claim_id = _parse_coordinator_claim_id(check.stdout)
         prompt = check.stdout
         baseline = _baseline_sha(cwd, pr)
         print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
-        rc = _run_executor(executor, prompt, cwd)
+        session = args.session_id or f"pid:{_loop_pid()}"
+        if claim_id:
+            coordinator.heartbeat_claim_id(claim_id, session)
+        try:
+            rc = _run_executor(executor, prompt, cwd)
+        except Exception as exc:
+            # The executor binary may be missing from PATH (OSError/FileNotFoundError)
+            # or otherwise fail to spawn. Release the claim so the PR is not left
+            # wrongly owned until the lease expires (codex P2), then move on to the
+            # next worktree rather than killing the whole loop on one bad spawn.
+            print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
+            if claim_id:
+                coordinator.release_claim_id(claim_id, session, "executor_failed")
+            continue
         if rc != 0:
             print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
+            if claim_id:
+                coordinator.release_claim_id(claim_id, session, "executor_failed")
             continue
         complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
         if pr is not None:
             complete_args += ["--pr", str(pr)]
-        subprocess.run(complete_args)
+        complete = subprocess.run(complete_args)
+        if claim_id:
+            reason = "completed" if complete.returncode == 0 else "complete_failed"
+            coordinator.release_claim_id(claim_id, session, reason)
 
 
 def main(argv: list[str] | None = None) -> int:

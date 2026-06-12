@@ -179,6 +179,9 @@ class PRData(BaseModel):
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
+    # agent-coordinator claim the dashboard holds after handing maintenance off
+    # to the local agent; released when the PR goes clean.
+    coordinator_claim_id: str | None = None
 
 
 class AgentProcess(BaseModel):
