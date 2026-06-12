@@ -141,12 +141,16 @@ though it still has unresolved review threads. To prevent that, every `arm` also
 appends to a **durable, worktree-independent ledger**:
 
 ```
-~/.gaia/pr-watch/ledger/session-<id>.jsonl   # {pr, branch, worktree, opened_at, baseline_sha}
+~/.gaia/pr-watch/ledger/session-<id>.jsonl   # {pr, branch, worktree, opened_at, baseline_sha, repo}
 ```
 
 The ledger is keyed by session, lives under `$HOME` (outside any worktree), and is
-the source of truth for "PRs this session opened." Override its location with
-`GAIA_PR_LEDGER_DIR` (and the orphan-claim dir with `GAIA_PR_CLAIM_DIR`).
+the source of truth for "PRs this session opened." Entries are scoped by `repo`
+(GitHub `owner/name`) so a session that spans multiple checkouts keeps a same-number
+PR in each repo distinct; `reconcile-prs --cwd <repo>` only acts on that repo's PRs.
+Legacy entries written before repo scoping (no `repo` field) are still honored.
+Override its location with `GAIA_PR_LEDGER_DIR` (and the orphan-claim dir with
+`GAIA_PR_CLAIM_DIR`).
 
 **`reconcile-prs`** unions live-worktree PRs with detached ledger PRs (worktree
 gone) and fetches each one's live review-thread + CI state directly from GitHub,

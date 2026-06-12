@@ -85,3 +85,52 @@ def test_detached_stop_block_has_no_fake_cwd_command(tmp_path, monkeypatch, caps
     assert "complete --cwd (no worktree)" not in err   # no non-executable command
     assert "--cwd (no worktree)" not in err
     assert "820" in err                                 # but the PR is still named
+
+
+# --- round-2 #2: reconcile scopes ledger PRs to the target repo -------------
+
+def test_reconcile_only_surfaces_target_repo_pr(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    # Same session opened PR #12 in two different repos.
+    sl.append("sess-X", pr=12, branch="a", worktree=str(tmp_path / "wtA"),
+              repo="org/repoA")
+    sl.append("sess-X", pr=12, branch="b", worktree=str(tmp_path / "wtB"),
+              repo="org/repoB")
+    monkeypatch.setattr(mc, "_repo_slug", lambda cwd: "org/repoA")
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+
+    queried_cwds = []
+
+    def fake_state(pr, cwd):
+        queried_cwds.append((pr, cwd))
+        return ("open", "https://x/pull/12", False, [])
+
+    monkeypatch.setattr(mc, "_pr_open_state", fake_state)
+    mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    # Exactly one record (repoA's PR 12); repoB's same-number PR is NOT surfaced.
+    assert len(records) == 1
+    assert records[0]["pr"] == 12 and records[0]["branch"] == "a"
+    # And the foreign-repo PR was never queried against repoA's cwd.
+    assert len(queried_cwds) == 1
+
+
+def test_reconcile_prune_does_not_drop_foreign_repo_pr(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=12, branch="a", worktree=str(tmp_path / "wtA"),
+              repo="org/repoA")
+    sl.append("sess-X", pr=12, branch="b", worktree=str(tmp_path / "wtB"),
+              repo="org/repoB")
+    monkeypatch.setattr(mc, "_repo_slug", lambda cwd: "org/repoA")
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+    # repoA's PR 12 is closed -> would be pruned.
+    monkeypatch.setattr(mc, "_pr_open_state",
+                        lambda pr, cwd: ("closed", "", False, []))
+    mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+    remaining = sl.read("sess-X")
+    # repoB's PR 12 must survive the repoA-scoped prune.
+    assert {(e.repo, e.pr) for e in remaining} == {("org/repoB", 12)}

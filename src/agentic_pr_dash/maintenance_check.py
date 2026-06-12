@@ -47,6 +47,22 @@ def _current_branch(cwd: str) -> str:
 _GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
 
 
+def _repo_slug(cwd: str) -> str:
+    """GitHub ``owner/name`` for the checkout at ``cwd``, or "" if undetectable.
+
+    Used to scope ledger/claim records so a session that spans multiple repos
+    (different ``--cwd`` checkouts) never has a same-number PR in one repo
+    clobber or mis-resolve another's (PR #16 review round 2, P1). Best-effort:
+    an empty slug degrades to the legacy repo-less (unscoped) behavior.
+    """
+    from pathlib import Path  # noqa: PLC0415
+    from .config import _detect_repo  # noqa: PLC0415
+    try:
+        return _detect_repo(Path(cwd)) or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _resolve_pr_for_branch(cwd: str):
     """Find the open PR whose headRefName matches the current branch.
 
@@ -517,7 +533,8 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
         except (OSError, subprocess.TimeoutExpired):
             baseline = None
         branch = _current_branch(cwd)
-        session_ledger.append(session_id, pr_number, branch, cwd, baseline)
+        session_ledger.append(session_id, pr_number, branch, cwd, baseline,
+                              repo=_repo_slug(cwd))
     except Exception:  # noqa: BLE001 — ledger is best-effort
         pass
     return True
@@ -579,6 +596,18 @@ def _list_my_open_prs(cwd: str) -> dict[str, tuple[int, bool]]:
     return out
 
 
+def _unresolved_review_threads(pr_number: int, cwd: str):
+    """Non-outdated, unresolved review threads for a PR (BOU-1587 AC #4).
+
+    Outdated threads (the code they pointed at changed) and resolved threads are
+    excluded — they are not actionable feedback.
+    """
+    from . import github_api  # noqa: PLC0415
+
+    threads = github_api.get_review_threads(pr_number, cwd)
+    return [t for t in threads if not t.is_resolved and not t.is_outdated]
+
+
 def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
     """True if the PR has at least one non-outdated, unresolved review thread.
 
@@ -586,10 +615,33 @@ def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
     (BOU-1587 AC #4). Outdated threads (the code they pointed at changed) and
     resolved threads do not count.
     """
-    from . import github_api  # noqa: PLC0415
+    return bool(_unresolved_review_threads(pr_number, cwd))
 
-    threads = github_api.get_review_threads(pr_number, cwd)
-    return any(not t.is_resolved and not t.is_outdated for t in threads)
+
+def _review_comments_from_threads(threads) -> list:
+    """Build ReviewComment records from review threads so the maintenance prompt
+    can render file/line/body details (PR #16 review round 2, P2).
+
+    Mirrors the inline-thread shape `github_api.get_unaddressed_comments`
+    produces, so a thread surfaced by the authoritative `_unresolved_review_threads`
+    check is hydrated identically to one that came through the normal path.
+    """
+    from .models import ReviewComment  # noqa: PLC0415
+
+    out = []
+    for t in threads:
+        top = t.top
+        out.append(ReviewComment(
+            id=top.database_id,
+            author=top.author,
+            body=top.body,
+            path=top.path,
+            line=top.line,
+            created_at=top.created_at,
+            is_inline=True,
+            thread_id=t.node_id,
+        ))
+    return out
 
 
 def _cmd_arm(args: argparse.Namespace) -> int:
@@ -687,9 +739,20 @@ def _check_worktree(cwd: str, self_session_id: str) -> tuple[int, str]:
     # would read as CLEAN despite needing work (PR #16 review, P2). Consult review
     # threads directly when nothing else flags it, so the ready/clean path honors
     # AC #4. Gated on `not blockers` so it adds at most one gh call on a
-    # would-be-clean tick.
-    if not blockers and pr_has_unresolved_review_threads(pr.number, cwd):
-        blockers = ["review_threads"]
+    # would-be-clean tick. Outdated threads are already filtered out of
+    # review_comments at the source (get_unaddressed_comments), so an outdated-only
+    # thread leaves `blockers` empty here and `_unresolved_review_threads` (which
+    # also drops outdated) returns nothing — the PR stays clean (PR #16 review
+    # round 2, P2).
+    if not blockers:
+        unresolved_threads = _unresolved_review_threads(pr.number, cwd)
+        if unresolved_threads:
+            # Hydrate the threads into review_comments so build_maintenance_prompt
+            # renders the file/line/body the agent needs — otherwise the stop gate
+            # blocks with an empty Review Comments section (PR #16 review round 2,
+            # P2).
+            pr.review_comments = _review_comments_from_threads(unresolved_threads)
+            blockers = ["review_comments"]
 
     if not blockers:
         # Clean check: refresh the alive heartbeat (hold ownership) and clear any
@@ -1605,16 +1668,17 @@ def _session_is_live(session_id: str, cwd: str | None = None) -> bool:
     return session_registry.pid_is_live(state.pid)
 
 
-def _claim_pr(pr_number: int, session_id: str, pid: int) -> bool:
+def _claim_pr(pr_number: int, session_id: str, pid: int, repo: str = "") -> bool:
     """Win an exclusive claim on an orphan PR. One live claimant wins; a claim
     held by a dead pid is taken over. Returns True on win (BOU-1587 Component G).
 
-    The read-decide-write runs under an exclusive lock so two concurrent live
-    claimants can't both observe "no claim" and both adopt the same PR (PR #16
-    review, P1)."""
+    The claim is scoped by ``repo`` so two repos' same-number PRs don't share one
+    claim file (PR #16 review round 2, P1). The read-decide-write runs under an
+    exclusive lock so two concurrent live claimants can't both observe "no claim"
+    and both adopt the same PR (PR #16 review, P1)."""
     from . import session_ledger, session_registry  # noqa: PLC0415
-    with session_ledger.claim_lock(pr_number):
-        existing = session_ledger.read_claim(pr_number)
+    with session_ledger.claim_lock(pr_number, repo):
+        existing = session_ledger.read_claim(pr_number, repo)
         if existing:
             if existing.get("session_id") == session_id:
                 return True
@@ -1625,7 +1689,7 @@ def _claim_pr(pr_number: int, session_id: str, pid: int) -> bool:
                 holder_pid = None
             if session_registry.pid_is_live(holder_pid):
                 return False  # a live session owns it
-        session_ledger.write_claim(pr_number, session_id, pid)
+        session_ledger.write_claim(pr_number, session_id, pid, repo)
         return True
 
 
@@ -1640,13 +1704,18 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
 
     eff_pid = pid if pid is not None else _resolve_owner_pid()
     present = set(_iter_worktree_paths(cwd))
+    # Only consider other sessions' entries that belong to THIS repo: each entry
+    # is queried via gh against `cwd`, so a PR from another repo would be resolved
+    # against the wrong remote (PR #16 review round 2, P1). Legacy repo-less
+    # entries pass the filter and degrade to the prior unscoped behavior.
+    target_repo = _repo_slug(cwd)
     adopted = []
     for other in session_ledger.list_session_ids():
         if other == session_id:
             continue
         if _session_is_live(other, cwd):
             continue  # owner still alive — its own loop handles it
-        for e in session_ledger.read(other):
+        for e in session_ledger.read(other, repo=target_repo):
             abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
             if abs_wt and abs_wt in present and _worktree_is_for_entry(abs_wt, e):
                 continue  # still THIS PR's live worktree → not orphaned
@@ -1657,9 +1726,10 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
             unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
             if not unresolved and not has_fail:
                 continue  # nothing to do
-            if not _claim_pr(e.pr, session_id, int(eff_pid)):
+            if not _claim_pr(e.pr, session_id, int(eff_pid), e.repo):
                 continue  # another live session won it
-            session_ledger.append(session_id, e.pr, e.branch, e.worktree, e.baseline_sha)
+            session_ledger.append(session_id, e.pr, e.branch, e.worktree,
+                                  e.baseline_sha, repo=e.repo)
             adopted.append({
                 "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
                 "worktree_present": False, "unresolved_threads": len(unresolved),
@@ -1694,9 +1764,14 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
     from . import session_ledger, github_api  # noqa: PLC0415
 
     present_worktrees = set(_iter_worktree_paths(cwd))
+    # Scope to THIS repo: each ledger PR is queried with gh against `cwd`, so a PR
+    # from another repo would be checked against the wrong remote (and pruned when
+    # `cwd`'s same-number PR is closed). Legacy repo-less entries still pass
+    # (PR #16 review round 2, P1).
+    target_repo = _repo_slug(cwd)
     records: list[dict] = []
     prune: set[int] = set()
-    for e in session_ledger.read(session_id):
+    for e in session_ledger.read(session_id, repo=target_repo):
         abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
         if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e):
             continue  # still THIS PR's live worktree; handled by the worktree pass
@@ -1715,7 +1790,7 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
         })
     if prune:
-        session_ledger.prune(session_id, prune)
+        session_ledger.prune(session_id, prune, repo=target_repo)
     return records
 
 
