@@ -1654,6 +1654,13 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
             pending.append((worktree, text))
+        elif code == 0 and session_id:
+            # gh answered authoritatively: no open PR for this branch. Prune any
+            # stale armed marker so _owned_open_pr_numbers doesn't demand a waiter
+            # for a merged/closed PR (BOU-1632 codex P2 finding 1).
+            marker = _read_marker(worktree) or {}
+            if str(marker.get("pr", "")).isdigit():
+                _prune_stale_marker(worktree, marker, session_id)
 
     # BOU-1587/1612: owned PRs whose worktree was torn down are STILL mandatory
     # work. They have no worktree to _check_worktree, so reconcile them from the
