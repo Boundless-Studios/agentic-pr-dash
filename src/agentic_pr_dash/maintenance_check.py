@@ -1533,6 +1533,37 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _owned_open_pr_numbers(owned: list[str]) -> set[int]:
+    """Collect PR numbers from the armed markers of owned worktrees.
+
+    Used by the stop-gate waiter branch to determine whether the session has
+    any open PRs that need a waiter. Reads markers only — no gh call needed
+    because stale markers are pruned by Task A3 and the stop-gate collects
+    from markers it already trusts.
+    """
+    numbers: set[int] = set()
+    for wt in owned:
+        marker = _read_marker(wt) or {}
+        pr_raw = marker.get("pr", "")
+        if str(pr_raw).isdigit():
+            numbers.add(int(pr_raw))
+    return numbers
+
+
+def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
+    """Render the spawn-waiter prompt shown by the stop-gate when no pending work
+    but the session owns at least one open non-draft PR and no live waiter exists.
+    """
+    pr_list = ", ".join(f"#{n}" for n in sorted(open_prs))
+    cmd = load_config(cwd).await_command.format(cwd=cwd, session_id=session_id)
+    return (
+        f"[pr-watch] You own open PR(s) {pr_list} with no pending feedback right now. "
+        f"Start the feedback waiter IN THE BACKGROUND (run_in_background / detached) so "
+        f"arriving review comments wake this session, then stop again:\n"
+        f"  {cmd}"
+    )
+
+
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
     # Fail SAFE: this runs on every Stop. A transient git/gh error must never
     # block the stop (exit 2) or spew a traceback each turn — degrade to exit 0.
@@ -1593,6 +1624,22 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
             pending.append(_detached_pending_entry(r))
 
     if not pending:
+        # Waiter enforcement (BOU-1632): when no pending work but this session
+        # owns open PRs and no live waiter exists, prompt to spawn one. The
+        # loop-break counter reuses the same "need-waiter:<prs>" fingerprint
+        # so 3 identical no-progress states release the gate.
+        if (not getattr(args, "no_waiter", False)) and session_id:
+            open_prs = _owned_open_pr_numbers(owned)
+            if open_prs and not _await_alive(cwd, session_id):
+                fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
+                count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+                _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+                threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
+                if count < threshold:
+                    print(_build_waiter_block(open_prs, cwd, session_id), file=sys.stderr)
+                    return 2
+                _save_stop_state(cwd, {"ts": now})  # release after threshold
+                return 0
         # Clear the loop counter but KEEP the timestamp so a clean idle session
         # does not re-run gh on every single turn.
         _save_stop_state(cwd, {"ts": now})
@@ -2245,6 +2292,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="PID",
         help="Owner pid for marker adoption (default: os.getppid()).",
+    )
+    stop_gate_p.add_argument(
+        "--no-waiter",
+        action="store_true",
+        default=False,
+        help="Skip the waiter-enforcement branch (for codex/non-interactive callers "
+        "that have no background-task wake channel).",
     )
 
     # --- reconcile-prs ---
