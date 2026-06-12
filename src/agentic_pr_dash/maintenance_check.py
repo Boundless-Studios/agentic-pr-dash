@@ -1854,6 +1854,7 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
     from . import session_ledger, github_api  # noqa: PLC0415
 
     present_worktrees = set(_iter_worktree_paths(cwd))
+    independent_worktrees = _live_independent_owner_paths(present_worktrees, session_id)
     # Scope to THIS repo: each ledger PR is queried with gh against `cwd`, so a PR
     # from another repo would be checked against the wrong remote (and pruned when
     # `cwd`'s same-number PR is closed). Legacy repo-less entries still pass
@@ -1863,6 +1864,13 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
     prune: set[int] = set()
     for e in session_ledger.read(session_id, repo=target_repo):
         abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
+        if (
+            abs_wt
+            and abs_wt in independent_worktrees
+            and not _read_marker(abs_wt)
+            and _current_branch(abs_wt) == e.branch
+        ):
+            continue  # marker-less same-branch worktree is owned by a live session
         if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e):
             continue  # still THIS PR's live worktree; handled by the worktree pass
         state, url, has_fail, failing, review_decision, merge_state, mergeable = (
