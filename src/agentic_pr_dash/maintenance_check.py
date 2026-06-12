@@ -2065,23 +2065,28 @@ def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
 # Pidfile written on entry, removed on every exit path.
 
 
-def _await_pidfile(cwd: str) -> str:
-    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.await.pid")
+def _await_pidfile(cwd: str, session_id: str = "") -> str:
+    """Per-session pidfile path. Each session gets its own file so two sessions
+    sharing a cwd don't clobber each other's waiter record (BOU-1632 codex P2 #2).
+    """
+    from . import session_ledger as _sl  # noqa: PLC0415
+    safe = _sl._safe_session(session_id) if session_id else "unknown"
+    return str(load_config(cwd).state_dir_for(cwd) / f"pr-watch.await.{safe}.pid")
 
 
-def _read_await_pidfile(cwd: str) -> dict:
+def _read_await_pidfile(cwd: str, session_id: str = "") -> dict:
     """Return the pidfile contents as a dict, or {} on missing/corrupt."""
     try:
-        with open(_await_pidfile(cwd), encoding="utf-8") as fh:
+        with open(_await_pidfile(cwd, session_id), encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def _write_await_pidfile(cwd: str, data: dict) -> None:
+def _write_await_pidfile(cwd: str, data: dict, session_id: str = "") -> None:
     """Write the await pidfile atomically (best-effort)."""
-    path = _await_pidfile(cwd)
+    path = _await_pidfile(cwd, session_id)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -2090,17 +2095,17 @@ def _write_await_pidfile(cwd: str, data: dict) -> None:
         pass
 
 
-def _remove_await_pidfile(cwd: str) -> None:
+def _remove_await_pidfile(cwd: str, session_id: str = "") -> None:
     """Remove the await pidfile (best-effort)."""
     try:
-        os.remove(_await_pidfile(cwd))
+        os.remove(_await_pidfile(cwd, session_id))
     except OSError:
         pass
 
 
 def _await_alive(cwd: str, session_id: str) -> bool:
     """True if a live waiter pidfile exists with a matching session_id."""
-    data = _read_await_pidfile(cwd)
+    data = _read_await_pidfile(cwd, session_id)
     if not data:
         return False
     return (
@@ -2143,7 +2148,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
     owner_pid = args.owner_pid if args.owner_pid else _resolve_owner_pid()
 
     # Single-instance guard: abort if a live waiter for this session already exists.
-    existing = _read_await_pidfile(cwd)
+    existing = _read_await_pidfile(cwd, session_id)
     if (
         existing
         and _pid_alive(str(existing.get("pid", "")))
@@ -2152,7 +2157,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
 
-    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id})
+    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id}, session_id)
     # max_wait == 0 means "one tick then exit" — set deadline to now so the
     # expiry check fires immediately after the first tick.
     now = time.time()
@@ -2211,7 +2216,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
 
             time.sleep(max(args.interval, 1))
     finally:
-        _remove_await_pidfile(cwd)
+        _remove_await_pidfile(cwd, session_id)
 
 
 def main(argv: list[str] | None = None) -> int:

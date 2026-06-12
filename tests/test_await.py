@@ -33,12 +33,12 @@ def _no_rate_limit(monkeypatch):
     config.load.cache_clear()
 
 
-def _await_pidfile_path(cwd: str) -> Path:
-    return Path(mc._await_pidfile(cwd))
+def _await_pidfile_path(cwd: str, session_id: str = SID) -> Path:
+    return Path(mc._await_pidfile(cwd, session_id))
 
 
 def _write_pidfile(cwd: str, pid: int, session_id: str) -> None:
-    path = _await_pidfile_path(cwd)
+    path = _await_pidfile_path(cwd, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"pid": pid, "session_id": session_id}), encoding="utf-8")
 
