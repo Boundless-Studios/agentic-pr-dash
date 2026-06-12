@@ -1582,12 +1582,12 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         if code == 10:
             pending.append((worktree, text))
 
-    # BOU-1587: owned PRs whose worktree was torn down are STILL mandatory work.
-    # They have no worktree to _check_worktree, so reconcile them from the durable
-    # ledger and block on any with unresolved review threads or failing CI. P1-first.
+    # BOU-1587/1612: owned PRs whose worktree was torn down are STILL mandatory
+    # work. They have no worktree to _check_worktree, so reconcile them from the
+    # durable ledger and block on any detached blocker with live-path parity.
     if session_id:
         detached = [r for r in _detached_pr_records(session_id, cwd)
-                    if r["unresolved_threads"] or r["ci_failing"]]
+                    if _record_has_blockers(r)]
         detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
         for r in detached:
             why = []
@@ -1595,6 +1595,10 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
                 why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
             if r["ci_failing"]:
                 why.append("failing CI")
+            if r.get("changes_requested"):
+                why.append("review-level CHANGES_REQUESTED")
+            if r.get("merge_conflict"):
+                why.append("merge conflict")
             tag = " [P1]" if r["p1"] else ""
             text = (
                 f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
@@ -1654,26 +1658,30 @@ def _iter_worktree_paths(cwd: str):
 
 
 def _pr_open_state(pr_number: int, cwd: str):
-    """(state, url, has_failing_ci, failing_checks) for a PR.
+    """(state, url, has_failing_ci, failing_checks, review_decision, merge_state) for a PR.
 
     state is 'open' | 'merged' | 'closed' | 'unknown'. Detached-PR live state for
-    reconcile-prs / stop-gate (BOU-1587). gh-unavailable -> ('unknown', '', False, []).
+    reconcile-prs / stop-gate (BOU-1587). gh-unavailable returns empty blocker state.
     """
     from . import github_api  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
 
+    unavailable = ("unknown", "", False, [], "", "")
     try:
         res = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "state,url,isDraft"],
+            [
+                "gh", "pr", "view", str(pr_number),
+                "--json", "state,url,isDraft,reviewDecision,mergeStateStatus",
+            ],
             cwd=cwd, capture_output=True, text=True, timeout=15)
     except (OSError, subprocess.TimeoutExpired):
-        return ("unknown", "", False, [])
+        return unavailable
     if res.returncode != 0:
-        return ("unknown", "", False, [])
+        return unavailable
     try:
         d = _json.loads(res.stdout or "{}")
     except ValueError:
-        return ("unknown", "", False, [])
+        return unavailable
     state = str(d.get("state", "unknown")).lower()  # OPEN/MERGED/CLOSED
     # A PR armed while open but later converted to draft is not-ready: surface it
     # as 'draft' so the detached path skips it, mirroring the live-worktree path's
@@ -1684,7 +1692,27 @@ def _pr_open_state(pr_number: int, cwd: str):
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [c.name for c in checks
                if c.conclusion == "failure" and not github_api._is_infra_check(c.name)]
-    return (state, url, bool(failing), failing)
+    review_decision = str(d.get("reviewDecision") or "")
+    merge_state = str(d.get("mergeStateStatus") or "")
+    return (state, url, bool(failing), failing, review_decision, merge_state)
+
+
+def _unpack_pr_open_state(raw):
+    """Normalize legacy 4-tuples from tests/callers to the current 6-field shape."""
+    if len(raw) == 4:
+        state, url, has_fail, failing = raw
+        return state, url, has_fail, failing, "", ""
+    state, url, has_fail, failing, review_decision, merge_state = raw
+    return state, url, has_fail, failing, review_decision, merge_state
+
+
+def _record_has_blockers(record: dict) -> bool:
+    return bool(
+        record["unresolved_threads"]
+        or record["ci_failing"]
+        or record.get("changes_requested")
+        or record.get("merge_conflict")
+    )
 
 
 def _thread_is_p1(thread) -> bool:
@@ -1763,12 +1791,16 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
             abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
             if abs_wt and abs_wt in present and _worktree_is_for_entry(abs_wt, e):
                 continue  # still THIS PR's live worktree → not orphaned
-            state, url, has_fail, failing = _pr_open_state(e.pr, cwd)
+            state, url, has_fail, failing, review_decision, merge_state = (
+                _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
+            )
             if state in ("merged", "closed", "unknown", "draft"):
                 continue
             threads = github_api.get_review_threads(e.pr, cwd)
             unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
-            if not unresolved and not has_fail:
+            changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
+            merge_conflict = str(merge_state).upper() == "DIRTY"
+            if not unresolved and not has_fail and not changes_requested and not merge_conflict:
                 continue  # nothing to do
             if not _claim_pr(e.pr, session_id, int(eff_pid), e.repo):
                 continue  # another live session won it
@@ -1778,6 +1810,10 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
                 "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
                 "worktree_present": False, "unresolved_threads": len(unresolved),
                 "ci_failing": has_fail, "failing_checks": failing,
+                "changes_requested": changes_requested,
+                "review_decision": review_decision,
+                "merge_conflict": merge_conflict,
+                "merge_state": merge_state,
                 "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
                 "adopted_from": other,
             })
@@ -1796,6 +1832,8 @@ def _worktree_is_for_entry(path: str, entry) -> bool:
     marker = _read_marker(path) or {}
     if str(marker.get("pr", "")) == str(entry.pr):
         return True
+    if not marker:
+        return False
     branch = _current_branch(path)
     return bool(branch) and entry.branch and branch == entry.branch
 
@@ -1819,7 +1857,9 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
         abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
         if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e):
             continue  # still THIS PR's live worktree; handled by the worktree pass
-        state, url, has_fail, failing = _pr_open_state(e.pr, cwd)
+        state, url, has_fail, failing, review_decision, merge_state = (
+            _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
+        )
         if state in ("merged", "closed"):
             prune.add(e.pr)
             continue
@@ -1827,10 +1867,16 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
             continue  # not-ready; skip but keep the ledger entry (may reopen)
         threads = github_api.get_review_threads(e.pr, cwd)
         unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
+        merge_conflict = str(merge_state).upper() == "DIRTY"
         records.append({
             "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
             "worktree_present": False, "unresolved_threads": len(unresolved),
             "ci_failing": has_fail, "failing_checks": failing,
+            "changes_requested": changes_requested,
+            "review_decision": review_decision,
+            "merge_conflict": merge_conflict,
+            "merge_state": merge_state,
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
         })
     if prune:
@@ -1862,15 +1908,23 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
         if pr in records:
             records[pr]["worktree_present"] = True
             continue
-        state, url, has_fail, failing = _pr_open_state(pr, wt)
+        state, url, has_fail, failing, review_decision, merge_state = (
+            _unpack_pr_open_state(_pr_open_state(pr, wt))
+        )
         if state in ("merged", "closed"):
             continue
         threads = github_api.get_review_threads(pr, wt)
         unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
+        merge_conflict = str(merge_state).upper() == "DIRTY"
         records[pr] = {
             "pr": pr, "url": url or f"(pr {pr})", "branch": _current_branch(wt),
             "worktree_present": True, "unresolved_threads": len(unresolved),
             "ci_failing": has_fail, "failing_checks": failing,
+            "changes_requested": changes_requested,
+            "review_decision": review_decision,
+            "merge_conflict": merge_conflict,
+            "merge_state": merge_state,
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
         }
 

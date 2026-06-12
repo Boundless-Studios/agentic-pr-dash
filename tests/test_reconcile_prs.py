@@ -30,6 +30,71 @@ def test_detached_pr_with_unresolved_thread_is_surfaced(tmp_path, monkeypatch, c
     assert r["unresolved_threads"] >= 1 and r["url"].endswith("/pull/777")
 
 
+def test_detached_pr_with_review_level_changes_requested_is_surfaced(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=779, branch="bou-review", worktree=str(tmp_path / "gone"))
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+        "open", "https://github.com/o/r/pull/779", False, [],
+        "CHANGES_REQUESTED", "CLEAN",
+    ))
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["pr"] == 779
+    assert records[0]["changes_requested"] is True
+
+
+def test_detached_pr_with_dirty_merge_state_is_surfaced(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=780, branch="bou-conflict", worktree=str(tmp_path / "gone"))
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+        "open", "https://github.com/o/r/pull/780", False, [],
+        "", "DIRTY",
+    ))
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["pr"] == 780
+    assert records[0]["merge_conflict"] is True
+    assert records[0]["merge_state"] == "DIRTY"
+
+
+def test_markerless_recreated_worktree_is_not_skipped(tmp_path, monkeypatch, capsys):
+    reused = tmp_path / "reused-wt"
+    reused.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=781, branch="bou-same", worktree=str(reused))
+    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([str(reused)]))
+    monkeypatch.setattr(mc, "_read_marker", lambda path: None)
+    monkeypatch.setattr(mc, "_current_branch", lambda path: "bou-same")
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+        "open", "https://github.com/o/r/pull/781", False, []))
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    assert records[0]["pr"] == 781
+    assert records[0]["worktree_present"] is False
+
+
 def test_merged_detached_pr_is_pruned_and_omitted(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=900, branch="bou-merged", worktree=str(tmp_path / "gone"))
