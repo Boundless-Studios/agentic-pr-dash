@@ -4,6 +4,8 @@ import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from agent_coordinator.models import OwnerIdentity
 from agent_coordinator.service import TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
@@ -11,6 +13,14 @@ from agentic_pr_dash import coordinator as pr_coordinator
 from agentic_pr_dash import app as dashboard_app
 from agentic_pr_dash import github_api, maintenance, orchestrator, session_registry
 from agentic_pr_dash.models import AgentProcess, MaintenanceStatus, PRData, PRStatus, ReviewComment
+
+
+@pytest.fixture(autouse=True)
+def _isolate_coordinator_store(tmp_path: Path, monkeypatch):
+    """Point the agent-coordinator store at a per-test path so claims created by
+    these tests never read/write an ambient store and expectations can't depend
+    on claims left by other runs (codex P2)."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(tmp_path / "coordinator-claims.jsonl"))
 
 
 def _comment(comment_id: int = 55) -> ReviewComment:
@@ -30,6 +40,37 @@ def _claim_current_pr(pr: PRData) -> None:
         OwnerIdentity(session_id="owner-1", pid=os.getpid(), worktree_path=pr.worktree_path),
         lease_seconds=300,
     )
+
+
+def test_dashboard_dispatch_claims_and_suppresses_duplicate_requeue(monkeypatch, tmp_path: Path):
+    """The dashboard dispatch path must create a coordinator claim so the next
+    60s refresh with unchanged blockers does NOT re-queue the same maintenance
+    (codex P1)."""
+    worktree = tmp_path / "feature-one"
+    worktree.mkdir()
+
+    pr = PRData(
+        number=321,
+        title="Fix comments",
+        branch="feature/one",
+        url="https://github.com/Boundless-Studios/gaia-free/pull/321",
+        worktree_path=str(worktree),
+        status=PRStatus.HAS_COMMENTS,
+        review_comments=[_comment()],
+    )
+
+    monkeypatch.setattr(github_api, "get_failed_logs", lambda *a, **k: {})
+
+    orch = orchestrator.Orchestrator(repo_cwd=None)
+
+    # First dispatch creates the claim.
+    assert pr_coordinator.dispatch_decision_for_pr(pr).should_dispatch is True
+    asyncio.run(orch.dispatch_pr_maintenance(pr))
+
+    # An unchanged-blocker refresh now sees the active claim and is suppressed.
+    decision = pr_coordinator.dispatch_decision_for_pr(pr)
+    assert decision.should_dispatch is False
+    assert decision.state == "active"
 
 
 def test_refresh_requeues_matching_active_state_when_owner_session_ended(monkeypatch, tmp_path: Path):

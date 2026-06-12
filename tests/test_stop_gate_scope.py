@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from agentic_pr_dash import config, maintenance_check
+from agentic_pr_dash import config, coordinator, maintenance_check
+from agentic_pr_dash.models import PRData, PRStatus, ReviewComment
 
 
 SID = "sess-owned"
@@ -55,7 +56,7 @@ def test_stop_gate_does_not_adopt_unmarked_open_pr_worktrees(
 
     checked: list[str] = []
 
-    def _check(path: str, session_id: str) -> tuple[int, str]:
+    def _check(path: str, session_id: str, *, claim: bool = True) -> tuple[int, str]:
         checked.append(path)
         if Path(path) == unrelated:
             return 10, "unrelated blocker\nPR_NUMBER=202"
@@ -94,10 +95,58 @@ def test_stop_gate_skips_marker_owned_path_with_live_independent_owner(
     monkeypatch.setattr(
         maintenance_check,
         "_check_worktree",
-        lambda path, session_id: checked.append(path) or (10, "blocker\nPR_NUMBER=1"),
+        lambda path, session_id, *, claim=True: checked.append(path) or (10, "blocker\nPR_NUMBER=1"),
     )
 
     rc = maintenance_check.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
 
     assert rc == 0
     assert checked == []
+
+
+def _blocked_pr(worktree: Path) -> PRData:
+    return PRData(
+        number=42,
+        title="needs review",
+        branch="feature/x",
+        url="https://github.com/Boundless-Studios/gaia-free/pull/42",
+        worktree_path=str(worktree),
+        status=PRStatus.HAS_COMMENTS,
+        review_comments=[
+            ReviewComment(id=7, author="r", body="fix", created_at="2026-06-11T12:00:00Z")
+        ],
+    )
+
+
+def _stub_check_worktree_to_blockers(monkeypatch: pytest.MonkeyPatch, pr: PRData) -> None:
+    """Stub the pre-claim gauntlet so _check_worktree reaches the claim block."""
+    monkeypatch.setattr(maintenance_check, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(maintenance_check, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(maintenance_check, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(maintenance_check, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+
+
+def test_passive_stop_gate_probe_does_not_create_coordinator_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The passive stop-gate probe (claim=False) must report pending work without
+    creating an agent-coordinator claim, so a later active check still sees it."""
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    pr = _blocked_pr(worktree)
+    _stub_check_worktree_to_blockers(monkeypatch, pr)
+
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=False)
+
+    assert code == 10
+    assert "PR_NUMBER=42" in text
+    assert "COORDINATOR_CLAIM_ID" not in text
+    # No claim was written, so an active loop check still finds the work.
+    assert coordinator.dispatch_decision_for_pr(pr).should_dispatch is True
+
+    active_code, active_text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert active_code == 10
+    assert "COORDINATOR_CLAIM_ID" in active_text

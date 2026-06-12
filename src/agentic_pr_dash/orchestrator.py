@@ -26,6 +26,12 @@ RUNNER_SUMMARY_REFRESH_SECONDS = 6 * 60 * 60
 # Statuses that mean a dispatch is already in flight — don't re-queue for the
 # same blocker set every poll cycle.
 ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SIGNALED})
+
+# Stable owner id for the agent-coordinator claim the dashboard takes when it
+# hands maintenance off to the local agent. The claim suppresses the dashboard
+# from re-queuing the same maintenance every poll cycle (the old queued-state
+# guard was removed; suppression now rides entirely on coordinator claims).
+DASHBOARD_OWNER_SESSION_ID = "agentic-pr-dash-dashboard"
 # Each poll enriches every open PR with several REST + GraphQL calls. At 15s
 # this comfortably exceeded GitHub's hourly API limit for even a handful of
 # PRs, starving the API to zero and causing refresh failures. 60s keeps the
@@ -307,6 +313,20 @@ class Orchestrator:
                     get_tracker(_load_config(pr.worktree_path)).close_task(
                         pr.maintenance.bead_id, cwd=pr.worktree_path
                     )
+                # Release any dashboard-held coordinator claim now that the work
+                # is done (a stale claim would otherwise sit until lease expiry).
+                if pr.coordinator_claim_id:
+                    try:
+                        coordinator.release_claim_id(
+                            pr.coordinator_claim_id, DASHBOARD_OWNER_SESSION_ID, "completed"
+                        )
+                    except Exception as exc:  # best-effort; lease bounds it anyway
+                        self.log(
+                            f"Could not release coordinator claim for #{num}: {exc}",
+                            pr_number=num,
+                            level="warn",
+                        )
+                    pr.coordinator_claim_id = None
                 pr.maintenance = None
                 pr.activity_message = None
                 pr.activity_source = None
@@ -422,6 +442,19 @@ class Orchestrator:
             pr.activity_message = "Delegated to local agent"
             pr.activity_source = "dashboard"
             pr.agent_failure_reason = None
+            # Claim the PR in agent-coordinator so the next poll with unchanged
+            # blockers sees an active claim and does NOT re-queue this same
+            # maintenance every cycle (codex P1). The fingerprint is blocker-
+            # derived, so when the blockers change the new work is unsuppressed;
+            # the lease bounds a stale claim if the handed-off agent never runs.
+            claim = coordinator.claim_pr(
+                pr,
+                session_id=DASHBOARD_OWNER_SESSION_ID,
+                pid=None,
+                agent="agentic-pr-dash-dashboard",
+                lease_seconds=load_config(pr.worktree_path).lease_seconds,
+            )
+            pr.coordinator_claim_id = claim.claim_id if claim else None
             self.log(
                 f"Queued PR maintenance for local agent: {', '.join(blockers)}",
                 pr_number=pr.number,

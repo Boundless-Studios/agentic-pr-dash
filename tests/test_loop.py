@@ -170,3 +170,36 @@ def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
     assert ("heartbeat", "claim-1", "sess-1") in calls
     assert ("executor", str(worktree)) in calls
     assert ("release", "claim-1", "sess-1", "completed") in calls
+
+
+def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
+    """If the executor cannot be spawned (e.g. binary missing → OSError), the
+    coordinator claim must be released so the PR is not left wrongly owned until
+    the lease expires."""
+    calls = []
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            return types.SimpleNamespace(
+                returncode=loop.CHECK_WORK_FOUND,
+                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    def boom(executor, prompt, cwd):
+        raise FileNotFoundError("codex: command not found")
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
+    monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    monkeypatch.setattr(loop, "_run_executor", boom)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: calls.append(("heartbeat", claim_id, session_id)))
+    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda claim_id, session_id, reason: calls.append(("release", claim_id, session_id, reason)))
+
+    loop._tick(_args(cwd=["/repo/root"], session_id="sess-1"), "codex {prompt}")
+
+    assert ("heartbeat", "claim-1", "sess-1") in calls
+    assert ("release", "claim-1", "sess-1", "executor_failed") in calls
