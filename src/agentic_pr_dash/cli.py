@@ -7,11 +7,12 @@ Subcommands:
     arm           Stamp a worktree's open PR with an ownership marker for a session.
     list-owned    Print worktree paths a session owns.
     stop-gate     Stop-hook core: block idling while owned PRs have pending work.
+    reconcile-prs List every PR a session owns (live + detached ledger), with state.
     record        Record a session lifecycle event (for the dashboard's live view).
     loop          Run check/fix/complete continuously, dispatching to a configured agent.
     serve         Run the web dashboard.
 
-``check/complete/arm/list-owned/stop-gate`` route into the stateless maintenance
+``check/complete/arm/list-owned/stop-gate/reconcile-prs`` route into the stateless maintenance
 executor; ``record`` into the session registry; ``loop`` and ``serve`` are runtime
 drivers. Run ``agentic-pr-dash <cmd> --help`` for per-subcommand options.
 """
@@ -20,7 +21,7 @@ from __future__ import annotations
 
 import sys
 
-_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate"}
+_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate", "reconcile-prs"}
 _USAGE = __doc__
 
 

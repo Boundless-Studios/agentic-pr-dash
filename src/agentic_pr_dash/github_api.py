@@ -1136,7 +1136,12 @@ def get_unaddressed_comments(
     # Inline review threads via GraphQL
     threads = get_review_threads(pr_number, cwd)
     for thread in threads:
-        if thread.is_resolved:
+        # Skip resolved threads AND outdated ones: an outdated thread points at
+        # code that has since changed, so it is not actionable feedback. Treating
+        # it as unaddressed would make a green-CI PR with only an outdated thread
+        # read as blocked, and would prevent `pr_has_unresolved_review_threads`
+        # from being authoritative (PR #16 review round 2, P2).
+        if thread.is_resolved or thread.is_outdated:
             continue
         replies_as_dicts = [
             {"body": r.body, "created_at": r.created_at}
