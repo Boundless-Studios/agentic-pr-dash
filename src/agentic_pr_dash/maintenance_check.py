@@ -1679,6 +1679,11 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         # so 3 identical no-progress states release the gate.
         if (not getattr(args, "no_waiter", False)) and session_id:
             open_prs = _owned_open_pr_numbers(owned)
+            # Also count detached ledger PRs that are still open (worktree gone
+            # but PR live) — those need a waiter too (BOU-1632 codex P2 #3).
+            for _dr in _detached_pr_records(session_id, cwd):
+                if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
+                    open_prs = open_prs | {_dr["pr"]}
             if open_prs and not _await_alive(cwd, session_id):
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -2190,8 +2195,10 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             # Include detached-ledger PRs (parity with stop-gate).
+            _detached_this_tick: list[dict] = []
             if session_id:
-                for r in _detached_pr_records(session_id, cwd):
+                _detached_this_tick = _detached_pr_records(session_id, cwd)
+                for r in _detached_this_tick:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))
 
@@ -2204,7 +2211,13 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 )
                 return 10
 
-            if not owned and not getattr(args, "keep_alive_without_prs", False):
+            # Keep ticking when owned is empty but the session has open detached
+            # ledger PRs that may develop blockers (BOU-1632 codex P2 #3).
+            has_open_detached = any(
+                r.get("state") not in ("merged", "closed", "draft", "unknown")
+                for r in _detached_this_tick
+            )
+            if not owned and not has_open_detached and not getattr(args, "keep_alive_without_prs", False):
                 return 0
 
             if deadline is not None and time.time() >= deadline:
