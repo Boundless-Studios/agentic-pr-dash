@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import sys
 
-_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate", "reconcile-prs"}
+_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate", "reconcile-prs", "await"}
 _USAGE = __doc__
 
 
