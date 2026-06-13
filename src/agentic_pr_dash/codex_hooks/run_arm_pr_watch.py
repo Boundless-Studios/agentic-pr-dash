@@ -109,20 +109,31 @@ def _skip_command_prefixes(tokens: list[str]) -> int:
     return index
 
 
-def split_command_segments(command: str) -> list[str]:
-    """Split a command line into top-level segments on shell control operators.
+def split_command_segments(command: str) -> list[tuple[str, str]]:
+    """Split a command line into top-level ``(leading_op, segment)`` pairs.
 
     Breaks on ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines while respecting
     single/double quotes and backslash escapes, so a compound one-liner such as
-    ``git push && gh pr create --fill`` yields both commands. Without this, a
-    leading ``git``/``cd`` token hides a later ``gh pr ...`` from detection and
-    the freshly opened PR is never armed.
+    ``git push && gh pr create --fill`` yields both commands. ``leading_op`` is
+    the operator that precedes a segment (``""`` for the first) so the caller can
+    honor shell conditionals — a segment guarded by ``||`` only runs on the
+    previous command's failure, and a ``&&`` guard only on its success.
     """
-    segments: list[str] = []
+    pairs: list[tuple[str, str]] = []
     buf: list[str] = []
+    pending_op = ""  # operator that precedes the segment currently in `buf`
     quote: str | None = None
     i = 0
     n = len(command)
+
+    def _flush(next_op: str) -> None:
+        nonlocal pending_op
+        seg = "".join(buf).strip()
+        if seg:
+            pairs.append((pending_op, seg))
+        buf.clear()
+        pending_op = next_op
+
     while i < n:
         ch = command[i]
         if quote is not None:
@@ -145,20 +156,19 @@ def split_command_segments(command: str) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
-        if command[i : i + 2] in ("&&", "||"):
-            segments.append("".join(buf))
-            buf = []
+        two = command[i : i + 2]
+        if two in ("&&", "||"):
+            _flush(two)
             i += 2
             continue
         if ch in (";", "|", "&", "\n"):
-            segments.append("".join(buf))
-            buf = []
+            _flush(";" if ch in (";", "\n") else ch)
             i += 1
             continue
         buf.append(ch)
         i += 1
-    segments.append("".join(buf))
-    return [seg.strip() for seg in segments if seg.strip()]
+    _flush("")
+    return pairs
 
 
 def cd_target(command: str) -> str | None:
@@ -169,7 +179,7 @@ def cd_target(command: str) -> str | None:
     command (e.g. ``cd ../wt && gh pr ready``).
     """
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(command, comments=True)
     except ValueError:
         return None
     index = _skip_command_prefixes(tokens)
@@ -211,7 +221,7 @@ def parse_gh_pr_arm_target(command: str):
     ``(None, None)`` so arm resolves the current branch.
     """
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(command, comments=True)
     except ValueError:
         return None
 
@@ -285,7 +295,7 @@ def is_gh_pr_open(command: str) -> bool:
 
 def is_git_push(command: str) -> bool:
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(command, comments=True)
     except ValueError:
         return False
     if not tokens:
@@ -329,7 +339,7 @@ def is_git_push(command: str) -> bool:
 
 def effective_git_cwd(command: str, base_cwd: str) -> str:
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(command, comments=True)
     except ValueError:
         return base_cwd
 
@@ -373,6 +383,33 @@ def effective_git_cwd(command: str, base_cwd: str) -> str:
     if work_tree is not None:
         return str((Path(cwd) / work_tree).resolve())
     return cwd
+
+
+def _command_failed(payload: dict) -> bool:
+    """Best-effort: True only when the tool reports a non-zero exit code.
+
+    A PostToolUse fires after the command ran; the exit code (when the harness
+    provides it) tells us whether a ``&&``-guarded later segment actually
+    executed. Absent/unparseable exit info → ``False`` (assume it ran), so the
+    common ``git push && gh pr create`` still arms.
+    """
+    response = payload.get("tool_response")
+    candidates = []
+    if isinstance(response, dict):
+        for key in ("exit_code", "exitCode", "returncode", "code", "status"):
+            if key in response:
+                candidates.append(response.get(key))
+    for key in ("exit_code", "exitCode", "returncode"):
+        if key in payload:
+            candidates.append(payload.get(key))
+    for value in candidates:
+        if isinstance(value, bool):
+            continue
+        if isinstance(value, int):
+            return value != 0
+        if isinstance(value, str) and value.lstrip("-").isdigit():
+            return int(value) != 0
+    return False
 
 
 def _arm(cwd: str, session_id: str, *, pr: str | None = None, branch: str | None = None) -> None:
@@ -419,10 +456,14 @@ def main() -> int:
 
     # Walk each top-level segment so a `gh pr ...` after a separator (e.g.
     # `git push && gh pr create`) is still detected, and a preceding `cd`
-    # relocates the effective arm cwd.
+    # relocates the effective arm cwd. Honor shell conditionals: a `||`-guarded
+    # segment only runs on the previous command's failure, and a `&&`-guarded
+    # one only on success — don't record ownership for a PR action the shell
+    # never executed.
     autoloop = pr_watch_autoloop_enabled()
+    failed = _command_failed(payload)
     eff_cwd = base_cwd
-    for segment in split_command_segments(command):
+    for op, segment in split_command_segments(command):
         destination = cd_target(segment)
         if destination is not None:
             # Expand ~ / ~user first: `cd ~/wt` runs gh from the home-relative
@@ -434,6 +475,10 @@ def main() -> int:
                 else str((Path(eff_cwd) / destination).resolve())
             )
             continue
+        if op == "||":
+            continue  # only-on-failure guard: the PR action wasn't intended
+        if op == "&&" and failed:
+            continue  # prior command failed → this segment never ran
         target = parse_gh_pr_arm_target(segment)
         if target is not None:
             pr_number, branch = target

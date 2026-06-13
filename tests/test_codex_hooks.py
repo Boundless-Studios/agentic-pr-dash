@@ -204,6 +204,65 @@ def test_gh_pr_create_option_value_not_treated_as_branch(monkeypatch, tmp_path):
     assert "--pr" not in calls[0]
 
 
+def test_inline_shell_comment_not_treated_as_branch(monkeypatch, tmp_path):
+    # `# open PR` is a shell comment, not a positional; create arms the current
+    # branch (codex PR #21).
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --fill # open PR"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls
+    assert "--branch" not in calls[0]
+    assert "--pr" not in calls[0]
+
+
+def test_or_guarded_gh_pr_segment_is_not_armed(monkeypatch, tmp_path):
+    # `cmd || gh pr ready 123` only runs gh on cmd's failure — don't record
+    # ownership for a PR action the shell (usually) never ran.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "make build || gh pr ready 123"},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_and_guarded_segment_skipped_when_command_failed(monkeypatch, tmp_path):
+    # `git push && gh pr create` with a non-zero exit means the push failed and
+    # gh never ran → do not arm.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push && gh pr create --fill"},
+        "tool_response": {"exit_code": 1},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_and_guarded_segment_armed_when_command_succeeded(monkeypatch, tmp_path):
+    # Same command, exit 0 → push succeeded, gh pr create ran → arm.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push && gh pr create --fill"},
+        "tool_response": {"exit_code": 0},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+    assert len(calls) == 1
+    assert calls[0][:2] == ["arm", "--cwd"]
+
+
 def test_cd_home_relative_target_is_expanded(monkeypatch, tmp_path):
     home = tmp_path / "home"
     worktree = home / "wt"

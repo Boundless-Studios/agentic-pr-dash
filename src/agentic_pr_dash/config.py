@@ -120,6 +120,14 @@ class Config:
     ``maintenance_loop_pidfile`` / a ``daemon_dir`` (env or toml); defaults to
     ``~/.claude/daemons/pr-maintenance-loop.pid``."""
 
+    maintenance_loop_machine_wide: bool = False
+    """Whether the detached loop services EVERY worktree on the machine (rather
+    than a single ``--session-id``/repo scope). Only then is a live loop proof of
+    coverage for an arbitrary session, so the stop-gate honors
+    ``maintenance_loop_pidfile`` only when this is set. Default ``False`` keeps
+    multi-repo/multi-session machines safe — a foreign-scoped loop never
+    suppresses another session's waiter (codex PR #21 review)."""
+
     extra: dict = field(default_factory=dict)
     """Anything else from the ``[project]`` table, for adapters to read."""
 
@@ -246,6 +254,11 @@ def load(cwd: str | None = None) -> Config:
         )
         loop_pidfile = daemon_dir / "pr-maintenance-loop.pid"
 
+    machine_wide_raw = _env("MAINTENANCE_LOOP_MACHINE_WIDE")
+    if machine_wide_raw is None:
+        machine_wide_raw = proj.get("maintenance_loop_machine_wide")
+    machine_wide = str(machine_wide_raw).strip().lower() in {"1", "true", "yes", "on"}
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
@@ -253,6 +266,7 @@ def load(cwd: str | None = None) -> Config:
         executor=_env("EXECUTOR") or proj.get("executor") or "",
         await_command=await_command,
         maintenance_loop_pidfile=loop_pidfile,
+        maintenance_loop_machine_wide=machine_wide,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,

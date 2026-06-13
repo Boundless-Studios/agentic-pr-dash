@@ -2148,7 +2148,13 @@ def _detached_loop_alive(cwd: str) -> bool:
     Reads the daemon pidfile resolved by config (``maintenance_loop_pidfile`` /
     ``daemon_dir``, default ``~/.claude/daemons/pr-maintenance-loop.pid``).
     """
-    pidfile = load_config(cwd).maintenance_loop_pidfile
+    cfg = load_config(cwd)
+    # Only a machine-wide loop is proof of coverage for an arbitrary session; a
+    # session/repo-scoped loop on a shared pidfile must NOT suppress this
+    # session's waiter (codex PR #21 review).
+    if not cfg.maintenance_loop_machine_wide:
+        return False
+    pidfile = cfg.maintenance_loop_pidfile
     if pidfile is None:
         return False
     try:

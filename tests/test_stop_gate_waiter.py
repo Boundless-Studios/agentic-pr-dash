@@ -115,10 +115,14 @@ def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, c
 
 
 def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
-    """_detached_loop_alive: live pid → True, dead pid → False, missing → False."""
+    """_detached_loop_alive: live pid → True, dead pid → False, missing → False.
+
+    Requires the machine-wide opt-in (a scoped loop is not proof of coverage).
+    """
     daemon_dir = tmp_path / "daemons"
     daemon_dir.mkdir()
     monkeypatch.setenv("GAIA_DAEMON_DIR", str(daemon_dir))
+    monkeypatch.setenv("GAIA_MAINTENANCE_LOOP_MACHINE_WIDE", "true")
     config.load.cache_clear()
 
     pidfile = daemon_dir / "pr-maintenance-loop.pid"
@@ -132,6 +136,20 @@ def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
 
     # Dead pid → not alive. PID 1 is always live, so use a pid that cannot exist.
     pidfile.write_text("2147483647", encoding="utf-8")
+    assert mc._detached_loop_alive(str(tmp_path)) is False
+
+
+def test_detached_loop_alive_false_without_machine_wide_optin(tmp_path, monkeypatch):
+    """A live loop on a shared pidfile does NOT count unless declared machine-wide
+    — a session/repo-scoped loop must not suppress another session's waiter."""
+    daemon_dir = tmp_path / "daemons"
+    daemon_dir.mkdir()
+    (daemon_dir / "pr-maintenance-loop.pid").write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(daemon_dir))
+    monkeypatch.delenv("GAIA_MAINTENANCE_LOOP_MACHINE_WIDE", raising=False)
+    monkeypatch.delenv("AGENTIC_PR_DASH_MAINTENANCE_LOOP_MACHINE_WIDE", raising=False)
+    config.load.cache_clear()
+
     assert mc._detached_loop_alive(str(tmp_path)) is False
 
 
