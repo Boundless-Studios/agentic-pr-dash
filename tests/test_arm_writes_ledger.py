@@ -61,6 +61,43 @@ def test_cmd_arm_branch_not_checked_out_here_skips(tmp_path, monkeypatch):
     assert resolved == []
 
 
+def test_cmd_arm_pr_on_matching_branch_arms(tmp_path, monkeypatch):
+    import argparse
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    monkeypatch.setattr(mc, "_pr_draft_status", lambda cwd, pr: False)
+    monkeypatch.setattr(mc, "_pr_head_branch", lambda cwd, pr: "feature")
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature")
+
+    args = argparse.Namespace(
+        cwd=str(wt), session_id="sess-Z", pid=99, pr=777, branch=None
+    )
+    assert mc._cmd_arm(args) == 0
+    assert [e.pr for e in sl.read("sess-Z")] == [777]
+
+
+def test_cmd_arm_pr_wrong_branch_skips(tmp_path, monkeypatch):
+    import argparse
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    monkeypatch.setattr(mc, "_pr_draft_status", lambda cwd, pr: False)
+    monkeypatch.setattr(mc, "_pr_head_branch", lambda cwd, pr: "feature")
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "some-other-branch")
+
+    args = argparse.Namespace(
+        cwd=str(wt), session_id="sess-Z", pid=99, pr=777, branch=None
+    )
+    # PR 777's head branch isn't checked out here → skip, no ledger entry.
+    assert mc._cmd_arm(args) == 0
+    assert sl.read("sess-Z") == []
+
+
 def test_ledger_append_failure_is_nonfatal(tmp_path, monkeypatch):
     # Point the ledger dir at a path that cannot be created (under a regular file).
     blocker = tmp_path / "blocker"

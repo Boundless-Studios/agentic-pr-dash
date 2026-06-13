@@ -11,6 +11,22 @@ def _git(cwd, *args):
     subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
 
 
+def test_loop_pidfile_write_and_remove(tmp_path):
+    pidfile = tmp_path / "daemons" / "pr-maintenance-loop.pid"
+
+    loop._write_loop_pidfile(pidfile)
+    assert pidfile.read_text(encoding="utf-8").strip() == str(os.getpid())
+
+    # Only remove a pidfile that still holds our pid.
+    pidfile.write_text("999999", encoding="utf-8")
+    loop._remove_loop_pidfile(pidfile)
+    assert pidfile.exists()  # not ours → left alone
+
+    pidfile.write_text(str(os.getpid()), encoding="utf-8")
+    loop._remove_loop_pidfile(pidfile)
+    assert not pidfile.exists()
+
+
 def _make_repo(tmp_path):
     _git(tmp_path, "init", "-q")
     _git(tmp_path, "config", "user.email", "t@t")

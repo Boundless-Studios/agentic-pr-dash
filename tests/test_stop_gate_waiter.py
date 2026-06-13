@@ -114,6 +114,31 @@ def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, c
     assert "await" not in err.lower()
 
 
+def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypatch, capsys):
+    """The detached loop only services worktree-backed PRs. A detached-ledger PR
+    (worktree torn down, no blockers yet) must still get a waiter even when a
+    machine-wide loop is live (codex PR #21 review)."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+
+    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(
+        mc,
+        "_detached_pr_records",
+        lambda sid, cwd: [{"pr": 99, "state": "open", "p1": False, "unresolved_threads": 0}],
+    )
+    monkeypatch.setattr(mc, "_record_has_blockers", lambda r: False)
+    monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(mc, "_detached_loop_alive", lambda cwd: True)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "99" in err  # detached PR still demands a waiter
+    assert "42" not in err  # worktree-backed PR is covered by the live loop
+
+
 def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
     """_detached_loop_alive: live pid → True, dead pid → False, missing → False.
 

@@ -263,6 +263,11 @@ def parse_gh_pr_arm_target(command: str):
             head_branch = tok[len("--head=") :]
             i += 1
             continue
+        if tok.startswith("-H") and tok != "-H":
+            # Attached shorthand: `-Hfeature` or `-H=feature` (pflag syntax).
+            head_branch = tok[2:].lstrip("=")
+            i += 1
+            continue
         if tok.startswith("-"):
             i += 1
             continue

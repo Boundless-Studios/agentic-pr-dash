@@ -294,6 +294,19 @@ def test_gh_pr_create_head_passes_branch(monkeypatch, tmp_path):
     assert "--pr" not in calls[0]
 
 
+def test_gh_pr_create_attached_head_shorthand_passes_branch(monkeypatch, tmp_path):
+    # pflag accepts `-Hfeature` / `-H=feature` attached shorthand.
+    for cmd in ("gh pr create --fill -Hfeature-x", "gh pr create --fill -H=feature-x"):
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sess-A",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": cmd},
+        }
+        calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+        assert calls[0][calls[0].index("--branch") + 1] == "feature-x", cmd
+
+
 def test_gh_pr_after_shell_separator_is_detected(monkeypatch, tmp_path):
     payload = {
         "cwd": str(tmp_path),

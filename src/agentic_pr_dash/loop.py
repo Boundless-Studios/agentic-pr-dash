@@ -19,6 +19,7 @@ dependence on ``claude``/``codex``.
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import subprocess
 import sys
@@ -196,6 +197,31 @@ def _tick(args, executor: str) -> None:
             coordinator.release_claim_id(claim_id, session, reason)
 
 
+def _write_loop_pidfile(pidfile: Path | None) -> None:
+    """Stamp this loop's pid so the stop-gate's ``_detached_loop_alive`` can see
+    it (BOU-1653). Best-effort: if it can't be written, coverage detection just
+    won't treat the loop as alive."""
+    if pidfile is None:
+        return
+    try:
+        pidfile.parent.mkdir(parents=True, exist_ok=True)
+        pidfile.write_text(str(os.getpid()), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _remove_loop_pidfile(pidfile: Path | None) -> None:
+    """Remove the pidfile on exit — but only if it still holds OUR pid, so we
+    never delete a file an external supervisor has re-stamped."""
+    if pidfile is None:
+        return
+    try:
+        if pidfile.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            pidfile.unlink()
+    except OSError:
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     cfg = load_config()
     parser = argparse.ArgumentParser(prog="agentic-pr-dash loop", description=__doc__)
@@ -222,9 +248,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.once:
         _tick(args, executor)
         return 0
-    while True:
-        _tick(args, executor)
-        time.sleep(max(5, args.interval))
+    # Long-running daemon: publish our pid so the stop-gate can detect live
+    # detached coverage (BOU-1653).
+    _write_loop_pidfile(cfg.maintenance_loop_pidfile)
+    try:
+        while True:
+            _tick(args, executor)
+            time.sleep(max(5, args.interval))
+    finally:
+        _remove_loop_pidfile(cfg.maintenance_loop_pidfile)
 
 
 if __name__ == "__main__":
