@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 from agentic_pr_dash import maintenance_check
+from agentic_pr_dash.config import load as load_config
 
 _TRUE_VALUES = {"1", "true", "TRUE", "True", "yes", "YES", "on", "ON"}
 
@@ -433,6 +434,24 @@ def _arm(cwd: str, session_id: str, *, pr: str | None = None, branch: str | None
         print(f"run_arm_pr_watch.py: arm returned {result}; continuing", file=sys.stderr)
 
 
+def _write_session_marker(cwd: str, session_id: str) -> None:
+    """Stamp the worktree's owning-session self-id at SessionStart (BOU-1442).
+
+    Written UNCONDITIONALLY — independent of the pr-watch opt-in — because it is
+    just "who launched here" (no PR side effects): `arm`/`list-owned` and
+    sub-agent PR registration read it to learn the parent session id. The
+    opt-in still gates the `.armed` marker below.
+    """
+    if not session_id:
+        return
+    try:
+        marker = load_config(cwd).session_marker_for(cwd)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(f"{session_id}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
     payload = load_payload()
     phase = sys.argv[1] if len(sys.argv) > 1 else payload.get("hook_event_name", "")
@@ -441,8 +460,10 @@ def main() -> int:
         return 0
 
     if phase == "SessionStart":
+        cwd = normalized_cwd(payload)
+        _write_session_marker(cwd, session_id)
         if pr_watch_autoloop_enabled():
-            _arm(normalized_cwd(payload), session_id)
+            _arm(cwd, session_id)
         return 0
 
     if phase != "PostToolUse":
