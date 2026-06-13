@@ -56,8 +56,6 @@ def test_session_start_writes_self_id_and_arms_only_when_opted_in(monkeypatch, t
             str(tmp_path),
             "--session-id",
             "codex-session",
-            "--pid",
-            "4242",
         ]
     ]
 
@@ -129,10 +127,230 @@ def test_pr_open_arms_without_autoloop_opt_in(monkeypatch, tmp_path):
             str(tmp_path),
             "--session-id",
             "sess-A",
-            "--pid",
-            "4242",
         ]
     ]
+
+
+def test_arm_omits_pid_so_arm_resolves_durable_owner(monkeypatch, tmp_path):
+    # The hook must NOT stamp os.getppid() (the short-lived shell): it lets
+    # `maintenance_check arm` walk to the durable claude/codex owner instead.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --fill"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls
+    assert "--pid" not in calls[0]
+
+
+def test_gh_pr_ready_with_number_passes_explicit_pr(monkeypatch, tmp_path):
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr ready 123"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--pr") + 1] == "123"
+
+
+def test_gh_pr_ready_pull_url_skips_arming(monkeypatch, tmp_path):
+    # A pull URL may name another repository we can't arm from this cwd; skip
+    # rather than mis-mark the local repo (codex PR #21 review).
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr ready https://github.com/o/r/pull/456"},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_gh_explicit_repo_skips_arming(monkeypatch, tmp_path):
+    # `-R other/repo` targets a different repository; arming in this cwd would
+    # mark the wrong PR, so skip.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh -R other/repo pr ready 123"},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_gh_pr_create_option_value_not_treated_as_branch(monkeypatch, tmp_path):
+    # `--title 'Fix flaky test'` is an option value, NOT a positional branch;
+    # create takes its branch only from --head. With neither --pr nor --branch,
+    # arm resolves the current branch (codex PR #21 P1).
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --title 'Fix flaky test' --body wip"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls
+    assert "--branch" not in calls[0]
+    assert "--pr" not in calls[0]
+
+
+def test_inline_shell_comment_not_treated_as_branch(monkeypatch, tmp_path):
+    # `# open PR` is a shell comment, not a positional; create arms the current
+    # branch (codex PR #21).
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --fill # open PR"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls
+    assert "--branch" not in calls[0]
+    assert "--pr" not in calls[0]
+
+
+def test_or_guarded_gh_pr_segment_is_not_armed(monkeypatch, tmp_path):
+    # `cmd || gh pr ready 123` only runs gh on cmd's failure — don't record
+    # ownership for a PR action the shell (usually) never ran.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "make build || gh pr ready 123"},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_and_guarded_segment_skipped_when_command_failed(monkeypatch, tmp_path):
+    # `git push && gh pr create` with a non-zero exit means the push failed and
+    # gh never ran → do not arm.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push && gh pr create --fill"},
+        "tool_response": {"exit_code": 1},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_and_guarded_segment_armed_when_command_succeeded(monkeypatch, tmp_path):
+    # Same command, exit 0 → push succeeded, gh pr create ran → arm.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push && gh pr create --fill"},
+        "tool_response": {"exit_code": 0},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+    assert len(calls) == 1
+    assert calls[0][:2] == ["arm", "--cwd"]
+
+
+def test_cd_home_relative_target_is_expanded(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    worktree = home / "wt"
+    worktree.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "cd ~/wt && gh pr ready"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--cwd") + 1] == str(worktree)
+
+
+def test_gh_pr_create_head_passes_branch(monkeypatch, tmp_path):
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --fill --head feature-x"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--branch") + 1] == "feature-x"
+    assert "--pr" not in calls[0]
+
+
+def test_gh_pr_create_attached_head_shorthand_passes_branch(monkeypatch, tmp_path):
+    # pflag accepts `-Hfeature` / `-H=feature` attached shorthand.
+    for cmd in ("gh pr create --fill -Hfeature-x", "gh pr create --fill -H=feature-x"):
+        payload = {
+            "cwd": str(tmp_path),
+            "session_id": "sess-A",
+            "tool_name": "exec_command",
+            "tool_input": {"cmd": cmd},
+        }
+        calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+        assert calls[0][calls[0].index("--branch") + 1] == "feature-x", cmd
+
+
+def test_gh_pr_after_shell_separator_is_detected(monkeypatch, tmp_path):
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push && gh pr create --fill"},
+    }
+
+    # No autoloop opt-in: the git push must NOT arm, but the trailing gh pr
+    # create must arm unconditionally even though it follows a separator.
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert len(calls) == 1
+    assert calls[0][:2] == ["arm", "--cwd"]
+
+
+def test_leading_cd_relocates_arm_cwd(monkeypatch, tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "cd wt && gh pr ready"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--cwd") + 1] == str(worktree.resolve())
+
+
+def test_exec_command_workdir_overrides_payload_cwd(monkeypatch, tmp_path):
+    workdir = tmp_path / "sibling"
+    workdir.mkdir()
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --fill", "workdir": str(workdir)},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--cwd") + 1] == str(workdir)
 
 
 def test_git_push_honors_opt_in_and_effective_git_cwd(monkeypatch, tmp_path):

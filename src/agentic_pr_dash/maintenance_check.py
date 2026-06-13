@@ -312,6 +312,38 @@ def _pr_draft_status(cwd: str, pr_number: int):
     return bool(data["isDraft"])
 
 
+def _pr_head_branch(cwd: str, pr_number: int):
+    """The PR's head branch name (``headRefName``), or ``None`` if gh can't say.
+
+    Used to refuse an explicit ``arm --pr <N>`` when the cwd isn't on PR N's
+    head branch: the marker/ledger are written for cwd, but later ``check --cwd``
+    resolves the PR from the cwd's current branch, so a marker for a PR that
+    isn't checked out here would shadow the real one.
+    """
+    import json  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "headRefName"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout or "")
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    head = data.get("headRefName")
+    return head if isinstance(head, str) and head else None
+
+
 def _parse_iso(value: str):
     if not value:
         return None
@@ -663,7 +695,22 @@ def _cmd_arm(args: argparse.Namespace) -> int:
 
     pr_number = args.pr
     if pr_number is None:
-        branch = _current_branch(cwd)
+        explicit_branch = getattr(args, "branch", None)
+        if explicit_branch:
+            # `gh` accepts `<owner>:<branch>` for --head, but `gh pr list --head`
+            # rejects the owner qualifier — strip it before resolving.
+            explicit_branch = explicit_branch.split(":", 1)[-1]
+        current_branch = _current_branch(cwd)
+        if explicit_branch and explicit_branch != current_branch:
+            # The marker/ledger are written for THIS cwd, whose checked-out
+            # branch resolves the PR on later `check --cwd`. Arming a branch that
+            # isn't checked out here would mark the wrong worktree, so decline —
+            # the worktree that actually holds the branch will arm it.
+            print(
+                f"branch {explicit_branch} is not checked out in {cwd}; not arming"
+            )
+            return 0
+        branch = explicit_branch or current_branch
         if not branch:
             print("could not resolve branch; nothing to arm")
             return 0
@@ -686,6 +733,19 @@ def _cmd_arm(args: argparse.Namespace) -> int:
             return 0
         if status:
             print(f"PR #{pr_number} is a draft; not arming")
+            return 0
+        # The marker is written for cwd, whose current branch resolves the PR on
+        # later `check --cwd`. Only arm an explicit --pr when the cwd is actually
+        # on that PR's head branch; otherwise a `gh pr ready 123` from an
+        # unrelated checkout would shadow the real owner (codex PR #21 review).
+        head_branch = _pr_head_branch(cwd, int(pr_number))
+        if head_branch is None:
+            print(f"could not verify PR #{pr_number}'s head branch (gh unavailable); not arming")
+            return 0
+        if head_branch != _current_branch(cwd):
+            print(
+                f"PR #{pr_number} (head {head_branch}) is not checked out in {cwd}; not arming"
+            )
             return 0
 
     if _write_arm_marker(cwd, session_id, int(pid), int(pr_number)):
@@ -1679,12 +1739,19 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         # loop-break counter reuses the same "need-waiter:<prs>" fingerprint
         # so 3 identical no-progress states release the gate.
         if (not getattr(args, "no_waiter", False)) and session_id:
-            open_prs = _owned_open_pr_numbers(owned)
-            # Also count detached ledger PRs that are still open (worktree gone
-            # but PR live) — those need a waiter too (BOU-1632 codex P2 #3).
+            # A live machine-wide detached loop services WORKTREE-backed PRs, so
+            # a per-session waiter is redundant for those (BOU-1653).
+            worktree_prs = (
+                set() if _detached_loop_alive(cwd) else _owned_open_pr_numbers(owned)
+            )
+            # Detached-ledger PRs (worktree torn down) are NOT serviced by the
+            # loop — it only polls worktree dirs — so they ALWAYS need a waiter,
+            # even when the loop is live (BOU-1632 codex P2 #3; codex PR #21).
+            detached_prs = set()
             for _dr in _detached_pr_records(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
-                    open_prs = open_prs | {_dr["pr"]}
+                    detached_prs.add(_dr["pr"])
+            open_prs = worktree_prs | detached_prs
             if open_prs and not _await_alive(cwd, session_id):
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -2120,6 +2187,31 @@ def _await_alive(cwd: str, session_id: str) -> bool:
     )
 
 
+def _detached_loop_alive(cwd: str) -> bool:
+    """True when the detached ``pr-maintenance-loop`` daemon is running.
+
+    When the loop is live it is sufficient idle coverage for PR feedback, so the
+    stop-gate can skip prompting for a fragile per-session in-session waiter
+    (BOU-1653) — the loop wakes/dispatches on arriving review/CI work instead.
+    Reads the daemon pidfile resolved by config (``maintenance_loop_pidfile`` /
+    ``daemon_dir``, default ``~/.claude/daemons/pr-maintenance-loop.pid``).
+    """
+    cfg = load_config(cwd)
+    # Only a machine-wide loop is proof of coverage for an arbitrary session; a
+    # session/repo-scoped loop on a shared pidfile must NOT suppress this
+    # session's waiter (codex PR #21 review).
+    if not cfg.maintenance_loop_machine_wide:
+        return False
+    pidfile = cfg.maintenance_loop_pidfile
+    if pidfile is None:
+        return False
+    try:
+        pid_raw = pidfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return _pid_alive(pid_raw)
+
+
 def _detached_pending_entry(r: dict) -> tuple[str, str]:
     """Build the (label, text) pending entry for a detached PR record.
 
@@ -2336,6 +2428,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="PR number to arm. When omitted, resolves the worktree branch's open "
         "@me PR via gh and refuses to arm a draft or a branch with no open PR.",
+    )
+    arm_p.add_argument(
+        "--branch",
+        default=None,
+        metavar="BRANCH",
+        help="Head branch whose open PR to arm (e.g. `gh pr create --head <branch>` "
+        "from a sibling worktree). Ignored when --pr is given; when both are "
+        "omitted the worktree's current branch is resolved.",
     )
 
     # --- stop-gate ---

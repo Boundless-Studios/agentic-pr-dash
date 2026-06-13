@@ -113,6 +113,21 @@ class Config:
     """Shell command template the stop-gate surfaces when spawning the in-session
     feedback waiter; ``{cwd}`` and ``{session_id}`` are substituted at render time."""
 
+    maintenance_loop_pidfile: Path | None = None
+    """Pidfile of the detached ``pr-maintenance-loop`` daemon. When that process
+    is live it is sufficient idle coverage, so the stop-gate skips the fragile
+    per-session feedback-waiter prompt (BOU-1653). Resolved from
+    ``maintenance_loop_pidfile`` / a ``daemon_dir`` (env or toml); defaults to
+    ``~/.claude/daemons/pr-maintenance-loop.pid``."""
+
+    maintenance_loop_machine_wide: bool = False
+    """Whether the detached loop services EVERY worktree on the machine (rather
+    than a single ``--session-id``/repo scope). Only then is a live loop proof of
+    coverage for an arbitrary session, so the stop-gate honors
+    ``maintenance_loop_pidfile`` only when this is set. Default ``False`` keeps
+    multi-repo/multi-session machines safe — a foreign-scoped loop never
+    suppresses another session's waiter (codex PR #21 review)."""
+
     extra: dict = field(default_factory=dict)
     """Anything else from the ``[project]`` table, for adapters to read."""
 
@@ -227,12 +242,31 @@ def load(cwd: str | None = None) -> Config:
         or _default_await_cmd
     )
 
+    pidfile_raw = _env("MAINTENANCE_LOOP_PIDFILE") or proj.get("maintenance_loop_pidfile")
+    if pidfile_raw:
+        loop_pidfile = Path(pidfile_raw).expanduser()
+    else:
+        daemon_dir_raw = _env("DAEMON_DIR") or proj.get("daemon_dir")
+        daemon_dir = (
+            Path(daemon_dir_raw).expanduser()
+            if daemon_dir_raw
+            else Path.home() / ".claude" / "daemons"
+        )
+        loop_pidfile = daemon_dir / "pr-maintenance-loop.pid"
+
+    machine_wide_raw = _env("MAINTENANCE_LOOP_MACHINE_WIDE")
+    if machine_wide_raw is None:
+        machine_wide_raw = proj.get("maintenance_loop_machine_wide")
+    machine_wide = str(machine_wide_raw).strip().lower() in {"1", "true", "yes", "on"}
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
         tracker=(_env("TRACKER") or proj.get("tracker") or "none").lower(),
         executor=_env("EXECUTOR") or proj.get("executor") or "",
         await_command=await_command,
+        maintenance_loop_pidfile=loop_pidfile,
+        maintenance_loop_machine_wide=machine_wide,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,

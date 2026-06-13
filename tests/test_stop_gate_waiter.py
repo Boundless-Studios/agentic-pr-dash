@@ -23,10 +23,14 @@ SID = "sess-waiter-test"
 
 
 @pytest.fixture(autouse=True)
-def _no_rate_limit(monkeypatch):
+def _no_rate_limit(monkeypatch, tmp_path):
     """Disable stop-interval rate-limiting so tests run without waiting."""
     monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "0")
     monkeypatch.setenv("GAIA_PR_WATCH_STOP_LOOP_THRESHOLD", "3")
+    # Isolate from any real detached pr-maintenance-loop daemon on this machine:
+    # point the daemon dir at an empty path so _detached_loop_alive resolves a
+    # missing pidfile (False) unless a test opts in explicitly.
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(tmp_path / "empty-daemons"))
     config.load.cache_clear()
     yield
     config.load.cache_clear()
@@ -86,6 +90,92 @@ def test_stop_gate_no_waiter_flag_suppresses(tmp_path, monkeypatch, capsys):
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID, "--no-waiter"])
     assert rc == 0
+
+
+def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, capsys):
+    """A live detached pr-maintenance-loop is sufficient idle coverage (BOU-1653).
+
+    With no pending work and an owned open PR, the stop-gate must NOT prompt for
+    a per-session waiter when the detached loop daemon is alive → exit 0.
+    """
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+
+    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: False)
+    # The autouse fixture forces the loop dead; flip it live for this case.
+    monkeypatch.setattr(mc, "_detached_loop_alive", lambda cwd: True)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "await" not in err.lower()
+
+
+def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypatch, capsys):
+    """The detached loop only services worktree-backed PRs. A detached-ledger PR
+    (worktree torn down, no blockers yet) must still get a waiter even when a
+    machine-wide loop is live (codex PR #21 review)."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+
+    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(
+        mc,
+        "_detached_pr_records",
+        lambda sid, cwd: [{"pr": 99, "state": "open", "p1": False, "unresolved_threads": 0}],
+    )
+    monkeypatch.setattr(mc, "_record_has_blockers", lambda r: False)
+    monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(mc, "_detached_loop_alive", lambda cwd: True)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "99" in err  # detached PR still demands a waiter
+    assert "42" not in err  # worktree-backed PR is covered by the live loop
+
+
+def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
+    """_detached_loop_alive: live pid → True, dead pid → False, missing → False.
+
+    Requires the machine-wide opt-in (a scoped loop is not proof of coverage).
+    """
+    daemon_dir = tmp_path / "daemons"
+    daemon_dir.mkdir()
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(daemon_dir))
+    monkeypatch.setenv("GAIA_MAINTENANCE_LOOP_MACHINE_WIDE", "true")
+    config.load.cache_clear()
+
+    pidfile = daemon_dir / "pr-maintenance-loop.pid"
+
+    # Missing pidfile → not alive.
+    assert mc._detached_loop_alive(str(tmp_path)) is False
+
+    # Live pid (this process) → alive.
+    pidfile.write_text(str(os.getpid()), encoding="utf-8")
+    assert mc._detached_loop_alive(str(tmp_path)) is True
+
+    # Dead pid → not alive. PID 1 is always live, so use a pid that cannot exist.
+    pidfile.write_text("2147483647", encoding="utf-8")
+    assert mc._detached_loop_alive(str(tmp_path)) is False
+
+
+def test_detached_loop_alive_false_without_machine_wide_optin(tmp_path, monkeypatch):
+    """A live loop on a shared pidfile does NOT count unless declared machine-wide
+    — a session/repo-scoped loop must not suppress another session's waiter."""
+    daemon_dir = tmp_path / "daemons"
+    daemon_dir.mkdir()
+    (daemon_dir / "pr-maintenance-loop.pid").write_text(str(os.getpid()), encoding="utf-8")
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(daemon_dir))
+    monkeypatch.delenv("GAIA_MAINTENANCE_LOOP_MACHINE_WIDE", raising=False)
+    monkeypatch.delenv("AGENTIC_PR_DASH_MAINTENANCE_LOOP_MACHINE_WIDE", raising=False)
+    config.load.cache_clear()
+
+    assert mc._detached_loop_alive(str(tmp_path)) is False
 
 
 def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
