@@ -1678,7 +1678,11 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         # owns open PRs and no live waiter exists, prompt to spawn one. The
         # loop-break counter reuses the same "need-waiter:<prs>" fingerprint
         # so 3 identical no-progress states release the gate.
-        if (not getattr(args, "no_waiter", False)) and session_id:
+        if (
+            (not getattr(args, "no_waiter", False))
+            and session_id
+            and not _detached_loop_alive(cwd)
+        ):
             open_prs = _owned_open_pr_numbers(owned)
             # Also count detached ledger PRs that are still open (worktree gone
             # but PR live) — those need a waiter too (BOU-1632 codex P2 #3).
@@ -2118,6 +2122,25 @@ def _await_alive(cwd: str, session_id: str) -> bool:
         data.get("session_id") == session_id
         and _pid_alive(str(data.get("pid", "")))
     )
+
+
+def _detached_loop_alive(cwd: str) -> bool:
+    """True when the detached ``pr-maintenance-loop`` daemon is running.
+
+    When the loop is live it is sufficient idle coverage for PR feedback, so the
+    stop-gate can skip prompting for a fragile per-session in-session waiter
+    (BOU-1653) — the loop wakes/dispatches on arriving review/CI work instead.
+    Reads the daemon pidfile resolved by config (``maintenance_loop_pidfile`` /
+    ``daemon_dir``, default ``~/.claude/daemons/pr-maintenance-loop.pid``).
+    """
+    pidfile = load_config(cwd).maintenance_loop_pidfile
+    if pidfile is None:
+        return False
+    try:
+        pid_raw = pidfile.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    return _pid_alive(pid_raw)
 
 
 def _detached_pending_entry(r: dict) -> tuple[str, str]:
