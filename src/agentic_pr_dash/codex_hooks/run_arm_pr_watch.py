@@ -28,7 +28,15 @@ def load_payload() -> dict:
 
 
 def normalized_payload(payload: dict) -> dict:
-    """Map Codex ``exec_command`` payloads to the Bash shape Claude hooks use."""
+    """Map Codex ``exec_command`` payloads to the Bash shape Claude hooks use.
+
+    A Codex ``exec_command`` may carry its own ``tool_input.workdir`` — the
+    directory the command actually ran in (e.g. ``gh pr create`` invoked against
+    a sibling worktree). That executed workdir, when present, is the correct cwd
+    to arm: the top-level payload ``cwd`` / hook process cwd can point at a
+    different worktree and make ``maintenance_check arm`` resolve the wrong (or
+    no) PR. Surface it as the normalized ``cwd`` so the workdir wins.
+    """
     tool_name = payload.get("tool_name")
     if tool_name in {"exec_command", "functions.exec_command"}:
         tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
@@ -36,6 +44,9 @@ def normalized_payload(payload: dict) -> dict:
         normalized = dict(payload)
         normalized["tool_name"] = "Bash"
         normalized["tool_input"] = {"command": command}
+        workdir = tool_input.get("workdir")
+        if isinstance(workdir, str) and workdir:
+            normalized["cwd"] = workdir
         return normalized
     return payload
 
@@ -98,18 +109,118 @@ def _skip_command_prefixes(tokens: list[str]) -> int:
     return index
 
 
-def is_gh_pr_open(command: str) -> bool:
+def split_command_segments(command: str) -> list[str]:
+    """Split a command line into top-level segments on shell control operators.
+
+    Breaks on ``&&``, ``||``, ``;``, ``|``, ``&`` and newlines while respecting
+    single/double quotes and backslash escapes, so a compound one-liner such as
+    ``git push && gh pr create --fill`` yields both commands. Without this, a
+    leading ``git``/``cd`` token hides a later ``gh pr ...`` from detection and
+    the freshly opened PR is never armed.
+    """
+    segments: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                buf.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(ch)
+            buf.append(command[i + 1])
+            i += 2
+            continue
+        if command[i : i + 2] in ("&&", "||"):
+            segments.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        if ch in (";", "|", "&", "\n"):
+            segments.append("".join(buf))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    segments.append("".join(buf))
+    return [seg.strip() for seg in segments if seg.strip()]
+
+
+def cd_target(command: str) -> str | None:
+    """Return the destination of a ``cd <dir>`` command segment, else ``None``.
+
+    A bare ``cd`` (to ``$HOME``) returns ``None`` — only an explicit directory
+    relocates the effective arm cwd for a later segment in the same compound
+    command (e.g. ``cd ../wt && gh pr ready``).
+    """
     try:
         tokens = shlex.split(command)
     except ValueError:
-        return False
+        return None
+    index = _skip_command_prefixes(tokens)
+    if index >= len(tokens) or tokens[index] != "cd":
+        return None
+    index += 1
+    while index < len(tokens) and tokens[index].startswith("-"):
+        index += 1
+    if index < len(tokens):
+        return tokens[index]
+    return None
+
+
+def _pr_number_from_token(token: str) -> str | None:
+    """Extract an explicit PR number from a ``gh pr`` positional argument.
+
+    Accepts a bare number, ``#123``, or a GitHub pull-request URL; returns
+    ``None`` for anything else (e.g. a branch name, which the caller treats as
+    a ``--branch`` target instead).
+    """
+    candidate = token.lstrip("#")
+    if candidate.isdigit():
+        return candidate
+    if "/pull/" in token:
+        tail = token.split("/pull/", 1)[1].split("/", 1)[0].split("?", 1)[0]
+        if tail.isdigit():
+            return tail
+    return None
+
+
+def parse_gh_pr_arm_target(command: str):
+    """Parse a single command segment for a PR-arming ``gh pr`` invocation.
+
+    Returns ``None`` when the segment is not a ``gh pr create|ready|new``. When
+    it is, returns ``(pr_number, branch)`` where exactly one (or neither) is
+    set: an explicit ``gh pr ready 123`` / pull URL yields a pr number, a
+    ``--head <branch>`` (create) or a non-numeric ``ready <branch>`` positional
+    yields a branch, and a plain ``gh pr create``/``ready`` yields ``(None,
+    None)`` so arm resolves the current branch.
+    """
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None
 
     index = _skip_command_prefixes(tokens)
     if index >= len(tokens):
-        return False
+        return None
     token = tokens[index]
     if token != "gh" and not token.endswith("/gh"):
-        return False
+        return None
     index += 1
 
     value_flags = {"-R", "--repo"}
@@ -117,18 +228,50 @@ def is_gh_pr_open(command: str) -> bool:
         index += 2 if tokens[index] in value_flags else 1
 
     if index >= len(tokens) or tokens[index] != "pr":
-        return False
+        return None
     index += 1
+
+    subcommand = None
+    head_branch = None
+    positional = None
     while index < len(tokens):
         token = tokens[index]
+        if subcommand is None and not token.startswith("-"):
+            subcommand = token
+            index += 1
+            continue
+        if token in {"-H", "--head"} and index + 1 < len(tokens):
+            head_branch = tokens[index + 1]
+            index += 2
+            continue
+        if token.startswith("--head="):
+            head_branch = token[len("--head=") :]
+            index += 1
+            continue
         if token in value_flags:
             index += 2
             continue
         if token.startswith("-"):
             index += 1
             continue
-        return token in {"create", "ready", "new"}
-    return False
+        if subcommand is not None and positional is None:
+            positional = token
+        index += 1
+
+    if subcommand not in {"create", "ready", "new"}:
+        return None
+
+    if positional is not None:
+        pr_number = _pr_number_from_token(positional)
+        if pr_number is not None:
+            return (pr_number, None)
+        # A non-numeric positional (e.g. `gh pr ready my-branch`) names a branch.
+        return (None, head_branch or positional)
+    return (None, head_branch)
+
+
+def is_gh_pr_open(command: str) -> bool:
+    return parse_gh_pr_arm_target(command) is not None
 
 
 def is_git_push(command: str) -> bool:
@@ -223,18 +366,18 @@ def effective_git_cwd(command: str, base_cwd: str) -> str:
     return cwd
 
 
-def _arm(cwd: str, session_id: str) -> None:
-    result = maintenance_check.main(
-        [
-            "arm",
-            "--cwd",
-            cwd,
-            "--session-id",
-            session_id,
-            "--pid",
-            str(os.getppid()),
-        ]
-    )
+def _arm(cwd: str, session_id: str, *, pr: str | None = None, branch: str | None = None) -> None:
+    # Deliberately omit --pid: when this hook runs through a repo-local shell
+    # shim, os.getppid() is the short-lived shell that exits the instant the
+    # hook returns, so a marker stamped with it looks dead immediately and a
+    # sibling/detached loop can adopt the same PR. Letting `arm` resolve the pid
+    # walks the ancestry to the durable claude/codex session instead.
+    argv = ["arm", "--cwd", cwd, "--session-id", session_id]
+    if pr is not None:
+        argv += ["--pr", str(pr)]
+    elif branch is not None:
+        argv += ["--branch", branch]
+    result = maintenance_check.main(argv)
     if result != 0:
         print(f"run_arm_pr_watch.py: arm returned {result}; continuing", file=sys.stderr)
 
@@ -246,27 +389,46 @@ def main() -> int:
     if not session_id:
         return 0
 
-    cwd = normalized_cwd(payload)
     if phase == "SessionStart":
         if pr_watch_autoloop_enabled():
-            _arm(cwd, session_id)
+            _arm(normalized_cwd(payload), session_id)
         return 0
 
     if phase != "PostToolUse":
         return 0
 
+    # Normalize first so a Codex exec_command's own workdir wins over the
+    # top-level/hook-process cwd when choosing where to arm.
     normalized = normalized_payload(payload)
     if normalized.get("tool_name") != "Bash":
         return 0
+    base_cwd = normalized_cwd(normalized)
     tool_input = normalized.get("tool_input") if isinstance(normalized.get("tool_input"), dict) else {}
     command = tool_input.get("command", "")
     if not isinstance(command, str):
         return 0
 
-    if is_gh_pr_open(command):
-        _arm(cwd, session_id)
-    elif is_git_push(command) and pr_watch_autoloop_enabled():
-        _arm(effective_git_cwd(command, cwd), session_id)
+    # Walk each top-level segment so a `gh pr ...` after a separator (e.g.
+    # `git push && gh pr create`) is still detected, and a preceding `cd`
+    # relocates the effective arm cwd.
+    autoloop = pr_watch_autoloop_enabled()
+    eff_cwd = base_cwd
+    for segment in split_command_segments(command):
+        destination = cd_target(segment)
+        if destination is not None:
+            eff_cwd = (
+                destination
+                if os.path.isabs(destination)
+                else str((Path(eff_cwd) / destination).resolve())
+            )
+            continue
+        target = parse_gh_pr_arm_target(segment)
+        if target is not None:
+            pr_number, branch = target
+            _arm(eff_cwd, session_id, pr=pr_number, branch=branch)
+            continue
+        if autoloop and is_git_push(segment):
+            _arm(effective_git_cwd(segment, eff_cwd), session_id)
     return 0
 
 

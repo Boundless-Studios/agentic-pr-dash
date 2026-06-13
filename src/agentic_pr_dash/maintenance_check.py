@@ -663,7 +663,7 @@ def _cmd_arm(args: argparse.Namespace) -> int:
 
     pr_number = args.pr
     if pr_number is None:
-        branch = _current_branch(cwd)
+        branch = getattr(args, "branch", None) or _current_branch(cwd)
         if not branch:
             print("could not resolve branch; nothing to arm")
             return 0
@@ -2336,6 +2336,14 @@ def main(argv: list[str] | None = None) -> int:
         metavar="N",
         help="PR number to arm. When omitted, resolves the worktree branch's open "
         "@me PR via gh and refuses to arm a draft or a branch with no open PR.",
+    )
+    arm_p.add_argument(
+        "--branch",
+        default=None,
+        metavar="BRANCH",
+        help="Head branch whose open PR to arm (e.g. `gh pr create --head <branch>` "
+        "from a sibling worktree). Ignored when --pr is given; when both are "
+        "omitted the worktree's current branch is resolved.",
     )
 
     # --- stop-gate ---
