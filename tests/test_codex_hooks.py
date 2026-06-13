@@ -60,6 +60,25 @@ def test_session_start_writes_self_id_and_arms_only_when_opted_in(monkeypatch, t
     ]
 
 
+def test_session_start_writes_self_id_even_without_optin(monkeypatch, tmp_path):
+    # BOU-1442: the owning-session self-id is stamped at SessionStart regardless
+    # of the pr-watch opt-in (it's "who launched here", no PR side effects) so
+    # both Claude and Codex arming route through this one hook.
+    from agentic_pr_dash.config import load as load_config
+
+    payload = {
+        "cwd": str(tmp_path),
+        "hook_event_name": "SessionStart",
+        "session_id": "sess-self",
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["SessionStart"])
+
+    assert calls == []  # not opted in → no arm
+    marker = load_config(str(tmp_path)).session_marker_for(str(tmp_path))
+    assert marker.read_text(encoding="utf-8").strip() == "sess-self"
+
+
 def test_payload_session_id_beats_codex_and_legacy_env(monkeypatch, tmp_path):
     payload = {"cwd": str(tmp_path), "session_id": "payload-session"}
 
