@@ -183,32 +183,32 @@ def cd_target(command: str) -> str | None:
     return None
 
 
-def _pr_number_from_token(token: str) -> str | None:
-    """Extract an explicit PR number from a ``gh pr`` positional argument.
+def _names_explicit_repo(tokens: list[str]) -> bool:
+    """True if a ``-R``/``--repo`` flag targets another repository.
 
-    Accepts a bare number, ``#123``, or a GitHub pull-request URL; returns
-    ``None`` for anything else (e.g. a branch name, which the caller treats as
-    a ``--branch`` target instead).
+    ``gh pr ready``/``create`` inherit ``-R/--repo`` to act on a different repo
+    (https://cli.github.com/manual/gh_pr_ready). We can only arm a PR in the
+    current worktree's repo, so an explicit repo means "not ours" — skip rather
+    than mis-mark the local cwd.
     """
-    candidate = token.lstrip("#")
-    if candidate.isdigit():
-        return candidate
-    if "/pull/" in token:
-        tail = token.split("/pull/", 1)[1].split("/", 1)[0].split("?", 1)[0]
-        if tail.isdigit():
-            return tail
-    return None
+    for tok in tokens:
+        if tok in {"-R", "--repo"} or tok.startswith("--repo="):
+            return True
+        if tok.startswith("-R") and len(tok) > 2:
+            return True
+    return False
 
 
 def parse_gh_pr_arm_target(command: str):
     """Parse a single command segment for a PR-arming ``gh pr`` invocation.
 
-    Returns ``None`` when the segment is not a ``gh pr create|ready|new``. When
-    it is, returns ``(pr_number, branch)`` where exactly one (or neither) is
-    set: an explicit ``gh pr ready 123`` / pull URL yields a pr number, a
-    ``--head <branch>`` (create) or a non-numeric ``ready <branch>`` positional
-    yields a branch, and a plain ``gh pr create``/``ready`` yields ``(None,
-    None)`` so arm resolves the current branch.
+    Returns ``None`` when the segment is not an armable ``gh pr create|ready|new``
+    in the current repo (including explicit ``-R/--repo`` or a pull URL, which
+    may name another repo we can't arm from here). Otherwise returns
+    ``(pr_number, branch)`` with at most one set: an explicit ``gh pr ready 123``
+    yields a pr number; a ``create --head <branch>`` or non-numeric
+    ``ready <branch>`` yields a branch; a plain ``create``/``ready`` yields
+    ``(None, None)`` so arm resolves the current branch.
     """
     try:
         tokens = shlex.split(command)
@@ -231,43 +231,52 @@ def parse_gh_pr_arm_target(command: str):
         return None
     index += 1
 
+    if _names_explicit_repo(tokens):
+        return None
+
+    rest = tokens[index:]
     subcommand = None
     head_branch = None
     positional = None
-    while index < len(tokens):
-        token = tokens[index]
-        if subcommand is None and not token.startswith("-"):
-            subcommand = token
-            index += 1
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        if subcommand is None and not tok.startswith("-"):
+            subcommand = tok
+            i += 1
             continue
-        if token in {"-H", "--head"} and index + 1 < len(tokens):
-            head_branch = tokens[index + 1]
-            index += 2
+        if tok in {"-H", "--head"} and i + 1 < len(rest):
+            head_branch = rest[i + 1]
+            i += 2
             continue
-        if token.startswith("--head="):
-            head_branch = token[len("--head=") :]
-            index += 1
+        if tok.startswith("--head="):
+            head_branch = tok[len("--head=") :]
+            i += 1
             continue
-        if token in value_flags:
-            index += 2
+        if tok.startswith("-"):
+            i += 1
             continue
-        if token.startswith("-"):
-            index += 1
-            continue
-        if subcommand is not None and positional is None:
-            positional = token
-        index += 1
+        if positional is None:
+            positional = tok
+        i += 1
 
-    if subcommand not in {"create", "ready", "new"}:
-        return None
+    if subcommand in {"create", "new"}:
+        # create/new take NO positional branch — only --head names one, so a
+        # positional here is an option value (e.g. `--title 'Fix'`), never a
+        # branch. Owner-prefix stripping for --head happens in `arm`.
+        return (None, head_branch) if head_branch else (None, None)
 
-    if positional is not None:
-        pr_number = _pr_number_from_token(positional)
-        if pr_number is not None:
-            return (pr_number, None)
-        # A non-numeric positional (e.g. `gh pr ready my-branch`) names a branch.
-        return (None, head_branch or positional)
-    return (None, head_branch)
+    if subcommand == "ready":
+        if positional is None:
+            return (None, None)  # arm the current branch
+        bare = positional.lstrip("#")
+        if bare.isdigit():
+            return (bare, None)  # explicit PR number in the current repo
+        if "/pull/" in positional:
+            return None  # a pull URL may point at another repo — skip
+        return (None, positional)  # a branch designator
+
+    return None
 
 
 def is_gh_pr_open(command: str) -> bool:
@@ -416,6 +425,9 @@ def main() -> int:
     for segment in split_command_segments(command):
         destination = cd_target(segment)
         if destination is not None:
+            # Expand ~ / ~user first: `cd ~/wt` runs gh from the home-relative
+            # worktree, not `<old cwd>/~/wt`.
+            destination = os.path.expanduser(destination)
             eff_cwd = (
                 destination
                 if os.path.isabs(destination)

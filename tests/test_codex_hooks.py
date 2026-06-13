@@ -160,7 +160,9 @@ def test_gh_pr_ready_with_number_passes_explicit_pr(monkeypatch, tmp_path):
     assert calls[0][calls[0].index("--pr") + 1] == "123"
 
 
-def test_gh_pr_ready_with_pull_url_passes_explicit_pr(monkeypatch, tmp_path):
+def test_gh_pr_ready_pull_url_skips_arming(monkeypatch, tmp_path):
+    # A pull URL may name another repository we can't arm from this cwd; skip
+    # rather than mis-mark the local repo (codex PR #21 review).
     payload = {
         "cwd": str(tmp_path),
         "session_id": "sess-A",
@@ -168,9 +170,55 @@ def test_gh_pr_ready_with_pull_url_passes_explicit_pr(monkeypatch, tmp_path):
         "tool_input": {"cmd": "gh pr ready https://github.com/o/r/pull/456"},
     }
 
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_gh_explicit_repo_skips_arming(monkeypatch, tmp_path):
+    # `-R other/repo` targets a different repository; arming in this cwd would
+    # mark the wrong PR, so skip.
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh -R other/repo pr ready 123"},
+    }
+
+    assert _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"]) == []
+
+
+def test_gh_pr_create_option_value_not_treated_as_branch(monkeypatch, tmp_path):
+    # `--title 'Fix flaky test'` is an option value, NOT a positional branch;
+    # create takes its branch only from --head. With neither --pr nor --branch,
+    # arm resolves the current branch (codex PR #21 P1).
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr create --title 'Fix flaky test' --body wip"},
+    }
+
     calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
 
-    assert calls[0][calls[0].index("--pr") + 1] == "456"
+    assert calls
+    assert "--branch" not in calls[0]
+    assert "--pr" not in calls[0]
+
+
+def test_cd_home_relative_target_is_expanded(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    worktree = home / "wt"
+    worktree.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    payload = {
+        "cwd": str(tmp_path),
+        "session_id": "sess-A",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "cd ~/wt && gh pr ready"},
+    }
+
+    calls = _run_arm_hook(monkeypatch, payload, argv=["PostToolUse"])
+
+    assert calls[0][calls[0].index("--cwd") + 1] == str(worktree)
 
 
 def test_gh_pr_create_head_passes_branch(monkeypatch, tmp_path):

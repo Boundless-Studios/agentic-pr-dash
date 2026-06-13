@@ -663,7 +663,22 @@ def _cmd_arm(args: argparse.Namespace) -> int:
 
     pr_number = args.pr
     if pr_number is None:
-        branch = getattr(args, "branch", None) or _current_branch(cwd)
+        explicit_branch = getattr(args, "branch", None)
+        if explicit_branch:
+            # `gh` accepts `<owner>:<branch>` for --head, but `gh pr list --head`
+            # rejects the owner qualifier — strip it before resolving.
+            explicit_branch = explicit_branch.split(":", 1)[-1]
+        current_branch = _current_branch(cwd)
+        if explicit_branch and explicit_branch != current_branch:
+            # The marker/ledger are written for THIS cwd, whose checked-out
+            # branch resolves the PR on later `check --cwd`. Arming a branch that
+            # isn't checked out here would mark the wrong worktree, so decline —
+            # the worktree that actually holds the branch will arm it.
+            print(
+                f"branch {explicit_branch} is not checked out in {cwd}; not arming"
+            )
+            return 0
+        branch = explicit_branch or current_branch
         if not branch:
             print("could not resolve branch; nothing to arm")
             return 0

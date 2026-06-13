@@ -14,7 +14,7 @@ def test_write_arm_marker_appends_ledger(tmp_path, monkeypatch):
     assert entries[0].worktree == str(wt)
 
 
-def test_cmd_arm_branch_resolves_explicit_head_not_current(tmp_path, monkeypatch):
+def test_cmd_arm_branch_matching_current_resolves(tmp_path, monkeypatch):
     import argparse
 
     wt = tmp_path / "wt"
@@ -27,16 +27,38 @@ def test_cmd_arm_branch_resolves_explicit_head_not_current(tmp_path, monkeypatch
         resolved_branches.append(branch)
         return (321, False)  # (pr_number, is_draft)
 
-    # If the branch arg were ignored we'd fall back to _current_branch; make that
-    # a sentinel that must never be the resolved branch.
-    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "current-branch")
+    # An explicit --branch is only armed when it is the cwd's checked-out branch
+    # (the marker is written for cwd). Owner prefix is stripped before resolving.
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature-head")
     monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", fake_resolve)
 
     args = argparse.Namespace(
-        cwd=str(wt), session_id="sess-Z", pid=99, pr=None, branch="feature-head"
+        cwd=str(wt), session_id="sess-Z", pid=99, pr=None, branch="monalisa:feature-head"
     )
     assert mc._cmd_arm(args) == 0
-    assert resolved_branches == ["feature-head"]
+    assert resolved_branches == ["feature-head"]  # owner prefix stripped
+
+
+def test_cmd_arm_branch_not_checked_out_here_skips(tmp_path, monkeypatch):
+    import argparse
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    resolved: list[str] = []
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "current-branch")
+    monkeypatch.setattr(
+        mc, "_resolve_open_pr_for_branch", lambda cwd, branch: resolved.append(branch)
+    )
+
+    args = argparse.Namespace(
+        cwd=str(wt), session_id="sess-Z", pid=99, pr=None, branch="other-branch"
+    )
+    # other-branch is not checked out in cwd → skip rather than mark the wrong
+    # worktree; the PR is never resolved.
+    assert mc._cmd_arm(args) == 0
+    assert resolved == []
 
 
 def test_ledger_append_failure_is_nonfatal(tmp_path, monkeypatch):
