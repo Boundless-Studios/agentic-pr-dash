@@ -981,6 +981,88 @@ def _marker_session_id(worktree_path: str) -> str | None:
     return None
 
 
+def _resolve_maintenance_roots(anchor_cwd: str) -> list[str]:
+    """``[anchor] + configured maintenance_repo_roots``, existing git repos only.
+
+    The anchor (the super-repo, e.g. gaia) supplies the root list via its own
+    ``agentic-pr-dash.toml`` (``maintenance_repo_roots``). Each returned root is
+    then discovered with its OWN ``git worktree list`` and — at the per-worktree
+    layer — resolves its OWN per-repo config, so state/markers never bleed across
+    repos (BOU-1546, extends the BOU-1540 ``config_cwd`` pattern).
+
+    Roots that don't exist or aren't git worktrees are skipped (a registered repo
+    that isn't checked out on this machine must not abort the others). Order is
+    anchor-first, then config order; duplicates are collapsed.
+    """
+    anchor = os.path.abspath(os.path.expanduser(anchor_cwd))
+    cfg = load_config(anchor)
+    out: list[str] = []
+    seen: set[str] = set()
+    for cand in (anchor, *getattr(cfg, "maintenance_repo_roots", ())):
+        ab = os.path.abspath(os.path.expanduser(str(cand)))
+        if ab in seen:
+            continue
+        try:
+            probe = subprocess.run(
+                ["git", "-C", ab, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode != 0:
+            continue
+        seen.add(ab)
+        out.append(ab)
+    return out
+
+
+def _maint_roots_for(anchor_cwd: str) -> list[str]:
+    """Roots to service from ``anchor_cwd``, with the anchor ALWAYS included.
+
+    ``_resolve_maintenance_roots`` existence-filters every candidate (so an
+    unregistered/uncloned sibling is skipped), but the anchor must be serviced
+    even when it isn't a git worktree — its own discovery handles that — so the
+    single-repo behavior is preserved when no roots are configured (BOU-1546).
+    """
+    cwd = os.path.abspath(os.path.expanduser(anchor_cwd))
+    resolved = _resolve_maintenance_roots(cwd)
+    return resolved if cwd in resolved else [cwd, *resolved]
+
+
+def _owned_worktrees_across_roots(session_id: str, anchor_cwd: str) -> list[str]:
+    """Owned worktrees across ``[anchor] + maintenance_repo_roots`` (deduped).
+
+    Shared by the stop-gate and the feedback waiter so a super-repo (gaia)
+    surfaces — and the spawned waiter actually polls — PRs it owns in sibling
+    repos, not just the anchor checkout (BOU-1546; codex PR #30 review P1)."""
+    owned: list[str] = []
+    seen: set[str] = set()
+    for root in _maint_roots_for(anchor_cwd):
+        for wt in _collect_stop_gate_worktrees(session_id, root):
+            if wt not in seen:
+                seen.add(wt)
+                owned.append(wt)
+    return owned
+
+
+def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dict]:
+    """Detached-ledger records across all roots, deduped by ``(root, pr)``.
+
+    Each repo's ledger is queried per root. PR numbers are unique only WITHIN a
+    repo, so dedupe on ``(root, pr)`` — a blocking ``#42`` in one repo must not
+    suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
+    records: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for root in _maint_roots_for(anchor_cwd):
+        for r in _detached_pr_records(session_id, root):
+            key = (root, r["pr"])
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(r)
+    return records
+
+
 def _cmd_list_owned(args: argparse.Namespace) -> int:
     """Print worktree paths this session owns — markered OR reconciled-and-adopted.
 
@@ -1001,32 +1083,52 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     Adoption only ever targets UNOWNED worktrees (the same condition `check` uses
     to decide it may service one), so the pid/heartbeat ownership gate still
     yields exactly one executor per PR — no cross-session double-servicing.
-    """
-    # Surface a REAL discovery failure (cwd is missing / not a git worktree) as a
-    # non-zero exit. Otherwise `_iter_worktrees_with_branch` swallows the git
-    # error and yields nothing, so an empty result here is indistinguishable from
-    # "owns nothing" — and the loop, which now treats rc-0-empty as authoritative,
-    # would service nothing for that repo instead of falling back to its root
-    # (PR #7 review, P2).
-    try:
-        probe = subprocess.run(
-            ["git", "-C", args.cwd, "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # A hung/unresponsive git invocation is itself a discovery failure — match
-        # the 10s bound `_iter_worktrees_with_branch` uses and signal failure
-        # rather than stalling the loop forever (PR #7 review, P2).
-        print(f"list-owned: worktree probe failed/timed out: {args.cwd}", file=sys.stderr)
-        return 3
-    if probe.returncode != 0:
-        print(f"list-owned: not a git worktree: {args.cwd}", file=sys.stderr)
-        return 3
 
-    paths = _collect_owned_worktrees(args.session_id, args.cwd, args.pid)
-    for path in paths:
-        print(path)
-    return 0
+    BOU-1546: when the anchor config registers ``maintenance_repo_roots``, this
+    aggregates owned worktrees across ``[anchor] + roots`` — each root discovered
+    with its own ``git worktree list`` — so a super-repo (gaia) surfaces PRs it
+    owns in sibling repos. The anchor's exit-code contract is preserved (rc 3 only
+    when the ANCHOR itself isn't a git worktree, so the loop's per-cwd fallback
+    still fires); a sibling-root discovery failure warns but does not abort.
+    """
+    anchor = os.path.abspath(os.path.expanduser(args.cwd))
+    seen: set[str] = set()
+    anchor_failed = False
+    # Always ATTEMPT the anchor (even if it's not a git worktree) so its failure
+    # yields rc 3 and the loop's per-cwd fallback fires; _resolve_maintenance_roots
+    # would otherwise silently drop a failing anchor.
+    resolved = _resolve_maintenance_roots(args.cwd)
+    roots = resolved if anchor in resolved else [anchor, *resolved]
+    for root in roots:
+        # Surface a REAL discovery failure (root is missing / not a git worktree).
+        # Otherwise `_iter_worktrees_with_branch` swallows the git error and yields
+        # nothing, so an empty result is indistinguishable from "owns nothing" —
+        # and the loop, which treats rc-0-empty as authoritative, would service
+        # nothing for that repo instead of falling back to its root (PR #7, P2).
+        try:
+            probe = subprocess.run(
+                ["git", "-C", root, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # A hung/unresponsive git invocation is itself a discovery failure —
+            # match the 10s bound `_iter_worktrees_with_branch` uses.
+            print(f"list-owned: worktree probe failed/timed out: {root}", file=sys.stderr)
+            if root == anchor:
+                anchor_failed = True
+            continue
+        if probe.returncode != 0:
+            print(f"list-owned: not a git worktree: {root}", file=sys.stderr)
+            if root == anchor:
+                anchor_failed = True
+            continue
+        for path in _collect_owned_worktrees(args.session_id, root, args.pid):
+            if path not in seen:
+                seen.add(path)
+                print(path)
+    # rc 3 only when the ANCHOR itself failed (the loop's per-cwd fallback relies
+    # on it); sibling-root failures are non-fatal and already warned above.
+    return 3 if anchor_failed else 0
 
 
 def _self_pid_chain(max_depth: int = 16) -> set[int]:
@@ -1701,8 +1803,13 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     # would let two sessions fix the same PR (codex P2). Fall back to cwd only
     # when ownership is genuinely unknown (no session identity at all).
     session_id = args.session_id or _read_session_marker(cwd)
+    # BOU-1546: a super-repo (gaia) aggregates across [anchor] + the configured
+    # maintenance_repo_roots, each root discovered with its own discovery, so PRs
+    # owned in sibling repos still block the stop. The anchor is ALWAYS included
+    # even if it's not a git worktree (its own discovery handles that), so the
+    # existing single-repo behavior is unchanged when no roots are configured.
     if session_id:
-        owned = _collect_stop_gate_worktrees(session_id, cwd)
+        owned = _owned_worktrees_across_roots(session_id, cwd)
     else:
         owned = [cwd]
 
@@ -1727,7 +1834,9 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     # work. They have no worktree to _check_worktree, so reconcile them from the
     # durable ledger and block on any detached blocker with live-path parity.
     if session_id:
-        detached = [r for r in _detached_pr_records(session_id, cwd)
+        # Detached records live in each repo's own ledger, so collect per root
+        # (BOU-1546) — a torn-down sibling PR must still surface. Dedupe by pr.
+        detached = [r for r in _detached_records_across_roots(session_id, cwd)
                     if _record_has_blockers(r)]
         detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
         for r in detached:
@@ -1747,8 +1856,10 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
             # Detached-ledger PRs (worktree torn down) are NOT serviced by the
             # loop — it only polls worktree dirs — so they ALWAYS need a waiter,
             # even when the loop is live (BOU-1632 codex P2 #3; codex PR #21).
+            # Span all roots so a sibling repo's detached PR still demands a
+            # waiter (codex PR #30 review, P2).
             detached_prs = set()
-            for _dr in _detached_pr_records(session_id, cwd):
+            for _dr in _detached_records_across_roots(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
                     detached_prs.add(_dr["pr"])
             open_prs = worktree_prs | detached_prs
@@ -2271,7 +2382,10 @@ def _cmd_await(args: argparse.Namespace) -> int:
             if not _pid_alive(str(owner_pid)):
                 return 0
 
-            owned = _collect_stop_gate_worktrees(session_id, cwd) if session_id else [cwd]
+            # Span [anchor] + maintenance_repo_roots so a waiter spawned with
+            # --cwd <super-repo> actually polls sibling-repo PRs it was demanded
+            # to cover (codex PR #30 review, P1; parity with the stop-gate).
+            owned = _owned_worktrees_across_roots(session_id, cwd) if session_id else [cwd]
 
             pending: list[tuple[str, str]] = []
             for worktree in owned:
@@ -2290,7 +2404,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
             # Include detached-ledger PRs (parity with stop-gate).
             _detached_this_tick: list[dict] = []
             if session_id:
-                _detached_this_tick = _detached_pr_records(session_id, cwd)
+                _detached_this_tick = _detached_records_across_roots(session_id, cwd)
                 for r in _detached_this_tick:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))

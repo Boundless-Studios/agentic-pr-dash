@@ -128,6 +128,16 @@ class Config:
     multi-repo/multi-session machines safe — a foreign-scoped loop never
     suppresses another session's waiter (codex PR #21 review)."""
 
+    maintenance_repo_roots: tuple[str, ...] = ()
+    """Additional repo MAIN-CHECKOUT paths this (super-)repo services PR
+    maintenance for, beyond its own checkout (BOU-1546). The stop-gate /
+    list-owned expand ``[anchor] + maintenance_repo_roots`` and run per-root
+    ``git worktree list`` discovery; each worktree still resolves its OWN
+    per-repo config, so state/markers never bleed across repos. Set in the
+    super-repo's ``agentic-pr-dash.toml`` (``maintenance_repo_roots = [...]``)
+    or via ``AGENTIC_PR_DASH_MAINTENANCE_REPO_ROOTS`` (comma/``os.pathsep``
+    separated). Paths are ``~``-expanded and absolutized at load."""
+
     extra: dict = field(default_factory=dict)
     """Anything else from the ``[project]`` table, for adapters to read."""
 
@@ -259,6 +269,31 @@ def load(cwd: str | None = None) -> Config:
         machine_wide_raw = proj.get("maintenance_loop_machine_wide")
     machine_wide = str(machine_wide_raw).strip().lower() in {"1", "true", "yes", "on"}
 
+    roots_raw = _env("MAINTENANCE_REPO_ROOTS")
+    if roots_raw is None:
+        roots_raw = proj.get("maintenance_repo_roots") or []
+    if isinstance(roots_raw, str):
+        # env form: comma- or os.pathsep-separated
+        roots_raw = roots_raw.replace(os.pathsep, ",").split(",")
+    seen_roots: set[str] = set()
+    maintenance_repo_roots: list[str] = []
+    for entry in roots_raw:
+        text = str(entry).strip()
+        if not text:
+            continue
+        expanded = os.path.expanduser(text)
+        # Resolve a RELATIVE root (e.g. "../agentic-pr-dash") against the config
+        # file's directory (``root``), NOT the process cwd — the stop hook / loop
+        # may run from anywhere while pointing ``--cwd`` at the super-repo, so a
+        # cwd-relative absolutize would land on the wrong path and get skipped
+        # (codex PR #30 review, P2).
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(root), expanded)
+        ab = os.path.abspath(expanded)
+        if ab not in seen_roots:
+            seen_roots.add(ab)
+            maintenance_repo_roots.append(ab)
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
@@ -267,6 +302,7 @@ def load(cwd: str | None = None) -> Config:
         await_command=await_command,
         maintenance_loop_pidfile=loop_pidfile,
         maintenance_loop_machine_wide=machine_wide,
+        maintenance_repo_roots=tuple(maintenance_repo_roots),
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,
