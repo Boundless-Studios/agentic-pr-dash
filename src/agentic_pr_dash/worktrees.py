@@ -1,4 +1,10 @@
-"""Worktree discovery — finds all git worktrees and their metadata."""
+"""Git worktree discovery and branch-to-worktree mapping.
+
+The dashboard needs to connect a GitHub PR branch to a local checkout before it
+can attribute agents, open terminals, or display ports. This module owns the
+``git worktree list`` parsing plus light ``.env`` metadata extraction. It does
+not start, stop, or clean worktrees; tools such as worktree-deck own that.
+"""
 
 from __future__ import annotations
 

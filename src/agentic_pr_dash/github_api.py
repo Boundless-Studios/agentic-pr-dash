@@ -1,7 +1,14 @@
-"""GitHub API helpers using gh CLI.
+"""GitHub state collection for PR maintenance and dashboard rendering.
 
-Extracted and improved from .claude/hooks/post-push-ci-watch.py.
-Key improvement: comment filtering by commit date to skip already-addressed comments.
+This module is the boundary around GitHub. It shells out to ``gh`` / ``git`` and
+uses GitHub REST or GraphQL where needed, then converts raw responses into
+package models such as ``CICheck`` and ``ReviewComment``. Higher layers should
+ask this module for PR state instead of parsing GitHub output themselves.
+
+Responsibilities include PR lookup, mergeability, CI checks, review threads,
+failed-log snippets, changed files, and self-hosted runner health. Comment
+filtering is commit-aware so already-addressed review feedback does not keep
+reappearing as live work.
 """
 
 from __future__ import annotations
