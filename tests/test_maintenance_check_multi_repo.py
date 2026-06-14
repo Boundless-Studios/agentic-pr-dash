@@ -124,7 +124,7 @@ def test_stop_gate_blocks_when_sibling_has_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mc, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [os.path.abspath(cwd)])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
 
     args = argparse.Namespace(cwd=str(anchor), session_id="sess-1",
                               pid=os.getpid(), no_waiter=True)
@@ -141,7 +141,7 @@ def test_stop_gate_clean_across_roots_exits_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mc, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [os.path.abspath(cwd)])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     # No open PRs → no waiter demand.
     monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: set())
 
@@ -171,7 +171,7 @@ def test_detached_records_dedup_by_root_and_number(tmp_path, monkeypatch):
     rec_a = {"pr": 42, "p1": True, "unresolved_threads": 1, "state": "open", "url": "u-a"}
     rec_b = {"pr": 42, "p1": False, "unresolved_threads": 2, "state": "open", "url": "u-b"}
 
-    def fake_detached(sid, cwd, include_legacy=True):
+    def fake_detached(sid, cwd, include_legacy=True, prune_legacy=True):
         if _rp(cwd) == _rp(sib):
             return [rec_b]
         if _rp(cwd) == _rp(anchor):
@@ -223,11 +223,27 @@ def test_detached_across_roots_processes_legacy_only_at_anchor(tmp_path, monkeyp
     anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
     calls = {}
 
-    def fake_detached(sid, cwd, include_legacy=True):
-        calls[_rp(cwd)] = include_legacy
+    def fake_detached(sid, cwd, include_legacy=True, prune_legacy=True):
+        calls[_rp(cwd)] = (include_legacy, prune_legacy)
         return []
 
     monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
     mc._detached_records_across_roots("sess", str(anchor))
-    assert calls[_rp(anchor)] is True       # anchor handles legacy
-    assert calls[_rp(sib)] is False         # sibling is strict
+    # Anchor reads legacy but NEVER prunes it (codex PR #32 P2); sibling is strict.
+    assert calls[_rp(anchor)] == (True, False)
+    assert calls[_rp(sib)][0] is False
+
+
+def test_ledger_strict_read_empty_repo_excludes_legacy(tmp_path, monkeypatch):
+    # codex PR #32 P2: a strict read/prune with an EMPTY repo (undetectable remote)
+    # must still exclude legacy rows (their repo is also "").
+    from agentic_pr_dash import session_ledger as sl
+    monkeypatch.setattr(sl, "ledger_path", lambda sid: str(tmp_path / f"{sid}.jsonl"))
+    sl.append("sess", 7, "legacy", "/wt/legacy", repo="")  # legacy, no repo
+
+    assert sl.read("sess", repo="", include_legacy=False) == []      # strict: no legacy
+    assert any(not e.repo for e in sl.read("sess", repo="", include_legacy=True))  # loose: legacy
+
+    # Strict prune with empty repo must NOT drop the legacy row.
+    sl.prune("sess", {7}, repo="", include_legacy=False)
+    assert any((not e.repo) and e.pr == 7 for e in sl.read("sess"))

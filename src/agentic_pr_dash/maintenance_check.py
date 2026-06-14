@@ -1054,10 +1054,15 @@ def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dic
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
     for i, root in enumerate(_maint_roots_for(anchor_cwd)):
-        # Process legacy repo-less ledger entries against the ANCHOR only (i == 0);
-        # replaying/pruning them per sibling lets a same-number PR drop the legacy
-        # entry before its real repo is checked (codex PR #30 review, P2).
-        for r in _detached_pr_records(session_id, root, include_legacy=(i == 0)):
+        # Legacy repo-less entries are read against the ANCHOR only (i == 0) so they
+        # surface once, not per sibling (codex PR #30, P2) — and are NEVER pruned in
+        # this cross-root pass (prune_legacy=False), since a repo-less entry's true
+        # repo is unknown and a same-number closed PR on the anchor remote must not
+        # drop a still-open sibling PR (codex PR #32, P2).
+        recs = (_detached_pr_records(session_id, root, include_legacy=True, prune_legacy=False)
+                if i == 0
+                else _detached_pr_records(session_id, root, include_legacy=False))
+        for r in recs:
             key = (root, r["pr"])
             if key in seen:
                 continue
@@ -2112,15 +2117,21 @@ def _worktree_is_for_entry(path: str, entry) -> bool:
 
 
 def _detached_pr_records(session_id: str, cwd: str,
-                         include_legacy: bool = True) -> list[dict]:
+                         include_legacy: bool = True,
+                         prune_legacy: bool = True) -> list[dict]:
     """Records for this session's ledger PRs whose worktree is GONE, with live
     GitHub state. Does NO worktree adoption, so it is safe for the Stop hook
     (which must never adopt unmarked worktrees). Prunes merged/closed PRs.
 
-    ``include_legacy=False`` skips (and never prunes) the repo-less legacy ledger
-    entries — set when iterating multiple roots so legacy entries are processed
-    against exactly one repo (the anchor), not replayed/pruned per sibling (codex
-    PR #30 review, P2).
+    ``include_legacy=False`` skips the repo-less legacy ledger entries entirely —
+    set when iterating multiple roots so legacy entries are read against exactly
+    one repo (the anchor), not replayed per sibling (codex PR #30 review, P2).
+
+    ``prune_legacy=False`` reads legacy entries (for surfacing) but NEVER prunes
+    them. A repo-less entry's true repo is unknown, so a same-number merged/closed
+    PR on the queried (anchor) remote must not delete it — a torn-down sibling PR
+    would silently stop being monitored. Used for the anchor pass in cross-root
+    mode (codex PR #32, P2).
     """
     from . import session_ledger, github_api  # noqa: PLC0415
 
@@ -2172,7 +2183,7 @@ def _detached_pr_records(session_id: str, cwd: str,
         })
     if prune:
         session_ledger.prune(session_id, prune, repo=target_repo,
-                             include_legacy=include_legacy)
+                             include_legacy=(include_legacy and prune_legacy))
     return records
 
 

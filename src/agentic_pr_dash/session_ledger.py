@@ -113,10 +113,14 @@ def read(session_id: str, repo: str | None = None,
         return []
     entries = list(out.values())
     if repo is not None:
+        # A row is "legacy" iff it has NO recorded repo. In strict mode
+        # (include_legacy=False) legacy rows are excluded REGARDLESS of `repo` —
+        # otherwise a strict read with an empty `repo` (undetectable remote) would
+        # still match legacy rows via ``e.repo == repo == ""`` (codex PR #32, P2).
         if include_legacy:
             entries = [e for e in entries if e.repo == repo or not e.repo]
         else:
-            entries = [e for e in entries if e.repo == repo]
+            entries = [e for e in entries if e.repo and e.repo == repo]
     return entries
 
 
@@ -173,7 +177,15 @@ def prune(session_id: str, drop_prs: set[int], repo: str | None = None,
     with _flock(ledger_path(session_id) + ".lock"):
         entries = []
         for e in read(session_id):
-            eligible = repo is None or e.repo == repo or (include_legacy and not e.repo)
+            # A legacy (repo-less) row is eligible ONLY via include_legacy, never
+            # via ``e.repo == repo`` — else a strict prune with an empty `repo`
+            # would still drop legacy rows (codex PR #32, P2).
+            if repo is None:
+                eligible = True
+            elif not e.repo:
+                eligible = include_legacy
+            else:
+                eligible = e.repo == repo
             if eligible and e.pr in drop:
                 continue
             entries.append(e)
