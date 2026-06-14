@@ -67,7 +67,7 @@ def test_await_exits_10_with_prompt_when_work_found(tmp_path, monkeypatch, capsy
         mc, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [str(tmp_path / "worktree")]
     )
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
 
     wt = tmp_path / "worktree"
     wt.mkdir()
@@ -97,7 +97,7 @@ def test_await_exits_0_when_no_owned_open_prs(tmp_path, monkeypatch, capsys):
     """When there are no owned worktrees and no detached PR records, exits 0."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
 
     rc = mc.main([
         "await",
@@ -148,7 +148,7 @@ def test_await_stale_pidfile_not_exit_3(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(mc, "_pid_alive", _fake_pid_alive)
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
 
     rc = mc.main([
         "await",
@@ -165,7 +165,7 @@ def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
     """When --max-wait 0 and nothing pending, exits 0."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(tmp_path)])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
 
     def _clean_check(path, session_id, *, claim=True):
         return 0, "nothing pending"
@@ -203,7 +203,7 @@ def test_await_stamps_heartbeat_each_tick(tmp_path, monkeypatch):
         mc, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [str(wt)]
     )
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
     monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "clean"))
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", _fake_heartbeat)
 
@@ -235,7 +235,7 @@ def test_await_pidfile_written_and_removed(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", _collect_and_check_pidfile)
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True: [])
 
     rc = mc.main([
         "await",

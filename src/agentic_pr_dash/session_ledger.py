@@ -72,7 +72,8 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def read(session_id: str, repo: str | None = None) -> list[LedgerEntry]:
+def read(session_id: str, repo: str | None = None,
+         include_legacy: bool = True) -> list[LedgerEntry]:
     """Entries for a session, deduplicated by ``(repo, pr)`` (last line wins).
 
     When ``repo`` is given, restrict the result to that repo PLUS any legacy
@@ -80,7 +81,12 @@ def read(session_id: str, repo: str | None = None) -> list[LedgerEntry]:
     therefore unknown — dropping them would silently stop monitoring them). The
     ``(repo, pr)`` dedup key means the SAME PR number in two repos no longer
     overwrites the other (PR #16 review round 2, P1).
-    """
+
+    ``include_legacy=False`` excludes the repo-less legacy entries — used when
+    iterating MULTIPLE roots so a legacy entry is processed against exactly one
+    repo (the anchor) instead of being replayed against every sibling, which
+    would let a same-number PR in one repo prune the legacy entry before the
+    real repo is checked (codex PR #30 review, P2)."""
     path = ledger_path(session_id)
     out: dict[tuple[str, int], LedgerEntry] = {}
     try:
@@ -107,7 +113,10 @@ def read(session_id: str, repo: str | None = None) -> list[LedgerEntry]:
         return []
     entries = list(out.values())
     if repo is not None:
-        entries = [e for e in entries if e.repo == repo or not e.repo]
+        if include_legacy:
+            entries = [e for e in entries if e.repo == repo or not e.repo]
+        else:
+            entries = [e for e in entries if e.repo == repo]
     return entries
 
 
@@ -150,16 +159,21 @@ def append(session_id: str, pr: int, branch: str, worktree: str,
         _write_all(session_id, entries)
 
 
-def prune(session_id: str, drop_prs: set[int], repo: str | None = None) -> None:
+def prune(session_id: str, drop_prs: set[int], repo: str | None = None,
+          include_legacy: bool = True) -> None:
     """Drop ledger entries by PR number. When ``repo`` is given, only entries for
     that repo (plus legacy repo-less entries) are eligible — so pruning a
     merged/closed PR in repoA never drops a same-number PR in repoB (PR #16
-    review round 2, P1)."""
+    review round 2, P1).
+
+    ``include_legacy=False`` makes legacy repo-less entries INeligible for this
+    prune — used on non-anchor roots so a sibling's same-number closed PR can't
+    drop a legacy entry that belongs to another repo (codex PR #30 review, P2)."""
     drop = {int(p) for p in drop_prs}
     with _flock(ledger_path(session_id) + ".lock"):
         entries = []
         for e in read(session_id):
-            eligible = repo is None or e.repo == repo or not e.repo
+            eligible = repo is None or e.repo == repo or (include_legacy and not e.repo)
             if eligible and e.pr in drop:
                 continue
             entries.append(e)
