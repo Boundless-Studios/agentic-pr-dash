@@ -1756,13 +1756,17 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     # would let two sessions fix the same PR (codex P2). Fall back to cwd only
     # when ownership is genuinely unknown (no session identity at all).
     session_id = args.session_id or _read_session_marker(cwd)
+    # BOU-1546: a super-repo (gaia) aggregates across [anchor] + the configured
+    # maintenance_repo_roots, each root discovered with its own discovery, so PRs
+    # owned in sibling repos still block the stop. The anchor is ALWAYS included
+    # even if it's not a git worktree (its own discovery handles that), so the
+    # existing single-repo behavior is unchanged when no roots are configured.
+    _resolved_roots = _resolve_maintenance_roots(cwd)
+    maint_roots = _resolved_roots if cwd in _resolved_roots else [cwd, *_resolved_roots]
     if session_id:
-        # BOU-1546: a super-repo (gaia) aggregates owned worktrees across
-        # [anchor] + maintenance_repo_roots, each root discovered with its own
-        # `git worktree list`, so PRs owned in sibling repos still block the stop.
         owned = []
         seen_owned: set[str] = set()
-        for root in _resolve_maintenance_roots(cwd):
+        for root in maint_roots:
             for wt in _collect_stop_gate_worktrees(session_id, root):
                 if wt not in seen_owned:
                     seen_owned.add(wt)
@@ -1795,7 +1799,7 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
         # (BOU-1546) — a torn-down sibling PR must still surface. Dedupe by pr.
         detached = []
         seen_detached: set = set()
-        for root in _resolve_maintenance_roots(cwd):
+        for root in maint_roots:
             for r in _detached_pr_records(session_id, root):
                 if r["pr"] in seen_detached or not _record_has_blockers(r):
                     continue
