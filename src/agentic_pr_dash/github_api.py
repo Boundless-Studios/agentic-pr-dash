@@ -523,6 +523,36 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     return checks
 
 
+def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
+    """Snapshot GitHub check-runs for a specific commit ``sha``.
+
+    A push targets a specific commit, so the post-push CI watcher keys off the
+    pushed SHA rather than the PR's current head (which can race ahead). Returns
+    a deduped list of ``{name, status, conclusion}`` dicts — the stable contract
+    the post-push results file and stop-gate consume.
+    """
+    r = _run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs",
+         "--jq", ".check_runs[] | {name, status, conclusion}"],
+        cwd=cwd, timeout_s=20,
+    )
+    if r.returncode != 0:
+        return []
+    checks: list[dict] = []
+    for line in r.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            checks.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    by_name: dict[str, dict] = {}
+    for c in checks:
+        if c.get("name"):
+            by_name[c["name"]] = c
+    return list(by_name.values()) if by_name else checks
+
+
 def get_workflow_queue_health(
     pr_number: int,
     cwd: str | None = None,
