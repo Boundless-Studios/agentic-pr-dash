@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentic-pr-dash"
-version = "0.2.2"
+version = "0.2.3"
 description = "Watch your open PRs, detect what's blocking each (CI, review comments, conflicts), and let an agent resolve them — with a one-agent-per-PR ownership lease."
 readme = "README.md"
 requires-python = ">=3.11"
