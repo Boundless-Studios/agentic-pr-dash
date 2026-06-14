@@ -1,4 +1,11 @@
-"""Durable session runtime event registry for Gaia agent/worktree sessions."""
+"""Durable runtime session event registry for agent/worktree activity.
+
+Agent launchers can emit ``started``, ``exited``, and activity events into this
+JSONL registry. The dashboard reads the registry to answer "is an agent already
+working in this worktree?" without guessing from PR state alone. The default
+paths preserve Gaia compatibility, but the registry is configured through
+``agentic-pr-dash`` settings and is not Gaia-specific.
+"""
 
 from __future__ import annotations
 
