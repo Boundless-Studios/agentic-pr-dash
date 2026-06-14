@@ -38,10 +38,14 @@ RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "agentic-pr-dash" / "runner-summ
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/(\d+)(?:[/?#]|$)")
 
 _REVIEW_THREADS_QUERY = """
-query($owner: String!, $repo: String!, $pr: Int!) {
+query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -132,6 +136,63 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     except json.JSONDecodeError:
         return None
     return prs if isinstance(prs, list) else None
+
+
+_PR_HEAD_FIELDS = (
+    "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
+    "headRefOid,headRefName,baseRefName"
+)
+
+
+def find_pr_by_head(
+    branch: str,
+    state: str = "open",
+    cwd: str | None = None,
+    *,
+    head_oid: str | None = None,
+) -> dict | None:
+    """Find a PR by its head branch name, returning the full PR payload.
+
+    Unlike :func:`list_open_prs` (author-scoped, no body), this resolves the PR
+    for a specific *head branch* and returns the fields a Stop/QA gate needs to
+    evaluate gate policy: ``number, title, body, url, isDraft, mergeStateStatus,
+    reviewDecision, headRefOid, headRefName, baseRefName``.
+
+    ``state`` is one of ``"open"``, ``"merged"``, ``"closed"``, ``"all"``. When
+    ``head_oid`` is given, only a PR whose ``headRefOid`` matches it is returned
+    — the caller uses this to confirm that a merged PR corresponds to the
+    *current* local HEAD (squash-merged branches can stay ahead of the default
+    branch, and a reused branch name must still go through the normal gates).
+
+    Returns ``None`` on any ``gh`` failure (so the caller fails open) or when no
+    matching PR exists.
+    """
+    if not branch:
+        return None
+    limit = "1" if state == "open" else "20"
+    cmd = [
+        "gh", "pr", "list",
+        "--head", branch,
+        "--state", state,
+        "--limit", limit,
+        "--json", _PR_HEAD_FIELDS,
+    ]
+    r = _run(cmd, cwd=cwd, timeout_s=30)
+    if r.returncode != 0:
+        return None
+    try:
+        payload = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for pr in payload:
+        if not isinstance(pr, dict):
+            continue
+        if head_oid is not None and pr.get("headRefOid") != head_oid:
+            continue
+        return pr
+    return None
 
 
 def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
@@ -358,57 +419,75 @@ def get_new_pr_commits(
 
 
 def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThread]:
-    """Return all review threads for a PR via GraphQL."""
+    """Return all review threads for a PR via GraphQL.
+
+    Paginates over ``reviewThreads`` (100 per page) so PRs with more than 100
+    threads are not silently truncated — a hot review can easily exceed the
+    first page, and a truncated thread list would let resolved-elsewhere or
+    still-open threads slip past the caller's resolved/outdated filtering.
+    """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
         return []
-    r = _run(
-        [
+
+    threads: list[ReviewThread] = []
+    cursor: str | None = None
+    while True:
+        cmd = [
             "gh", "api", "graphql",
             "-f", f"query={_REVIEW_THREADS_QUERY}",
             "-F", f"owner={owner}",
             "-F", f"repo={repo}",
             "-F", f"pr={pr_number}",
-        ],
-        cwd=cwd,
-        timeout_s=30,
-    )
-    if r.returncode != 0:
-        return []
-    try:
-        data = json.loads(r.stdout)
-        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return []
-
-    threads: list[ReviewThread] = []
-    for node in nodes:
+        ]
+        if cursor:
+            cmd.extend(["-F", f"cursor={cursor}"])
+        r = _run(cmd, cwd=cwd, timeout_s=30)
+        if r.returncode != 0:
+            break
         try:
-            comment_nodes = node["comments"]["nodes"]
-            if not comment_nodes:
+            data = json.loads(r.stdout)
+            review_threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            nodes = review_threads["nodes"]
+            page_info = review_threads.get("pageInfo") or {}
+        except (json.JSONDecodeError, KeyError, TypeError):
+            break
+
+        for node in nodes:
+            try:
+                comment_nodes = node["comments"]["nodes"]
+                if not comment_nodes:
+                    continue
+
+                def _parse_comment(c: dict) -> ReviewThreadComment:
+                    return ReviewThreadComment(
+                        database_id=int(c.get("databaseId") or 0),
+                        path=c.get("path"),
+                        line=c.get("line"),
+                        body=str(c.get("body") or ""),
+                        author=str((c.get("author") or {}).get("login") or "unknown"),
+                        created_at=str(c.get("createdAt") or ""),
+                    )
+
+                top = _parse_comment(comment_nodes[0])
+                replies = [_parse_comment(c) for c in comment_nodes[1:]]
+                threads.append(ReviewThread(
+                    node_id=str(node["id"]),
+                    is_resolved=bool(node.get("isResolved")),
+                    is_outdated=bool(node.get("isOutdated")),
+                    top=top,
+                    replies=replies,
+                ))
+            except (KeyError, TypeError, ValueError):
                 continue
 
-            def _parse_comment(c: dict) -> ReviewThreadComment:
-                return ReviewThreadComment(
-                    database_id=int(c.get("databaseId") or 0),
-                    path=c.get("path"),
-                    line=c.get("line"),
-                    body=str(c.get("body") or ""),
-                    author=str((c.get("author") or {}).get("login") or "unknown"),
-                    created_at=str(c.get("createdAt") or ""),
-                )
+        if not page_info.get("hasNextPage"):
+            break
+        next_cursor = page_info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            break
+        cursor = next_cursor
 
-            top = _parse_comment(comment_nodes[0])
-            replies = [_parse_comment(c) for c in comment_nodes[1:]]
-            threads.append(ReviewThread(
-                node_id=str(node["id"]),
-                is_resolved=bool(node.get("isResolved")),
-                is_outdated=bool(node.get("isOutdated")),
-                top=top,
-                replies=replies,
-            ))
-        except (KeyError, TypeError, ValueError):
-            continue
     return threads
 
 
