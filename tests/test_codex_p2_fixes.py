@@ -108,7 +108,7 @@ def test_stop_gate_demands_waiter_for_detached_open_pr(tmp_path, monkeypatch, ca
     # Detached record: PR 201 is open, no current blockers
     monkeypatch.setattr(
         mc, "_detached_pr_records",
-        lambda sid, cwd: [{
+        lambda sid, cwd, include_legacy=True: [{
             "pr": 201, "url": "https://x/pull/201", "branch": "bou-201",
             "worktree_present": False, "unresolved_threads": 0,
             "ci_failing": False, "failing_checks": [],
@@ -147,7 +147,7 @@ def test_await_keeps_ticking_when_owned_empty_but_detached_prs_exist(
     def fake_collect_worktrees(sid, cwd):
         return []  # no live worktrees
 
-    def fake_detached(sid, cwd):
+    def fake_detached(sid, cwd, include_legacy=True):
         tick_count[0] += 1
         if tick_count[0] == 1:
             # First tick: open but no blockers

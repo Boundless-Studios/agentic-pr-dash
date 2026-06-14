@@ -1053,8 +1053,11 @@ def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dic
     suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
-    for root in _maint_roots_for(anchor_cwd):
-        for r in _detached_pr_records(session_id, root):
+    for i, root in enumerate(_maint_roots_for(anchor_cwd)):
+        # Process legacy repo-less ledger entries against the ANCHOR only (i == 0);
+        # replaying/pruning them per sibling lets a same-number PR drop the legacy
+        # entry before its real repo is checked (codex PR #30 review, P2).
+        for r in _detached_pr_records(session_id, root, include_legacy=(i == 0)):
             key = (root, r["pr"])
             if key in seen:
                 continue
@@ -2108,10 +2111,16 @@ def _worktree_is_for_entry(path: str, entry) -> bool:
     return bool(branch) and entry.branch and branch == entry.branch
 
 
-def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
+def _detached_pr_records(session_id: str, cwd: str,
+                         include_legacy: bool = True) -> list[dict]:
     """Records for this session's ledger PRs whose worktree is GONE, with live
     GitHub state. Does NO worktree adoption, so it is safe for the Stop hook
     (which must never adopt unmarked worktrees). Prunes merged/closed PRs.
+
+    ``include_legacy=False`` skips (and never prunes) the repo-less legacy ledger
+    entries — set when iterating multiple roots so legacy entries are processed
+    against exactly one repo (the anchor), not replayed/pruned per sibling (codex
+    PR #30 review, P2).
     """
     from . import session_ledger, github_api  # noqa: PLC0415
 
@@ -2120,11 +2129,11 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
     # Scope to THIS repo: each ledger PR is queried with gh against `cwd`, so a PR
     # from another repo would be checked against the wrong remote (and pruned when
     # `cwd`'s same-number PR is closed). Legacy repo-less entries still pass
-    # (PR #16 review round 2, P1).
+    # (PR #16 review round 2, P1) unless include_legacy is False.
     target_repo = _repo_slug(cwd)
     records: list[dict] = []
     prune: set[int] = set()
-    for e in session_ledger.read(session_id, repo=target_repo):
+    for e in session_ledger.read(session_id, repo=target_repo, include_legacy=include_legacy):
         abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
         if (
             abs_wt
@@ -2162,7 +2171,8 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
         })
     if prune:
-        session_ledger.prune(session_id, prune, repo=target_repo)
+        session_ledger.prune(session_id, prune, repo=target_repo,
+                             include_legacy=include_legacy)
     return records
 
 
