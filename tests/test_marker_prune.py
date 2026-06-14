@@ -118,7 +118,7 @@ def test_check_subcommand_prunes_stale_marker_via_stop_gate(tmp_path, monkeypatc
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     # No open PR found for the branch (it was merged)
     monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "no open PR for this branch"))
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: set())
 
     # Also stub _read_marker to return the marker data and _pr_open_state to merged
@@ -148,7 +148,7 @@ def test_stop_gate_prunes_stale_marker_for_merged_pr_and_exits_0(
     monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: None)
     # _live_foreign_owner returns None (no foreign owner)
     monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd: [])
+    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     # _pr_open_state returns 'merged' so _prune_stale_marker fires
     monkeypatch.setattr(
         mc, "_pr_open_state",

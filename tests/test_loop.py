@@ -134,6 +134,29 @@ def test_discover_passes_cwd_to_list_owned(monkeypatch):
     assert captured["cmd"][captured["cmd"].index("--cwd") + 1] == "/repo/root"
 
 
+def test_discover_machine_wide_spans_all_maintenance_roots(monkeypatch):
+    # BOU-1546: a machine-wide loop (no --session-id) must enumerate worktrees
+    # across [anchor] + maintenance_repo_roots, not just args.cwd[0].
+    from agentic_pr_dash import maintenance_check as mc
+    monkeypatch.setattr(mc, "_resolve_maintenance_roots",
+                        lambda c: ["/repoA", "/repoB"])
+
+    def fake_run(cmd, *a, **k):
+        cwd = k.get("cwd")
+        if cwd == "/repoA":
+            return types.SimpleNamespace(
+                stdout="worktree /repoA/wt1\nworktree /repoA/wt2\n",
+                stderr="", returncode=0)
+        if cwd == "/repoB":
+            return types.SimpleNamespace(
+                stdout="worktree /repoB/wt1\n", stderr="", returncode=0)
+        return types.SimpleNamespace(stdout="", stderr="", returncode=0)
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    got = loop._discover_cwds(_args(session_id="", cwd=["/repoA"]))
+    assert got == ["/repoA/wt1", "/repoA/wt2", "/repoB/wt1"]
+
+
 def test_discover_iterates_all_configured_cwds(monkeypatch):
     # Repeatable --cwd: list-owned runs once per configured repo and the owned
     # paths are merged; a repo whose discovery fails falls back to its own root

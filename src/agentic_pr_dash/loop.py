@@ -69,12 +69,32 @@ def _discover_cwds(args) -> list[str]:
             for ln in out.stdout.splitlines():
                 _add(ln.strip())
         return discovered
-    # Every worktree on the machine.
-    out = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"], cwd=args.cwd[0],
-        capture_output=True, text=True,
-    )
-    paths = [ln.split(" ", 1)[1].strip() for ln in out.stdout.splitlines() if ln.startswith("worktree ")]
+    # Every worktree on the machine, ACROSS every configured root (BOU-1546).
+    # Span all --cwd values AND each one's maintenance_repo_roots so a machine-wide
+    # gaia loop (no --session-id) services sibling repos too — previously this only
+    # enumerated args.cwd[0], silently dropping extra --cwd and all config roots.
+    from .maintenance_check import _resolve_maintenance_roots  # noqa: PLC0415
+
+    roots: list[str] = []
+    seen_roots: set[str] = set()
+    for c in (args.cwd or ["."]):
+        for r in _resolve_maintenance_roots(c):
+            if r not in seen_roots:
+                seen_roots.add(r)
+                roots.append(r)
+    paths: list[str] = []
+    seen_paths: set[str] = set()
+    for root in roots:
+        out = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"], cwd=root,
+            capture_output=True, text=True,
+        )
+        for ln in out.stdout.splitlines():
+            if ln.startswith("worktree "):
+                p = ln.split(" ", 1)[1].strip()
+                if p and p not in seen_paths:
+                    seen_paths.add(p)
+                    paths.append(p)
     return paths or list(args.cwd)
 
 

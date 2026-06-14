@@ -1051,10 +1051,24 @@ def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dic
     Each repo's ledger is queried per root. PR numbers are unique only WITHIN a
     repo, so dedupe on ``(root, pr)`` — a blocking ``#42`` in one repo must not
     suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
+    roots = _maint_roots_for(anchor_cwd)
+    # Legacy pruning is only UNSAFE when more than one root is probed: with a
+    # single root the repo is unambiguous, so a merged/closed legacy row should
+    # still be pruned (preserving the pre-BOU-1546 single-root behavior — a normal
+    # checkout must not accumulate stale legacy rows re-queried every tick, codex
+    # PR #32 P3). With multiple roots a same-number closed PR on one remote must
+    # not delete a row open on another, so legacy is never pruned.
+    prune_legacy = len(roots) <= 1
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
-    for root in _maint_roots_for(anchor_cwd):
-        for r in _detached_pr_records(session_id, root):
+    for root in roots:
+        # A repo-less LEGACY entry's true repo is unknown, so it must be checked
+        # against EVERY root to surface a sibling-owned PR (anchor-only reads hide a
+        # sibling PR when the anchor has the same number closed — codex PR #32 P2b).
+        # Dedup by (root, pr) — numbers are unique only within a repo, so the SAME
+        # number in two repos stays distinct (codex PR #30, P2).
+        for r in _detached_pr_records(session_id, root, include_legacy=True,
+                                      prune_legacy=prune_legacy):
             key = (root, r["pr"])
             if key in seen:
                 continue
@@ -2108,10 +2122,22 @@ def _worktree_is_for_entry(path: str, entry) -> bool:
     return bool(branch) and entry.branch and branch == entry.branch
 
 
-def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
+def _detached_pr_records(session_id: str, cwd: str,
+                         include_legacy: bool = True,
+                         prune_legacy: bool = True) -> list[dict]:
     """Records for this session's ledger PRs whose worktree is GONE, with live
     GitHub state. Does NO worktree adoption, so it is safe for the Stop hook
     (which must never adopt unmarked worktrees). Prunes merged/closed PRs.
+
+    ``include_legacy=False`` skips the repo-less legacy ledger entries entirely —
+    set when iterating multiple roots so legacy entries are read against exactly
+    one repo (the anchor), not replayed per sibling (codex PR #30 review, P2).
+
+    ``prune_legacy=False`` reads legacy entries (for surfacing) but NEVER prunes
+    them. A repo-less entry's true repo is unknown, so a same-number merged/closed
+    PR on the queried (anchor) remote must not delete it — a torn-down sibling PR
+    would silently stop being monitored. Used for the anchor pass in cross-root
+    mode (codex PR #32, P2).
     """
     from . import session_ledger, github_api  # noqa: PLC0415
 
@@ -2120,11 +2146,11 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
     # Scope to THIS repo: each ledger PR is queried with gh against `cwd`, so a PR
     # from another repo would be checked against the wrong remote (and pruned when
     # `cwd`'s same-number PR is closed). Legacy repo-less entries still pass
-    # (PR #16 review round 2, P1).
+    # (PR #16 review round 2, P1) unless include_legacy is False.
     target_repo = _repo_slug(cwd)
     records: list[dict] = []
     prune: set[int] = set()
-    for e in session_ledger.read(session_id, repo=target_repo):
+    for e in session_ledger.read(session_id, repo=target_repo, include_legacy=include_legacy):
         abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
         if (
             abs_wt
@@ -2162,7 +2188,8 @@ def _detached_pr_records(session_id: str, cwd: str) -> list[dict]:
             "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
         })
     if prune:
-        session_ledger.prune(session_id, prune, repo=target_repo)
+        session_ledger.prune(session_id, prune, repo=target_repo,
+                             include_legacy=(include_legacy and prune_legacy))
     return records
 
 
