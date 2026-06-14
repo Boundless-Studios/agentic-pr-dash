@@ -140,8 +140,16 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
 
 _PR_HEAD_FIELDS = (
     "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
-    "headRefOid,headRefName,baseRefName"
+    "headRefOid,headRefName,headRepositoryOwner,baseRefName"
 )
+
+# `gh pr list --head` is a *prefix* filter (GitHub returns every PR whose head
+# branch *begins* with the query, so `--head fix` also returns `fix-123`). A
+# bare `--limit 1` can therefore hand the single result slot to a prefix match
+# and drop the exact-branch PR before we can filter for it — so we fetch a wide
+# page and exact-filter `headRefName` (and, for fork heads, `headRepositoryOwner`)
+# in Python instead.
+_PR_HEAD_LOOKUP_LIMIT = "30"
 
 
 def find_pr_by_head(
@@ -171,17 +179,19 @@ def find_pr_by_head(
         return None
     # `gh` accepts `<owner>:<branch>` for --head (fork/head-qualified specs), but
     # `gh pr list --head` rejects the owner qualifier — strip it before resolving
-    # (mirrors the arm flow in maintenance_check). The bare name is also what we
-    # match `headRefName` against below.
-    branch = branch.split(":", 1)[-1]
+    # (mirrors the arm flow in maintenance_check). We KEEP the owner separately so
+    # two fork PRs with the same branch name (`alice:feature`, `bob:feature`) don't
+    # collide: results are post-filtered by `headRepositoryOwner` below.
+    head_owner = ""
+    if ":" in branch:
+        head_owner, branch = branch.split(":", 1)
     if not branch:
         return None
-    limit = "1" if state == "open" else "20"
     cmd = [
         "gh", "pr", "list",
         "--head", branch,
         "--state", state,
-        "--limit", limit,
+        "--limit", _PR_HEAD_LOOKUP_LIMIT,
         "--json", _PR_HEAD_FIELDS,
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
@@ -201,10 +211,26 @@ def find_pr_by_head(
         # head-branch match so a Stop/QA gate never evaluates the wrong PR.
         if str(pr.get("headRefName") or "") != branch:
             continue
+        # When the caller supplied an owner-qualified head (`alice:feature`),
+        # require the PR's head-repo owner to match so a same-named branch on a
+        # different fork (`bob:feature`) isn't returned in its place.
+        if head_owner and str(_pr_head_owner(pr)) != head_owner:
+            continue
         if head_oid is not None and pr.get("headRefOid") != head_oid:
             continue
         return pr
     return None
+
+
+def _pr_head_owner(pr: dict) -> str:
+    """Extract the head-repository owner login from a `gh pr list` PR payload.
+
+    `gh` serializes ``headRepositoryOwner`` as ``{"login": ..., "id": ...}``;
+    return the bare login (or "" when absent)."""
+    owner = pr.get("headRepositoryOwner")
+    if isinstance(owner, dict):
+        return str(owner.get("login") or "")
+    return str(owner or "")
 
 
 def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
@@ -444,7 +470,9 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
     :class:`RuntimeError` rather than returning a partial list: silently
     dropping later pages would let still-open threads slip past the
     unresolved-thread gate — the exact truncation hazard this pagination is
-    meant to eliminate.
+    meant to eliminate. A malformed page that reports ``hasNextPage=true`` but
+    omits/empties ``endCursor`` is treated the same way (we cannot advance, so
+    raising beats truncating).
     """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
@@ -517,7 +545,15 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
             break
         next_cursor = page_info.get("endCursor")
         if not isinstance(next_cursor, str) or not next_cursor:
-            break
+            # GitHub claims another page but gave us no cursor to fetch it. We
+            # cannot advance, so any thread on the unreachable page(s) would be
+            # silently dropped — the exact truncation hazard this pagination is
+            # meant to eliminate. Refuse to return a partial list.
+            raise RuntimeError(
+                f"get_review_threads: page for PR #{pr_number} reports "
+                f"hasNextPage=true but no endCursor; refusing to return a "
+                f"partial thread list"
+            )
         cursor = next_cursor
         paged = True
 

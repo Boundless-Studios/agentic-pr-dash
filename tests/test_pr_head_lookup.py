@@ -48,9 +48,10 @@ def test_find_pr_by_head_returns_full_open_pr(monkeypatch):
     assert pr["number"] == 7
     assert pr["body"] == "## Root cause\nx"
     assert pr["baseRefName"] == "main"
-    # open lookups cap at limit 1
+    # open lookups fetch a wide page (not --limit 1) so a prefix match can't
+    # occupy the single slot and drop the exact-branch PR.
     assert "--limit" in captured["cmd"]
-    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "1"
+    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "30"
 
 
 def test_find_pr_by_head_no_match_returns_none(monkeypatch):
@@ -106,13 +107,14 @@ def test_find_pr_by_head_strips_owner_qualifier(monkeypatch):
     def fake_run(cmd, timeout_s=20, cwd=None):
         captured["cmd"] = cmd
         return _cp(json.dumps([
-            {"number": 4, "headRefName": "feature", "headRefOid": "y", "url": "u"},
+            {"number": 4, "headRefName": "feature", "headRefOid": "y",
+             "headRepositoryOwner": {"login": "alice"}, "url": "u"},
         ]))
 
     monkeypatch.setattr(github_api, "_run", fake_run)
     pr = github_api.find_pr_by_head("alice:feature", "open", ".")
     assert pr is not None and pr["number"] == 4
-    # the owner qualifier is stripped before --head
+    # the owner qualifier is stripped before --head (owner is post-filtered)
     assert captured["cmd"][captured["cmd"].index("--head") + 1] == "feature"
 
 
@@ -125,7 +127,56 @@ def test_find_pr_by_head_merged_uses_wide_limit(monkeypatch):
 
     monkeypatch.setattr(github_api, "_run", fake_run)
     github_api.find_pr_by_head("b", "merged", ".")
-    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "20"
+    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "30"
+
+
+def test_find_pr_by_head_prefix_match_not_dropped(monkeypatch):
+    # `--head fix` is a prefix filter and a wide page returns both `fix-123`
+    # (prefix) and the exact `fix`. With the old `--limit 1` the prefix match
+    # could occupy the single slot and the exact PR would be dropped → None.
+    # A wide page + exact-filter must still find the exact-branch PR.
+    payload = [
+        {"number": 11, "headRefName": "fix-123", "headRefOid": "a", "url": "u1"},
+        {"number": 22, "headRefName": "fix", "headRefOid": "b", "url": "u2"},
+    ]
+    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    pr = github_api.find_pr_by_head("fix", "open", ".")
+    assert pr is not None and pr["number"] == 22
+
+
+def test_find_pr_by_head_fork_owner_match(monkeypatch):
+    # Two fork PRs share branch name `feature`. An owner-qualified head
+    # (`alice:feature`) must return alice's PR, not bob's.
+    payload = [
+        {"number": 1, "headRefName": "feature", "headRefOid": "a",
+         "headRepositoryOwner": {"login": "bob"}, "url": "u1"},
+        {"number": 2, "headRefName": "feature", "headRefOid": "b",
+         "headRepositoryOwner": {"login": "alice"}, "url": "u2"},
+    ]
+    captured: dict = {}
+
+    def fake_run(cmd, timeout_s=20, cwd=None):
+        captured["cmd"] = cmd
+        return _cp(json.dumps(payload))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    pr = github_api.find_pr_by_head("alice:feature", "open", ".")
+    assert pr is not None and pr["number"] == 2
+    # the owner qualifier is stripped before --head, but headRepositoryOwner is
+    # requested so the owner can be post-filtered.
+    assert captured["cmd"][captured["cmd"].index("--head") + 1] == "feature"
+    fields = captured["cmd"][captured["cmd"].index("--json") + 1]
+    assert "headRepositoryOwner" in fields
+
+
+def test_find_pr_by_head_fork_owner_mismatch_returns_none(monkeypatch):
+    # Only bob's same-named branch exists; alice:feature must NOT match it.
+    payload = [
+        {"number": 1, "headRefName": "feature", "headRefOid": "a",
+         "headRepositoryOwner": {"login": "bob"}, "url": "u1"},
+    ]
+    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    assert github_api.find_pr_by_head("alice:feature", "open", ".") is None
 
 
 # --------------------------------------------------------------------------- #
@@ -220,6 +271,26 @@ def test_get_review_threads_later_page_failure_raises(monkeypatch):
             return _cp("", returncode=1)  # transient failure on page 2
         page = {
             "pageInfo": {"hasNextPage": True, "endCursor": "PAGE2"},
+            "nodes": [_thread_node(101, "old.py", 10)],
+        }
+        return _cp(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    with pytest.raises(RuntimeError, match="partial thread list"):
+        github_api.get_review_threads(5, ".")
+
+
+def test_get_review_threads_next_page_without_cursor_raises(monkeypatch):
+    # GitHub reports hasNextPage=true but omits/empties endCursor: we can't
+    # advance, so threads on the unreachable page would be silently dropped.
+    # Must raise rather than return a truncated list.
+    import pytest
+
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, timeout_s=20, cwd=None):
+        page = {
+            "pageInfo": {"hasNextPage": True, "endCursor": None},
             "nodes": [_thread_node(101, "old.py", 10)],
         }
         return _cp(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}))
