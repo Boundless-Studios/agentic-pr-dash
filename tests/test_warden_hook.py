@@ -39,8 +39,8 @@ def _run_main(monkeypatch, payload: dict, *, warden_stdout: str = "", warden_rc:
         for k, v in env.items():
             monkeypatch.setenv(k, v)
 
-    # Stub resolve_warden_hook
-    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda: warden_bin)
+    # Stub resolve_warden_hook (accepts the optional normalised-payload arg)
+    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda *a, **kw: warden_bin)
 
     captured: list[str] = []
     monkeypatch.setattr("builtins.print", lambda *args, **kwargs: captured.append(
@@ -107,7 +107,7 @@ def test_non_bash_tool_passes_through(monkeypatch):
     called: list[bool] = []
     monkeypatch.setattr(run_warden.subprocess, "run", lambda *a, **kw: called.append(True))
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
-    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda: "/fake/warden-hook")
+    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda *a, **kw: "/fake/warden-hook")
     assert run_warden.main() == 0
     assert called == []
 
@@ -208,24 +208,53 @@ def _ask_payload(command: str) -> str:
     })
 
 
-def test_ask_version_probe_trusted_binary_allow(monkeypatch):
-    """ask + trusted playwright --version → allow (None)."""
-    warden_out = _ask_payload("node_modules/.bin/playwright --version")
+def _plant_probe(root: Path, rel: str) -> None:
+    """Create an executable file at *root*/*rel* so the probe resolves in-repo."""
+    target = root / rel
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\necho v\n")
+    target.chmod(0o755)
+
+
+def test_ask_version_probe_trusted_binary_allow(monkeypatch, tmp_path):
+    """ask + trusted playwright --version (real in-repo probe) → allow (None)."""
+    _plant_probe(tmp_path, "node_modules/.bin/playwright")
+    cmd = "node_modules/.bin/playwright --version"
+    warden_out = _ask_payload(cmd)
     rc, out = _run_main(monkeypatch,
-                        _make_bash_payload("node_modules/.bin/playwright --version"),
+                        _make_bash_payload(cmd, cwd=str(tmp_path)),
                         warden_stdout=warden_out)
     assert rc == 0
     assert out == ""
 
 
-def test_ask_version_probe_frontend_path_allow(monkeypatch):
-    """ask + frontend/node_modules/.bin/playwright --version → allow."""
-    warden_out = _ask_payload("frontend/node_modules/.bin/playwright --version")
+def test_ask_version_probe_frontend_path_allow(monkeypatch, tmp_path):
+    """ask + frontend/node_modules/.bin/playwright --version (real probe) → allow."""
+    _plant_probe(tmp_path, "frontend/node_modules/.bin/playwright")
+    cmd = "frontend/node_modules/.bin/playwright --version"
+    warden_out = _ask_payload(cmd)
     rc, out = _run_main(monkeypatch,
-                        _make_bash_payload("frontend/node_modules/.bin/playwright --version"),
+                        _make_bash_payload(cmd, cwd=str(tmp_path)),
                         warden_stdout=warden_out)
     assert rc == 0
     assert out == ""
+
+
+def test_ask_version_probe_nonexistent_binary_denied(monkeypatch):
+    """ask + version probe that does NOT resolve to a real in-repo file → deny.
+
+    Finding 6 (BOU-1671): the probe must resolve to a real file under the repo
+    root before being auto-allowed, so a relative node_modules/.bin/playwright
+    that is absent (or planted in a writable subdir that is not the repo) is not
+    treated as a trusted probe.
+    """
+    cmd = "node_modules/.bin/playwright --version"
+    warden_out = _ask_payload(cmd)
+    rc, out = _run_main(monkeypatch,
+                        _make_bash_payload(cmd, cwd="/repo/does/not/exist"),
+                        warden_stdout=warden_out)
+    decoded = json.loads(out)
+    assert decoded["decision"] == "block"
 
 
 def test_ask_chmod_deny_with_git_update_index_guidance(monkeypatch):
@@ -321,8 +350,21 @@ def test_deny_reason_for_ask_non_string_command():
     assert "Configure Warden" in reason
 
 
-def test_deny_reason_for_ask_version_probe_allow():
-    assert run_warden._deny_reason_for_ask("node_modules/.bin/playwright --version") is None
+def test_deny_reason_for_ask_version_probe_allow(tmp_path):
+    probe = tmp_path / "node_modules" / ".bin" / "playwright"
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text("#!/bin/sh\n")
+    probe.chmod(0o755)
+    assert run_warden._deny_reason_for_ask(
+        "node_modules/.bin/playwright --version", cwd=str(tmp_path)
+    ) is None
+
+
+def test_deny_reason_for_ask_version_probe_no_cwd_denies():
+    """Without a resolvable cwd the probe is not vouched for → deny."""
+    assert run_warden._deny_reason_for_ask(
+        "node_modules/.bin/playwright --version"
+    ) is not None
 
 
 def test_deny_reason_for_ask_chained_version_probe_deny():
@@ -340,7 +382,7 @@ def test_behavior_disabled_via_env_skips_warden(monkeypatch):
     """AGENTIC_PR_DASH_HOOK_WARDEN=false → early exit, no warden call."""
     monkeypatch.setenv("AGENTIC_PR_DASH_HOOK_WARDEN", "false")
     called: list[bool] = []
-    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda: called.append(True) or "/x")
+    monkeypatch.setattr(run_warden, "resolve_warden_hook", lambda *a, **kw: called.append(True) or "/x")
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(_make_bash_payload("ls"))))
     rc = run_warden.main()
     assert rc == 0

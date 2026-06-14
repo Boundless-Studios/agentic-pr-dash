@@ -64,13 +64,30 @@ def _normalized_cwd(payload: dict) -> str:
     return os.getcwd()
 
 
+# Metadata keys that warden's session-scoped behaviour (per-session approval /
+# YOLO state) depends on. We rename only the tool fields that need normalising
+# and pass these through verbatim when present, so the downstream warden-hook
+# can still distinguish the active session.
+_PASSTHROUGH_METADATA_KEYS = ("session_id", "transcript_path")
+
+
 def normalized_payload(payload: dict) -> dict:
-    """Return ``{tool_name, tool_input, cwd}`` normalised for both Claude and Codex hooks."""
-    return {
+    """Return the normalised hook payload for both Claude and Codex hooks.
+
+    Always contains ``{tool_name, tool_input, cwd}``; passthrough metadata such
+    as ``session_id`` is preserved when present so warden's session-scoped
+    behaviour keeps working.
+    """
+    normalized = {
         "tool_name": _normalized_tool_name(payload),
         "tool_input": _normalized_tool_input(payload),
         "cwd": _normalized_cwd(payload),
     }
+    for key in _PASSTHROUGH_METADATA_KEYS:
+        value = payload.get(key)
+        if value is not None:
+            normalized[key] = value
+    return normalized
 
 
 def repo_root(payload: dict | None = None) -> Path:

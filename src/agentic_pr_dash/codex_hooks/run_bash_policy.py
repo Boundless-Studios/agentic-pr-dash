@@ -42,10 +42,19 @@ from agentic_pr_dash.codex_hooks._payload import (
 )
 
 
+# The leading path may be ``..``, ``../``, ``../..``, ``../../foo`` etc. —
+# any path that starts by walking into the parent tree. We match a leading
+# ``..`` segment optionally followed by ``/``-separated continuation so deeper
+# parent walks (``find ../.. -name AGENTS.md``) are caught too, not just ``..``.
 _PARENT_TREE_AGENTS_SEARCH_RE = re.compile(
     r"""
     ^\s*
-    find\s+(?:\.\./?|['"]\.\./?['"])
+    find\s+
+    (?:
+        \.\.(?:/[^\s;&|]*)*          # ..  ../  ../..  ../../foo
+        |
+        ['"]\.\.(?:/[^\s;&|]*)*['"]  # quoted forms of the above
+    )
     (?:\s+(?![;&|])\S+)*
     \s+-name\s+['"]?AGENTS\.md['"]?
     (?:\s+(?![;&|])\S+)*
@@ -96,11 +105,35 @@ def _block_reason_for_command(command: object) -> str | None:
     return None
 
 
+# Sentinel exit code used when a hook signals a block via its stdout JSON
+# (``{"decision":"block",...}``) while still exiting 0 — see ``_stdout_is_block``.
+# The Codex hook contract treats a block decision as final regardless of exit
+# status, so we surface it as a non-zero return so ``run()`` short-circuits and
+# no later hook can append more stdout after the block JSON.
+_STDOUT_BLOCK_RC = 2
+
+
+def _stdout_is_block(stdout: str) -> bool:
+    """Return True iff *stdout* is a Codex ``{"decision":"block",...}`` payload."""
+    trimmed = stdout.strip()
+    if not trimmed:
+        return False
+    try:
+        payload = json.loads(trimmed)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(payload, dict) and payload.get("decision") == "block"
+
+
 def run_script(path: str, payload_text: str, *, base: Path | None = None) -> int:
     """Run a hook script ``path`` (relative to *base*) with *payload_text* on stdin.
 
     Prints the script's stdout/stderr to the current process's stdout/stderr so
     any ``{"decision":"block",...}`` emitted by the script reaches the hook harness.
+
+    Returns the child's exit code, or ``_STDOUT_BLOCK_RC`` when the child exits 0
+    but emits a block decision on stdout — so a stdout-only block is treated as
+    final and the policy engine stops invoking later hooks.
     """
     resolved_base = base if base is not None else hook_base_dir()
     result = subprocess.run(
@@ -114,18 +147,89 @@ def run_script(path: str, payload_text: str, *, base: Path | None = None) -> int
         print(result.stdout, end="")
     if result.stderr:
         print(result.stderr, end="", file=sys.stderr)
+    if result.returncode == 0 and _stdout_is_block(result.stdout):
+        return _STDOUT_BLOCK_RC
     return result.returncode
 
 
+# Top-level shell operators that separate one command from the next. We split
+# the raw command on these (respecting quotes) so a commit chained after setup
+# (``cd subdir && git commit -m x``, even space-free ``cd x&&git commit``) is
+# still recognised — the shell will run the ``git commit`` segment, so
+# commit-only hooks must fire for it. Longest operators first so ``&&``/``||``
+# are matched before a bare ``&``/``|``.
+_SHELL_SEPARATORS = ("&&", "||", ";", "|", "&")
+
+
+def _split_top_level_segments(command: str) -> list[str]:
+    """Split a raw shell command into top-level segments on shell operators.
+
+    Quote- and escape-aware so separators inside single/double quotes (e.g. a
+    commit message ``-m 'a && b'``) do not split the command. Backgrounding and
+    pipe operators are treated as separators alongside ``&&``/``||``/``;``.
+    """
+    segments: list[str] = []
+    current: list[str] = []
+    i = 0
+    n = len(command)
+    quote: str | None = None
+    while i < n:
+        ch = command[i]
+        if quote is not None:
+            current.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                current.append(command[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            current.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            current.append(ch)
+            current.append(command[i + 1])
+            i += 2
+            continue
+        matched = next(
+            (sep for sep in _SHELL_SEPARATORS if command.startswith(sep, i)),
+            None,
+        )
+        if matched is not None:
+            segments.append("".join(current))
+            current = []
+            i += len(matched)
+            continue
+        current.append(ch)
+        i += 1
+    segments.append("".join(current))
+    return [seg for seg in (s.strip() for s in segments) if seg]
+
+
 def is_git_commit_command(command: str) -> bool:
-    """Return True iff *command* is a ``git commit`` invocation.
+    """Return True iff *command* contains a top-level ``git commit`` invocation.
 
     Handles leading ``env``/``KEY=VAL`` prefixes and ``git`` global option flags
     (``-C``, ``-c``, ``--git-dir``, ``--work-tree``, ``--namespace``) before the
-    subcommand position.  Returns False for unparseable commands.
+    subcommand position.  A commit chained after setup
+    (``cd subdir && git commit -m x``, ``make && git commit ...``) is detected
+    by scanning each top-level shell segment.  Returns False for unparseable
+    commands.
     """
+    return any(
+        _segment_is_git_commit(segment)
+        for segment in _split_top_level_segments(command)
+    )
+
+
+def _segment_is_git_commit(segment: str) -> bool:
+    """Return True iff a single command segment is a ``git commit`` invocation."""
     try:
-        tokens = shlex.split(command)
+        tokens = shlex.split(segment)
     except ValueError:
         return False
 

@@ -83,7 +83,7 @@ def _candidate_from_login_shell() -> str | None:
     return candidates[0] if candidates else None
 
 
-def resolve_warden_hook() -> str | None:
+def resolve_warden_hook(payload: dict | None = None) -> str | None:
     """Locate the ``warden-hook`` binary.
 
     Search order:
@@ -93,6 +93,11 @@ def resolve_warden_hook() -> str | None:
        repo ``scripts/``, ``~/.local/bin``, ``~/bin``, ``~/.cargo/bin``,
        ``/opt/homebrew/bin``, ``/usr/local/bin``.
     4. Login-shell ``command -v warden-hook`` (last resort, spawns a subshell).
+
+    *payload* (the normalised hook payload) is used to resolve the repo-local
+    ``.venv``/``scripts`` fallbacks against the actual checkout (its ``cwd``)
+    rather than the hook process cwd — so repo-local installs where
+    ``warden-hook`` lives in the target worktree are found.
     """
     env_candidate = _candidate_from_env()
     if env_candidate:
@@ -103,7 +108,7 @@ def resolve_warden_hook() -> str | None:
         return path_candidate
 
     python_bin = Path(sys.executable).resolve().parent
-    repo = repo_root()
+    repo = repo_root(payload)
     fallback_candidates = [
         python_bin / "warden-hook",
         repo / ".venv" / "bin" / "warden-hook",
@@ -207,7 +212,45 @@ def _append_detail(message: str, detail: str | None) -> str:
     return f"{message} Details: {trimmed}"
 
 
-def _deny_reason_for_ask(command: object, permission_reason: str | None = None) -> str | None:
+def _probe_resolves_under_repo(command: str, cwd: object) -> bool:
+    """Return True iff the version-probe binary resolves to a real file under *cwd*.
+
+    The probe path is repo-relative (e.g. ``node_modules/.bin/playwright``). We
+    resolve it against the payload cwd/repo root and confirm the fully-resolved
+    path (following symlinks) stays inside that root and is an existing regular
+    file. This prevents auto-allowing a probe that, when the Bash command runs
+    from a writable subdirectory, points at an attacker-planted binary —
+    a relative ``node_modules/.bin/playwright`` that escapes the repo (via a
+    symlink) or does not exist is NOT treated as a trusted probe.
+    """
+    if not isinstance(cwd, str) or not cwd:
+        # No reliable root to resolve against — do not vouch for the probe.
+        return False
+
+    # The matched probe path is the leading token of the command.
+    probe_rel = command.strip().split()[0]
+    try:
+        root = Path(cwd).resolve(strict=False)
+        resolved = (root / probe_rel).resolve(strict=False)
+    except OSError:
+        return False
+
+    if not _is_executable_file(resolved):
+        return False
+
+    try:
+        resolved.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def _deny_reason_for_ask(
+    command: object,
+    permission_reason: str | None = None,
+    *,
+    cwd: object = None,
+) -> str | None:
     """Return a deterministic deny reason for commands that triggered warden 'ask'.
 
     Returns None to signal that the command should be allowed (no blocking output).
@@ -232,7 +275,12 @@ def _deny_reason_for_ask(command: object, permission_reason: str | None = None) 
     # (`true&&frontend/.../playwright --version`), a command substitution
     # (`$(id)/.../playwright --version`), or a non-repo path (`../tmp/.../playwright
     # --version`) all fail to match and fall through to the deny path below.
-    if _VERSION_PROBE_RE.fullmatch(cmd):
+    # The regex shape (fullmatch, explicit dir/binary allowlists) already blocks
+    # chains, substitutions and `../` traversal. We additionally require the
+    # probe to resolve to a real file inside the repo root so a relative
+    # node_modules/.bin/playwright running from a writable subdir (or via a
+    # symlink escaping the repo) is not auto-allowed.
+    if _VERSION_PROBE_RE.fullmatch(cmd) and _probe_resolves_under_repo(cmd, cwd):
         return None
 
     # chmod — suggest safe alternatives
@@ -277,7 +325,9 @@ def _deny_reason_for_ask(command: object, permission_reason: str | None = None) 
     )
 
 
-def _translate_warden_stdout(stdout: str, command: object = "") -> str | None:
+def _translate_warden_stdout(
+    stdout: str, command: object = "", *, cwd: object = None
+) -> str | None:
     """Translate warden stdout into a block reason, or None to allow.
 
     Returns None → allow (no output).
@@ -320,7 +370,7 @@ def _translate_warden_stdout(stdout: str, command: object = "") -> str | None:
     if permission_decision == "ask":
         # 'ask' is unsupported by Codex/Claude hooks — collapse to allow or deny
         # deterministically based on command pattern analysis.
-        return _deny_reason_for_ask(command, permission_reason)
+        return _deny_reason_for_ask(command, permission_reason, cwd=cwd)
     return MALFORMED_WARDEN_OUTPUT
 
 
@@ -336,7 +386,7 @@ def main() -> int:
     if normalized["tool_name"] != "Bash":
         return 0
 
-    warden_hook = resolve_warden_hook()
+    warden_hook = resolve_warden_hook(normalized)
     if warden_hook is None:
         return _emit_codex_block(
             "Warden is required for Bash PreToolUse safety, but `warden-hook` was not found. "
@@ -369,7 +419,9 @@ def main() -> int:
         )
 
     command = normalized.get("tool_input", {}).get("command", "")
-    translated_block_reason = _translate_warden_stdout(result.stdout, command)
+    translated_block_reason = _translate_warden_stdout(
+        result.stdout, command, cwd=normalized.get("cwd")
+    )
     if translated_block_reason is None:
         return 0
     return _emit_codex_block(translated_block_reason)
