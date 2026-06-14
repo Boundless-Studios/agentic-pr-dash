@@ -44,43 +44,60 @@ def branch_drift_message(
     if not candidate_ids or not current_branch:
         return None
 
-    events = session_registry.read_events()
+    # Resolve the registry on the TARGET worktree's behalf — the hook/adapter
+    # process may run from a different cwd than the worktree being gated, and
+    # that worktree can point its registry elsewhere via agentic-pr-dash.toml.
+    registry = session_registry.registry_path(str(worktree))
+    events = session_registry.read_events(registry)
 
-    started_event: dict | None = None
+    # The newest `started` event per candidate id (session-id reuse across
+    # relaunches means a later `started` supersedes an earlier one for THAT id).
+    # We keep one started event per id rather than collapsing to a single global
+    # newest, so a benign newer candidate cannot mask a drifting older candidate.
     candidate_set = set(candidate_ids)
+    started_by_id: dict[str, dict] = {}
     for event in reversed(events):
-        if str(event.get("session_id") or "") not in candidate_set:
+        session_id = str(event.get("session_id") or "")
+        if session_id not in candidate_set or session_id in started_by_id:
             continue
         if str(event.get("event") or "") != "started":
             continue
-        started_event = event
-        break
-    if started_event is None:
+        started_by_id[session_id] = event
+        if len(started_by_id) == len(candidate_set):
+            break
+    if not started_by_id:
         return None
 
-    started_branch = str(started_event.get("branch") or "").strip()
     primary = set(primary_branches)
-    if (
-        not started_branch
-        or started_branch == current_branch
-        or started_branch in primary
-    ):
-        return None
-
-    started_worktree = str(started_event.get("worktree_path") or "").strip()
-    if not started_worktree:
-        return None
     try:
-        registered_worktree = Path(started_worktree).expanduser().resolve()
         current_worktree = Path(worktree).resolve()
     except OSError:
         return None
-    if registered_worktree != current_worktree:
-        return None
 
-    return (
-        "Session branch drift detected: this session started on "
-        f"'{started_branch}' but the checkout is now on '{current_branch}'. "
-        "Standing down so the QA gate does not ask this session to commit, "
-        "push, or PR sibling-owned work."
-    )
+    for started_event in started_by_id.values():
+        started_branch = str(started_event.get("branch") or "").strip()
+        if (
+            not started_branch
+            or started_branch == current_branch
+            or started_branch in primary
+        ):
+            continue
+
+        started_worktree = str(started_event.get("worktree_path") or "").strip()
+        if not started_worktree:
+            continue
+        try:
+            registered_worktree = Path(started_worktree).expanduser().resolve()
+        except OSError:
+            continue
+        if registered_worktree != current_worktree:
+            continue
+
+        return (
+            "Session branch drift detected: this session started on "
+            f"'{started_branch}' but the checkout is now on '{current_branch}'. "
+            "Standing down so the QA gate does not ask this session to commit, "
+            "push, or PR sibling-owned work."
+        )
+
+    return None

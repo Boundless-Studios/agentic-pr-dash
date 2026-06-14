@@ -137,6 +137,42 @@ def test_drift_uses_most_recent_started_event_branch(tmp_path, monkeypatch):
     assert "fix/original-owner" in msg
 
 
+def test_drift_detected_when_older_candidate_drifts_under_benign_newer(tmp_path, monkeypatch):
+    """With multiple candidate ids, a benign newest `started` must not mask an
+    older candidate whose `started` recorded the original non-primary branch."""
+    registry = tmp_path / "events.jsonl"
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    _write_events(
+        registry,
+        [
+            # Launcher session: started on the original owner branch (drift).
+            {
+                "session_id": "launcher-session",
+                "event": "started",
+                "timestamp": "2026-06-06T07:00:00Z",
+                "branch": "fix/original-owner",
+                "worktree_path": str(worktree),
+            },
+            # Payload session: started later, already on the current branch (benign).
+            {
+                "session_id": "payload-session",
+                "event": "started",
+                "timestamp": "2026-06-06T07:05:00Z",
+                "branch": "fix/foreign-sibling",
+                "worktree_path": str(worktree),
+            },
+        ],
+    )
+    monkeypatch.setenv("GAIA_SESSION_REGISTRY", str(registry))
+
+    msg = branch_drift_message(
+        ["payload-session", "launcher-session"], "fix/foreign-sibling", worktree
+    )
+    assert msg is not None
+    assert "fix/original-owner" in msg
+
+
 def test_no_session_ids_returns_none(tmp_path, monkeypatch):
     registry = tmp_path / "events.jsonl"
     monkeypatch.setenv("GAIA_SESSION_REGISTRY", str(registry))
