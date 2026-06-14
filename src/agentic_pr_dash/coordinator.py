@@ -1,4 +1,11 @@
-"""agent-coordinator integration for PR maintenance ownership."""
+"""agent-coordinator integration for dashboard-triggered PR maintenance.
+
+The dashboard may notice that a PR needs work before an in-worktree agent does.
+This module claims a stable "PR maintenance" task through ``agent-coordinator``
+so repeated dashboard polls do not enqueue duplicate fixes and so another live
+owner can defer cleanly. It owns claim identity, blocker fingerprints, and
+release/adoption helpers; it does not inspect GitHub directly.
+"""
 
 from __future__ import annotations
 

@@ -1,4 +1,10 @@
-"""Pydantic models for PR dashboard state."""
+"""Shared data model for PR maintenance, dashboard cards, and runner state.
+
+GitHub responses, worktree metadata, ownership markers, maintenance handoff
+state, CI checks, and runner queues all converge here before being rendered or
+passed between subsystems. Keep external parsing out of this file; models should
+describe already-normalized state and expose small derived labels/properties.
+"""
 
 from __future__ import annotations
 

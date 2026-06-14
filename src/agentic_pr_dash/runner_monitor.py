@@ -1,4 +1,10 @@
-"""GitHub Actions desktop runner load aggregation for the PR dashboard."""
+"""GitHub Actions runner load aggregation for the dashboard.
+
+The dashboard can show whether self-hosted runner capacity is the bottleneck for
+pending CI. This module gathers workflow-job and runner-pool state through the
+GitHub API helpers and returns compact summaries for cards and queue warnings.
+It is optional: when no runner label is configured, the runner panel disappears.
+"""
 
 from __future__ import annotations
 
