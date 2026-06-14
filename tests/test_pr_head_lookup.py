@@ -77,8 +77,8 @@ def test_find_pr_by_head_empty_branch_returns_none(monkeypatch):
 
 def test_find_pr_by_head_oid_filter_matches(monkeypatch):
     payload = [
-        {"number": 1, "headRefOid": "aaa", "url": "u1"},
-        {"number": 2, "headRefOid": "bbb", "url": "u2"},
+        {"number": 1, "headRefOid": "aaa", "headRefName": "b", "url": "u1"},
+        {"number": 2, "headRefOid": "bbb", "headRefName": "b", "url": "u2"},
     ]
     monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
     pr = github_api.find_pr_by_head("b", "merged", ".", head_oid="bbb")
@@ -86,9 +86,34 @@ def test_find_pr_by_head_oid_filter_matches(monkeypatch):
 
 
 def test_find_pr_by_head_oid_filter_no_match(monkeypatch):
-    payload = [{"number": 1, "headRefOid": "aaa"}]
+    payload = [{"number": 1, "headRefOid": "aaa", "headRefName": "b"}]
     monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
     assert github_api.find_pr_by_head("b", "merged", ".", head_oid="zzz") is None
+
+
+def test_find_pr_by_head_requires_exact_head_match(monkeypatch):
+    # `--head fix` is a prefix filter and can return `fix-123`; we must reject it.
+    payload = [
+        {"number": 9, "headRefOid": "x", "headRefName": "fix-123", "url": "u"},
+    ]
+    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    assert github_api.find_pr_by_head("fix", "open", ".") is None
+
+
+def test_find_pr_by_head_strips_owner_qualifier(monkeypatch):
+    captured: dict = {}
+
+    def fake_run(cmd, timeout_s=20, cwd=None):
+        captured["cmd"] = cmd
+        return _cp(json.dumps([
+            {"number": 4, "headRefName": "feature", "headRefOid": "y", "url": "u"},
+        ]))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    pr = github_api.find_pr_by_head("alice:feature", "open", ".")
+    assert pr is not None and pr["number"] == 4
+    # the owner qualifier is stripped before --head
+    assert captured["cmd"][captured["cmd"].index("--head") + 1] == "feature"
 
 
 def test_find_pr_by_head_merged_uses_wide_limit(monkeypatch):
@@ -170,3 +195,58 @@ def test_get_review_threads_single_page(monkeypatch):
     threads = github_api.get_review_threads(5, ".")
     assert len(threads) == 1
     assert threads[0].top.database_id == 202
+
+
+def test_get_review_threads_first_page_failure_returns_empty(monkeypatch):
+    # Total unavailability on page 1 → [] (fail open, like find_pr_by_head).
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp("", returncode=1))
+    assert github_api.get_review_threads(5, ".") == []
+
+
+def test_get_review_threads_later_page_failure_raises(monkeypatch):
+    # Page 1 advertises hasNextPage; page 2 fails → must NOT return a partial
+    # list (silent truncation hazard) — raise instead.
+    import pytest
+
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, timeout_s=20, cwd=None):
+        cursor = None
+        for part in cmd:
+            if isinstance(part, str) and part.startswith("cursor="):
+                cursor = part.split("=", 1)[1]
+        if cursor == "PAGE2":
+            return _cp("", returncode=1)  # transient failure on page 2
+        page = {
+            "pageInfo": {"hasNextPage": True, "endCursor": "PAGE2"},
+            "nodes": [_thread_node(101, "old.py", 10)],
+        }
+        return _cp(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    with pytest.raises(RuntimeError, match="partial thread list"):
+        github_api.get_review_threads(5, ".")
+
+
+def test_get_review_threads_later_page_malformed_raises(monkeypatch):
+    import pytest
+
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, timeout_s=20, cwd=None):
+        cursor = None
+        for part in cmd:
+            if isinstance(part, str) and part.startswith("cursor="):
+                cursor = part.split("=", 1)[1]
+        if cursor == "PAGE2":
+            return _cp("not json")  # malformed page 2
+        page = {
+            "pageInfo": {"hasNextPage": True, "endCursor": "PAGE2"},
+            "nodes": [_thread_node(101, "old.py", 10)],
+        }
+        return _cp(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    with pytest.raises(RuntimeError, match="partial thread list"):
+        github_api.get_review_threads(5, ".")

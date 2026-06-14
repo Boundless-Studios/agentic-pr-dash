@@ -169,6 +169,13 @@ def find_pr_by_head(
     """
     if not branch:
         return None
+    # `gh` accepts `<owner>:<branch>` for --head (fork/head-qualified specs), but
+    # `gh pr list --head` rejects the owner qualifier — strip it before resolving
+    # (mirrors the arm flow in maintenance_check). The bare name is also what we
+    # match `headRefName` against below.
+    branch = branch.split(":", 1)[-1]
+    if not branch:
+        return None
     limit = "1" if state == "open" else "20"
     cmd = [
         "gh", "pr", "list",
@@ -188,6 +195,11 @@ def find_pr_by_head(
         return None
     for pr in payload:
         if not isinstance(pr, dict):
+            continue
+        # `--head` is a prefix filter (GitHub matches branch names *beginning*
+        # with the query, so `fix` also returns `fix-123`). Require an exact
+        # head-branch match so a Stop/QA gate never evaluates the wrong PR.
+        if str(pr.get("headRefName") or "") != branch:
             continue
         if head_oid is not None and pr.get("headRefOid") != head_oid:
             continue
@@ -425,6 +437,14 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
     threads are not silently truncated — a hot review can easily exceed the
     first page, and a truncated thread list would let resolved-elsewhere or
     still-open threads slip past the caller's resolved/outdated filtering.
+
+    A *first*-page failure returns ``[]`` (total unavailability — callers fail
+    open, matching :func:`find_pr_by_head`). But once a page has succeeded and
+    advertised ``hasNextPage``, a failure fetching a *subsequent* page raises
+    :class:`RuntimeError` rather than returning a partial list: silently
+    dropping later pages would let still-open threads slip past the
+    unresolved-thread gate — the exact truncation hazard this pagination is
+    meant to eliminate.
     """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
@@ -432,6 +452,7 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
 
     threads: list[ReviewThread] = []
     cursor: str | None = None
+    paged: bool = False  # True once we've started fetching a non-first page
     while True:
         cmd = [
             "gh", "api", "graphql",
@@ -444,13 +465,24 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
             cmd.extend(["-F", f"cursor={cursor}"])
         r = _run(cmd, cwd=cwd, timeout_s=30)
         if r.returncode != 0:
+            if paged:
+                raise RuntimeError(
+                    f"get_review_threads: page after the first failed for PR "
+                    f"#{pr_number} (gh exit {r.returncode}); refusing to return "
+                    f"a partial thread list"
+                )
             break
         try:
             data = json.loads(r.stdout)
             review_threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
             nodes = review_threads["nodes"]
             page_info = review_threads.get("pageInfo") or {}
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            if paged:
+                raise RuntimeError(
+                    f"get_review_threads: malformed page after the first for PR "
+                    f"#{pr_number}; refusing to return a partial thread list"
+                ) from exc
             break
 
         for node in nodes:
@@ -487,6 +519,7 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
         if not isinstance(next_cursor, str) or not next_cursor:
             break
         cursor = next_cursor
+        paged = True
 
     return threads
 
