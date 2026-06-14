@@ -41,6 +41,25 @@ def _is_executable_file(path: Path) -> bool:
     return path.is_file() and os.access(path, os.X_OK)
 
 
+def _find_checkout_root(start: Path) -> Path:
+    """Walk up from *start* to the checkout root (dir containing ``.git``).
+
+    A Bash tool can run from a subdirectory of the repo (``/repo/pkg``), so the
+    payload cwd is not necessarily the checkout root. We ascend until we find a
+    ``.git`` directory or file (worktrees use a ``.git`` file), which is the real
+    trust boundary for repo-local probe binaries and warden fallback installs.
+    Falls back to *start* itself when no marker is found.
+    """
+    try:
+        current = start.resolve(strict=False)
+    except OSError:
+        return start
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return current
+
+
 def _candidate_from_env() -> str | None:
     env_candidates = [
         os.environ.get("WARDEN_HOOK_BIN", "").strip(),
@@ -108,11 +127,21 @@ def resolve_warden_hook(payload: dict | None = None) -> str | None:
         return path_candidate
 
     python_bin = Path(sys.executable).resolve().parent
-    repo = repo_root(payload)
-    fallback_candidates = [
-        python_bin / "warden-hook",
-        repo / ".venv" / "bin" / "warden-hook",
-        repo / "scripts" / "warden-hook",
+    # The payload cwd may be a subdirectory of the repo (``/repo/pkg``); resolve
+    # the actual checkout root (the dir with ``.git``) so a repo-local
+    # ``.venv``/``scripts`` install at the checkout root is found even when the
+    # command runs from a nested directory. Search both the checkout root and the
+    # raw payload cwd to cover non-git roots and avoid regressions.
+    payload_cwd = repo_root(payload)
+    checkout_root = _find_checkout_root(payload_cwd)
+    repo_roots: list[Path] = [checkout_root]
+    if payload_cwd != checkout_root:
+        repo_roots.append(payload_cwd)
+    fallback_candidates = [python_bin / "warden-hook"]
+    for repo in repo_roots:
+        fallback_candidates.append(repo / ".venv" / "bin" / "warden-hook")
+        fallback_candidates.append(repo / "scripts" / "warden-hook")
+    fallback_candidates += [
         Path.home() / ".local" / "bin" / "warden-hook",
         Path.home() / "bin" / "warden-hook",
         Path.home() / ".cargo" / "bin" / "warden-hook",
@@ -216,12 +245,15 @@ def _probe_resolves_under_repo(command: str, cwd: object) -> bool:
     """Return True iff the version-probe binary resolves to a real file under *cwd*.
 
     The probe path is repo-relative (e.g. ``node_modules/.bin/playwright``). We
-    resolve it against the payload cwd/repo root and confirm the fully-resolved
-    path (following symlinks) stays inside that root and is an existing regular
-    file. This prevents auto-allowing a probe that, when the Bash command runs
-    from a writable subdirectory, points at an attacker-planted binary —
-    a relative ``node_modules/.bin/playwright`` that escapes the repo (via a
-    symlink) or does not exist is NOT treated as a trusted probe.
+    resolve the *checkout root* (the dir containing ``.git``) by walking up from
+    the payload cwd, then resolve the probe against that root and confirm the
+    fully-resolved path (following symlinks) stays inside the checkout root and
+    is an existing regular file. Using the checkout root rather than the payload
+    exec dir prevents auto-allowing an attacker-planted probe in a writable
+    subdirectory: a Bash tool running from ``/repo/tmp`` must not be able to
+    auto-allow ``/repo/tmp/node_modules/.bin/playwright`` — only the repo-root
+    ``node_modules``/``frontend/node_modules`` probes are trusted. A probe that
+    escapes the checkout (via a symlink) or does not exist is NOT trusted.
     """
     if not isinstance(cwd, str) or not cwd:
         # No reliable root to resolve against — do not vouch for the probe.
@@ -230,7 +262,7 @@ def _probe_resolves_under_repo(command: str, cwd: object) -> bool:
     # The matched probe path is the leading token of the command.
     probe_rel = command.strip().split()[0]
     try:
-        root = Path(cwd).resolve(strict=False)
+        root = _find_checkout_root(Path(cwd)).resolve(strict=False)
         resolved = (root / probe_rel).resolve(strict=False)
     except OSError:
         return False

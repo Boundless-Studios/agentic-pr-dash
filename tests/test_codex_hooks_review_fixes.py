@@ -77,8 +77,13 @@ def test_non_commit_chain_not_detected():
 # ---------------------------------------------------------------------------
 
 
-def test_stdout_block_short_circuits(tmp_path):
-    """A hook emitting {"decision":"block"} with exit 0 stops later hooks."""
+def test_stdout_block_short_circuits(tmp_path, capsys):
+    """A hook emitting {"decision":"block"} with exit 0 stops later hooks.
+
+    Per the Codex contract (rev28b finding 8) the stdout-JSON block path stays
+    distinct from the exit-2/stderr path: run() returns exit 0 (the child already
+    printed valid block JSON on stdout) while still short-circuiting later hooks.
+    """
     blocker = tmp_path / "blocker.py"
     blocker.write_text(
         "import json\n"
@@ -92,7 +97,11 @@ def test_stdout_block_short_circuits(tmp_path):
         [("blk", "blocker.py"), ("later", "later.py")],
         [], base_dir=tmp_path, payload_text="{}", command="ls",
     )
-    assert rc != 0  # block surfaced as non-zero so run() short-circuits
+    out = capsys.readouterr().out
+    # Block JSON preserved on the stdout/exit-0 path; later hook short-circuited.
+    assert rc == 0
+    assert json.loads(out.strip().splitlines()[0])["decision"] == "block"
+    assert "SHOULD-NOT-RUN" not in out
 
 
 def test_run_script_returns_block_rc_on_stdout_block(tmp_path, capsys):

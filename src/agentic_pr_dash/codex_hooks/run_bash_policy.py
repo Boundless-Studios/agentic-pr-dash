@@ -46,10 +46,18 @@ from agentic_pr_dash.codex_hooks._payload import (
 # any path that starts by walking into the parent tree. We match a leading
 # ``..`` segment optionally followed by ``/``-separated continuation so deeper
 # parent walks (``find ../.. -name AGENTS.md``) are caught too, not just ``..``.
+#
+# ``find`` accepts global options (``-H``/``-L``/``-P``/``-Olevel``/``-D...``)
+# *before* the path operands (``find -L ../.. -name AGENTS.md``), so we allow a
+# run of those options between ``find`` and the parent path — otherwise an
+# option prefix would slip the parent-tree search past the guard.
 _PARENT_TREE_AGENTS_SEARCH_RE = re.compile(
     r"""
     ^\s*
     find\s+
+    (?:                              # optional pre-path find global options
+        (?:-[HLP]+|-O\S*|-D\S+)\s+
+    )*
     (?:
         \.\.(?:/[^\s;&|]*)*          # ..  ../  ../..  ../../foo
         |
@@ -95,26 +103,41 @@ def _block_reason_for_command(command: object) -> str | None:
     if not isinstance(command, str):
         return None
 
-    if _PARENT_TREE_AGENTS_SEARCH_RE.match(command):
-        return (
-            "`find .. -name AGENTS.md` searches sibling repositories from shared code roots. "
-            "Use `test -f AGENTS.md` in the current checkout, one bounded parent check when "
-            "needed, or a path-scoped search under the current repository instead."
-        )
+    # Scan each top-level shell segment: a parent-tree AGENTS.md search chained
+    # after a benign prefix (``cd . && find ../.. -name AGENTS.md`` or
+    # ``echo ok; find .. -name AGENTS.md``) still executes, so the anchored guard
+    # must run against each segment, not just the whole raw command.
+    for segment in _split_top_level_segments(command):
+        if _PARENT_TREE_AGENTS_SEARCH_RE.match(segment):
+            return (
+                "`find .. -name AGENTS.md` searches sibling repositories from shared code roots. "
+                "Use `test -f AGENTS.md` in the current checkout, one bounded parent check when "
+                "needed, or a path-scoped search under the current repository instead."
+            )
 
     return None
 
 
 # Sentinel exit code used when a hook signals a block via its stdout JSON
-# (``{"decision":"block",...}``) while still exiting 0 — see ``_stdout_is_block``.
-# The Codex hook contract treats a block decision as final regardless of exit
-# status, so we surface it as a non-zero return so ``run()`` short-circuits and
-# no later hook can append more stdout after the block JSON.
-_STDOUT_BLOCK_RC = 2
+# (``{"decision":"block",...}`` or ``hookSpecificOutput.permissionDecision:"deny"``)
+# while still exiting 0 — see ``_stdout_is_block``. The Codex contract treats a
+# *stdout-JSON* block and an *exit-2/stderr* block as two distinct paths: a JSON
+# denial on stdout is parsed for its reason, while exit 2 is handled as a failed/
+# stderr-style hook. We must therefore keep the stdout-JSON block on the exit-0
+# path (the child already printed valid JSON to stdout) and only stop invoking
+# later hooks, rather than rewriting it to exit 2 (which would print JSON to
+# stdout *and* exit non-zero and corrupt the contract). This negative sentinel
+# never collides with a real child exit code; ``run()`` maps it back to 0.
+_STDOUT_BLOCK_RC = -1000
 
 
 def _stdout_is_block(stdout: str) -> bool:
-    """Return True iff *stdout* is a Codex ``{"decision":"block",...}`` payload."""
+    """Return True iff *stdout* is a Codex block payload.
+
+    Recognises both the legacy top-level ``{"decision":"block",...}`` shape and
+    the current ``hookSpecificOutput.permissionDecision:"deny"`` shape — either
+    one is a final deny that must short-circuit the remaining hooks.
+    """
     trimmed = stdout.strip()
     if not trimmed:
         return False
@@ -122,18 +145,27 @@ def _stdout_is_block(stdout: str) -> bool:
         payload = json.loads(trimmed)
     except json.JSONDecodeError:
         return False
-    return isinstance(payload, dict) and payload.get("decision") == "block"
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("decision") == "block":
+        return True
+    hook_specific = payload.get("hookSpecificOutput")
+    return (
+        isinstance(hook_specific, dict)
+        and hook_specific.get("permissionDecision") == "deny"
+    )
 
 
 def run_script(path: str, payload_text: str, *, base: Path | None = None) -> int:
     """Run a hook script ``path`` (relative to *base*) with *payload_text* on stdin.
 
     Prints the script's stdout/stderr to the current process's stdout/stderr so
-    any ``{"decision":"block",...}`` emitted by the script reaches the hook harness.
+    any block decision emitted by the script reaches the hook harness.
 
     Returns the child's exit code, or ``_STDOUT_BLOCK_RC`` when the child exits 0
     but emits a block decision on stdout — so a stdout-only block is treated as
-    final and the policy engine stops invoking later hooks.
+    final (later hooks are not invoked) while ``run()`` keeps the response on the
+    exit-0 / stdout-JSON path rather than rewriting it to a non-zero exit.
     """
     resolved_base = base if base is not None else hook_base_dir()
     result = subprocess.run(
@@ -157,8 +189,11 @@ def run_script(path: str, payload_text: str, *, base: Path | None = None) -> int
 # (``cd subdir && git commit -m x``, even space-free ``cd x&&git commit``) is
 # still recognised — the shell will run the ``git commit`` segment, so
 # commit-only hooks must fire for it. Longest operators first so ``&&``/``||``
-# are matched before a bare ``&``/``|``.
-_SHELL_SEPARATORS = ("&&", "||", ";", "|", "&")
+# are matched before a bare ``&``/``|``. A literal newline is also a top-level
+# shell command separator (``make\ngit commit -m x`` runs the commit), so it is
+# included — otherwise commit-only hooks would be skipped for newline-chained
+# commits.
+_SHELL_SEPARATORS = ("&&", "||", ";", "|", "&", "\n")
 
 
 def _split_top_level_segments(command: str) -> list[str]:
@@ -257,11 +292,31 @@ def _segment_is_git_commit(segment: str) -> bool:
         "--work-tree",
         "--namespace",
     }
+    # Valid no-argument git global options (``git -h`` usage:
+    # ``[-p | --paginate | -P | --no-pager] ... <command>``). They take no value
+    # and may legitimately precede the subcommand, so ``git --no-pager commit``
+    # and ``git -P commit`` must still be detected as commits.
+    no_value_flags = {
+        "-p",
+        "-P",
+        "--paginate",
+        "--no-pager",
+        "--no-replace-objects",
+        "--bare",
+        "--literal-pathspecs",
+        "--glob-pathspecs",
+        "--noglob-pathspecs",
+        "--icase-pathspecs",
+        "--no-optional-locks",
+    }
     while index < len(tokens):
         token = tokens[index]
         if token == "commit":
             return True
         if token.startswith("-"):
+            if token in no_value_flags:
+                index += 1
+                continue
             if token.split("=", 1)[0] in option_value_flags:
                 index += 2 if "=" not in token else 1
                 continue
@@ -327,6 +382,11 @@ def run(
         if not behavior_enabled(hook_name):
             continue
         rc = run_script(hook_path, payload_text, base=base_dir)
+        if rc == _STDOUT_BLOCK_RC:
+            # Stdout-JSON block: the child already printed the block JSON on
+            # stdout. Stop invoking later hooks but keep the exit-0/stdout-JSON
+            # path intact (do not rewrite to a non-zero exit).
+            return 0
         if rc != 0:
             return rc
 
@@ -335,6 +395,8 @@ def run(
             if not behavior_enabled(hook_name):
                 continue
             rc = run_script(hook_path, payload_text, base=base_dir)
+            if rc == _STDOUT_BLOCK_RC:
+                return 0
             if rc != 0:
                 return rc
 
