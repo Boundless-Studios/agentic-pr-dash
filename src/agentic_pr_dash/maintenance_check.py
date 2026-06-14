@@ -1051,19 +1051,24 @@ def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dic
     Each repo's ledger is queried per root. PR numbers are unique only WITHIN a
     repo, so dedupe on ``(root, pr)`` — a blocking ``#42`` in one repo must not
     suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
+    roots = _maint_roots_for(anchor_cwd)
+    # Legacy pruning is only UNSAFE when more than one root is probed: with a
+    # single root the repo is unambiguous, so a merged/closed legacy row should
+    # still be pruned (preserving the pre-BOU-1546 single-root behavior — a normal
+    # checkout must not accumulate stale legacy rows re-queried every tick, codex
+    # PR #32 P3). With multiple roots a same-number closed PR on one remote must
+    # not delete a row open on another, so legacy is never pruned.
+    prune_legacy = len(roots) <= 1
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
-    for root in _maint_roots_for(anchor_cwd):
+    for root in roots:
         # A repo-less LEGACY entry's true repo is unknown, so it must be checked
         # against EVERY root to surface a sibling-owned PR (anchor-only reads hide a
-        # sibling PR when the anchor has the same number closed — codex PR #32 P2b),
-        # but it is NEVER pruned in this cross-root pass (prune_legacy=False): a
-        # same-number closed PR on one remote must not delete a row that is open on
-        # another (codex PR #30/#32 P2). Single-root callers still prune via the
-        # _detached_pr_records defaults. Dedup by (root, pr) — numbers are unique
-        # only within a repo, so the SAME number in two repos stays distinct.
+        # sibling PR when the anchor has the same number closed — codex PR #32 P2b).
+        # Dedup by (root, pr) — numbers are unique only within a repo, so the SAME
+        # number in two repos stays distinct (codex PR #30, P2).
         for r in _detached_pr_records(session_id, root, include_legacy=True,
-                                      prune_legacy=False):
+                                      prune_legacy=prune_legacy):
             key = (root, r["pr"])
             if key in seen:
                 continue

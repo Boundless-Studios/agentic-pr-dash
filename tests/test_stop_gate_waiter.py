@@ -135,8 +135,11 @@ def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypat
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     err = capsys.readouterr().err
     assert rc == 2
-    assert "99" in err  # detached PR still demands a waiter
-    assert "42" not in err  # worktree-backed PR is covered by the live loop
+    # Use the "#<n>" PR token, not a bare number — the rendered await command
+    # contains the cwd path, whose random pytest tmp id can coincidentally contain
+    # the digits "42" (e.g. pytest-423).
+    assert "#99" in err  # detached PR still demands a waiter
+    assert "#42" not in err  # worktree-backed PR is covered by the live loop
 
 
 def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):

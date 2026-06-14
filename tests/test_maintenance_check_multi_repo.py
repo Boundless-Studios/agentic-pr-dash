@@ -233,6 +233,21 @@ def test_detached_across_roots_reads_legacy_everywhere_never_prunes(tmp_path, mo
     assert calls[_rp(sib)] == (True, False)
 
 
+def test_detached_single_root_still_prunes_legacy(tmp_path, monkeypatch):
+    # codex PR #32 P3: a single-root checkout (no maintenance_repo_roots) must
+    # still prune merged/closed legacy rows — pruning is only unsafe with >1 root.
+    anchor = _make_repo(tmp_path / "anchor")  # no configured roots
+    calls = {}
+
+    def fake_detached(sid, cwd, include_legacy=True, prune_legacy=True):
+        calls[_rp(cwd)] = (include_legacy, prune_legacy)
+        return []
+
+    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    mc._detached_records_across_roots("sess", str(anchor))
+    assert calls[_rp(anchor)] == (True, True)  # legacy pruning preserved
+
+
 def test_ledger_strict_read_empty_repo_excludes_legacy(tmp_path, monkeypatch):
     # codex PR #32 P2: a strict read/prune with an EMPTY repo (undetectable remote)
     # must still exclude legacy rows (their repo is also "").
