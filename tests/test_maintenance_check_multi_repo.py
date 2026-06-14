@@ -216,9 +216,9 @@ def test_ledger_strict_read_and_prune_exclude_legacy(tmp_path, monkeypatch):
     assert not any(e.repo == "ownerA/repoA" and e.pr == 42 for e in after)  # repoA dropped
 
 
-def test_detached_across_roots_processes_legacy_only_at_anchor(tmp_path, monkeypatch):
-    # codex P2: legacy entries are processed against the anchor only, not replayed
-    # against every sibling root.
+def test_detached_across_roots_reads_legacy_everywhere_never_prunes(tmp_path, monkeypatch):
+    # codex PR #32 P2b: a legacy row's true repo is unknown, so EVERY root reads
+    # legacy (to surface a sibling-owned PR) but NONE prune it in cross-root mode.
     sib = _make_repo(tmp_path / "sibling")
     anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
     calls = {}
@@ -229,9 +229,8 @@ def test_detached_across_roots_processes_legacy_only_at_anchor(tmp_path, monkeyp
 
     monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
     mc._detached_records_across_roots("sess", str(anchor))
-    # Anchor reads legacy but NEVER prunes it (codex PR #32 P2); sibling is strict.
     assert calls[_rp(anchor)] == (True, False)
-    assert calls[_rp(sib)][0] is False
+    assert calls[_rp(sib)] == (True, False)
 
 
 def test_ledger_strict_read_empty_repo_excludes_legacy(tmp_path, monkeypatch):

@@ -1053,16 +1053,17 @@ def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dic
     suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
-    for i, root in enumerate(_maint_roots_for(anchor_cwd)):
-        # Legacy repo-less entries are read against the ANCHOR only (i == 0) so they
-        # surface once, not per sibling (codex PR #30, P2) — and are NEVER pruned in
-        # this cross-root pass (prune_legacy=False), since a repo-less entry's true
-        # repo is unknown and a same-number closed PR on the anchor remote must not
-        # drop a still-open sibling PR (codex PR #32, P2).
-        recs = (_detached_pr_records(session_id, root, include_legacy=True, prune_legacy=False)
-                if i == 0
-                else _detached_pr_records(session_id, root, include_legacy=False))
-        for r in recs:
+    for root in _maint_roots_for(anchor_cwd):
+        # A repo-less LEGACY entry's true repo is unknown, so it must be checked
+        # against EVERY root to surface a sibling-owned PR (anchor-only reads hide a
+        # sibling PR when the anchor has the same number closed — codex PR #32 P2b),
+        # but it is NEVER pruned in this cross-root pass (prune_legacy=False): a
+        # same-number closed PR on one remote must not delete a row that is open on
+        # another (codex PR #30/#32 P2). Single-root callers still prune via the
+        # _detached_pr_records defaults. Dedup by (root, pr) — numbers are unique
+        # only within a repo, so the SAME number in two repos stays distinct.
+        for r in _detached_pr_records(session_id, root, include_legacy=True,
+                                      prune_legacy=False):
             key = (root, r["pr"])
             if key in seen:
                 continue
