@@ -17,6 +17,18 @@ It is **project-agnostic**: the GitHub repo, on-disk state directory, task
 tracker, agent executor, and CI runner label are all configuration, not
 hardcoded.
 
+## Mental model
+
+Think of each PR as a case file. `agentic-pr-dash` checks the file, decides
+whether CI, merge conflicts, or review comments need attention, records who owns
+the fix, and hands a prompt to the agent command your project configured.
+
+It does not know how to fix your app. Your project decides which agent runs,
+which tracker records work, which CI runners matter, and which safety policies
+apply. For example, Gaia is one downstream app repo that uses `agentic-pr-dash`;
+Gaia owns its beads, proof, test, Docker, and database policy, while
+`agentic-pr-dash` owns generic PR state and one-agent-per-PR coordination.
+
 ## The board
 
 ![PR dashboard board](docs/images/dashboard-board.png)
@@ -131,6 +143,9 @@ worked by one agent at a time — no double-fixing, no clobbered commits.
 
 *An agent holding the lease on PR #421 — addressing the reviewer's comment and
 the failing unit test, with the heartbeat and progress timestamps ticking.*
+
+For maintainers, see [Architecture](docs/ARCHITECTURE.md) for the setup model,
+configuration contract, runtime flows, data model, and code map.
 
 ### Durable PR ledger — surviving worktree teardown (BOU-1587)
 
