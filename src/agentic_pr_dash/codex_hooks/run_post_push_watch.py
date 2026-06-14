@@ -57,13 +57,27 @@ def _normalized_cwd(payload: dict) -> str:
 
 
 def find_push_cwd(payload: dict) -> str | None:
-    """Return the effective worktree of a ``git push`` in this payload, else None.
+    """Return the effective worktree of a *successful* ``git push``, else None.
 
     Walks compound command segments (honoring ``cd`` relocation and ``&&``/``||``
-    guards) exactly like the arming hook so ``cd ../wt && git push`` and
-    ``git -C nested push`` resolve to the directory the push actually targeted.
-    A push that the shell never ran (failed ``&&`` guard, ``||`` guard) returns
-    None — there's nothing new to watch.
+    guards) like the arming hook so ``cd ../wt && git push`` and
+    ``git -C nested push`` resolve to the directory the push targeted.
+
+    Unlike the (idempotent, low-harm) arm hook, this one kills a live watcher and
+    starts polling the pushed SHA, so a false arm on a push that never landed
+    replaces a valid watch with a bogus timeout. We therefore arm only when the
+    push provably *succeeded*:
+
+    * The whole command exited 0 → every executed segment, including the push,
+      succeeded.
+    * The command failed but the push is **not** the last executed segment
+      (e.g. ``git push && gh pr create`` where ``gh pr create`` failed): a failed
+      push would have short-circuited the ``&&`` chain, so the push must have
+      landed. The trailing failed segment carries the non-zero exit, not the push.
+
+    A lone ``git push`` (or one that is the final segment) that exits non-zero is
+    a rejected/non-fast-forward push → return None; there is nothing new to
+    watch. ``||``-guarded pushes (failure fallbacks) are likewise skipped.
     """
     normalized = normalized_payload(payload)
     if normalized.get("tool_name") != "Bash":
@@ -75,6 +89,11 @@ def find_push_cwd(payload: dict) -> str | None:
 
     failed = _command_failed(payload)
     eff_cwd = _normalized_cwd(normalized)
+
+    # Resolve each segment's effective cwd, recording the LAST git-push segment
+    # and whether any executable (non-cd) segment follows it.
+    push_cwd: str | None = None
+    push_is_last = True
     for op, segment in split_command_segments(command):
         destination = cd_target(segment)
         if destination is not None:
@@ -86,12 +105,25 @@ def find_push_cwd(payload: dict) -> str | None:
             )
             continue
         if op == "||":
-            continue
-        if op == "&&" and failed:
+            # Failure-fallback segment: it runs only when the prior command
+            # failed, so it neither is a push we watch nor proves a prior push
+            # succeeded. Ignore it entirely.
             continue
         if is_git_push(segment):
-            return effective_git_cwd(segment, eff_cwd)
-    return None
+            push_cwd = effective_git_cwd(segment, eff_cwd)
+            push_is_last = True
+            continue
+        # A non-cd, non-``||`` segment that runs after a push proves the push did
+        # not end the chain (a failed push short-circuits the ``&&`` that guards
+        # this segment), so the push must have succeeded.
+        if push_cwd is not None:
+            push_is_last = False
+
+    if push_cwd is None:
+        return None
+    if failed and push_is_last:
+        return None
+    return push_cwd
 
 
 def main() -> int:

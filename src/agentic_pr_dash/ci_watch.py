@@ -37,6 +37,18 @@ WATCH_TIMEOUT_S = 540
 
 INFRA_CHECK_PATTERNS = github_api.INFRA_CHECK_PATTERNS
 
+# A GitHub check run is only finished when its ``status`` is ``completed``;
+# every other status (``queued``, ``in_progress``, ``requested``, ``waiting``,
+# ``pending``) means CI is still running and we must keep polling. See the
+# Checks API docs ("about check runs").
+COMPLETED_STATUS = "completed"
+
+# Conclusions that are NOT a clean pass. GitHub treats anything other than
+# ``success`` (and the soft ``neutral``/``skipped``) as needing attention:
+# ``failure``, ``cancelled``, ``timed_out``, ``action_required``, ``stale``,
+# ``startup_failure``. We surface those as blocking.
+PASSING_CONCLUSIONS = ("success", "neutral", "skipped")
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -89,10 +101,21 @@ class CIWatchConfig:
             except (KeyError, ValueError):
                 return default
 
+        def _under_project(value: str | None, default: Path) -> Path:
+            # A relative override must anchor under the *pushed* worktree
+            # (``project_dir``), not the hook/background process cwd — otherwise
+            # ``cd wt && git push`` with a relative ``.claude/ci-watch-latest.json``
+            # writes results into the wrong worktree and the pushed repo's
+            # stop-gate can't read them.
+            if not value:
+                return default
+            p = Path(value)
+            return p if p.is_absolute() else project / p
+
         return cls(
             project_dir=project,
-            results_file=Path(results) if results else project / ".claude" / "ci-watch-latest.json",
-            pid_file=Path(pid) if pid else project / ".claude" / "ci-watch.pid",
+            results_file=_under_project(results, project / ".claude" / "ci-watch-latest.json"),
+            pid_file=_under_project(pid, project / ".claude" / "ci-watch.pid"),
             status_command=e.get("CI_WATCH_STATUS_COMMAND") or None,
             complete_command=e.get("CI_WATCH_COMPLETE_COMMAND") or None,
             poll_interval_s=_ival("CI_WATCH_POLL_INTERVAL_S", POLL_INTERVAL_S),
@@ -166,6 +189,36 @@ def head_sha(project_dir: Path) -> str:
     return _git(project_dir, ["rev-parse", "HEAD"])
 
 
+def commit_date(project_dir: Path, sha: str) -> str:
+    """UTC ISO (``...Z``) committer date of ``sha`` from the local repo.
+
+    Anchors the review-comment freshness check to the *pushed* commit rather
+    than re-fetching the PR's latest commit from GitHub, which can still report
+    the previous head for a second or two right after a push (BOU-1479) and
+    would resurface comments the just-pushed fix already addressed. Returns ""
+    if the sha isn't resolvable locally."""
+    if not sha:
+        return ""
+    out = _git(project_dir, ["show", "-s", "--format=%cI", sha])
+    if not out:
+        return ""
+    # %cI emits the committer's local offset (e.g. ...-07:00); normalize to a
+    # ...Z UTC stamp so it sorts lexicographically against GitHub createdAt.
+    stamp = out.splitlines()[0].strip()
+    return _to_utc_z(stamp)
+
+
+def _to_utc_z(stamp: str) -> str:
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(stamp)
+    except ValueError:
+        return stamp
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def repo_slug(project_dir: Path) -> str:
     env_repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
     if env_repo and "/" in env_repo:
@@ -218,9 +271,13 @@ def snapshot_ci(sha: str, project_dir: Path) -> dict:
     if not checks:
         return {"status": "no_checks", "message": "No CI checks found"}
 
-    failing = [c for c in checks if c.get("conclusion") in ("failure", "cancelled", "timed_out")]
-    pending = [c for c in checks if c.get("status") in ("queued", "in_progress")]
-    passed = [c for c in checks if c.get("conclusion") == "success"]
+    # Anything not ``completed`` is still running. Among completed checks, only
+    # the soft-pass conclusions count as passing; every other terminal
+    # conclusion (failure/cancelled/timed_out/action_required/stale/...) blocks.
+    pending = [c for c in checks if c.get("status") != COMPLETED_STATUS]
+    completed = [c for c in checks if c.get("status") == COMPLETED_STATUS]
+    failing = [c for c in completed if c.get("conclusion") not in PASSING_CONCLUSIONS]
+    passed = [c for c in completed if c.get("conclusion") in PASSING_CONCLUSIONS]
 
     code_failures = [c for c in failing if not _is_infra_check(c.get("name", ""))]
     infra_failures = [c for c in failing if _is_infra_check(c.get("name", ""))]
@@ -237,45 +294,73 @@ def snapshot_ci(sha: str, project_dir: Path) -> dict:
             "infra_failures": [c.get("name", "?") for c in infra_failures]}
 
 
+# Outcomes returned by the poller. ``done`` → all checks completed (caller
+# classifies pass/fail); ``no_checks`` → the commit legitimately has no CI (a
+# non-blocking terminal state, NOT a timeout); ``timeout`` → still running when
+# the deadline elapsed.
+POLL_DONE = "done"
+POLL_NO_CHECKS = "no_checks"
+POLL_TIMEOUT = "timeout"
+
+# How long to keep seeing zero check runs before concluding the commit has no
+# CI at all (rather than checks that simply haven't registered yet).
+NO_CHECKS_GRACE_S = 90
+
+
 def poll_checks_for_commit(
     sha: str,
     cfg: CIWatchConfig,
     pr_number: int | None = None,
-) -> tuple[list[dict], bool]:
-    """Poll check-runs for ``sha`` until none are in-progress or timeout.
+) -> tuple[list[dict], str]:
+    """Poll check-runs for ``sha`` until they complete, vanish, or timeout.
 
     Emits the optional ``status`` adapter on each poll so a project can mirror
-    live progress. Returns ``(checks, timed_out)``.
+    live progress. A check run is finished only when ``status == "completed"``;
+    every other status (queued/in_progress/requested/waiting/pending) keeps the
+    poll alive. Returns ``(checks, outcome)`` where ``outcome`` is one of
+    :data:`POLL_DONE`, :data:`POLL_NO_CHECKS`, :data:`POLL_TIMEOUT`.
+
+    If the commit reports zero check runs for ``NO_CHECKS_GRACE_S`` (a repo
+    without CI, or a commit whose workflows create no checks), the poll returns
+    ``POLL_NO_CHECKS`` instead of spinning to a blocking timeout.
     """
     deadline = time.time() + cfg.watch_timeout_s
     time.sleep(cfg.initial_delay_s)
+    first_seen_empty: float | None = None
     while time.time() < deadline:
         checks = github_api.get_check_runs_for_commit(sha, str(cfg.project_dir))
-        if checks:
-            in_progress = [c for c in checks if c.get("status") in ("queued", "in_progress")]
-            done = [c for c in checks if c.get("status") == "completed"]
-            failed = [c for c in done if c.get("conclusion") in ("failure", "cancelled")]
-            passed = [c for c in done if c.get("conclusion") == "success"]
+        if not checks:
+            if first_seen_empty is None:
+                first_seen_empty = time.time()
+            elif time.time() - first_seen_empty >= NO_CHECKS_GRACE_S:
+                return [], POLL_NO_CHECKS
+            time.sleep(cfg.poll_interval_s)
+            continue
+        first_seen_empty = None
+        in_progress = [c for c in checks if c.get("status") != COMPLETED_STATUS]
+        done = [c for c in checks if c.get("status") == COMPLETED_STATUS]
+        failed = [c for c in done if c.get("conclusion") not in PASSING_CONCLUSIONS]
+        passed = [c for c in done if c.get("conclusion") in PASSING_CONCLUSIONS]
 
-            pending_names = ", ".join(c.get("name", "?") for c in in_progress[:2])
-            if failed:
-                fail_names = ", ".join(c.get("name", "?") for c in failed)
-                msg = f"CI: {fail_names} FAILED | {len(passed)} ok, {len(in_progress)} running"
-            elif in_progress:
-                msg = f"CI: {len(passed)}/{len(checks)} ok | running: {pending_names}"
-            else:
-                msg = f"CI: {len(passed)}/{len(checks)} ok"
-            run_adapter(
-                cfg.status_command,
-                {"status": "watching", "message": msg, "pr": str(pr_number or ""),
-                 "sha": sha, "branch": ""},
-                cfg.project_dir,
-            )
+        pending_names = ", ".join(c.get("name", "?") for c in in_progress[:2])
+        if failed:
+            fail_names = ", ".join(c.get("name", "?") for c in failed)
+            msg = f"CI: {fail_names} FAILED | {len(passed)} ok, {len(in_progress)} running"
+        elif in_progress:
+            msg = f"CI: {len(passed)}/{len(checks)} ok | running: {pending_names}"
+        else:
+            msg = f"CI: {len(passed)}/{len(checks)} ok"
+        run_adapter(
+            cfg.status_command,
+            {"status": "watching", "message": msg, "pr": str(pr_number or ""),
+             "sha": sha, "branch": ""},
+            cfg.project_dir,
+        )
 
-            if not in_progress:
-                return checks, False
+        if not in_progress:
+            return checks, POLL_DONE
         time.sleep(cfg.poll_interval_s)
-    return [], True
+    return [], POLL_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +372,44 @@ def write_results(cfg: CIWatchConfig, results: dict) -> None:
     cfg.results_file.write_text(json.dumps(results, indent=2) + "\n")
 
 
+def _is_our_watcher(pid: int) -> bool:
+    """True only if ``pid`` is a live process running this watcher module.
+
+    The pid file can outlive a finished watcher, and the OS may recycle that pid
+    for an unrelated process. Before killing, confirm the live process is a
+    ``ci_watch`` background poller so we never ``SIGKILL`` an innocent neighbor.
+    """
+    try:
+        r = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if r.returncode != 0:
+        return False
+    cmdline = r.stdout.strip()
+    return "agentic_pr_dash.ci_watch" in cmdline and "--background" in cmdline
+
+
 def kill_previous_watcher(cfg: CIWatchConfig) -> None:
-    """Kill any previous background watcher so stale results don't linger."""
+    """Kill a previous background watcher so stale results don't linger.
+
+    Only kills when the recorded pid is verifiably still THIS watcher module
+    (guards against a recycled pid). The pid file is always cleared afterwards.
+    """
     if not cfg.pid_file.exists():
         return
     try:
         pid = int(cfg.pid_file.read_text().strip())
-        os.kill(pid, 9)
     except (ValueError, OSError):
-        pass
+        cfg.pid_file.unlink(missing_ok=True)
+        return
+    if _is_our_watcher(pid):
+        try:
+            os.kill(pid, 9)
+        except OSError:
+            pass
     cfg.pid_file.unlink(missing_ok=True)
 
 
@@ -308,8 +422,17 @@ def background_watch(sha: str, pr_number: int, branch: str, cfg: CIWatchConfig) 
 
     Mirrors progress through the configured ``status`` adapter and the terminal
     state through the ``complete`` adapter. The results-file contract is stable
-    so a project's stop-gate can read it for final enforcement.
+    so a project's stop-gate can read it for final enforcement. The pid file is
+    always removed on exit so a finished watcher's stale pid can never be
+    ``SIGKILL``ed after the OS recycles it.
     """
+    try:
+        _background_watch(sha, pr_number, branch, cfg)
+    finally:
+        cfg.pid_file.unlink(missing_ok=True)
+
+
+def _background_watch(sha: str, pr_number: int, branch: str, cfg: CIWatchConfig) -> None:
     write_results(cfg, {
         "sha": sha, "pr_number": pr_number, "branch": branch,
         "status": "watching", "timestamp": time.time(),
@@ -321,11 +444,11 @@ def background_watch(sha: str, pr_number: int, branch: str, cfg: CIWatchConfig) 
         cfg.project_dir,
     )
 
-    checks, timed_out = poll_checks_for_commit(sha, cfg, pr_number=pr_number)
+    checks, outcome = poll_checks_for_commit(sha, cfg, pr_number=pr_number)
 
     results: dict = {"sha": sha, "pr_number": pr_number, "branch": branch, "timestamp": time.time()}
 
-    if timed_out:
+    if outcome == POLL_TIMEOUT:
         results["status"] = "timeout"
         results["message"] = f"CI timed out on {pr_link(cfg.project_dir, pr_number)} (commit {sha[:8]})"
         results["action_needed"] = True
@@ -338,8 +461,33 @@ def background_watch(sha: str, pr_number: int, branch: str, cfg: CIWatchConfig) 
         )
         return
 
+    if outcome == POLL_NO_CHECKS:
+        # No CI on this commit is not a failure — mirror the foreground snapshot's
+        # classification rather than blocking with a bogus timeout.
+        results["status"] = "no_checks"
+        results["action_needed"] = False
+        results["checks_total"] = 0
+        results["message"] = (
+            f"No CI checks ran on {pr_link(cfg.project_dir, pr_number)} (commit {sha[:8]})"
+        )
+        comments = _unaddressed_comments(pr_number, sha, cfg.project_dir)
+        if comments:
+            results["review_comments"] = comments
+            results["action_needed"] = True
+            results["message"] += f" | {len(comments)} PR review comment(s) to address."
+        write_results(cfg, results)
+        run_adapter(
+            cfg.complete_command,
+            {"status": results["status"], "message": results["message"],
+             "pr": str(pr_number), "sha": sha, "branch": branch},
+            cfg.project_dir,
+        )
+        return
+
+    # A completed check is a code failure unless its conclusion is a clean pass.
     all_failures = [c for c in checks if isinstance(c, dict)
-                    and c.get("conclusion") in ("failure", "cancelled", "timed_out")]
+                    and c.get("status") == COMPLETED_STATUS
+                    and c.get("conclusion") not in PASSING_CONCLUSIONS]
     code_failures = [c for c in all_failures if not _is_infra_check(c.get("name", ""))]
     infra_failures = [c for c in all_failures if _is_infra_check(c.get("name", ""))]
 
@@ -383,13 +531,19 @@ def background_watch(sha: str, pr_number: int, branch: str, cfg: CIWatchConfig) 
 
 
 def _unaddressed_comments(pr_number: int, sha: str, project_dir: Path) -> list[dict]:
-    """Unaddressed review comments since the pushed commit, as plain dicts."""
+    """Unaddressed review comments since the *pushed* commit, as plain dicts.
+
+    Anchors on the pushed ``sha``'s local commit date so a just-pushed fix
+    isn't measured against a stale GitHub head. Falls back to the PR's latest
+    commit date only when the sha can't be resolved locally."""
+    since = commit_date(project_dir, sha)
+    if not since:
+        try:
+            _, since = github_api.get_latest_commit(pr_number, str(project_dir))
+        except Exception:  # noqa: BLE001 - advisory
+            since = ""
     try:
-        _, commit_date = github_api.get_latest_commit(pr_number, str(project_dir))
-    except Exception:  # noqa: BLE001 - advisory
-        commit_date = ""
-    try:
-        comments = github_api.get_unaddressed_comments(pr_number, commit_date, str(project_dir))
+        comments = github_api.get_unaddressed_comments(pr_number, since, str(project_dir))
     except Exception:  # noqa: BLE001 - advisory
         return []
     out: list[dict] = []

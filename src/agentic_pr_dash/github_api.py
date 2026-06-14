@@ -524,33 +524,88 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
-    """Snapshot GitHub check-runs for a specific commit ``sha``.
+    """Snapshot GitHub status for a specific commit ``sha``.
 
     A push targets a specific commit, so the post-push CI watcher keys off the
     pushed SHA rather than the PR's current head (which can race ahead). Returns
     a deduped list of ``{name, status, conclusion}`` dicts — the stable contract
     the post-push results file and stop-gate consume.
+
+    Combines BOTH of GitHub's status mechanisms so the watcher can't miss a
+    pending/failing signal:
+
+    * **Check runs** (``/commits/{sha}/check-runs``) — paginated with
+      ``--paginate`` because the endpoint caps at 30 per page, so a commit with
+      31+ checks would otherwise drop a failing/pending job on page 2+.
+    * **Commit statuses** (``/commits/{sha}/status``) — the older mechanism still
+      surfaced on PRs (e.g. external CI). Mapped into the same shape so a repo
+      that reports statuses instead of checks isn't seen as ``no_checks``.
     """
-    r = _run(
-        ["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs",
-         "--jq", ".check_runs[] | {name, status, conclusion}"],
-        cwd=cwd, timeout_s=20,
-    )
-    if r.returncode != 0:
-        return []
     checks: list[dict] = []
-    for line in r.stdout.strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            checks.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+
+    r = _run(
+        ["gh", "api", "--paginate",
+         f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs",
+         "--jq", ".check_runs[] | {name, status, conclusion}"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode == 0:
+        for line in r.stdout.strip().split("\n"):
+            if not line.strip():
+                continue
+            try:
+                checks.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+    checks.extend(_get_commit_statuses(sha, cwd))
+
     by_name: dict[str, dict] = {}
     for c in checks:
         if c.get("name"):
             by_name[c["name"]] = c
     return list(by_name.values()) if by_name else checks
+
+
+# Combined-status states → our (status, conclusion) model. A commit status is
+# ``success`` / ``failure`` / ``error`` / ``pending``.
+_STATUS_STATE_MAP = {
+    "success": ("completed", "success"),
+    "failure": ("completed", "failure"),
+    "error": ("completed", "failure"),
+    "pending": ("in_progress", None),
+}
+
+
+def _get_commit_statuses(sha: str, cwd: str | None = None) -> list[dict]:
+    """Commit statuses for ``sha`` mapped into the check-run dict shape.
+
+    Uses the combined-status endpoint's per-context entries so each external
+    CI context becomes one ``{name, status, conclusion}`` dict. Best-effort:
+    returns ``[]`` on any failure (advisory watcher)."""
+    r = _run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/status",
+         "--jq", ".statuses[] | {context, state}"],
+        cwd=cwd, timeout_s=20,
+    )
+    if r.returncode != 0:
+        return []
+    out: list[dict] = []
+    for line in r.stdout.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        context = entry.get("context")
+        if not context:
+            continue
+        status, conclusion = _STATUS_STATE_MAP.get(
+            entry.get("state", ""), ("in_progress", None)
+        )
+        out.append({"name": context, "status": status, "conclusion": conclusion})
+    return out
 
 
 def get_workflow_queue_health(
