@@ -38,10 +38,14 @@ RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "agentic-pr-dash" / "runner-summ
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/(\d+)(?:[/?#]|$)")
 
 _REVIEW_THREADS_QUERY = """
-query($owner: String!, $repo: String!, $pr: Int!) {
+query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $pr) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -132,6 +136,101 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     except json.JSONDecodeError:
         return None
     return prs if isinstance(prs, list) else None
+
+
+_PR_HEAD_FIELDS = (
+    "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
+    "headRefOid,headRefName,headRepositoryOwner,baseRefName"
+)
+
+# `gh pr list --head` is a *prefix* filter (GitHub returns every PR whose head
+# branch *begins* with the query, so `--head fix` also returns `fix-123`). A
+# bare `--limit 1` can therefore hand the single result slot to a prefix match
+# and drop the exact-branch PR before we can filter for it — so we fetch a wide
+# page and exact-filter `headRefName` (and, for fork heads, `headRepositoryOwner`)
+# in Python instead.
+_PR_HEAD_LOOKUP_LIMIT = "30"
+
+
+def find_pr_by_head(
+    branch: str,
+    state: str = "open",
+    cwd: str | None = None,
+    *,
+    head_oid: str | None = None,
+) -> dict | None:
+    """Find a PR by its head branch name, returning the full PR payload.
+
+    Unlike :func:`list_open_prs` (author-scoped, no body), this resolves the PR
+    for a specific *head branch* and returns the fields a Stop/QA gate needs to
+    evaluate gate policy: ``number, title, body, url, isDraft, mergeStateStatus,
+    reviewDecision, headRefOid, headRefName, baseRefName``.
+
+    ``state`` is one of ``"open"``, ``"merged"``, ``"closed"``, ``"all"``. When
+    ``head_oid`` is given, only a PR whose ``headRefOid`` matches it is returned
+    — the caller uses this to confirm that a merged PR corresponds to the
+    *current* local HEAD (squash-merged branches can stay ahead of the default
+    branch, and a reused branch name must still go through the normal gates).
+
+    Returns ``None`` on any ``gh`` failure (so the caller fails open) or when no
+    matching PR exists.
+    """
+    if not branch:
+        return None
+    # `gh` accepts `<owner>:<branch>` for --head (fork/head-qualified specs), but
+    # `gh pr list --head` rejects the owner qualifier — strip it before resolving
+    # (mirrors the arm flow in maintenance_check). We KEEP the owner separately so
+    # two fork PRs with the same branch name (`alice:feature`, `bob:feature`) don't
+    # collide: results are post-filtered by `headRepositoryOwner` below.
+    head_owner = ""
+    if ":" in branch:
+        head_owner, branch = branch.split(":", 1)
+    if not branch:
+        return None
+    cmd = [
+        "gh", "pr", "list",
+        "--head", branch,
+        "--state", state,
+        "--limit", _PR_HEAD_LOOKUP_LIMIT,
+        "--json", _PR_HEAD_FIELDS,
+    ]
+    r = _run(cmd, cwd=cwd, timeout_s=30)
+    if r.returncode != 0:
+        return None
+    try:
+        payload = json.loads(r.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+    for pr in payload:
+        if not isinstance(pr, dict):
+            continue
+        # `--head` is a prefix filter (GitHub matches branch names *beginning*
+        # with the query, so `fix` also returns `fix-123`). Require an exact
+        # head-branch match so a Stop/QA gate never evaluates the wrong PR.
+        if str(pr.get("headRefName") or "") != branch:
+            continue
+        # When the caller supplied an owner-qualified head (`alice:feature`),
+        # require the PR's head-repo owner to match so a same-named branch on a
+        # different fork (`bob:feature`) isn't returned in its place.
+        if head_owner and str(_pr_head_owner(pr)) != head_owner:
+            continue
+        if head_oid is not None and pr.get("headRefOid") != head_oid:
+            continue
+        return pr
+    return None
+
+
+def _pr_head_owner(pr: dict) -> str:
+    """Extract the head-repository owner login from a `gh pr list` PR payload.
+
+    `gh` serializes ``headRepositoryOwner`` as ``{"login": ..., "id": ...}``;
+    return the bare login (or "" when absent)."""
+    owner = pr.get("headRepositoryOwner")
+    if isinstance(owner, dict):
+        return str(owner.get("login") or "")
+    return str(owner or "")
 
 
 def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
@@ -358,57 +457,106 @@ def get_new_pr_commits(
 
 
 def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThread]:
-    """Return all review threads for a PR via GraphQL."""
+    """Return all review threads for a PR via GraphQL.
+
+    Paginates over ``reviewThreads`` (100 per page) so PRs with more than 100
+    threads are not silently truncated — a hot review can easily exceed the
+    first page, and a truncated thread list would let resolved-elsewhere or
+    still-open threads slip past the caller's resolved/outdated filtering.
+
+    A *first*-page failure returns ``[]`` (total unavailability — callers fail
+    open, matching :func:`find_pr_by_head`). But once a page has succeeded and
+    advertised ``hasNextPage``, a failure fetching a *subsequent* page raises
+    :class:`RuntimeError` rather than returning a partial list: silently
+    dropping later pages would let still-open threads slip past the
+    unresolved-thread gate — the exact truncation hazard this pagination is
+    meant to eliminate. A malformed page that reports ``hasNextPage=true`` but
+    omits/empties ``endCursor`` is treated the same way (we cannot advance, so
+    raising beats truncating).
+    """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
         return []
-    r = _run(
-        [
+
+    threads: list[ReviewThread] = []
+    cursor: str | None = None
+    paged: bool = False  # True once we've started fetching a non-first page
+    while True:
+        cmd = [
             "gh", "api", "graphql",
             "-f", f"query={_REVIEW_THREADS_QUERY}",
             "-F", f"owner={owner}",
             "-F", f"repo={repo}",
             "-F", f"pr={pr_number}",
-        ],
-        cwd=cwd,
-        timeout_s=30,
-    )
-    if r.returncode != 0:
-        return []
-    try:
-        data = json.loads(r.stdout)
-        nodes = data["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"]
-    except (json.JSONDecodeError, KeyError, TypeError):
-        return []
-
-    threads: list[ReviewThread] = []
-    for node in nodes:
+        ]
+        if cursor:
+            cmd.extend(["-F", f"cursor={cursor}"])
+        r = _run(cmd, cwd=cwd, timeout_s=30)
+        if r.returncode != 0:
+            if paged:
+                raise RuntimeError(
+                    f"get_review_threads: page after the first failed for PR "
+                    f"#{pr_number} (gh exit {r.returncode}); refusing to return "
+                    f"a partial thread list"
+                )
+            break
         try:
-            comment_nodes = node["comments"]["nodes"]
-            if not comment_nodes:
+            data = json.loads(r.stdout)
+            review_threads = data["data"]["repository"]["pullRequest"]["reviewThreads"]
+            nodes = review_threads["nodes"]
+            page_info = review_threads.get("pageInfo") or {}
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            if paged:
+                raise RuntimeError(
+                    f"get_review_threads: malformed page after the first for PR "
+                    f"#{pr_number}; refusing to return a partial thread list"
+                ) from exc
+            break
+
+        for node in nodes:
+            try:
+                comment_nodes = node["comments"]["nodes"]
+                if not comment_nodes:
+                    continue
+
+                def _parse_comment(c: dict) -> ReviewThreadComment:
+                    return ReviewThreadComment(
+                        database_id=int(c.get("databaseId") or 0),
+                        path=c.get("path"),
+                        line=c.get("line"),
+                        body=str(c.get("body") or ""),
+                        author=str((c.get("author") or {}).get("login") or "unknown"),
+                        created_at=str(c.get("createdAt") or ""),
+                    )
+
+                top = _parse_comment(comment_nodes[0])
+                replies = [_parse_comment(c) for c in comment_nodes[1:]]
+                threads.append(ReviewThread(
+                    node_id=str(node["id"]),
+                    is_resolved=bool(node.get("isResolved")),
+                    is_outdated=bool(node.get("isOutdated")),
+                    top=top,
+                    replies=replies,
+                ))
+            except (KeyError, TypeError, ValueError):
                 continue
 
-            def _parse_comment(c: dict) -> ReviewThreadComment:
-                return ReviewThreadComment(
-                    database_id=int(c.get("databaseId") or 0),
-                    path=c.get("path"),
-                    line=c.get("line"),
-                    body=str(c.get("body") or ""),
-                    author=str((c.get("author") or {}).get("login") or "unknown"),
-                    created_at=str(c.get("createdAt") or ""),
-                )
+        if not page_info.get("hasNextPage"):
+            break
+        next_cursor = page_info.get("endCursor")
+        if not isinstance(next_cursor, str) or not next_cursor:
+            # GitHub claims another page but gave us no cursor to fetch it. We
+            # cannot advance, so any thread on the unreachable page(s) would be
+            # silently dropped — the exact truncation hazard this pagination is
+            # meant to eliminate. Refuse to return a partial list.
+            raise RuntimeError(
+                f"get_review_threads: page for PR #{pr_number} reports "
+                f"hasNextPage=true but no endCursor; refusing to return a "
+                f"partial thread list"
+            )
+        cursor = next_cursor
+        paged = True
 
-            top = _parse_comment(comment_nodes[0])
-            replies = [_parse_comment(c) for c in comment_nodes[1:]]
-            threads.append(ReviewThread(
-                node_id=str(node["id"]),
-                is_resolved=bool(node.get("isResolved")),
-                is_outdated=bool(node.get("isOutdated")),
-                top=top,
-                replies=replies,
-            ))
-        except (KeyError, TypeError, ValueError):
-            continue
     return threads
 
 
