@@ -35,7 +35,8 @@ the project using it:
    which CI runner pool matters, and which local policies must be enforced?"
 ```
 
-For Gaia, that means `agentic-pr-dash` owns generic PR maintenance and
+For example, Gaia is a downstream application repo that uses
+`agentic-pr-dash`. In Gaia, `agentic-pr-dash` owns generic PR maintenance and
 coordination. Gaia owns beads policy, proof gates, production-command blocking,
 test-wrapper rules, Docker/database details, and the exact Codex command used to
 fix a PR.
