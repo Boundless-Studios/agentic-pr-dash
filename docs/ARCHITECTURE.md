@@ -1,23 +1,98 @@
 # agentic-pr-dash Architecture
 
-This document is the maintainer map for `agentic-pr-dash`. The README explains
-the user-facing workflow; this file explains the package structure, runtime
-flows, state files, and integration boundaries.
+This document explains `agentic-pr-dash` from the outside in. Start here if you
+need a mental model before reading the Python modules.
 
-## Purpose
+## ELI5 Mental Model
 
-`agentic-pr-dash` monitors GitHub pull requests and coordinates automated
-maintenance without letting multiple agents work the same PR at the same time.
-It has three independently useful layers:
+Imagine your GitHub PRs are patients in a waiting room.
 
-- executor commands for read-only blocker detection and completion;
-- a loop that dispatches fixes to a configured agent command;
-- a FastAPI/HTMX dashboard that renders PR, runner, worktree, and agent state.
+Each PR might be healthy, waiting on CI, failing tests, blocked by review
+comments, or already being treated by an agent. `agentic-pr-dash` is the nurse's
+station:
 
-The package is project-agnostic. It discovers or accepts the GitHub repo, reads a
-config file, shells out to `gh` and `git`, and writes local coordination state.
-Project policy such as which agent to run, which task tracker to use, or which
-CI runner label matters is configuration.
+- it checks each PR's chart;
+- it decides which PRs need attention;
+- it makes sure only one agent works on a PR at a time;
+- it records who is working;
+- it shows the whole room on a dashboard;
+- it can hand a fix prompt to whatever agent command the project configured.
+
+It is not the doctor. It does not know how to fix Gaia, how to run Gaia tests, or
+how to satisfy a specific reviewer. It gathers the evidence, writes the work
+order, gives that work order to an agent, and later checks whether the PR became
+healthy.
+
+The simplest responsibility split is:
+
+```text
+agentic-pr-dash:
+  "What is blocking this PR, who owns the fix, and what prompt should be handed
+   to an agent?"
+
+the project using it:
+  "Which agent command should run, which task tracker should record the work,
+   which CI runner pool matters, and which local policies must be enforced?"
+```
+
+For Gaia, that means `agentic-pr-dash` owns generic PR maintenance and
+coordination. Gaia owns beads policy, proof gates, production-command blocking,
+test-wrapper rules, Docker/database details, and the exact Codex command used to
+fix a PR.
+
+## One-Sentence Summary
+
+`agentic-pr-dash` watches GitHub PRs, classifies blockers, coordinates ownership
+so agents do not collide, and exposes the result through CLI commands, a loop,
+hooks, and a dashboard.
+
+## What It Owns
+
+`agentic-pr-dash` owns generic PR maintenance:
+
+- resolve the current branch or explicit number to a GitHub PR;
+- fetch CI, review-comment, mergeability, and latest-commit state;
+- decide whether a PR is clean, pending, failing, conflicted, or awaiting review
+  fixes;
+- create and read ownership markers so two agents do not fix the same PR;
+- keep a durable ledger so PR responsibility can survive worktree deletion;
+- build fix prompts from the live blockers;
+- dispatch those prompts through a configured executor;
+- record session activity for dashboard visibility;
+- render PR and runner state in the web dashboard;
+- provide generic Codex/Claude hook helpers.
+
+## What It Does Not Own
+
+`agentic-pr-dash` does not own project policy:
+
+- no Gaia test command policy;
+- no Gaia proof-bundle policy;
+- no Gaia production-command blocking;
+- no Gaia Docker or database details;
+- no hardcoded issue labels or runner names;
+- no assumption that Codex, Claude, beads, or any one tracker is mandatory.
+
+Those choices belong in the consuming repo's config or local hook wrappers.
+
+## How To Read The Code
+
+Read the code as four cooperating layers:
+
+1. `cli.py` chooses which subsystem should handle a command.
+2. `github_api.py`, `maintenance_check.py`, and `models.py` answer: "what is
+   true about this PR right now?"
+3. `loop.py`, `coordinator.py`, `session_ledger.py`, and `session_registry.py`
+   answer: "who is allowed to work on it?"
+4. `orchestrator.py`, `app.py`, and `server.py` answer: "what should humans see
+   on the dashboard?"
+
+Most confusing behavior becomes easier if you ask two questions:
+
+- Is this about generic PR state and ownership? If yes, it probably belongs
+  here.
+- Is this about one project's local safety rules or build/test/proof workflow?
+  If yes, it belongs in that project and should enter through config.
 
 ## Setup Model
 
@@ -52,7 +127,7 @@ Legacy `GAIA_*` environment variables and `.gaia` state directories are honored
 as fallbacks for existing Gaia installs, but new behavior should use the
 `AGENTIC_PR_DASH_*` namespace and package config.
 
-## Design Boundaries
+## Responsibility Boundaries
 
 The package owns generic PR maintenance:
 
@@ -75,9 +150,12 @@ Downstream repos own project policy:
 - stop-gate waiter command;
 - any build, test, production, proof, design-system, or deployment rules.
 
-If a behavior mentions a specific app's Docker stack, database, auth setup,
-proof harness, deployment target, issue labels, or local Make target, keep that
-behavior in the app repo and invoke it through config or a local adapter.
+The rule of thumb: the package should understand PRs and ownership, not one
+repo's local rituals.
+
+For example, `agentic-pr-dash` can provide an `executor` template. Gaia can set
+that template to `codex exec --full-auto {prompt}`. The package should not
+hardcode Codex, Gaia's `bd` labels, Gaia's proof bundle, or Gaia's test wrapper.
 
 ## Runtime Flows
 
@@ -103,6 +181,9 @@ agentic-pr-dash serve
 Keep command registration here small and explicit. New subcommands should route
 to a focused module rather than growing `cli.py`.
 
+In plain terms: every command starts at the same front door, then immediately
+gets sent to the smaller part of the package that owns that job.
+
 ### Read-Only Blocker Detection
 
 `maintenance_check.check` is the stop-gate and loop's read-only inspection path.
@@ -117,6 +198,9 @@ It:
 
 The check path must remain read-only. Ownership markers are written by `arm`,
 loop coordination, or explicit state commands, not by the inspection itself.
+
+Think of `check` as reading the PR's chart. It should not claim ownership, close
+tasks, or mutate local state just because it looked.
 
 ### Ownership and Lease Coordination
 
