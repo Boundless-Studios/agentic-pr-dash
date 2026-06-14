@@ -111,6 +111,13 @@ def load_settings(*, defaults_path: Path, local_path: Path) -> dict[str, Any]:
     return merged
 
 
+#: Maps a settings section to the env-key builder for its per-item overrides.
+_SECTION_ENV_KEY: dict[str, Callable[[str], str]] = {
+    "hooks": _env_key,
+    "skills": _skill_env_key,
+}
+
+
 def _resolve_item(
     section: str,
     item_name: str,
@@ -119,6 +126,19 @@ def _resolve_item(
     defaults_path: Path,
     local_path: Path,
 ) -> bool:
+    # An env override must win even for an item that never appears in
+    # defaults/local/profile (e.g. a default-enabled or brand-new hook).
+    # ``_apply_env_overrides`` only iterates keys already present, so it can't
+    # disable such an item — consult the env key for the requested item directly
+    # before falling back to the resolved settings / default.
+    env_key_builder = _SECTION_ENV_KEY.get(section)
+    if env_key_builder is not None:
+        env_value = os.environ.get(env_key_builder(item_name))
+        if env_value is not None:
+            parsed = _parse_bool(env_value)
+            if parsed is not None:
+                return parsed
+
     cfg = load_settings(defaults_path=defaults_path, local_path=local_path)
     value = (cfg.get(section, {}) or {}).get(item_name, default)
     if isinstance(value, bool):

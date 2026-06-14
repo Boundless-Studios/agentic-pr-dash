@@ -193,8 +193,14 @@ class StopChecksRunner:
         lists where every entry is intended to run).
         """
         final_rc = 0
-        emitted_json = False
         human_output = HumanOutputBuffer()
+        # Defer JSON emission until every hook has run so a later BLOCKING
+        # (exit-2) JSON can win over an earlier success/approval JSON. With
+        # multiple Stop hooks, the harness must see the block reason, not the
+        # first hook's stdout. We hold the best JSON candidate (and which hook
+        # produced it) and route every other JSON/human chunk to stderr.
+        chosen_json: str | None = None
+        chosen_json_blocking = False
 
         for hook_name, hook_path in hooks:
             forced = bypass_enable_check is not None and bypass_enable_check(hook_name)
@@ -209,6 +215,8 @@ class StopChecksRunner:
                 env=hook_env,
             )
             child_stdout_is_json = _stdout_is_json(result.stdout)
+            child_blocking = result.returncode == 2
+
             if result.returncode != 0 and not child_stdout_is_json:
                 if result.stdout:
                     human_output.add(result.stdout)
@@ -217,27 +225,46 @@ class StopChecksRunner:
                     if result.stderr.strip()
                     else "unknown error"
                 )
-                if not emitted_json:
-                    self.emit_error_json(
-                        f"run_stop_checks: stop hook '{hook_name}' exited with code "
-                        f"{result.returncode}: {error_detail}"
-                    )
-                    emitted_json = True
+                error_json = json.dumps(
+                    {
+                        "hook_event_name": "Stop",
+                        "error": (
+                            f"run_stop_checks: stop hook '{hook_name}' exited with code "
+                            f"{result.returncode}: {error_detail}"
+                        ),
+                    }
+                )
+                # A blocking exit-2 error supersedes any earlier non-blocking
+                # JSON; a non-blocking error only fills the slot if empty.
+                if chosen_json is None or (child_blocking and not chosen_json_blocking):
+                    if chosen_json is not None:
+                        human_output.add(chosen_json)
+                    chosen_json = error_json
+                    chosen_json_blocking = child_blocking
                 if result.stderr:
                     human_output.add(result.stderr)
             else:
                 if result.stdout:
-                    if child_stdout_is_json and not emitted_json:
-                        print(result.stdout, end="")
-                        emitted_json = True
+                    if child_stdout_is_json and (
+                        chosen_json is None or (child_blocking and not chosen_json_blocking)
+                    ):
+                        # Promote this JSON to the authoritative output; demote
+                        # any previously chosen (non-blocking) JSON to stderr.
+                        if chosen_json is not None:
+                            human_output.add(chosen_json)
+                        chosen_json = result.stdout
+                        chosen_json_blocking = child_blocking
                     else:
                         human_output.add(result.stdout)
                 if result.stderr:
                     human_output.add(result.stderr)
+
             if result.returncode == 2:
                 final_rc = 2
             elif result.returncode != 0 and final_rc == 0:
                 final_rc = result.returncode
 
+        if chosen_json is not None:
+            print(chosen_json, end="")
         human_output.emit()
         return final_rc

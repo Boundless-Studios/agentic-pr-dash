@@ -334,6 +334,111 @@ def test_default_settings_fragment_is_usable_as_defaults(tmp_path):
     )
 
 
+# --------------------------------------------------------------------------- #
+# BOU-1672 Codex P2 review findings
+# --------------------------------------------------------------------------- #
+def test_normalized_payload_preserves_session_and_response_fields(tmp_path):
+    """Finding 1: normalization must not drop session_id / tool_response.
+
+    The arm hook reads session_id (ownership) and tool_response (skip after a
+    failed command); rebuilding a 3-key dict would silently strip them.
+    """
+    payload = {
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "git push", "workdir": "/wt"},
+        "session_id": "sess-abc",
+        "tool_response": {"exit_code": 1, "stderr": "boom"},
+        "hook_event_name": "PreToolUse",
+    }
+    norm = payload_mod.normalized_payload(payload, repo_root=_root(tmp_path))
+    # Translated fields still normalized
+    assert norm["tool_name"] == "Bash"
+    assert norm["tool_input"] == {"command": "git push"}
+    assert norm["cwd"] == "/wt"
+    # Untranslated fields survive
+    assert norm["session_id"] == "sess-abc"
+    assert norm["tool_response"] == {"exit_code": 1, "stderr": "boom"}
+    assert norm["hook_event_name"] == "PreToolUse"
+
+
+def test_normalized_payload_does_not_mutate_input(tmp_path):
+    payload = {"tool_name": "exec_command", "tool_input": {"cmd": "ls"}, "session_id": "s"}
+    payload_mod.normalized_payload(payload, repo_root=_root(tmp_path))
+    # original untouched
+    assert payload["tool_name"] == "exec_command"
+    assert payload["tool_input"] == {"cmd": "ls"}
+
+
+def test_env_override_disables_default_enabled_unlisted_hook(tmp_path, monkeypatch):
+    """Finding 2: CODEX_HOOK_<NAME>=off must disable an item absent from settings."""
+    defaults = tmp_path / "default-settings.json"
+    defaults.write_text("{}", encoding="utf-8")
+    local = tmp_path / "local.json"
+    monkeypatch.setenv("CODEX_HOOK_FOO", "off")
+    assert (
+        settings_mod.hook_enabled(
+            "foo", default=True, defaults_path=defaults, local_path=local
+        )
+        is False
+    )
+
+
+def test_env_override_enables_default_disabled_unlisted_skill(tmp_path, monkeypatch):
+    defaults = tmp_path / "default-settings.json"
+    defaults.write_text("{}", encoding="utf-8")
+    local = tmp_path / "local.json"
+    monkeypatch.setenv("CODEX_SKILL_BAR", "on")
+    assert (
+        settings_mod.skill_enabled(
+            "bar", default=False, defaults_path=defaults, local_path=local
+        )
+        is True
+    )
+
+
+def test_stop_runner_blocking_json_wins_over_earlier_success_json(tmp_path, capsys):
+    """Finding 3: a later exit-2 JSON block must reach stdout, not the earlier OK JSON."""
+    ok = _hook_script(
+        tmp_path, "ok.py", "import json\nprint(json.dumps({'decision':'approve'}))\n"
+    )
+    block = _hook_script(
+        tmp_path,
+        "block.py",
+        "import json, sys\nprint(json.dumps({'decision':'block','reason':'nope'}))\n"
+        "raise SystemExit(2)\n",
+    )
+    runner = runners_mod.StopChecksRunner(resolve_path=lambda x: x, is_enabled=lambda _n: True)
+    rc = runner.run(
+        [("ok", ok), ("block", block)], payload_text="{}", hook_env=dict(os.environ)
+    )
+    out = capsys.readouterr()
+    assert rc == 2
+    # Authoritative stdout JSON is the block decision, not the earlier approval.
+    assert json.loads(out.out.strip()) == {"decision": "block", "reason": "nope"}
+    # The demoted approval JSON is routed to stderr.
+    assert "approve" in out.err
+
+
+def test_stop_runner_keeps_block_json_even_when_block_runs_first(tmp_path, capsys):
+    """If the blocking hook runs first, a later success JSON must not displace it."""
+    block = _hook_script(
+        tmp_path,
+        "block.py",
+        "import json\nprint(json.dumps({'decision':'block'}))\nraise SystemExit(2)\n",
+    )
+    ok = _hook_script(
+        tmp_path, "ok.py", "import json\nprint(json.dumps({'decision':'approve'}))\n"
+    )
+    runner = runners_mod.StopChecksRunner(resolve_path=lambda x: x, is_enabled=lambda _n: True)
+    rc = runner.run(
+        [("block", block), ("ok", ok)], payload_text="{}", hook_env=dict(os.environ)
+    )
+    out = capsys.readouterr()
+    assert rc == 2
+    assert json.loads(out.out.strip()) == {"decision": "block"}
+    assert "approve" in out.err
+
+
 def test_package_reexports_public_symbols():
     for name in (
         "normalized_payload",

@@ -65,11 +65,17 @@ def normalized_cwd(payload: dict, *, repo_root: Callable[[], Path]) -> str:
 
 
 def normalized_payload(payload: dict, *, repo_root: Callable[[], Path]) -> dict:
-    return {
-        "tool_name": normalized_tool_name(payload),
-        "tool_input": normalized_tool_input(payload),
-        "cwd": normalized_cwd(payload, repo_root=repo_root),
-    }
+    # Start from a copy of the raw payload so that fields shared hooks rely on
+    # but this adapter doesn't translate (``session_id``, ``tool_response``,
+    # etc.) survive normalization. The arm hook reads ``session_id`` to attribute
+    # ownership and ``tool_response`` to skip PR actions after a failed command;
+    # rebuilding a fresh 3-key dict would silently strip them and make those
+    # hooks no-op or mis-arm.
+    normalized = dict(payload)
+    normalized["tool_name"] = normalized_tool_name(payload)
+    normalized["tool_input"] = normalized_tool_input(payload)
+    normalized["cwd"] = normalized_cwd(payload, repo_root=repo_root)
+    return normalized
 
 
 def apply_shared_env(payload: dict, *, repo_root: Callable[[], Path]) -> None:
