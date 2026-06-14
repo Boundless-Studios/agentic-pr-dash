@@ -20,48 +20,114 @@ def _cp(stdout: str, returncode: int = 0) -> subprocess.CompletedProcess:
 
 # --------------------------------------------------------------------------- #
 # find_pr_by_head
+#
+# find_pr_by_head now resolves heads via an EXACT REST query
+# (`gh api repos/{owner}/{repo}/pulls?head=owner:branch`) and then fetches the
+# full Stop/QA-gate contract fields per match via `gh pr view <n> --json`.
+# The helper below builds a `_run` fake that dispatches on the gh subcommand so
+# tests can describe both stages declaratively.
 # --------------------------------------------------------------------------- #
 
-def test_find_pr_by_head_returns_full_open_pr(monkeypatch):
-    captured: dict = {}
+def _install_gh_fake(
+    monkeypatch,
+    *,
+    rest_pages,
+    pr_views,
+    repo_owner="acme",
+    repo_name="repo",
+):
+    """Patch ``github_api._run`` with a gh dispatcher.
+
+    ``rest_pages`` is a list of REST `pulls` page payloads (each a list of dicts
+    with at least ``number``), returned in order for successive `gh api ...pulls`
+    calls. ``pr_views`` maps PR number -> the full ``gh pr view --json`` dict (or
+    a (returncode, stdout) failure tuple). ``gh repo view`` returns owner/name.
+    """
+    state = {"rest_idx": 0, "calls": []}
+    rest_iter = list(rest_pages)
 
     def fake_run(cmd, timeout_s=20, cwd=None):
-        captured["cmd"] = cmd
-        return _cp(json.dumps([
-            {
-                "number": 7,
-                "title": "Fix the thing",
-                "body": "## Root cause\nx",
-                "url": "https://x/pull/7",
-                "isDraft": False,
-                "mergeStateStatus": "CLEAN",
-                "reviewDecision": "APPROVED",
-                "headRefOid": "deadbeef",
-                "headRefName": "fix/thing",
-                "baseRefName": "main",
-            }
-        ]))
+        state["calls"].append(cmd)
+        # gh repo view --json owner,name  → repo resolution
+        if cmd[:3] == ["gh", "repo", "view"]:
+            return _cp(json.dumps({"owner": {"login": repo_owner}, "name": repo_name}))
+        # gh api ...repos/{owner}/{repo}/pulls?... → exact-head REST query
+        if cmd[:2] == ["gh", "api"] and any("pulls?head=" in p for p in cmd):
+            idx = state["rest_idx"]
+            state["rest_idx"] += 1
+            page = rest_iter[idx] if idx < len(rest_iter) else []
+            return _cp(json.dumps(page))
+        # gh pr view <n> --json ... → full contract fields
+        if cmd[:3] == ["gh", "pr", "view"]:
+            number = int(cmd[3])
+            entry = pr_views.get(number)
+            if isinstance(entry, tuple):
+                rc, out = entry
+                return _cp(out, returncode=rc)
+            return _cp(json.dumps(entry))
+        raise AssertionError(f"unexpected gh invocation: {cmd}")
 
     monkeypatch.setattr(github_api, "_run", fake_run)
+    return state
+
+
+def _full_pr(number, head="fix/thing", oid="deadbeef", owner=None, **extra):
+    pr = {
+        "number": number,
+        "title": f"PR {number}",
+        "body": "## Root cause\nx",
+        "url": f"https://x/pull/{number}",
+        "isDraft": False,
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": "APPROVED",
+        "headRefOid": oid,
+        "headRefName": head,
+        "baseRefName": "main",
+    }
+    if owner is not None:
+        pr["headRepositoryOwner"] = {"login": owner}
+    pr.update(extra)
+    return pr
+
+
+def test_find_pr_by_head_returns_full_open_pr(monkeypatch):
+    state = _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 7}]],
+        pr_views={7: _full_pr(7, head="fix/thing", oid="deadbeef")},
+    )
     pr = github_api.find_pr_by_head("fix/thing", "open", ".")
     assert pr is not None
     assert pr["number"] == 7
     assert pr["body"] == "## Root cause\nx"
     assert pr["baseRefName"] == "main"
-    # open lookups fetch a wide page (not --limit 1) so a prefix match can't
-    # occupy the single slot and drop the exact-branch PR.
-    assert "--limit" in captured["cmd"]
-    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "30"
+    # the head is resolved via an EXACT REST query, not a prefix `gh pr list`.
+    rest_calls = [c for c in state["calls"] if c[:2] == ["gh", "api"]]
+    assert rest_calls, "expected an exact-head REST query"
+    # owner:branch separator colon is preserved; the branch's `/` is percent-encoded.
+    assert any("head=acme:fix%2Fthing" in p for c in rest_calls for p in c)
 
 
 def test_find_pr_by_head_no_match_returns_none(monkeypatch):
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp("[]"))
+    _install_gh_fake(monkeypatch, rest_pages=[[]], pr_views={})
     assert github_api.find_pr_by_head("fix/none", "open", ".") is None
 
 
 def test_find_pr_by_head_gh_failure_returns_none(monkeypatch):
+    # REST query itself fails → fail open.
     monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp("", returncode=1))
     assert github_api.find_pr_by_head("fix/x", "open", ".") is None
+
+
+def test_find_pr_by_head_pr_view_failure_returns_none(monkeypatch):
+    # REST resolves the number but the full-fields fetch fails → fail open
+    # (distinct from a genuine no-match, which returns None via [] pages).
+    _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 7}]],
+        pr_views={7: (1, "")},
+    )
+    assert github_api.find_pr_by_head("fix/thing", "open", ".") is None
 
 
 def test_find_pr_by_head_empty_branch_returns_none(monkeypatch):
@@ -77,106 +143,133 @@ def test_find_pr_by_head_empty_branch_returns_none(monkeypatch):
 
 
 def test_find_pr_by_head_oid_filter_matches(monkeypatch):
-    payload = [
-        {"number": 1, "headRefOid": "aaa", "headRefName": "b", "url": "u1"},
-        {"number": 2, "headRefOid": "bbb", "headRefName": "b", "url": "u2"},
-    ]
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 1}, {"number": 2}]],
+        pr_views={
+            1: _full_pr(1, head="b", oid="aaa"),
+            2: _full_pr(2, head="b", oid="bbb"),
+        },
+    )
     pr = github_api.find_pr_by_head("b", "merged", ".", head_oid="bbb")
     assert pr is not None and pr["number"] == 2
 
 
 def test_find_pr_by_head_oid_filter_no_match(monkeypatch):
-    payload = [{"number": 1, "headRefOid": "aaa", "headRefName": "b"}]
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 1}]],
+        pr_views={1: _full_pr(1, head="b", oid="aaa")},
+    )
     assert github_api.find_pr_by_head("b", "merged", ".", head_oid="zzz") is None
 
 
-def test_find_pr_by_head_requires_exact_head_match(monkeypatch):
-    # `--head fix` is a prefix filter and can return `fix-123`; we must reject it.
-    payload = [
-        {"number": 9, "headRefOid": "x", "headRefName": "fix-123", "url": "u"},
-    ]
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
-    assert github_api.find_pr_by_head("fix", "open", ".") is None
-
-
 def test_find_pr_by_head_strips_owner_qualifier(monkeypatch):
-    captured: dict = {}
-
-    def fake_run(cmd, timeout_s=20, cwd=None):
-        captured["cmd"] = cmd
-        return _cp(json.dumps([
-            {"number": 4, "headRefName": "feature", "headRefOid": "y",
-             "headRepositoryOwner": {"login": "alice"}, "url": "u"},
-        ]))
-
-    monkeypatch.setattr(github_api, "_run", fake_run)
+    state = _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 4}]],
+        pr_views={4: _full_pr(4, head="feature", oid="y", owner="alice")},
+    )
     pr = github_api.find_pr_by_head("alice:feature", "open", ".")
     assert pr is not None and pr["number"] == 4
-    # the owner qualifier is stripped before --head (owner is post-filtered)
-    assert captured["cmd"][captured["cmd"].index("--head") + 1] == "feature"
+    # the owner-qualified head is sent to the EXACT REST query as `alice:feature`,
+    # and no repo-owner resolution is needed (the owner came from the caller).
+    rest_calls = [c for c in state["calls"] if c[:2] == ["gh", "api"]]
+    assert any("head=alice%3Afeature" in p or "head=alice:feature" in p
+               for c in rest_calls for p in c)
+    assert not any(c[:3] == ["gh", "repo", "view"] for c in state["calls"])
 
 
-def test_find_pr_by_head_merged_uses_wide_limit(monkeypatch):
-    captured: dict = {}
-
-    def fake_run(cmd, timeout_s=20, cwd=None):
-        captured["cmd"] = cmd
-        return _cp("[]")
-
-    monkeypatch.setattr(github_api, "_run", fake_run)
+def test_find_pr_by_head_merged_maps_to_closed_state(monkeypatch):
+    # REST has no "merged" state — a merged PR is closed. The query must request
+    # state=closed (not the literal "merged") so the merged PR is found.
+    state = _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[]],
+        pr_views={},
+    )
     github_api.find_pr_by_head("b", "merged", ".")
-    assert captured["cmd"][captured["cmd"].index("--limit") + 1] == "30"
+    rest_calls = [c for c in state["calls"] if c[:2] == ["gh", "api"]]
+    assert rest_calls
+    assert any("state=closed" in p for c in rest_calls for p in c)
+    assert not any("state=merged" in p for c in rest_calls for p in c)
 
 
-def test_find_pr_by_head_prefix_match_not_dropped(monkeypatch):
-    # `--head fix` is a prefix filter and a wide page returns both `fix-123`
-    # (prefix) and the exact `fix`. With the old `--limit 1` the prefix match
-    # could occupy the single slot and the exact PR would be dropped → None.
-    # A wide page + exact-filter must still find the exact-branch PR.
-    payload = [
-        {"number": 11, "headRefName": "fix-123", "headRefOid": "a", "url": "u1"},
-        {"number": 22, "headRefName": "fix", "headRefOid": "b", "url": "u2"},
-    ]
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+def test_find_pr_by_head_exact_match_independent_of_prefix_volume(monkeypatch):
+    # REGRESSION: previously `gh pr list --head fix` was a *prefix* filter capped
+    # at 30 results; if >30 PRs began with `fix` and the exact `fix` PR sorted
+    # past the first page, it was silently dropped → None → the gate falsely
+    # blocked "No open PR". The exact REST query returns ONLY the exact-head PR
+    # regardless of how many prefix-matches exist, so a single page with just the
+    # exact PR is what the server returns.
+    state = _install_gh_fake(
+        monkeypatch,
+        # The server-side exact-head filter returns ONLY #22 (the exact `fix`),
+        # never the 50 `fix-NNN` prefix siblings that drowned it before.
+        rest_pages=[[{"number": 22}]],
+        pr_views={22: _full_pr(22, head="fix", oid="b")},
+    )
     pr = github_api.find_pr_by_head("fix", "open", ".")
     assert pr is not None and pr["number"] == 22
+    # And the query was indeed the exact-head form, not a prefix `gh pr list`.
+    assert not any(c[:3] == ["gh", "pr", "list"] for c in state["calls"])
+
+
+def test_find_pr_by_head_paginates_rest(monkeypatch):
+    # Defensive pagination: if a full page (100) of matches comes back, a second
+    # page is fetched. The exact PR can live on the second page and must be found.
+    full_page = [{"number": n} for n in range(1, 101)]  # exactly per_page=100
+    second = [{"number": 777}]
+    state = _install_gh_fake(
+        monkeypatch,
+        rest_pages=[full_page, second],
+        pr_views={
+            **{n: _full_pr(n, head="other", oid=str(n)) for n in range(1, 101)},
+            777: _full_pr(777, head="fix", oid="z"),
+        },
+    )
+    pr = github_api.find_pr_by_head("fix", "open", ".")
+    assert pr is not None and pr["number"] == 777
+    page_params = [p for c in state["calls"] if c[:2] == ["gh", "api"]
+                   for p in c if "page=" in p]
+    assert any("page=2" in p for p in page_params)
 
 
 def test_find_pr_by_head_fork_owner_match(monkeypatch):
-    # Two fork PRs share branch name `feature`. An owner-qualified head
-    # (`alice:feature`) must return alice's PR, not bob's.
-    payload = [
-        {"number": 1, "headRefName": "feature", "headRefOid": "a",
-         "headRepositoryOwner": {"login": "bob"}, "url": "u1"},
-        {"number": 2, "headRefName": "feature", "headRefOid": "b",
-         "headRepositoryOwner": {"login": "alice"}, "url": "u2"},
-    ]
-    captured: dict = {}
-
-    def fake_run(cmd, timeout_s=20, cwd=None):
-        captured["cmd"] = cmd
-        return _cp(json.dumps(payload))
-
-    monkeypatch.setattr(github_api, "_run", fake_run)
+    # An owner-qualified head (`alice:feature`) resolves alice's PR via the exact
+    # REST head spec `alice:feature`; the headRepositoryOwner is re-verified.
+    state = _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 2}]],
+        pr_views={2: _full_pr(2, head="feature", oid="b", owner="alice")},
+    )
     pr = github_api.find_pr_by_head("alice:feature", "open", ".")
     assert pr is not None and pr["number"] == 2
-    # the owner qualifier is stripped before --head, but headRepositoryOwner is
-    # requested so the owner can be post-filtered.
-    assert captured["cmd"][captured["cmd"].index("--head") + 1] == "feature"
-    fields = captured["cmd"][captured["cmd"].index("--json") + 1]
-    assert "headRepositoryOwner" in fields
+    rest_calls = [c for c in state["calls"] if c[:2] == ["gh", "api"]]
+    assert any("head=alice%3Afeature" in p or "head=alice:feature" in p
+               for c in rest_calls for p in c)
 
 
 def test_find_pr_by_head_fork_owner_mismatch_returns_none(monkeypatch):
-    # Only bob's same-named branch exists; alice:feature must NOT match it.
-    payload = [
-        {"number": 1, "headRefName": "feature", "headRefOid": "a",
-         "headRepositoryOwner": {"login": "bob"}, "url": "u1"},
-    ]
-    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(json.dumps(payload)))
+    # The REST exact query is for `alice:feature`; if the only PR returned is
+    # actually bob's (defensive re-verify), it is rejected → None.
+    _install_gh_fake(
+        monkeypatch,
+        rest_pages=[[{"number": 1}]],
+        pr_views={1: _full_pr(1, head="feature", oid="a", owner="bob")},
+    )
     assert github_api.find_pr_by_head("alice:feature", "open", ".") is None
+
+
+def test_find_pr_by_head_repo_resolution_failure_returns_none(monkeypatch):
+    # Unqualified head needs the repo owner for the REST `head=owner:branch`
+    # spec; if `gh repo view` fails, fail open rather than guessing.
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("", ""))
+    monkeypatch.setattr(
+        github_api, "_run",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not reach gh api")),
+    )
+    assert github_api.find_pr_by_head("fix/thing", "open", ".") is None
 
 
 # --------------------------------------------------------------------------- #
