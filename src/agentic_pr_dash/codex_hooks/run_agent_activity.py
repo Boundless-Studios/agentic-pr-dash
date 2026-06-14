@@ -30,7 +30,10 @@ Concurrency & housekeeping:
   * Orphan records — dead owner pid, or untouched past a TTL — are pruned on
     every write. The firing session's own record is never pruned.
 
-The activity directory subdir is repo config (default ``.gaia``), overridable via
+The activity directory subdir is the dashboard's resolved state directory so the
+running dashboard and these hooks agree on one location: the modern
+``.agentic-pr-dash`` for fresh installs, or a pre-existing legacy ``.gaia`` when
+one is already present (the same precedence ``config.py`` uses). Overridable via
 ``AGENT_ACTIVITY_SUBDIR``. Best-effort: never blocks for long, never errors out.
 
 The payload arrives on stdin as ``{"hook_event_name", "session_id", "cwd",
@@ -48,15 +51,27 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
+from agentic_pr_dash.config import DEFAULT_STATE_DIRNAME, LEGACY_STATE_DIRNAME
+
 _TRACKED_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")
 _IDLE_TTL_SECONDS = 24 * 3600  # prune records untouched longer than this, regardless of pid
 _LOCK_ATTEMPTS = 50            # x _LOCK_SLEEP ~ 0.5s max wait before the unlocked fallback
 _LOCK_SLEEP = 0.01
-_DEFAULT_SUBDIR = ".gaia"
 
 
-def _activity_subdir() -> str:
-    return os.environ.get("AGENT_ACTIVITY_SUBDIR") or _DEFAULT_SUBDIR
+def _activity_subdir(root: str) -> str:
+    """The state-dir subdir to stamp into, matching the dashboard's resolution.
+
+    Explicit ``AGENT_ACTIVITY_SUBDIR`` wins. Otherwise prefer the modern
+    ``.agentic-pr-dash``, but adopt a pre-existing legacy ``.gaia`` so installs
+    that still carry the old dir keep a single source of truth (the same
+    precedence ``config._resolve_state_dir`` applies)."""
+    override = os.environ.get("AGENT_ACTIVITY_SUBDIR")
+    if override:
+        return override
+    if os.path.isdir(os.path.join(root, LEGACY_STATE_DIRNAME)):
+        return LEGACY_STATE_DIRNAME
+    return DEFAULT_STATE_DIRNAME
 
 
 def _now() -> str:
@@ -206,7 +221,7 @@ def main() -> int:
         owner_pid = os.getppid()
 
     root = _worktree_root(payload)
-    activity_dir = os.path.join(root, _activity_subdir())
+    activity_dir = os.path.join(root, _activity_subdir(root))
     path = os.path.join(activity_dir, "agent-activity.json")
     lock_path = os.path.join(activity_dir, ".agent-activity.lock")
 

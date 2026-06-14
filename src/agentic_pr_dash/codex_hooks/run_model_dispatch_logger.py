@@ -73,6 +73,11 @@ DEFAULT_MODEL_NAMES = {
 }
 _DEFAULT_MODEL = "opus-4.6"
 
+# Subagent-dispatch tool names across runtimes. Claude fires ``Agent``; Codex
+# fires ``spawn_agent`` (and the namespaced ``functions.spawn_agent`` shape seen
+# elsewhere in this package, e.g. ``run_arm_pr_watch``).
+_DISPATCH_TOOLS = {"Agent", "spawn_agent", "functions.spawn_agent"}
+
 
 def classify(description: str, prompt: str, subagent_type: str) -> str:
     if subagent_type == "Explore":
@@ -143,7 +148,7 @@ def main() -> int:
     if not isinstance(input_data, dict):
         return 0
 
-    if input_data.get("tool_name") != "Agent":
+    if input_data.get("tool_name") not in _DISPATCH_TOOLS:
         return 0
 
     tool_input = input_data.get("tool_input", {}) or {}

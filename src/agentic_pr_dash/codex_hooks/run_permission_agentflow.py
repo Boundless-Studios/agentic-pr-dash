@@ -6,9 +6,13 @@ local permission dialog is bypassed. When no hub is reachable — or the human
 never replies — the hook is a clean no-op and the normal permission dialog
 proceeds (project allow-list etc.).
 
-Subagent / non-interactive sessions skip routing (no UI to show a dialog, so
-routing would block on a reply that never comes) unless ``FORCE_AGENTFLOW`` is
-set. ADVISORY: this hook must never block the tool.
+Routing is gated on a reachable hub, not on stdin: a Claude command hook always
+receives its JSON payload piped on stdin and runs with no controlling terminal,
+so ``os.isatty(stdin)`` is *always* false and is useless as an "is a human
+watching" signal. Instead the hook routes whenever a healthy hub is discovered
+(the hub is the human's UI); set ``DISABLE_AGENTFLOW`` to force the local
+permission dialog even when a hub is up. ADVISORY: this hook never blocks — on a
+hub timeout or any error it falls through to the normal permission dialog.
 """
 
 from __future__ import annotations
@@ -72,15 +76,20 @@ def _load_payload() -> dict:
     return raw if isinstance(raw, dict) else {}
 
 
-def _interactive() -> bool:
-    """True if a human dialog could be shown. Subagents/non-interactive sessions
-    have no UI, so AgentFlow routing would block forever — skip unless forced."""
-    if os.environ.get("FORCE_AGENTFLOW"):
-        return True
-    try:
-        return os.isatty(sys.stdin.fileno())
-    except (OSError, ValueError):
+def _routing_enabled() -> bool:
+    """Whether to route permission prompts to AgentFlow at all.
+
+    A Claude command hook's stdin is the JSON payload (a pipe) and the process
+    has no controlling terminal, so ``os.isatty`` can't tell an interactive
+    session from a subagent — the *hub's* reachability is the real "a human can
+    answer" signal. Routing is therefore on by default and opt-out via
+    ``DISABLE_AGENTFLOW`` (or the legacy negative of ``FORCE_AGENTFLOW=0``)."""
+    if os.environ.get("DISABLE_AGENTFLOW"):
         return False
+    force = os.environ.get("FORCE_AGENTFLOW")
+    if force is not None and force.strip().lower() in {"0", "false", "no", "off", ""}:
+        return False
+    return True
 
 
 def main() -> int:
@@ -88,12 +97,12 @@ def main() -> int:
     if payload.get("hook_event_name") != "PermissionRequest":
         return 0
 
-    if not _interactive():
-        return 0  # background/subagent → normal permission handling
+    if not _routing_enabled():
+        return 0  # explicitly disabled → normal permission handling
 
-    base_url = agentflow.get_hub_url()
-    if not base_url or not agentflow.hub_is_healthy(base_url):
-        return 0
+    base_url = agentflow.get_healthy_hub_url()
+    if not base_url:
+        return 0  # no reachable hub → normal permission dialog
 
     tool_name = payload.get("tool_name", "Unknown")
     tool_input = payload.get("tool_input", {}) or {}

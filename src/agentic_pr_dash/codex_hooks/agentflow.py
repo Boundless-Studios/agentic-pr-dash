@@ -38,8 +38,9 @@ def runtime_files() -> list[Path]:
     return list(_DEFAULT_RUNTIME_FILES)
 
 
-def get_hub_url() -> str | None:
-    """Read the AgentFlow hub base URL from the first runtime file present."""
+def _iter_hub_urls() -> "list[str]":
+    """All candidate hub base URLs, most-preferred first, across runtime files."""
+    urls: list[str] = []
     for path in runtime_files():
         try:
             if not path.exists():
@@ -49,6 +50,30 @@ def get_hub_url() -> str | None:
             continue
         base = data.get("base_url")
         if isinstance(base, str) and base:
+            urls.append(base)
+    return urls
+
+
+def get_hub_url() -> str | None:
+    """Read the AgentFlow hub base URL from the first runtime file present.
+
+    Does NOT probe health — see ``get_healthy_hub_url`` for discovery that skips a
+    stale runtime file pointing at a dead hub.
+    """
+    urls = _iter_hub_urls()
+    return urls[0] if urls else None
+
+
+def get_healthy_hub_url() -> str | None:
+    """First runtime-file hub that actually answers ``hub_is_healthy``.
+
+    A crash/migration can leave a preferred runtime file pointing at a dead hub
+    while a later file (e.g. ``.sessionbus``) is live. Returning the first
+    *present* URL there would strand the configured fallback, so we keep walking
+    past unhealthy hubs instead of stopping at the first stale entry.
+    """
+    for base in _iter_hub_urls():
+        if hub_is_healthy(base):
             return base
     return None
 

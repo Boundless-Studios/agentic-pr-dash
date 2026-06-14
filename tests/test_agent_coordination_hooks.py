@@ -43,7 +43,8 @@ def _run(module, payload, *, argv=None, capsys=None):
 
 
 def _activity_file(tmp_path):
-    return tmp_path / ".gaia" / "agent-activity.json"
+    # Fresh worktree (no legacy .gaia present) → modern .agentic-pr-dash default.
+    return tmp_path / ".agentic-pr-dash" / "agent-activity.json"
 
 
 def test_activity_user_prompt_starts_busy_turn(tmp_path, monkeypatch):
@@ -99,7 +100,7 @@ def test_activity_two_sessions_coexist(tmp_path, monkeypatch):
 
 def test_activity_prunes_dead_pid_sibling(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
-    act_dir = tmp_path / ".gaia"
+    act_dir = tmp_path / ".agentic-pr-dash"
     act_dir.mkdir()
     # Seed a record owned by a definitely-dead pid.
     (act_dir / "agent-activity.json").write_text(json.dumps({"sessions": {"dead": {"state": "busy", "busy_since": "x", "updated": "x", "pid": 999999}}}))
@@ -107,6 +108,26 @@ def test_activity_prunes_dead_pid_sibling(tmp_path, monkeypatch):
     sessions = json.loads(_activity_file(tmp_path).read_text())["sessions"]
     assert "dead" not in sessions
     assert "live" in sessions
+
+
+def test_activity_default_is_modern_state_dir(tmp_path, monkeypatch):
+    """Fresh install with no legacy dir → stamps into .agentic-pr-dash, the same
+    dir the dashboard reads (not the legacy .gaia)."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("AGENT_ACTIVITY_SUBDIR", raising=False)
+    _run(run_agent_activity, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(tmp_path), "owner_pid": os.getpid()}, argv=["UserPromptSubmit"])
+    assert (tmp_path / ".agentic-pr-dash" / "agent-activity.json").exists()
+    assert not (tmp_path / ".gaia").exists()
+
+
+def test_activity_adopts_existing_legacy_dir(tmp_path, monkeypatch):
+    """A pre-existing legacy .gaia is honored so installs keep one source of truth."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("AGENT_ACTIVITY_SUBDIR", raising=False)
+    (tmp_path / ".gaia").mkdir()
+    _run(run_agent_activity, {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "cwd": str(tmp_path), "owner_pid": os.getpid()}, argv=["UserPromptSubmit"])
+    assert (tmp_path / ".gaia" / "agent-activity.json").exists()
+    assert not (tmp_path / ".agentic-pr-dash").exists()
 
 
 def test_activity_custom_subdir(tmp_path, monkeypatch):
@@ -173,6 +194,21 @@ def test_dispatch_default_log_path(tmp_path, monkeypatch, capsys):
     assert (tmp_path / ".beads" / "interactions.jsonl").exists()
 
 
+def test_dispatch_codex_spawn_agent_logged(tmp_path, monkeypatch, capsys):
+    """Codex subagent launches (spawn_agent / functions.spawn_agent) are logged,
+    not just Claude's Agent tool."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    for tool in ("spawn_agent", "functions.spawn_agent"):
+        log.unlink(missing_ok=True)
+        payload = {"tool_name": tool, "tool_input": {"description": "Review the changes", "model": "sonnet"}}
+        rc, _ = _run(run_model_dispatch_logger, payload, capsys=capsys)
+        assert rc == 0
+        entry = json.loads(log.read_text().strip())
+        assert entry["kind"] == "model_dispatch"
+        assert "task_type=code_review" in entry["prompt"]
+
+
 def test_dispatch_classify_helpers():
     assert run_model_dispatch_logger.classify("", "", "Explore") == "exploration"
     assert run_model_dispatch_logger.classify("implement a feature", "", "") == "small_impl"
@@ -204,6 +240,25 @@ def test_get_hub_url_none_when_absent(monkeypatch, tmp_path):
     assert agentflow.get_hub_url() is None
 
 
+def test_healthy_hub_skips_stale_first_file(monkeypatch, tmp_path):
+    """A stale preferred runtime file pointing at a dead hub must not strand a
+    healthy later file."""
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    a.write_text(json.dumps({"base_url": "http://dead"}))
+    b.write_text(json.dumps({"base_url": "http://live"}))
+    monkeypatch.setenv("AGENTFLOW_RUNTIME_FILES", os.pathsep.join([str(a), str(b)]))
+    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: u == "http://live")
+    assert agentflow.get_healthy_hub_url() == "http://live"
+
+
+def test_healthy_hub_none_when_all_dead(monkeypatch, tmp_path):
+    a = tmp_path / "a.json"
+    a.write_text(json.dumps({"base_url": "http://dead"}))
+    monkeypatch.setenv("AGENTFLOW_RUNTIME_FILES", str(a))
+    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: False)
+    assert agentflow.get_healthy_hub_url() is None
+
+
 def test_parse_permission_response():
     assert run_permission_agentflow.parse_permission_response("yes") is True
     assert run_permission_agentflow.parse_permission_response("ALLOW it") is True
@@ -225,15 +280,14 @@ def test_ask_user_wrong_tool_is_noop(monkeypatch, capsys):
 
 
 def test_ask_user_no_hub_falls_through(monkeypatch, capsys):
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: None)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: None)
     payload = {"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "x"}]}}
     rc, out = _run(run_ask_user_agentflow, payload, capsys=capsys)
     assert rc == 0 and out == ""
 
 
 def test_ask_user_returns_response_when_hub_replies(monkeypatch, capsys):
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: "http://hub")
-    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: True)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
     monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
     monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: "req")
     monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: "Option A")
@@ -241,20 +295,39 @@ def test_ask_user_returns_response_when_hub_replies(monkeypatch, capsys):
     rc, out = _run(run_ask_user_agentflow, payload, capsys=capsys)
     assert rc == 0
     parsed = json.loads(out.strip().splitlines()[-1])
-    assert parsed["decision"] == "block"
-    assert parsed["tool_result"]["answers"]["0"] == "Option A"
+    # Advisory: surface the answer as non-blocking context, never block/deny.
+    assert "decision" not in parsed
+    hso = parsed["hookSpecificOutput"]
+    assert hso["hookEventName"] == "PreToolUse"
+    assert "Option A" in hso["additionalContext"]
+    assert "permissionDecision" not in hso
+
+
+def test_ask_user_forwards_all_questions(monkeypatch, capsys):
+    """All 1–4 questions reach AgentFlow, not just the first."""
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
+    monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
+    sent = {}
+    monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: sent.update(k) or "req")
+    monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: "ok")
+    payload = {"tool_name": "AskUserQuestion", "tool_input": {"questions": [
+        {"question": "First?", "header": "Q1"},
+        {"question": "Second?", "header": "Q2"},
+    ]}}
+    rc, _ = _run(run_ask_user_agentflow, payload, capsys=capsys)
+    assert rc == 0
+    assert "First?" in sent["question"] and "Second?" in sent["question"]
 
 
 def test_ask_user_timeout_falls_through(monkeypatch, capsys):
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: "http://hub")
-    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: True)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
     monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
     monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: "req")
     monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: None)
     payload = {"tool_name": "AskUserQuestion", "tool_input": {"questions": [{"question": "Pick"}]}}
     rc, out = _run(run_ask_user_agentflow, payload, capsys=capsys)
     assert rc == 0
-    assert "block" not in out
+    assert out == ""
 
 
 # ── permission routing ───────────────────────────────────────────────
@@ -265,21 +338,36 @@ def test_permission_wrong_event_is_noop(monkeypatch, capsys):
     assert rc == 0 and out == ""
 
 
-def test_permission_non_interactive_skips(monkeypatch, capsys):
+def test_permission_disabled_env_skips(monkeypatch, capsys):
+    """DISABLE_AGENTFLOW forces the local dialog without probing the hub."""
     monkeypatch.delenv("FORCE_AGENTFLOW", raising=False)
-    monkeypatch.setattr(run_permission_agentflow, "_interactive", lambda: False)
+    monkeypatch.setenv("DISABLE_AGENTFLOW", "1")
     called = {"hub": False}
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: called.__setitem__("hub", True))
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: called.__setitem__("hub", True))
     payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"}}
     rc, out = _run(run_permission_agentflow, payload, capsys=capsys)
     assert rc == 0 and out == ""
     assert called["hub"] is False  # never even probes the hub
 
 
+def test_permission_routes_by_default_no_tty_guard(monkeypatch, capsys):
+    """No TTY guard: routing happens whenever a healthy hub exists (stdin is a
+    pipe for every hook, so isatty must not gate this)."""
+    monkeypatch.delenv("DISABLE_AGENTFLOW", raising=False)
+    monkeypatch.delenv("FORCE_AGENTFLOW", raising=False)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
+    monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
+    monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: "req")
+    monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: "yes")
+    payload = {"hook_event_name": "PermissionRequest", "tool_name": "Bash", "tool_input": {"command": "ls"}}
+    rc, out = _run(run_permission_agentflow, payload, capsys=capsys)
+    assert rc == 0
+    decision = json.loads(out.strip().splitlines()[-1])["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow"
+
+
 def test_permission_allow_decision(monkeypatch, capsys):
-    monkeypatch.setattr(run_permission_agentflow, "_interactive", lambda: True)
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: "http://hub")
-    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: True)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
     monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
     monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: "req")
     monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: "yes")
@@ -290,9 +378,7 @@ def test_permission_allow_decision(monkeypatch, capsys):
 
 
 def test_permission_deny_decision(monkeypatch, capsys):
-    monkeypatch.setattr(run_permission_agentflow, "_interactive", lambda: True)
-    monkeypatch.setattr(agentflow, "get_hub_url", lambda: "http://hub")
-    monkeypatch.setattr(agentflow, "hub_is_healthy", lambda u: True)
+    monkeypatch.setattr(agentflow, "get_healthy_hub_url", lambda: "http://hub")
     monkeypatch.setattr(agentflow, "register_session", lambda u, n, source: "sess")
     monkeypatch.setattr(agentflow, "create_request", lambda *a, **k: "req")
     monkeypatch.setattr(agentflow, "await_response", lambda *a, **k: "no thanks")
