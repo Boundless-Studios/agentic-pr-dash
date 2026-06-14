@@ -1016,6 +1016,53 @@ def _resolve_maintenance_roots(anchor_cwd: str) -> list[str]:
     return out
 
 
+def _maint_roots_for(anchor_cwd: str) -> list[str]:
+    """Roots to service from ``anchor_cwd``, with the anchor ALWAYS included.
+
+    ``_resolve_maintenance_roots`` existence-filters every candidate (so an
+    unregistered/uncloned sibling is skipped), but the anchor must be serviced
+    even when it isn't a git worktree — its own discovery handles that — so the
+    single-repo behavior is preserved when no roots are configured (BOU-1546).
+    """
+    cwd = os.path.abspath(os.path.expanduser(anchor_cwd))
+    resolved = _resolve_maintenance_roots(cwd)
+    return resolved if cwd in resolved else [cwd, *resolved]
+
+
+def _owned_worktrees_across_roots(session_id: str, anchor_cwd: str) -> list[str]:
+    """Owned worktrees across ``[anchor] + maintenance_repo_roots`` (deduped).
+
+    Shared by the stop-gate and the feedback waiter so a super-repo (gaia)
+    surfaces — and the spawned waiter actually polls — PRs it owns in sibling
+    repos, not just the anchor checkout (BOU-1546; codex PR #30 review P1)."""
+    owned: list[str] = []
+    seen: set[str] = set()
+    for root in _maint_roots_for(anchor_cwd):
+        for wt in _collect_stop_gate_worktrees(session_id, root):
+            if wt not in seen:
+                seen.add(wt)
+                owned.append(wt)
+    return owned
+
+
+def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dict]:
+    """Detached-ledger records across all roots, deduped by ``(root, pr)``.
+
+    Each repo's ledger is queried per root. PR numbers are unique only WITHIN a
+    repo, so dedupe on ``(root, pr)`` — a blocking ``#42`` in one repo must not
+    suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
+    records: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    for root in _maint_roots_for(anchor_cwd):
+        for r in _detached_pr_records(session_id, root):
+            key = (root, r["pr"])
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(r)
+    return records
+
+
 def _cmd_list_owned(args: argparse.Namespace) -> int:
     """Print worktree paths this session owns — markered OR reconciled-and-adopted.
 
@@ -1761,16 +1808,8 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     # owned in sibling repos still block the stop. The anchor is ALWAYS included
     # even if it's not a git worktree (its own discovery handles that), so the
     # existing single-repo behavior is unchanged when no roots are configured.
-    _resolved_roots = _resolve_maintenance_roots(cwd)
-    maint_roots = _resolved_roots if cwd in _resolved_roots else [cwd, *_resolved_roots]
     if session_id:
-        owned = []
-        seen_owned: set[str] = set()
-        for root in maint_roots:
-            for wt in _collect_stop_gate_worktrees(session_id, root):
-                if wt not in seen_owned:
-                    seen_owned.add(wt)
-                    owned.append(wt)
+        owned = _owned_worktrees_across_roots(session_id, cwd)
     else:
         owned = [cwd]
 
@@ -1797,14 +1836,8 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
     if session_id:
         # Detached records live in each repo's own ledger, so collect per root
         # (BOU-1546) — a torn-down sibling PR must still surface. Dedupe by pr.
-        detached = []
-        seen_detached: set = set()
-        for root in maint_roots:
-            for r in _detached_pr_records(session_id, root):
-                if r["pr"] in seen_detached or not _record_has_blockers(r):
-                    continue
-                seen_detached.add(r["pr"])
-                detached.append(r)
+        detached = [r for r in _detached_records_across_roots(session_id, cwd)
+                    if _record_has_blockers(r)]
         detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
         for r in detached:
             pending.append(_detached_pending_entry(r))
@@ -1823,8 +1856,10 @@ def _stop_gate_impl(args: argparse.Namespace) -> int:
             # Detached-ledger PRs (worktree torn down) are NOT serviced by the
             # loop — it only polls worktree dirs — so they ALWAYS need a waiter,
             # even when the loop is live (BOU-1632 codex P2 #3; codex PR #21).
+            # Span all roots so a sibling repo's detached PR still demands a
+            # waiter (codex PR #30 review, P2).
             detached_prs = set()
-            for _dr in _detached_pr_records(session_id, cwd):
+            for _dr in _detached_records_across_roots(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
                     detached_prs.add(_dr["pr"])
             open_prs = worktree_prs | detached_prs
@@ -2347,7 +2382,10 @@ def _cmd_await(args: argparse.Namespace) -> int:
             if not _pid_alive(str(owner_pid)):
                 return 0
 
-            owned = _collect_stop_gate_worktrees(session_id, cwd) if session_id else [cwd]
+            # Span [anchor] + maintenance_repo_roots so a waiter spawned with
+            # --cwd <super-repo> actually polls sibling-repo PRs it was demanded
+            # to cover (codex PR #30 review, P1; parity with the stop-gate).
+            owned = _owned_worktrees_across_roots(session_id, cwd) if session_id else [cwd]
 
             pending: list[tuple[str, str]] = []
             for worktree in owned:
@@ -2366,7 +2404,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
             # Include detached-ledger PRs (parity with stop-gate).
             _detached_this_tick: list[dict] = []
             if session_id:
-                _detached_this_tick = _detached_pr_records(session_id, cwd)
+                _detached_this_tick = _detached_records_across_roots(session_id, cwd)
                 for r in _detached_this_tick:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))

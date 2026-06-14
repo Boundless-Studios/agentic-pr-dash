@@ -281,7 +281,15 @@ def load(cwd: str | None = None) -> Config:
         text = str(entry).strip()
         if not text:
             continue
-        ab = os.path.abspath(os.path.expanduser(text))
+        expanded = os.path.expanduser(text)
+        # Resolve a RELATIVE root (e.g. "../agentic-pr-dash") against the config
+        # file's directory (``root``), NOT the process cwd — the stop hook / loop
+        # may run from anywhere while pointing ``--cwd`` at the super-repo, so a
+        # cwd-relative absolutize would land on the wrong path and get skipped
+        # (codex PR #30 review, P2).
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(root), expanded)
+        ab = os.path.abspath(expanded)
         if ab not in seen_roots:
             seen_roots.add(ab)
             maintenance_repo_roots.append(ab)
