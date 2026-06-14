@@ -1,0 +1,27 @@
+{
+  "hooks": {
+    "arm_pr_watch": true,
+    "peon_ping": true,
+    "post_push_ci_watch": true,
+    "session_daemons": true,
+    "stop_pr_maintenance": true,
+    "warden": true
+  },
+  "profiles": {
+    "active": "standard",
+    "available": {
+      "minimal": {
+        "peon_ping": false,
+        "post_push_ci_watch": false,
+        "session_daemons": false
+      },
+      "standard": {},
+      "strict": {
+        "post_push_ci_watch": true,
+        "session_daemons": true,
+        "stop_pr_maintenance": true,
+        "warden": true
+      }
+    }
+  }
+}
