@@ -132,6 +132,9 @@ worked by one agent at a time — no double-fixing, no clobbered commits.
 *An agent holding the lease on PR #421 — addressing the reviewer's comment and
 the failing unit test, with the heartbeat and progress timestamps ticking.*
 
+For maintainers, see [Architecture](docs/ARCHITECTURE.md) for the setup model,
+configuration contract, runtime flows, data model, and code map.
+
 ### Durable PR ledger — surviving worktree teardown (BOU-1587)
 
 Ownership markers live *inside* a worktree (`<state_dir>/pr-watch.armed`). When a
