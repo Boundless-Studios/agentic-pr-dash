@@ -981,6 +981,41 @@ def _marker_session_id(worktree_path: str) -> str | None:
     return None
 
 
+def _resolve_maintenance_roots(anchor_cwd: str) -> list[str]:
+    """``[anchor] + configured maintenance_repo_roots``, existing git repos only.
+
+    The anchor (the super-repo, e.g. gaia) supplies the root list via its own
+    ``agentic-pr-dash.toml`` (``maintenance_repo_roots``). Each returned root is
+    then discovered with its OWN ``git worktree list`` and — at the per-worktree
+    layer — resolves its OWN per-repo config, so state/markers never bleed across
+    repos (BOU-1546, extends the BOU-1540 ``config_cwd`` pattern).
+
+    Roots that don't exist or aren't git worktrees are skipped (a registered repo
+    that isn't checked out on this machine must not abort the others). Order is
+    anchor-first, then config order; duplicates are collapsed.
+    """
+    anchor = os.path.abspath(os.path.expanduser(anchor_cwd))
+    cfg = load_config(anchor)
+    out: list[str] = []
+    seen: set[str] = set()
+    for cand in (anchor, *getattr(cfg, "maintenance_repo_roots", ())):
+        ab = os.path.abspath(os.path.expanduser(str(cand)))
+        if ab in seen:
+            continue
+        try:
+            probe = subprocess.run(
+                ["git", "-C", ab, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if probe.returncode != 0:
+            continue
+        seen.add(ab)
+        out.append(ab)
+    return out
+
+
 def _cmd_list_owned(args: argparse.Namespace) -> int:
     """Print worktree paths this session owns — markered OR reconciled-and-adopted.
 
@@ -1001,32 +1036,52 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
     Adoption only ever targets UNOWNED worktrees (the same condition `check` uses
     to decide it may service one), so the pid/heartbeat ownership gate still
     yields exactly one executor per PR — no cross-session double-servicing.
-    """
-    # Surface a REAL discovery failure (cwd is missing / not a git worktree) as a
-    # non-zero exit. Otherwise `_iter_worktrees_with_branch` swallows the git
-    # error and yields nothing, so an empty result here is indistinguishable from
-    # "owns nothing" — and the loop, which now treats rc-0-empty as authoritative,
-    # would service nothing for that repo instead of falling back to its root
-    # (PR #7 review, P2).
-    try:
-        probe = subprocess.run(
-            ["git", "-C", args.cwd, "worktree", "list", "--porcelain"],
-            capture_output=True, text=True, timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        # A hung/unresponsive git invocation is itself a discovery failure — match
-        # the 10s bound `_iter_worktrees_with_branch` uses and signal failure
-        # rather than stalling the loop forever (PR #7 review, P2).
-        print(f"list-owned: worktree probe failed/timed out: {args.cwd}", file=sys.stderr)
-        return 3
-    if probe.returncode != 0:
-        print(f"list-owned: not a git worktree: {args.cwd}", file=sys.stderr)
-        return 3
 
-    paths = _collect_owned_worktrees(args.session_id, args.cwd, args.pid)
-    for path in paths:
-        print(path)
-    return 0
+    BOU-1546: when the anchor config registers ``maintenance_repo_roots``, this
+    aggregates owned worktrees across ``[anchor] + roots`` — each root discovered
+    with its own ``git worktree list`` — so a super-repo (gaia) surfaces PRs it
+    owns in sibling repos. The anchor's exit-code contract is preserved (rc 3 only
+    when the ANCHOR itself isn't a git worktree, so the loop's per-cwd fallback
+    still fires); a sibling-root discovery failure warns but does not abort.
+    """
+    anchor = os.path.abspath(os.path.expanduser(args.cwd))
+    seen: set[str] = set()
+    anchor_failed = False
+    # Always ATTEMPT the anchor (even if it's not a git worktree) so its failure
+    # yields rc 3 and the loop's per-cwd fallback fires; _resolve_maintenance_roots
+    # would otherwise silently drop a failing anchor.
+    resolved = _resolve_maintenance_roots(args.cwd)
+    roots = resolved if anchor in resolved else [anchor, *resolved]
+    for root in roots:
+        # Surface a REAL discovery failure (root is missing / not a git worktree).
+        # Otherwise `_iter_worktrees_with_branch` swallows the git error and yields
+        # nothing, so an empty result is indistinguishable from "owns nothing" —
+        # and the loop, which treats rc-0-empty as authoritative, would service
+        # nothing for that repo instead of falling back to its root (PR #7, P2).
+        try:
+            probe = subprocess.run(
+                ["git", "-C", root, "worktree", "list", "--porcelain"],
+                capture_output=True, text=True, timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            # A hung/unresponsive git invocation is itself a discovery failure —
+            # match the 10s bound `_iter_worktrees_with_branch` uses.
+            print(f"list-owned: worktree probe failed/timed out: {root}", file=sys.stderr)
+            if root == anchor:
+                anchor_failed = True
+            continue
+        if probe.returncode != 0:
+            print(f"list-owned: not a git worktree: {root}", file=sys.stderr)
+            if root == anchor:
+                anchor_failed = True
+            continue
+        for path in _collect_owned_worktrees(args.session_id, root, args.pid):
+            if path not in seen:
+                seen.add(path)
+                print(path)
+    # rc 3 only when the ANCHOR itself failed (the loop's per-cwd fallback relies
+    # on it); sibling-root failures are non-fatal and already warned above.
+    return 3 if anchor_failed else 0
 
 
 def _self_pid_chain(max_depth: int = 16) -> set[int]:
