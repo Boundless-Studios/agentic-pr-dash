@@ -14,8 +14,10 @@ reappearing as live work.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -97,7 +99,53 @@ class ReviewThread:
     replies: list[ReviewThreadComment] = field(default_factory=list)
 
 
-def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
+# Bounded retry for transient connectivity failures (BOU-1638 / BOU-1694).
+# A gh call that can't *reach* GitHub (DNS / connect / TLS / read timeout, or a
+# transient 5xx) typically succeeds moments later — the interactive shell's gh
+# works while a single Python-subprocess attempt happened to hit a blip. Making
+# the reach itself robust (not just diagnosable) is the point: we retry, and
+# only surface the diagnostics after the retries are exhausted. Tunables are env
+# overridable so tests can drive them deterministically.
+_GH_RETRY_ATTEMPTS = max(1, int(os.environ.get("APD_GH_RETRY_ATTEMPTS", "3")))
+_GH_RETRY_BASE_DELAY_S = float(os.environ.get("APD_GH_RETRY_BASE_DELAY_S", "0.5"))
+
+# Substrings that identify a CONNECTION-ESTABLISHMENT / transport failure — i.e.
+# the request almost certainly never reached GitHub, so re-attempting is safe
+# even for the resolveReviewThread mutation. Auth errors, bad args, and "no PRs"
+# are deliberately excluded: retrying those just wastes wall-clock.
+_CONNECTIVITY_STDERR_PATTERNS = (
+    "error connecting to",
+    "could not resolve host",
+    "no such host",
+    "temporary failure in name resolution",
+    "network is unreachable",
+    "connection refused",
+    "connection reset",
+    "connection timed out",
+    "i/o timeout",
+    "client.timeout exceeded",
+    "timeout awaiting response headers",
+    "tls handshake timeout",
+    # NB: our own full-duration TimeoutExpired wrapper ("gh timed out after Ns")
+    # is deliberately NOT retried — re-running a hung gh would multiply the
+    # worst-case stop-gate latency by the attempt count. Only fast-failing
+    # transport errors (connect/DNS/reset/5xx) above are worth a re-attempt.
+    "503 service unavailable",
+    "502 bad gateway",
+    "504 gateway time",
+)
+
+
+def _is_transient_connectivity_failure(result: subprocess.CompletedProcess) -> bool:
+    """True when a failed gh result looks like a transient transport failure
+    that is worth retrying (the request never reached GitHub)."""
+    if result.returncode == 0:
+        return False
+    stderr = (result.stderr or "").lower()
+    return any(pat in stderr for pat in _CONNECTIVITY_STDERR_PATTERNS)
+
+
+def _run_once(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd,
@@ -119,6 +167,24 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
         # OSError text so the operator sees "No such file or directory: 'gh'"
         # instead of a bare exit 1.
         return subprocess.CompletedProcess(cmd, 1, "", f"{type(exc).__name__}: {exc}")
+
+
+def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
+    """Run a gh command, retrying transient connectivity failures with backoff.
+
+    Non-connectivity failures (auth, bad args) and successes return immediately;
+    only connection-establishment failures are re-attempted, up to
+    ``_GH_RETRY_ATTEMPTS`` total with exponential backoff. This makes the reach
+    robust rather than merely diagnosable — BOU-1694's AC that the completion
+    path "can be retried successfully when direct gh works from the same cwd."
+    """
+    result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+    for attempt in range(1, _GH_RETRY_ATTEMPTS):
+        if not _is_transient_connectivity_failure(result):
+            return result
+        time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+        result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+    return result
 
 
 def _is_infra_check(name: str) -> bool:

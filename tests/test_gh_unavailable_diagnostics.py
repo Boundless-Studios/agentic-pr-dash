@@ -141,3 +141,95 @@ def test_check_worktree_surfaces_underlying_stderr(monkeypatch):
     assert "FileNotFoundError" in text or "No such file or directory" in text
     assert "remediation" in text
     assert text.strip() != "could not list PRs (gh unavailable)"
+
+
+# --------------------------------------------------------------------------- #
+# _run RETRIES transient connectivity failures (BOU-1694: robust reach, not
+# just diagnosable) — the actual fix for "the gh subprocess often can't reach
+# GitHub while the shell can."
+# --------------------------------------------------------------------------- #
+
+def _sequence_run(results):
+    """subprocess.run stub yielding the given CompletedProcess results in order
+    (repeating the last), recording how many times it was called."""
+    calls = {"n": 0}
+
+    def _stub(*a, **k):
+        i = calls["n"]
+        calls["n"] += 1
+        return results[min(i, len(results) - 1)]
+
+    return _stub, calls
+
+
+def test_run_retries_transient_connectivity_then_succeeds(monkeypatch):
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    stub, calls = _sequence_run([
+        _cp(returncode=1, stderr="error connecting to api.github.com"),
+        _cp(returncode=1, stderr="dial tcp: connection reset by peer"),
+        _cp(stdout="[]", returncode=0),
+    ])
+    monkeypatch.setattr(subprocess, "run", stub)
+
+    r = github_api._run(["gh", "pr", "list"])
+    assert r.returncode == 0
+    assert calls["n"] == 3  # two transient failures, then success
+
+
+def test_run_does_not_retry_non_connectivity_failure(monkeypatch):
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    stub, calls = _sequence_run([
+        _cp(returncode=1, stderr="gh auth status: not logged into any GitHub hosts"),
+    ])
+    monkeypatch.setattr(subprocess, "run", stub)
+
+    r = github_api._run(["gh", "pr", "list"])
+    assert r.returncode == 1
+    assert calls["n"] == 1  # auth failure surfaces immediately, never retried
+
+
+def test_run_does_not_retry_full_timeout_hang(monkeypatch):
+    # A full-duration gh hang must NOT be retried — that would multiply the
+    # worst-case stop-gate latency by the attempt count.
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def _hang(*a, **k):
+        calls["n"] += 1
+        raise subprocess.TimeoutExpired(cmd=["gh", "pr", "list"], timeout=20)
+
+    monkeypatch.setattr(subprocess, "run", _hang)
+    r = github_api._run(["gh", "pr", "list"], timeout_s=20)
+    assert r.returncode != 0
+    assert "timed out" in r.stderr.lower()
+    assert calls["n"] == 1
+
+
+def test_run_gives_up_after_bounded_attempts(monkeypatch):
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def _always_fail(*a, **k):
+        calls["n"] += 1
+        return _cp(returncode=1, stderr="error connecting to api.github.com")
+
+    monkeypatch.setattr(subprocess, "run", _always_fail)
+    r = github_api._run(["gh", "pr", "list"])
+    assert r.returncode == 1
+    assert calls["n"] == github_api._GH_RETRY_ATTEMPTS  # bounded, not infinite
+
+
+def test_list_open_prs_recovers_via_retry(monkeypatch):
+    """BOU-1694 AC: the completion path retries successfully when gh works
+    moments later from the same cwd."""
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    stub, calls = _sequence_run([
+        _cp(returncode=1, stderr="error connecting to api.github.com"),
+        _cp(stdout='[{"number": 7}]', returncode=0),
+    ])
+    monkeypatch.setattr(subprocess, "run", stub)
+
+    prs = github_api.list_open_prs(".")
+    assert prs == [{"number": 7}]
+    assert github_api.last_list_open_prs_failure() is None  # cleared on success
+    assert calls["n"] == 2
