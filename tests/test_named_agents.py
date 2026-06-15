@@ -216,12 +216,12 @@ def test_known_conflict_preserved_when_bulk_unknown_and_refetch_fails(monkeypatc
     orch = orchestrator.Orchestrator(repo_cwd=None)
 
     asyncio.run(orch.refresh_prs())
-    assert orch.prs[1].mergeable == "CONFLICTING"
-    assert orch.prs[1].status is PRStatus.MERGE_CONFLICT
+    assert orch.get_pr(1).mergeable == "CONFLICTING"
+    assert orch.get_pr(1).status is PRStatus.MERGE_CONFLICT
 
     # Next poll: bulk now reports UNKNOWN, and the per-PR refetch fails ("","").
     bulk["mergeStateStatus"] = "UNKNOWN"
     bulk["mergeable"] = "UNKNOWN"
     asyncio.run(orch.refresh_prs())
-    assert orch.prs[1].mergeable == "CONFLICTING"  # preserved, not erased
-    assert orch.prs[1].status is PRStatus.MERGE_CONFLICT
+    assert orch.get_pr(1).mergeable == "CONFLICTING"  # preserved, not erased
+    assert orch.get_pr(1).status is PRStatus.MERGE_CONFLICT

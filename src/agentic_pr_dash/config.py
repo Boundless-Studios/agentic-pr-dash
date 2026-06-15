@@ -136,7 +136,13 @@ class Config:
     per-repo config, so state/markers never bleed across repos. Set in the
     super-repo's ``agentic-pr-dash.toml`` (``maintenance_repo_roots = [...]``)
     or via ``AGENTIC_PR_DASH_MAINTENANCE_REPO_ROOTS`` (comma/``os.pathsep``
-    separated). Paths are ``~``-expanded and absolutized at load."""
+    separated). Paths are ``~``-expanded and absolutized at load.
+
+    This is ALSO the repo-selection knob for the PR DASHBOARD (BOU-1598): the
+    orchestrator polls ``[anchor] + maintenance_repo_roots`` and aggregates each
+    repo's open PRs, tagged by ``owner/name`` so same-number PRs across repos
+    don't collide. Zero extra roots ⇒ the dashboard covers only the anchor
+    (today's single-repo behavior)."""
 
     extra: dict = field(default_factory=dict)
     """Anything else from the ``[project]`` table, for adapters to read."""
