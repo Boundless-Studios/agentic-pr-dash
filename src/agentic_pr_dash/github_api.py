@@ -102,8 +102,23 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd,
         )
-    except (subprocess.TimeoutExpired, OSError):
-        return subprocess.CompletedProcess(cmd, 1, "", "")
+    except subprocess.TimeoutExpired as exc:
+        # Preserve WHY the call failed instead of returning a blank stderr that
+        # collapses every failure mode into an opaque "exit 1". A timeout is a
+        # distinct, actionable signal (gh hung / network stalled) that callers
+        # surface to operators — see list_open_prs / maintenance_check (BOU-1638).
+        partial = exc.stderr or exc.output or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        detail = f"gh timed out after {timeout_s}s: {' '.join(cmd)}"
+        stderr = f"{detail}\n{partial}".strip() if partial else detail
+        return subprocess.CompletedProcess(cmd, 1, "", stderr)
+    except OSError as exc:
+        # e.g. gh not on PATH, or a PATH/env difference between the interactive
+        # shell and this Python subprocess (the BOU-1638 root cause). Capture the
+        # OSError text so the operator sees "No such file or directory: 'gh'"
+        # instead of a bare exit 1.
+        return subprocess.CompletedProcess(cmd, 1, "", f"{type(exc).__name__}: {exc}")
 
 
 def _is_infra_check(name: str) -> bool:
@@ -123,6 +138,55 @@ def get_repo_info(cwd: str | None = None) -> tuple[str, str]:
         return "", ""
 
 
+@dataclass(frozen=True)
+class GhFailure:
+    """Diagnostics for a failed ``gh`` invocation.
+
+    Carried out-of-band (via :func:`last_list_open_prs_failure`) so the
+    ``None`` (=failure) vs ``[]`` (=genuinely no PRs) return-value invariant of
+    :func:`list_open_prs` stays intact — a transient outage must never be
+    mistaken for "no PRs" and prune tracked PRs (BOU-1638 / BOU-1694)."""
+
+    command: list[str]
+    returncode: int
+    stderr: str
+    reason: str  # short machine-ish category: "exit", "invalid-json", "not-a-list"
+
+    @property
+    def command_str(self) -> str:
+        return " ".join(self.command)
+
+    def describe(self) -> str:
+        """Multi-line operator-facing diagnostic + self-check + remediation."""
+        stderr = (self.stderr or "").strip() or "(no stderr captured)"
+        lines = [
+            f"gh call failed ({self.reason}): {self.command_str}",
+            f"  exit code: {self.returncode}",
+            f"  stderr: {stderr}",
+            "  remediation: this is usually a PATH/env or auth difference between "
+            "your interactive shell and the Python subprocess (or a transient "
+            "GitHub outage / rate-limit). Confirm `gh auth status` and that `gh` "
+            "is on PATH, then re-run the exact command above from the same cwd:",
+            f"    {self.command_str}",
+        ]
+        return "\n".join(lines)
+
+
+# Most-recent ``gh`` failure recorded by :func:`list_open_prs`, exposed so the
+# completion / check paths can surface real diagnostics instead of an opaque
+# "gh unavailable". Reset to ``None`` on every successful list so a stale failure
+# can't bleed into a later healthy call.
+_LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
+
+
+def last_list_open_prs_failure() -> GhFailure | None:
+    """Return diagnostics for the most recent failed :func:`list_open_prs` call.
+
+    ``None`` once a list has succeeded (or before any failure). Callers read
+    this immediately after a ``None`` return from :func:`list_open_prs`."""
+    return _LAST_LIST_OPEN_PRS_FAILURE
+
+
 def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     """List all open PRs authored by the current user.
 
@@ -130,19 +194,42 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     API is rate-limited or unreachable) so callers can distinguish a genuine
     "no open PRs" result (``[]``) from an API failure. Treating a failure as
     an empty list would let a transient outage prune every tracked PR.
+
+    On failure, diagnostics (command, exit code, stderr, reason) are recorded in
+    :func:`last_list_open_prs_failure` so the caller can surface the underlying
+    cause instead of a bare "gh unavailable".
     """
-    r = _run(
-        ["gh", "pr", "list", "--author", "@me", "--state", "open",
-         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt"],
-        cwd=cwd, timeout_s=30,
-    )
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    cmd = [
+        "gh", "pr", "list", "--author", "@me", "--state", "open",
+        "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
+    ]
+    r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
+        _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+            command=cmd, returncode=r.returncode, stderr=r.stderr or "", reason="exit",
+        )
         return None
     try:
         prs = json.loads(r.stdout or "[]")
     except json.JSONDecodeError:
+        _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+            command=cmd, returncode=r.returncode,
+            stderr=(r.stderr or "")
+            or f"gh returned non-JSON output: {(r.stdout or '')[:200]!r}",
+            reason="invalid-json",
+        )
         return None
-    return prs if isinstance(prs, list) else None
+    if not isinstance(prs, list):
+        _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+            command=cmd, returncode=r.returncode,
+            stderr=(r.stderr or "")
+            or f"gh returned a non-list JSON payload: {type(prs).__name__}",
+            reason="not-a-list",
+        )
+        return None
+    _LAST_LIST_OPEN_PRS_FAILURE = None
+    return prs
 
 
 _PR_HEAD_FIELDS = (

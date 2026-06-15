@@ -47,6 +47,30 @@ def _current_branch(cwd: str) -> str:
 _GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
 
 
+def _gh_unavailable_message(cwd: str | None = None) -> str:
+    """Operator-facing message for a failed ``list_open_prs`` resolution.
+
+    Surfaces the real diagnostics (failing command, exit code, stderr) plus a
+    remediation hint and self-check command captured by
+    ``github_api.last_list_open_prs_failure``, instead of a bare
+    "gh unavailable" that hides whether this was a real outage, an auth lapse,
+    or a PATH/env difference in the Python subprocess (BOU-1638 / BOU-1694).
+    """
+    from . import github_api  # noqa: PLC0415
+
+    failure = github_api.last_list_open_prs_failure()
+    if failure is None:
+        # No structured diagnostic (e.g. the failure predates this code path or
+        # was cleared) — degrade to the legacy string but keep it actionable.
+        where = f" in {cwd}" if cwd else ""
+        return (
+            "could not list PRs (gh unavailable): no diagnostics were captured. "
+            f"Re-run `gh pr list --author @me --state open`{where} from the same "
+            "cwd and check `gh auth status`."
+        )
+    return "could not list PRs (gh unavailable)\n" + failure.describe()
+
+
 def _repo_slug(cwd: str) -> str:
     """GitHub ``owner/name`` for the checkout at ``cwd``, or "" if undetectable.
 
@@ -793,7 +817,7 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     pr = _resolve_pr_for_branch(cwd)
 
     if pr is _GH_UNAVAILABLE:
-        return 2, "could not list PRs (gh unavailable)"
+        return 2, _gh_unavailable_message(cwd)
     if pr is None:
         return 0, "no open PR for this branch"
 
@@ -1453,7 +1477,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         pr = _resolve_pr_for_branch(cwd)
 
     if pr is _GH_UNAVAILABLE:
-        print("could not list PRs (gh unavailable)")
+        print(_gh_unavailable_message(cwd))
         return 2
     if pr is None:
         print("no open PR for this branch")
