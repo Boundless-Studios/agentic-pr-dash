@@ -300,16 +300,28 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
 
 _PR_HEAD_FIELDS = (
     "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
-    "headRefOid,headRefName,headRepositoryOwner,baseRefName"
+    "headRefOid,headRefName,headRepositoryOwner,baseRefName,mergedAt"
 )
 
-# `gh pr list --head` is a *prefix* filter (GitHub returns every PR whose head
-# branch *begins* with the query, so `--head fix` also returns `fix-123`). A
-# bare `--limit 1` can therefore hand the single result slot to a prefix match
-# and drop the exact-branch PR before we can filter for it — so we fetch a wide
-# page and exact-filter `headRefName` (and, for fork heads, `headRepositoryOwner`)
-# in Python instead.
-_PR_HEAD_LOOKUP_LIMIT = "30"
+# GitHub's REST `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}` performs
+# an *exact* head match server-side (unlike `gh pr list --head`, which is a
+# *prefix* filter — `--head fix` also returns `fix-123`). The prefix filter
+# forced us to over-fetch a wide page and exact-filter `headRefName` in Python,
+# which silently dropped the exact-branch PR whenever more than one page of
+# prefix-matches existed and the exact branch sorted beyond the fetched page.
+# We use the exact REST query for resolution instead, so the result is
+# independent of how many prefix-matches exist.
+#
+# REST `state` is one of {open, closed, all} (no "merged"); a merged PR is a
+# closed PR, so we map merged→closed for the *server-side* query. The REST API
+# cannot distinguish merged-from-closed, so when the caller asked for "merged"
+# we re-impose the merged-only gate in Python on each candidate via `mergedAt`
+# (a closed-but-not-merged PR has `mergedAt is null`) — see `find_pr_by_head`.
+_REST_STATE = {"open": "open", "closed": "closed", "merged": "closed", "all": "all"}
+# Page size cap for the exact-head REST query. Distinct PRs for one exact head
+# branch are rare (normally 1), so a single page is plenty; we still paginate
+# defensively below.
+_PR_HEAD_PER_PAGE = "100"
 
 
 def find_pr_by_head(
@@ -326,35 +338,157 @@ def find_pr_by_head(
     evaluate gate policy: ``number, title, body, url, isDraft, mergeStateStatus,
     reviewDecision, headRefOid, headRefName, baseRefName``.
 
-    ``state`` is one of ``"open"``, ``"merged"``, ``"closed"``, ``"all"``. When
-    ``head_oid`` is given, only a PR whose ``headRefOid`` matches it is returned
-    — the caller uses this to confirm that a merged PR corresponds to the
-    *current* local HEAD (squash-merged branches can stay ahead of the default
-    branch, and a reused branch name must still go through the normal gates).
+    ``state`` is one of ``"open"``, ``"merged"``, ``"closed"``, ``"all"``. For
+    ``"merged"`` the merged-only contract is enforced: a PR that was *closed
+    without merging* (``mergedAt is null``) is never returned, even though it
+    matches the underlying ``state=closed`` REST/list filter. When ``head_oid``
+    is given, only a PR whose ``headRefOid`` matches it is returned — the caller
+    uses this to confirm that a merged PR corresponds to the *current* local HEAD
+    (squash-merged branches can stay ahead of the default branch, and a reused
+    branch name must still go through the normal gates).
 
     Returns ``None`` on any ``gh`` failure (so the caller fails open) or when no
     matching PR exists.
     """
     if not branch:
         return None
-    # `gh` accepts `<owner>:<branch>` for --head (fork/head-qualified specs), but
-    # `gh pr list --head` rejects the owner qualifier — strip it before resolving
-    # (mirrors the arm flow in maintenance_check). We KEEP the owner separately so
-    # two fork PRs with the same branch name (`alice:feature`, `bob:feature`) don't
-    # collide: results are post-filtered by `headRepositoryOwner` below.
+    # `<owner>:<branch>` head specs (fork / head-qualified) carry the head-repo
+    # owner. We keep it so two fork PRs sharing a branch name (`alice:feature`,
+    # `bob:feature`) don't collide. When omitted, the head lives on the base repo,
+    # so the head owner is the base-repo owner (resolved below).
     head_owner = ""
     if ":" in branch:
         head_owner, branch = branch.split(":", 1)
     if not branch:
         return None
-    cmd = [
-        "gh", "pr", "list",
-        "--head", branch,
-        "--state", state,
-        "--limit", _PR_HEAD_LOOKUP_LIMIT,
-        "--json", _PR_HEAD_FIELDS,
-    ]
-    r = _run(cmd, cwd=cwd, timeout_s=30)
+
+    rest_state = _REST_STATE.get(state, "all")
+    # When the caller asked for "merged", the REST query can only narrow to
+    # `state=closed` (merged PRs ARE closed). A closed-but-not-merged PR also
+    # matches that server-side filter, so we re-impose the merged-only gate in
+    # Python below via `mergedAt` — a closed-unmerged PR has `mergedAt is null`
+    # and must NOT be returned when "merged" was requested.
+    merged_only = state == "merged"
+
+    if head_owner:
+        # Owner-qualified head (`alice:branch`): the exact REST `head=alice:branch`
+        # spec resolves the fork PR directly.
+        numbers = _exact_head_pr_numbers(head_owner, branch, rest_state, cwd=cwd)
+    else:
+        # Unqualified head (`branch`): the head may live on the base repo OR on a
+        # fork (`alice:branch`). REST `head=` requires an `owner:branch` spec, so
+        # an exact REST query can only cover the base-repo owner and would MISS a
+        # fork-backed PR. Use the (owner-agnostic) `gh pr list --head` lookup,
+        # which matches the branch on any head repo, then exact-filter in Python.
+        numbers = _unqualified_head_pr_numbers(branch, rest_state, cwd=cwd)
+    if numbers is None:
+        return None  # gh/API failure → fail open (distinct from "no match" → None)
+
+    for number in numbers:
+        pr = _pr_full_payload(number, cwd=cwd)
+        if pr is None:
+            return None  # gh failure fetching full fields → fail open
+        # The lookup already targets the branch (and, for qualified heads, the
+        # owner), but re-verify defensively so a contract change upstream can't
+        # slip the wrong PR past a Stop/QA gate.
+        if str(pr.get("headRefName") or "") != branch:
+            continue
+        if head_owner and str(_pr_head_owner(pr)) != head_owner:
+            continue
+        # Merged-only gate: REST `state=closed` also returns closed-unmerged PRs,
+        # so reject any candidate that was never merged when "merged" was asked.
+        if merged_only and not pr.get("mergedAt"):
+            continue
+        if head_oid is not None and pr.get("headRefOid") != head_oid:
+            continue
+        return pr
+    return None
+
+
+def _exact_head_pr_numbers(
+    owner: str, branch: str, rest_state: str, cwd: str | None = None
+) -> list[int] | None:
+    """Return PR numbers whose head is *exactly* ``owner:branch`` via REST.
+
+    Uses ``GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}`` which matches
+    the head branch exactly (no prefix matching), paginating defensively. Returns
+    ``None`` on any ``gh``/API failure (so the caller fails open) and ``[]`` when
+    no PR matches.
+    """
+    head_spec = f"{owner}:{branch}"
+    numbers: list[int] = []
+    page = 1
+    while True:
+        r = _run(
+            [
+                "gh", "api",
+                "-H", "Accept: application/vnd.github+json",
+                (
+                    "repos/{owner}/{repo}/pulls"
+                    f"?head={urllib.parse.quote(head_spec, safe=':')}"
+                    f"&state={rest_state}"
+                    f"&per_page={_PR_HEAD_PER_PAGE}&page={page}"
+                ),
+            ],
+            cwd=cwd,
+            timeout_s=30,
+        )
+        if r.returncode != 0:
+            return None
+        try:
+            payload = json.loads(r.stdout or "[]")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, list):
+            return None
+        for pr in payload:
+            if isinstance(pr, dict) and isinstance(pr.get("number"), int):
+                numbers.append(pr["number"])
+        if len(payload) < int(_PR_HEAD_PER_PAGE):
+            break
+        page += 1
+    return numbers
+
+
+# `gh pr list --head <branch>` accepts ONLY a bare branch name (the CLI rejects
+# the `owner:branch` qualifier) and matches that branch on ANY head repo —
+# including forks — which is exactly what we need for an unqualified head whose
+# PR may be fork-backed. It is, however, a *prefix* filter (`--head fix` also
+# returns `fix-123`), so we over-fetch a wide page and exact-filter in Python.
+_PR_HEAD_LIST_LIMIT = "100"
+# `gh pr list --state` takes {open, closed, merged, all} (unlike REST, which has
+# no "merged"); pass the caller's state through verbatim so a "merged" request
+# is honored server-side here.
+_PR_LIST_STATES = {"open", "closed", "merged", "all"}
+
+
+def _unqualified_head_pr_numbers(
+    branch: str, rest_state: str, cwd: str | None = None
+) -> list[int] | None:
+    """Return PR numbers whose head branch is exactly ``branch`` on *any* repo.
+
+    Used for an unqualified head (no ``owner:`` prefix), where the PR may be
+    fork-backed. REST ``head=`` requires an ``owner:branch`` spec and so cannot
+    cover a fork head, so we fall back to ``gh pr list --head`` (owner-agnostic,
+    fork-inclusive) and exact-filter ``headRefName`` in Python.
+
+    ``rest_state`` is the already-mapped REST state ({open,closed,all}); we
+    recover the caller's intent for the CLI's richer state vocabulary (which DOES
+    accept "merged") by passing it through when valid. Returns ``None`` on any
+    ``gh`` failure (fail open) and ``[]`` when nothing matches.
+    """
+    list_state = rest_state if rest_state in _PR_LIST_STATES else "all"
+    r = _run(
+        [
+            "gh", "pr", "list",
+            "--head", branch,
+            "--state", list_state,
+            "--limit", _PR_HEAD_LIST_LIMIT,
+            "--json", "number,headRefName",
+        ],
+        cwd=cwd,
+        timeout_s=30,
+    )
     if r.returncode != 0:
         return None
     try:
@@ -363,27 +497,41 @@ def find_pr_by_head(
         return None
     if not isinstance(payload, list):
         return None
+    numbers: list[int] = []
     for pr in payload:
         if not isinstance(pr, dict):
             continue
-        # `--head` is a prefix filter (GitHub matches branch names *beginning*
-        # with the query, so `fix` also returns `fix-123`). Require an exact
-        # head-branch match so a Stop/QA gate never evaluates the wrong PR.
+        # `--head` is a prefix filter; require an exact branch match so a
+        # Stop/QA gate never evaluates a `fix-123` when it asked for `fix`.
         if str(pr.get("headRefName") or "") != branch:
             continue
-        # When the caller supplied an owner-qualified head (`alice:feature`),
-        # require the PR's head-repo owner to match so a same-named branch on a
-        # different fork (`bob:feature`) isn't returned in its place.
-        if head_owner and str(_pr_head_owner(pr)) != head_owner:
-            continue
-        if head_oid is not None and pr.get("headRefOid") != head_oid:
-            continue
-        return pr
-    return None
+        if isinstance(pr.get("number"), int):
+            numbers.append(pr["number"])
+    return numbers
+
+
+def _pr_full_payload(number: int, cwd: str | None = None) -> dict | None:
+    """Fetch the full Stop/QA-gate contract fields for one PR via ``gh pr view``.
+
+    Returns ``None`` on any ``gh`` failure so the caller fails open. The returned
+    dict matches the historical ``gh pr list --json`` shape (same ``_PR_HEAD_FIELDS``).
+    """
+    r = _run(
+        ["gh", "pr", "view", str(number), "--json", _PR_HEAD_FIELDS],
+        cwd=cwd,
+        timeout_s=30,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        pr = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    return pr if isinstance(pr, dict) else None
 
 
 def _pr_head_owner(pr: dict) -> str:
-    """Extract the head-repository owner login from a `gh pr list` PR payload.
+    """Extract the head-repository owner login from a `gh pr view`/`pr list` payload.
 
     `gh` serializes ``headRepositoryOwner`` as ``{"login": ..., "id": ...}``;
     return the bare login (or "" when absent)."""
