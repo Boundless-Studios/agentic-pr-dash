@@ -2338,18 +2338,31 @@ def _detached_pr_records(session_id: str, cwd: str,
     return records
 
 
-def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool):
+def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool,
+                      include_legacy: bool = True, prune_legacy: bool = True):
     """Union of live-worktree PRs and detached ledger PRs, each with live state.
+
+    Single-REPO primitive: every gh/worktree query runs against ``cwd``, so PR
+    numbers are unique here and the result dict is keyed by bare ``pr``. The
+    cross-root wrapper (:func:`_owned_pr_records_all_roots`) keys the MERGED set by
+    ``(repo, pr)`` so a same-number PR in a sibling repo doesn't collide.
 
     Returns a list of dict records sorted severity-first (P1 -> thread count).
     Side effect: prunes merged/closed PRs from this session's ledger.
+
+    ``include_legacy=False`` / ``prune_legacy=False`` are threaded straight to
+    :func:`_detached_pr_records` so the cross-root wrapper can keep the legacy
+    repo-less anchor-pass invariant: a repo-less ledger entry resolves against the
+    anchor exactly once (not replayed per sibling), and is never pruned by a
+    sibling's same-number closed PR (codex PR #30 / PR #32 review).
     """
     from . import github_api  # noqa: PLC0415
 
     records: dict[int, dict] = {}
 
     # 1) Detached ledger PRs (worktree gone).
-    for rec in _detached_pr_records(session_id, cwd):
+    for rec in _detached_pr_records(session_id, cwd, include_legacy=include_legacy,
+                                    prune_legacy=prune_legacy):
         records[rec["pr"]] = rec
 
     # 2) Live worktree-owned PRs (unchanged ownership semantics).
@@ -2396,10 +2409,56 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
     return ordered
 
 
+def _owned_pr_records_all_roots(session_id: str, anchor_cwd: str, pid: int | None,
+                                adopt_orphans: bool):
+    """Owned-PR records across ``[anchor] + maintenance_repo_roots``, keyed by repo.
+
+    The per-session reconcile counterpart of :func:`_detached_records_across_roots`
+    (BOU-1596). Runs the single-repo :func:`_owned_pr_records` primitive once per
+    root — each root supplies its own gh/worktree cwd so CI / review-thread / draft
+    / merge checks hit the correct remote — then MERGES the per-root records keyed
+    by ``(repo, pr)`` so a same-number PR in two repos stays two distinct records.
+
+    Legacy repo-less anchor-pass invariant (codex PR #30 / PR #32, mirrored from
+    :func:`_detached_records_across_roots`): legacy pruning is only safe when a
+    single root is probed (the repo is then unambiguous). With more than one root,
+    every root READS legacy repo-less entries — a legacy row's true repo is unknown,
+    so it must be checked against every root to surface a sibling-owned PR — but NO
+    root PRUNES it (``prune_legacy=False``), so a sibling's same-number closed PR
+    can't delete a legacy entry whose real PR is still open on another remote. The
+    merge dedups by ``(repo, pr)``, so a legacy PR open on exactly one root yields
+    exactly one record there; a sibling's same-number CLOSED PR is skipped (state
+    merged/closed), so it doesn't manufacture a phantom duplicate.
+    """
+    roots = _maint_roots_for(anchor_cwd)
+    # Legacy pruning is unsafe across more than one root (codex PR #32 P3): a
+    # same-number closed PR on one remote must not delete a row open on another.
+    prune_legacy = len(roots) <= 1
+    merged: dict[tuple[str, int], dict] = {}
+    for root in roots:
+        repo = _repo_slug(root)
+        for rec in _owned_pr_records(session_id, root, pid, adopt_orphans,
+                                     include_legacy=True, prune_legacy=prune_legacy):
+            key = (repo, rec["pr"])
+            existing = merged.get(key)
+            if existing is None:
+                # Tag the record with its repo so callers can disambiguate.
+                rec = {**rec, "repo": repo}
+                merged[key] = rec
+            elif rec.get("worktree_present") and not existing.get("worktree_present"):
+                existing["worktree_present"] = True
+    ordered = sorted(merged.values(),
+                     key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
+    return ordered
+
+
 def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     import json as _json  # noqa: PLC0415
-    records = _owned_pr_records(args.session_id, os.path.abspath(args.cwd),
-                                args.pid, adopt_orphans=args.adopt_orphans)
+    # BOU-1596: aggregate the owned-PR queue across [anchor] + maintenance_repo_roots
+    # so a session reconciles every PR it opened across all repos it touched, in one
+    # pass, keyed by (repo, pr). P1-first ordering preserved.
+    records = _owned_pr_records_all_roots(args.session_id, os.path.abspath(args.cwd),
+                                          args.pid, adopt_orphans=args.adopt_orphans)
     for r in records:
         print(_json.dumps(r))
     return 0
