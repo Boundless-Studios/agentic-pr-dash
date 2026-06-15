@@ -776,7 +776,7 @@ def _bug_bash_ready_count(cards: list[WorktreeCard]) -> int:
     for card in cards:
         if card.status != PRStatus.CLEAN or not card.pr_number:
             continue
-        pr = orchestrator.prs.get(card.pr_number)
+        pr = orchestrator.get_pr(card.pr_number)
         if pr and "bug-bash" in pr.labels:
             count += 1
     return count
@@ -1354,7 +1354,7 @@ def _cleanup_response(request: Request, html: str, status_code: int) -> HTMLResp
 @app.post("/api/fix-comments/{pr_number}")
 async def fix_comments(pr_number: int, request: Request):
     import asyncio
-    pr = orchestrator.prs.get(pr_number)
+    pr = orchestrator.get_pr(pr_number)
     if not pr:
         return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:
@@ -1373,7 +1373,7 @@ async def fix_comments(pr_number: int, request: Request):
 @app.post("/api/retry-ci/{pr_number}")
 async def retry_ci(pr_number: int, request: Request):
     import asyncio
-    pr = orchestrator.prs.get(pr_number)
+    pr = orchestrator.get_pr(pr_number)
     if not pr:
         return _dispatch_response(request, '<span class="card-agent-status" style="color:var(--danger)">PR not found</span>')
     if not pr.worktree_path:

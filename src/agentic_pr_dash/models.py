@@ -154,6 +154,12 @@ class MaintenanceState(BaseModel):
 
 class PRData(BaseModel):
     number: int
+    # ``owner/name`` of the GitHub repo this PR belongs to. The dashboard can
+    # aggregate PRs across multiple repos (anchor + ``maintenance_repo_roots``),
+    # so the PR number alone is not unique — same-number PRs in two repos must
+    # not collide. Empty string for the legacy single-repo path where the repo
+    # is implicit. Derived from the PR url (``github.com/<owner>/<name>/pull/N``).
+    repo: str = ""
     title: str
     branch: str
     base_branch: str = "main"

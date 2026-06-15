@@ -149,7 +149,7 @@ def test_refresh_requeues_matching_active_state_when_owner_session_ended(monkeyp
     asyncio.run(orch.refresh_prs())
 
     assert len(created_tasks) == 1
-    assert orch.prs[123].status == PRStatus.HAS_COMMENTS
+    assert orch.get_pr(123).status == PRStatus.HAS_COMMENTS
 
 
 def test_refresh_requeues_fresh_queued_state_without_active_coordinator_claim(monkeypatch, tmp_path: Path):

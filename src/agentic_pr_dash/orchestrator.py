@@ -13,8 +13,35 @@ from datetime import datetime, timezone
 
 from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
+from .maintenance_check import _resolve_maintenance_roots
 from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
 from .worktrees import discover_worktrees, find_worktree_for_branch
+
+# Composite key for the tracked-PR map. The dashboard aggregates PRs across any
+# number of repos (anchor + ``maintenance_repo_roots``), so the PR number alone
+# is not unique — same-number PRs in two repos must be distinct entries.
+PRKey = tuple[str, int]
+
+
+def _repo_from_url(url: str) -> str:
+    """``owner/name`` parsed from a GitHub PR url, or ``""`` if unparseable.
+
+    ``https://github.com/Boundless-Studios/gaia-free/pull/12`` -> ``Boundless-Studios/gaia-free``.
+    Used to tag each PR with its repo so the multi-repo dashboard never collides
+    same-number PRs across repos (BOU-1598). Falls back to an empty tag (legacy
+    single-repo behavior) when the url has no recognisable ``/pull/`` segment.
+    """
+    if not url:
+        return ""
+    marker = "/pull/"
+    idx = url.find(marker)
+    if idx == -1:
+        return ""
+    tail = url[:idx]
+    parts = [p for p in tail.split("/") if p]
+    if len(parts) < 2:
+        return ""
+    return f"{parts[-2]}/{parts[-1]}"
 
 # Rolling "past 7 days" runner usage. The full recompute is heavy (~hundreds of
 # REST calls, several minutes), so it can't run every poll, but 24h left the
@@ -106,7 +133,13 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
 class Orchestrator:
     def __init__(self, repo_cwd: str | None = None):
         self.repo_cwd = repo_cwd
-        self.prs: dict[int, PRData] = {}
+        # Keyed by ``(repo, number)`` so PRs aggregated from multiple repos
+        # (anchor + ``maintenance_repo_roots``) never collide on PR number.
+        self.prs: dict[PRKey, PRData] = {}
+        # Which repo-root discovered each tracked PR, so a per-root poll prunes
+        # only its OWN merged/closed PRs (even when that root returns zero PRs)
+        # and never drops another repo's PRs on a transient failure.
+        self._pr_root: dict[PRKey, str | None] = {}
         self._inflight_prs: set[int] = set()
         self.events: list[EventEntry] = []
         cached_runner_summary = github_api.load_runner_execution_summary_cache()
@@ -130,6 +163,45 @@ class Orchestrator:
         if len(self.events) > self._max_events:
             self.events = self.events[:self._max_events]
 
+    def get_pr(self, pr_number: int, repo: str | None = None) -> PRData | None:
+        """Look up a tracked PR by number (and optionally repo).
+
+        The internal map is keyed by ``(repo, number)`` for multi-repo
+        aggregation, but the dashboard's human-dispatch routes only carry a PR
+        number. When ``repo`` is omitted, return the first tracked PR with that
+        number (single-repo and the overwhelmingly common case); a caller that
+        needs disambiguation across repos passes ``repo`` explicitly.
+        """
+        if repo is not None:
+            return self.prs.get((repo, pr_number))
+        for key, pr in self.prs.items():
+            # Composite ``(repo, number)`` key; tolerate a bare-int key too so
+            # fixtures/legacy callers that seed ``prs`` directly still resolve.
+            num = key[1] if isinstance(key, tuple) else key
+            if num == pr_number:
+                return pr
+        return None
+
+    def _repo_roots(self) -> list[str]:
+        """Repo roots the dashboard polls = ``[anchor] + maintenance_repo_roots``.
+
+        Reuses ``_resolve_maintenance_roots`` (the same expansion the maintenance
+        loop honors) so the dashboard covers exactly the repos the loop does.
+        When no extra roots are configured this resolves to just the anchor (or
+        ``[None]`` when the orchestrator has no repo_cwd), preserving today's
+        single-repo behavior.
+        """
+        if not self.repo_cwd:
+            return [None]
+        try:
+            roots = _resolve_maintenance_roots(self.repo_cwd)
+        except Exception as exc:
+            self.log(f"Could not resolve maintenance roots: {exc}", level="warn")
+            return [self.repo_cwd]
+        if self.repo_cwd not in roots:
+            roots = [self.repo_cwd, *roots]
+        return roots
+
     def start(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -144,37 +216,19 @@ class Orchestrator:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def refresh_prs(self) -> list[PRData]:
-        """Fetch all open PRs and update state."""
-        raw_prs = await asyncio.to_thread(github_api.list_open_prs, self.repo_cwd)
+        """Fetch all open PRs across every configured repo and update state.
+
+        The dashboard covers ``[anchor] + maintenance_repo_roots`` (BOU-1598):
+        the same root list the maintenance loop honors. Each root is polled with
+        that root as the ``github_api.*`` cwd, sequentially, with per-repo error
+        isolation — a single repo's poll failing (gh error or exception) must not
+        drop another repo's PRs. With no extra roots configured this reduces to
+        exactly today's single-repo behavior.
+        """
         now = datetime.now(timezone.utc)
 
-        # A None result means the GitHub API call failed (rate-limited or
-        # unreachable) rather than "no open PRs". Skip the whole cycle so a
-        # transient failure can neither prune every tracked PR nor, by
-        # aborting later mid-enrichment, leave merged PRs pinned on the board.
-        if raw_prs is None:
-            self.log(
-                "Skipping refresh: could not list open PRs (GitHub API unavailable)",
-                level="error",
-            )
-            return list(self.prs.values())
-
-        # Prune merged/closed PRs FIRST, straight from the cheap open-PR list,
-        # so a failure in the per-PR enrichment below can never leave a merged
-        # PR pinned — the bug this guards against. (Previously the prune was
-        # the last step and was skipped whenever enrichment raised.)
-        open_numbers = {
-            raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
-        }
-        for num in list(self.prs.keys()):
-            if num not in open_numbers:
-                old = self.prs.pop(num)
-                self.log(
-                    f"PR #{num} closed/merged: {old.title}",
-                    pr_number=num,
-                    level="success",
-                )
-
+        # Runner-execution summary is a fleet-wide stat — poll it once (anchor),
+        # not per-repo.
         if (
             self._weekly_runner_summary_polled_at is None
             or (now - self._weekly_runner_summary_polled_at).total_seconds() >= RUNNER_SUMMARY_REFRESH_SECONDS
@@ -187,16 +241,70 @@ class Orchestrator:
                 self._weekly_runner_summary_polled_at = now
                 github_api.save_runner_execution_summary_cache(runner_summary, now.isoformat())
 
+        for root in self._repo_roots():
+            try:
+                await self._refresh_repo(root, now)
+            except Exception as exc:
+                # Per-repo isolation: one bad repo must not sink the dashboard.
+                self.log(f"Poll error for repo root {root}: {exc}", level="error")
+
+        return list(self.prs.values())
+
+    async def _refresh_repo(self, root: str | None, now: datetime) -> None:
+        """Poll and enrich every open PR for a single repo root.
+
+        ``root`` is the cwd passed to every ``github_api.*`` call so the poll is
+        scoped to that repo. Tracked PRs are pruned per-root: only PRs this root
+        discovered are eligible to be pruned, so another repo's PRs (or a repo
+        whose poll just failed) are never dropped.
+        """
+        raw_prs = await asyncio.to_thread(github_api.list_open_prs, root)
+
+        # A None result means the GitHub API call failed (rate-limited or
+        # unreachable) rather than "no open PRs". Skip THIS repo's cycle so a
+        # transient failure can neither prune its tracked PRs nor, by aborting
+        # mid-enrichment, leave merged PRs pinned on the board. Other repos are
+        # untouched (per-repo isolation).
+        if raw_prs is None:
+            self.log(
+                f"Skipping refresh for {root}: could not list open PRs (GitHub API unavailable)",
+                level="error",
+            )
+            return
+
+        # Prune merged/closed PRs FIRST, straight from the cheap open-PR list,
+        # so a failure in the per-PR enrichment below can never leave a merged
+        # PR pinned. Scope the prune to PRs THIS root discovered so a sibling
+        # repo's PRs are never collaterally dropped.
+        open_numbers = {
+            raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
+        }
+        for key in list(self.prs.keys()):
+            if self._pr_root.get(key) != root:
+                continue
+            if key[1] not in open_numbers:
+                old = self.prs.pop(key)
+                self._pr_root.pop(key, None)
+                self.log(
+                    f"PR #{key[1]} closed/merged: {old.title}",
+                    pr_number=key[1],
+                    level="success",
+                )
+
         for raw in raw_prs:
             num = raw.get("number")
             if not isinstance(num, int):
                 continue
 
+            repo = _repo_from_url(raw.get("url", ""))
+            key: PRKey = (repo, num)
+
             # Get or create PR data
-            pr = self.prs.get(num)
+            pr = self.prs.get(key)
             if pr is None:
                 pr = PRData(
                     number=num,
+                    repo=repo,
                     title=raw.get("title", ""),
                     branch=raw.get("headRefName", ""),
                     base_branch=raw.get("baseRefName", "") or "main",
@@ -204,8 +312,9 @@ class Orchestrator:
                     is_draft=raw.get("isDraft", False),
                     created_at=raw.get("createdAt", ""),
                 )
-                self.prs[num] = pr
+                self.prs[key] = pr
                 self.log(f"Discovered PR #{num}: {pr.title}", pr_number=num)
+            self._pr_root[key] = root
 
             # Update metadata
             pr.title = raw.get("title", pr.title)
@@ -237,7 +346,7 @@ class Orchestrator:
 
             if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
                 refetched_state, refetched_mergeable = await asyncio.to_thread(
-                    github_api.get_mergeability, num, self.repo_cwd
+                    github_api.get_mergeability, num, root
                 )
                 # A successful refetch is authoritative — it also picks up a
                 # conflict that has since been resolved. A failed refetch returns
@@ -250,7 +359,7 @@ class Orchestrator:
             # Get latest commit info
             previous_commit_sha = pr.latest_commit_sha
             sha, date = await asyncio.to_thread(
-                github_api.get_latest_commit, num, self.repo_cwd
+                github_api.get_latest_commit, num, root
             )
             pr.latest_commit_sha = sha
             pr.latest_commit_date = date
@@ -259,12 +368,12 @@ class Orchestrator:
 
             # Get CI checks
             checks = await asyncio.to_thread(
-                github_api.get_ci_checks, num, self.repo_cwd
+                github_api.get_ci_checks, num, root
             )
             pr.ci_checks = checks
             if any(c.status in {"queued", "in_progress"} for c in checks):
                 queued_jobs, runner_pool_health, runner_execution_summary = await asyncio.to_thread(
-                    github_api.get_workflow_queue_health, num, self.repo_cwd
+                    github_api.get_workflow_queue_health, num, root
                 )
                 pr.queued_jobs = queued_jobs
                 pr.runner_pool_health = runner_pool_health
@@ -282,7 +391,7 @@ class Orchestrator:
 
             # Get unaddressed comments (filtered by commit date!)
             comments = await asyncio.to_thread(
-                github_api.get_unaddressed_comments, num, date, self.repo_cwd
+                github_api.get_unaddressed_comments, num, date, root
             )
             pr.review_comments = comments
 
@@ -395,8 +504,6 @@ class Orchestrator:
                     if coord_decision.should_dispatch:
                         asyncio.create_task(self.dispatch_pr_maintenance(pr))
 
-        return list(self.prs.values())
-
     @staticmethod
     def _has_merge_conflict(pr: PRData) -> bool:
         """A conflict is signalled by EITHER GitHub field.
@@ -467,11 +574,14 @@ class Orchestrator:
 
             logs: dict[str, str] = {}
             if pr.failing_checks:
+                # Fetch logs from the PR's own repo (its worktree) so multi-repo
+                # PRs don't read the anchor repo's logs. Falls back to the anchor
+                # cwd when no worktree is known.
                 logs = await asyncio.to_thread(
                     github_api.get_failed_logs,
                     pr.latest_commit_sha,
                     pr.failing_checks,
-                    self.repo_cwd,
+                    pr.worktree_path or self.repo_cwd,
                 )
             prompt = maintenance.build_maintenance_prompt(
                 pr, failed_logs=logs, guidance=guidance
@@ -503,7 +613,7 @@ class Orchestrator:
 
     async def dispatch_comment_fix(self, pr_number: int, guidance: str | None = None) -> None:
         """Auto- or human-triggered: queue unified PR maintenance."""
-        pr = self.prs.get(pr_number)
+        pr = self.get_pr(pr_number)
         if not pr:
             self.log(f"PR #{pr_number} not found", level="error")
             return
