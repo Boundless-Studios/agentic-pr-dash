@@ -15,7 +15,7 @@ import os
 import subprocess
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -54,9 +54,41 @@ def _default_registry(cwd: str | None = None) -> Path:
 
 DEFAULT_REGISTRY = _NEW_DEFAULT_REGISTRY
 
+# Upper bound on how many trailing event lines ``summarize_sessions`` /
+# ``read_events`` will parse when no explicit limit is given (BOU-1637). The
+# registry is append-only, so on a long-lived machine the file grows without
+# bound and every dashboard tick re-parsed the whole thing. Reading only the
+# tail keeps each summarize O(cap) instead of O(file); the most recent events
+# for a session are always the ones that decide its current state, and
+# ``compact_registry`` keeps the live tail small anyway. Override with
+# AGENTIC_PR_DASH_REGISTRY_READ_LIMIT (0/blank disables the cap).
+_DEFAULT_READ_LIMIT = 20000
+
+# Terminal sessions older than this are dropped by ``compact_registry`` — a
+# completed/failed session's events have no bearing on "who is working now".
+# Override with AGENTIC_PR_DASH_REGISTRY_RETENTION_SECONDS.
+_DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60  # 7 days
+
+# When the registry crosses this many lines, ``record_event`` opportunistically
+# self-compacts (drops old terminal sessions). Override / disable (0) via
+# AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD.
+_DEFAULT_COMPACT_THRESHOLD = 5000
+
 # Launch sources that are the dashboard's OWN automation, not an independent
 # session whose worktree we should defer to.
 DASHBOARD_LAUNCH_SOURCES = ("agentic-pr-dash", "pr-dashboard")
+
+
+def _read_limit() -> int | None:
+    """Default tail cap for an unbounded read, or None when disabled via env."""
+    raw = os.environ.get("AGENTIC_PR_DASH_REGISTRY_READ_LIMIT", "")
+    if raw == "":
+        return _DEFAULT_READ_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_READ_LIMIT
+    return value if value > 0 else None
 
 
 @dataclass
@@ -233,7 +265,41 @@ def record_event(
     )
     with target.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    # Amortized self-compaction (BOU-1637): once the registry crosses a line
+    # threshold, drop old terminal sessions so the append-only file can't grow
+    # without bound. Best-effort and atomic — a failure here never blocks the
+    # event write that just succeeded. Disabled by setting the threshold to 0.
+    try:
+        _maybe_compact(target)
+    except Exception:  # noqa: BLE001 — compaction is opportunistic, never fatal
+        pass
     return payload
+
+
+def _compact_threshold() -> int:
+    raw = os.environ.get("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "")
+    if raw == "":
+        return _DEFAULT_COMPACT_THRESHOLD
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_COMPACT_THRESHOLD
+    return value  # 0 disables auto-compaction
+
+
+def _maybe_compact(target: Path) -> None:
+    """Run ``compact_registry`` when the file exceeds the line threshold."""
+    threshold = _compact_threshold()
+    if threshold <= 0:
+        return
+    try:
+        # Counting newlines is cheaper than json-parsing every line.
+        with target.open("rb") as fh:
+            line_count = sum(1 for _ in fh)
+    except OSError:
+        return
+    if line_count >= threshold:
+        compact_registry(path=target)
 
 
 def record_event_from_env(event: str, **kwargs: Any) -> dict[str, Any]:
@@ -256,8 +322,13 @@ def read_events(path: Path | None = None, limit: int | None = None) -> list[dict
     if not target.exists():
         return []
     lines = target.read_text(encoding="utf-8").splitlines()
-    if limit is not None:
-        lines = lines[-limit:]
+    # An explicit ``limit`` wins; otherwise apply the default tail cap so an
+    # unbounded registry on a long-lived machine doesn't make every read O(file)
+    # (BOU-1637). The cap can be disabled via env for callers that truly need the
+    # whole history.
+    effective = limit if limit is not None else _read_limit()
+    if effective is not None:
+        lines = lines[-effective:]
     events: list[dict[str, Any]] = []
     for line in lines:
         try:
@@ -389,6 +460,102 @@ def summarize_sessions(path: Path | None = None) -> SessionSummary:
         if state.worktree_path:
             summary.by_worktree[state.worktree_path] = state
     return summary
+
+
+def _retention_seconds() -> int:
+    raw = os.environ.get("AGENTIC_PR_DASH_REGISTRY_RETENTION_SECONDS", "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return _DEFAULT_RETENTION_SECONDS
+    return value if value > 0 else _DEFAULT_RETENTION_SECONDS
+
+
+def _event_is_stale(event: dict[str, Any], cutoff_iso: str) -> bool:
+    """True if a TERMINAL session's event is older than the retention cutoff.
+
+    Non-terminal (still-running) sessions are never stale — a live agent's
+    ``started`` event must be kept even if it's old. Timestamps are RFC3339 /
+    ISO-8601 with a ``Z`` suffix (see ``_utc_now``), so a lexical compare is a
+    valid chronological compare.
+    """
+    if str(event.get("event") or "") not in {"completed", "failed", "cleanup_completed"}:
+        return False
+    return str(event.get("timestamp") or "") < cutoff_iso
+
+
+def compact_registry(path: Path | None = None, *, retention_seconds: int | None = None) -> int:
+    """Drop events for sessions that are terminal AND last-seen before the
+    retention cutoff, then atomically rewrite the registry (BOU-1637).
+
+    A session is kept in full when EITHER its latest state is non-terminal (still
+    running — liveness is decided later by ``pid_is_live``) OR its latest event is
+    within the retention window. Returns the number of event lines removed. The
+    append-only registry otherwise grows forever; periodic compaction bounds it so
+    ``summarize_sessions`` stays cheap and the tail cap never silently hides a
+    live session behind a wall of ancient terminal noise.
+    """
+    target = path or registry_path()
+    if not target.exists():
+        return 0
+    retention = retention_seconds if retention_seconds is not None else _retention_seconds()
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=retention)
+    cutoff_iso = cutoff.isoformat().replace("+00:00", "Z")
+
+    raw_lines = target.read_text(encoding="utf-8").splitlines()
+    parsed: list[tuple[str, dict[str, Any]]] = []
+    for line in raw_lines:
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict):
+            parsed.append((line, event))
+
+    # Decide per session: terminal in latest state AND its newest event is stale.
+    latest_event_by_session: dict[str, str] = {}
+    latest_ts_by_session: dict[str, str] = {}
+    for _line, event in parsed:
+        sid = str(event.get("session_id") or "")
+        if not sid:
+            continue
+        ts = str(event.get("timestamp") or "")
+        if ts >= latest_ts_by_session.get(sid, ""):
+            latest_ts_by_session[sid] = ts
+            latest_event_by_session[sid] = str(event.get("event") or "")
+
+    drop_sessions: set[str] = set()
+    for sid, last_event in latest_event_by_session.items():
+        if last_event not in {"completed", "failed", "cleanup_completed"}:
+            continue
+        if latest_ts_by_session.get(sid, "") < cutoff_iso:
+            drop_sessions.add(sid)
+
+    if not drop_sessions:
+        return 0
+
+    kept = [line for line, event in parsed
+            if str(event.get("session_id") or "") not in drop_sessions]
+    removed = len(parsed) - len(kept)
+    if removed <= 0:
+        return 0
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    import tempfile  # noqa: PLC0415
+
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".events.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            for line in kept:
+                handle.write(line + "\n")
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return 0
+    return removed
 
 
 def _record_from_args(args: argparse.Namespace) -> int:

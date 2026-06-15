@@ -427,10 +427,27 @@ def _fix_lease_active(lease_until: str) -> bool:
     """True if an in-progress fix lease (an absolute future timestamp the owner
     stamps when a check finds work) has not yet expired — the owner is mid-fix and
     not ticking, so the detached loop must keep deferring through the fix phase.
+
+    Fail-safe on a CORRUPT lease (BOU-1637): an empty value means "no lease" and
+    returns False, but a present-but-unparseable timestamp is treated as ACTIVE
+    (defer) rather than expired. The old behavior parsed a corrupt lease as "no
+    lease" → not-deferring, opening a double-dispatch window where both the owner
+    (mid-fix) and the detached loop fix the same PR. Deferring instead is bounded:
+    pid-liveness still reaps a genuinely-dead owner, so a corrupt lease on a dead
+    session does not strand the PR forever.
     """
+    if not lease_until:
+        return False  # no lease stamped at all → not deferring
     ts = _parse_iso(lease_until)
     if ts is None:
-        return False
+        # Present but unparseable — fail safe: treat as an active lease so we keep
+        # deferring instead of racing the (presumed) live owner mid-fix.
+        print(
+            f"[pr-watch] warning: unparseable fix_lease_until={lease_until!r}; "
+            f"treating as ACTIVE (deferring) to avoid a double-dispatch race",
+            file=sys.stderr,
+        )
+        return True
     from datetime import datetime, timezone  # noqa: PLC0415
 
     return datetime.now(timezone.utc) < ts
@@ -486,6 +503,23 @@ def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
     return _pid_alive(fields.get("pid", ""))
 
 
+# Heartbeat write coalescing window (BOU-1637). A clean tick refreshes the
+# heartbeat, but the freshness gate (`_heartbeat_fresh`) only cares whether the
+# stamp is within a multi-minute TTL, so re-stamping every few-second tick — each
+# an atomic tempfile+rename of every owned marker — is wasted I/O for a large
+# worktree pool. Skip the rewrite when the existing heartbeat is already newer
+# than now-minus-this-window AND no other field would change. Override via
+# AGENTIC_PR_DASH_HEARTBEAT_MIN_INTERVAL_SECONDS.
+_DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS = 60
+
+
+def _heartbeat_min_interval_seconds() -> int:
+    raw = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_MIN_INTERVAL_SECONDS", "")
+    if raw.isdigit() and int(raw) >= 0:
+        return int(raw)
+    return _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS
+
+
 def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> None:
     """Refresh this owner's coordination stamps in the marker (owner-only write).
 
@@ -495,6 +529,14 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     tick-less fix phase, so the detached loop must keep deferring through it); a
     clean check CLEARS any prior `fix_lease_until`, so a stopped-but-alive loop
     never pins the long lease without a fix in progress (PR #1909 review).
+
+    WRITE COALESCING (BOU-1637): the actual marker rewrite is skipped when nothing
+    the ownership gate cares about would change — the existing heartbeat is still
+    within the coalescing window and the fix-lease state is unchanged. This avoids
+    an atomic tempfile+rename of every owned marker on every few-second tick for a
+    large worktree pool, while still re-stamping promptly enough that the multi-
+    minute freshness TTL never lapses. A work-found tick (which sets a fresh fix
+    lease the detached loop relies on) ALWAYS writes.
     """
     if not self_session_id:
         return
@@ -504,6 +546,22 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
 
     now = datetime.now(timezone.utc)
+    prior_heartbeat = fields.get("heartbeat", "")
+    had_lease = "fix_lease_until" in fields
+
+    # Decide whether a write is even necessary BEFORE mutating `fields`.
+    if not work_found:
+        # Clean tick: a write is needed only if (a) we'd be clearing a stale fix
+        # lease, or (b) the heartbeat is older than the coalescing window (or
+        # absent/corrupt). Otherwise the marker already reflects a fresh-enough
+        # alive stamp and re-writing it buys nothing.
+        if not had_lease:
+            prior_ts = _parse_iso(prior_heartbeat)
+            if prior_ts is not None:
+                age = (now - prior_ts).total_seconds()
+                if 0 <= age < _heartbeat_min_interval_seconds():
+                    return  # heartbeat still fresh; skip the rewrite
+
     fields["heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     if work_found:
         fields["fix_lease_until"] = (now + timedelta(seconds=_fix_lease_seconds())).strftime(
@@ -890,8 +948,41 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     coordinator_claim_id: str | None = None
     coordinator_fingerprint: str | None = None
     if claim:
+        # Claim-FINGERPRINT gating (BOU-1637): a same-fingerprint active claim is
+        # the same blocker set already in flight — defer. But NEW feedback (a
+        # different blocker fingerprint: round-2 review threads, a fresh CI break)
+        # must NOT be suppressed by the round-1 claim. The coordinator keys claims
+        # by the FULL task identity (task_id + fingerprint), so look up the active
+        # claim by task_id alone and compare: only defer when the in-flight claim's
+        # fingerprint EQUALS the live one. Observed: round-2 Codex threads arrived
+        # while the round-1 dispatch claim was still leased, and `check` deferred
+        # with "claim is active" for up to the 30-min lease.
+        #
+        # The fingerprint hashes pr.review_comments, but the unresolved-thread
+        # hydration above ran ONLY when the PR was otherwise clean (`not blockers`).
+        # When round-1 left another blocker active (CI / merge conflict), a newly-
+        # arrived review thread never entered review_comments, so the fingerprint
+        # didn't change and the round-1 claim masked it — the exact observed bug.
+        # Merge the live unresolved threads in here (by comment id, last wins) so
+        # the fingerprint always reflects new review feedback regardless of which
+        # other blockers are present.
+        thread_comments = _review_comments_from_threads(
+            _unresolved_review_threads(pr.number, cwd)
+        )
+        if thread_comments:
+            merged = {c.id: c for c in pr.review_comments}
+            for c in thread_comments:
+                merged.setdefault(c.id, c)
+            pr.review_comments = list(merged.values())
+
+        live_fingerprint = coordinator.fingerprint_for_pr(pr)
+        active_fingerprint = coordinator.active_claim_fingerprint_for_pr(pr)
+        new_feedback = (
+            active_fingerprint is not None and active_fingerprint != live_fingerprint
+        )
+
         coord_decision = coordinator.dispatch_decision_for_pr(pr)
-        if not coord_decision.should_dispatch:
+        if not coord_decision.should_dispatch and not new_feedback:
             return 0, f"deferring to agent-coordinator {coord_decision.state}: {coord_decision.reason}"
 
         claimed = coordinator.claim_pr(
@@ -901,10 +992,11 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             agent="agentic-pr-dash-check",
             lease_seconds=_fix_lease_seconds(),
         )
-        if claimed is None:
+        if claimed is None and not new_feedback:
             return 0, "deferring to active agent-coordinator claim"
-        coordinator_claim_id = claimed.claim_id
-        coordinator_fingerprint = claimed.task.fingerprint
+        if claimed is not None:
+            coordinator_claim_id = claimed.claim_id
+            coordinator_fingerprint = claimed.task.fingerprint
 
         # We will service: refresh the heartbeat and set the long fix lease (a
         # tick-less fix phase is about to start).
@@ -1861,7 +1953,8 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
     Removes:
     - The .armed marker file
     - The pr-watch.stop-loop.json state file
-    - The session ledger entry for this PR
+    - The session ledger entry for this PR (and its claim file)
+    - The persisted maintenance state file (pr-<n>.json) for this PR (BOU-1637)
 
     ONLY fires when gh answered authoritatively (state in 'merged'|'closed').
     A network blip (state 'unknown') must NOT prune — that would destroy ownership
@@ -1888,11 +1981,20 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
     except OSError:
         pass
 
-    # Prune the ledger entry for this PR (best-effort).
+    # Prune the ledger entry for this PR (best-effort). This also removes the
+    # entry's exclusive-claim file (BOU-1637).
     try:
         from . import session_ledger  # noqa: PLC0415
         target_repo = _repo_slug(cwd)
         session_ledger.prune(session_id, {pr_number}, repo=target_repo)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Prune the persisted maintenance state file for the now-closed PR so the
+    # maintenance dir doesn't accumulate a pr-<n>.json per closed PR (BOU-1637).
+    try:
+        from . import maintenance  # noqa: PLC0415
+        maintenance.prune_state(cwd, pr_number)
     except Exception:  # noqa: BLE001
         pass
 

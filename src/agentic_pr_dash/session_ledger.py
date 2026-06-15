@@ -151,16 +151,64 @@ def append(session_id: str, pr: int, branch: str, worktree: str,
     overwrites its entry (last wins). Two repos that both have PR #N keep
     SEPARATE entries (PR #16 review round 2, P1).
 
-    The read-modify-write is serialized under an exclusive lock so concurrent
-    appends from parallel sub-agents never drop each other's PR (PR #16 review).
+    TRUE APPEND (BOU-1637): a single ``O(1)`` line append, NOT a read-all +
+    rewrite-all. ``read`` already dedups by ``(repo, pr)`` with last-line-wins, so
+    re-arming the same PR just writes a newer line that shadows the older one on
+    read — the file grows by at most one line per arm instead of being rewritten
+    in full every time. ``compact`` (or a prune that drops the PR) reclaims the
+    superseded lines. Still serialized under the exclusive lock so a concurrent
+    appender never interleaves a partial line.
     """
     repo = repo or ""
+    line = json.dumps({
+        "pr": int(pr), "branch": branch, "worktree": worktree,
+        "opened_at": _now(), "baseline_sha": baseline_sha, "repo": repo,
+    }) + "\n"
+    path = ledger_path(session_id)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    over_threshold = False
+    with _flock(path + ".lock"):
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(line)
+        # Amortized self-compaction: a long-lived session that only ever re-arms
+        # (never prunes) would otherwise accumulate superseded lines unbounded.
+        # Count cheaply under the same lock; compact (collapse to last-wins) when
+        # the physical line count crosses the threshold (BOU-1637).
+        threshold = _compact_threshold()
+        if threshold > 0:
+            try:
+                with open(path, "rb") as fh:
+                    over_threshold = sum(1 for _ in fh) >= threshold
+            except OSError:
+                over_threshold = False
+            if over_threshold:
+                _write_all(session_id, read(session_id))
+
+
+_DEFAULT_LEDGER_COMPACT_THRESHOLD = 1000
+
+
+def _compact_threshold() -> int:
+    raw = os.environ.get("GAIA_PR_LEDGER_COMPACT_THRESHOLD", "")
+    if raw == "":
+        return _DEFAULT_LEDGER_COMPACT_THRESHOLD
+    try:
+        return int(raw)
+    except ValueError:
+        return _DEFAULT_LEDGER_COMPACT_THRESHOLD
+
+
+def compact(session_id: str) -> None:
+    """Rewrite the ledger so each ``(repo, pr)`` keeps only its latest line.
+
+    A maintenance op for callers that want to reclaim the superseded lines a
+    true-append ``append`` leaves behind (BOU-1637). ``read`` already collapses
+    duplicates, so this never changes the logical contents — it only shrinks the
+    file. Serialized under the same lock as append/prune so it never races a
+    concurrent writer.
+    """
     with _flock(ledger_path(session_id) + ".lock"):
-        entries = [e for e in read(session_id)
-                   if not (e.pr == int(pr) and e.repo == repo)]
-        entries.append(LedgerEntry(int(pr), branch, worktree, _now(),
-                                   baseline_sha, repo))
-        _write_all(session_id, entries)
+        _write_all(session_id, read(session_id))
 
 
 def prune(session_id: str, drop_prs: set[int], repo: str | None = None,
@@ -172,8 +220,16 @@ def prune(session_id: str, drop_prs: set[int], repo: str | None = None,
 
     ``include_legacy=False`` makes legacy repo-less entries INeligible for this
     prune — used on non-anchor roots so a sibling's same-number closed PR can't
-    drop a legacy entry that belongs to another repo (codex PR #30 review, P2)."""
+    drop a legacy entry that belongs to another repo (codex PR #30 review, P2).
+
+    The exclusive-claim file backing each dropped ``(repo, pr)`` is removed too
+    (BOU-1637): claim files under ``claims/`` accumulated forever because prune
+    only ever rewrote the ledger. We remove a claim file ONLY for an entry that is
+    actually dropped here, using that entry's recorded repo so a legacy row and a
+    repo-scoped row clean up their respective ``pr-<n>.json`` /
+    ``pr-<repo>-<n>.json`` files."""
     drop = {int(p) for p in drop_prs}
+    pruned_keys: list[tuple[int, str]] = []
     with _flock(ledger_path(session_id) + ".lock"):
         entries = []
         for e in read(session_id):
@@ -187,9 +243,23 @@ def prune(session_id: str, drop_prs: set[int], repo: str | None = None,
             else:
                 eligible = e.repo == repo
             if eligible and e.pr in drop:
+                pruned_keys.append((e.pr, e.repo))
                 continue
             entries.append(e)
         _write_all(session_id, entries)
+    # Remove the claim file for each dropped entry (best-effort; outside the
+    # ledger lock — claim files have their own per-(repo, pr) lock and a missing
+    # file is a no-op).
+    for pr_num, entry_repo in pruned_keys:
+        _remove_claim(pr_num, entry_repo)
+
+
+def _remove_claim(pr: int, repo: str = "") -> None:
+    """Delete the exclusive-claim file for ``(repo, pr)`` if present (best-effort)."""
+    try:
+        os.remove(claim_path(pr, repo))
+    except OSError:
+        pass
 
 
 def claim_lock(pr: int, repo: str = ""):

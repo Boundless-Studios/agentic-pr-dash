@@ -10,7 +10,7 @@ release/adoption helpers; it does not inspect GitHub directly.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -138,6 +138,38 @@ def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> Disp
         reason=decision.reason,
         claim_id=claim.claim_id if claim else None,
     )
+
+
+def active_claim_fingerprint_for_pr(pr: PRData, *, now: datetime | None = None) -> str | None:
+    """Fingerprint of the latest ACTIVE claim for this PR's task_id, ignoring the
+    PR's CURRENT fingerprint (BOU-1637).
+
+    ``TaskCoordinator.status`` keys a claim by the FULL task identity (task_id +
+    fingerprint), so a status() lookup with the round-2 fingerprint can't see a
+    still-active round-1 claim whose fingerprint differs. To gate ``check`` on
+    "is the in-flight claim for the SAME blocker set?", we must look up the active
+    claim by task_id alone and compare fingerprints ourselves. Returns None when
+    no live, unexpired, unreleased claim exists for the PR's task_id — i.e. there
+    is nothing to defer to.
+    """
+    coord = _coordinator()
+    timestamp = now or datetime.now(timezone.utc)
+    target_id = task_identity_for_pr(pr).task_id
+    best: ClaimRecord | None = None
+    best_key = None
+    for claim in coord._claims_by_id().values():  # noqa: SLF001 — same package contract
+        if claim.task.task_id != target_id:
+            continue
+        if claim.status != "active":
+            continue
+        if timestamp >= claim.lease_expires_at:
+            continue
+        if not coord.pid_is_live(claim.owner.pid):
+            continue
+        key = (claim.claimed_at, claim.heartbeat_at, claim.claim_id)
+        if best_key is None or key > best_key:
+            best, best_key = claim, key
+    return best.task.fingerprint if best is not None else None
 
 
 def claim_pr(

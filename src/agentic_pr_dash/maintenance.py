@@ -97,6 +97,25 @@ def load_state(worktree_path: str, pr_number: int) -> MaintenanceState | None:
         return None
 
 
+def prune_state(worktree_path: str, pr_number: int) -> bool:
+    """Delete the persisted ``pr-<n>.json`` maintenance state for a PR (BOU-1637).
+
+    A maintenance state file lingers under ``.agentic-pr-dash/maintenance/`` after
+    its PR merges/closes — nothing ever removed it, so the directory accumulated a
+    file per PR forever. The reconcile/refresh path already knows which PRs closed;
+    it calls this to drop their state. Best-effort: a missing file is a no-op and
+    returns False. Returns True only when a file was actually removed.
+    """
+    path = state_path(worktree_path, pr_number)
+    try:
+        path.unlink()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+
+
 def queue_handoff(pr: PRData, prompt: str) -> MaintenanceState:
     if not pr.worktree_path:
         raise ValueError("PR has no worktree path")

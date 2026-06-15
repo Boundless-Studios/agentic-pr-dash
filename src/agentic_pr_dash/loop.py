@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -160,6 +161,52 @@ def _baseline_sha(cwd: str, pr: int | None) -> str:
     return _head_sha(cwd)
 
 
+def _executor_program(executor: str) -> str | None:
+    """The first shell token of the executor template — the program to spawn.
+
+    Returns None when the template is empty or shlex can't tokenize it (an
+    unbalanced quote, etc.), which is itself a misconfiguration the caller treats
+    as unresolvable.
+    """
+    try:
+        tokens = shlex.split(executor)
+    except ValueError:
+        return None
+    return tokens[0] if tokens else None
+
+
+def _validate_executor(executor: str) -> str | None:
+    """Return an error string if the configured executor can't be run, else None.
+
+    Resolves the executor's program on PATH at loop STARTUP (BOU-1637) so a
+    misconfigured command (typo, binary not installed) fails loudly immediately
+    instead of being discovered only on the first dispatch tick — by which point
+    a PR is already claimed and the loop spins releasing it every tick. An
+    absolute/relative path is checked for existence + executability; a bare name
+    is resolved via ``shutil.which``.
+    """
+    program = _executor_program(executor)
+    if program is None:
+        return (
+            f"executor command is empty or unparseable: {executor!r}. "
+            "Set a runnable command, e.g. executor = \"codex exec --full-auto {prompt}\"."
+        )
+    if os.sep in program or (os.altsep and os.altsep in program):
+        if os.path.isfile(program) and os.access(program, os.X_OK):
+            return None
+        return (
+            f"executor program {program!r} is not an executable file. "
+            "Fix the path in agentic-pr-dash.toml / AGENTIC_PR_DASH_EXECUTOR."
+        )
+    if shutil.which(program) is None:
+        return (
+            f"executor program {program!r} was not found on PATH. "
+            "Install it or correct the executor command in "
+            "agentic-pr-dash.toml / AGENTIC_PR_DASH_EXECUTOR."
+        )
+    return None
+
+
 def _run_executor(executor: str, prompt: str, cwd: str) -> int:
     """Run the configured executor with the prompt, in the worktree dir."""
     if "{prompt}" in executor:
@@ -263,6 +310,14 @@ def main(argv: list[str] | None = None) -> int:
             "  flag               ->  --executor '...'",
             file=sys.stderr,
         )
+        return 2
+
+    # Validate the executor up-front (BOU-1637): catch a missing/misconfigured
+    # command at startup, not on the first dispatch tick (where a PR would already
+    # be claimed). Fail loudly with exit 2 so a supervisor sees the misconfig.
+    executor_error = _validate_executor(executor)
+    if executor_error:
+        print(f"agentic-pr-dash loop: {executor_error}", file=sys.stderr)
         return 2
 
     if args.once:
