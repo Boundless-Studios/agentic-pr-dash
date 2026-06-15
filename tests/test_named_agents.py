@@ -205,7 +205,7 @@ def test_known_conflict_preserved_when_bulk_unknown_and_refetch_fails(monkeypatc
         "mergeStateStatus": "UNSTABLE", "mergeable": "CONFLICTING",
     }
     monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [bulk])
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: None)
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: None)
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda n, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda n, cwd=None: [])

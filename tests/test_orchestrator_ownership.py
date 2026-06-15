@@ -130,7 +130,7 @@ def test_refresh_requeues_matching_active_state_when_owner_session_ended(monkeyp
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
@@ -206,7 +206,7 @@ def test_refresh_requeues_fresh_queued_state_without_active_coordinator_claim(mo
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
@@ -272,7 +272,7 @@ def test_refresh_requeues_when_prequeue_owner_session_is_dead(monkeypatch, tmp_p
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
@@ -370,7 +370,7 @@ def test_refresh_keeps_matching_active_state_when_owner_session_is_live(monkeypa
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
@@ -460,7 +460,7 @@ def test_refresh_keeps_matching_active_state_for_process_only_owner(monkeypatch,
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
@@ -547,7 +547,7 @@ def test_refresh_reads_session_registry_from_target_worktree_config(monkeypatch,
             }
         ],
     )
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: str(worktree))
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: str(worktree))
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])

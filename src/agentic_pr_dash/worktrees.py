@@ -18,9 +18,9 @@ def _env(name: str, default: str = "") -> str:
     return os.environ.get("AGENTIC_PR_DASH_" + name) or os.environ.get("GAIA_" + name) or default
 
 
-def _run(cmd: list[str], timeout_s: int = 10) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout_s: int = 10, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd)
     except (subprocess.TimeoutExpired, OSError):
         return subprocess.CompletedProcess(cmd, 1, "", "")
 
@@ -36,7 +36,7 @@ def get_main_repo_root() -> str:
     return os.getcwd()
 
 
-def discover_worktrees() -> list[dict]:
+def discover_worktrees(root: str | None = None) -> list[dict]:
     """List all git worktrees with branch, path, and optional .env info.
 
     Returns list of dicts:
@@ -47,8 +47,13 @@ def discover_worktrees() -> list[dict]:
         frontend_port: str | None — from .env
         environment_name: str | None — from .env
         slot: str | None — from .env
+
+    ``root`` scopes discovery to a single repo: ``git worktree list`` runs with
+    ``root`` as its cwd, so it enumerates that repo's worktree pool rather than
+    whatever repo the process cwd happens to be in. Passing ``None`` preserves
+    the legacy process-cwd behavior (BOU-1720).
     """
-    r = _run(["git", "worktree", "list", "--porcelain"])
+    r = _run(["git", "worktree", "list", "--porcelain"], cwd=root)
     if r.returncode != 0:
         return []
 
@@ -118,9 +123,17 @@ def _parse_env(env_path: Path) -> dict:
     return result
 
 
-def find_worktree_for_branch(branch: str) -> str | None:
-    """Find the worktree path for a given branch name."""
-    for wt in discover_worktrees():
+def find_worktree_for_branch(branch: str, root: str | None = None) -> str | None:
+    """Find the worktree path for a given branch name.
+
+    ``root`` scopes the search to a single repo's worktree pool (BOU-1720). The
+    dashboard is multi-repo: two repos can each have a worktree on a same-named
+    branch (e.g. ``feature/x``), so an unscoped search can resolve a PR in repo A
+    to repo B's worktree. Passing the PR's repo root restricts ``discover_worktrees``
+    to that repo so the match lands in the right checkout. ``None`` preserves the
+    legacy process-cwd behavior.
+    """
+    for wt in discover_worktrees(root=root):
         if wt.get("branch") == branch:
             return wt["path"]
     return None
