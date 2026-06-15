@@ -66,6 +66,13 @@ DASHBOARD_OWNER_SESSION_ID = "agentic-pr-dash-dashboard"
 # PR babysitter.
 POLL_INTERVAL_SECONDS = 60
 
+# Per-PR enrichment (mergeability / latest commit / CI checks / queue health /
+# unaddressed comments) is independent across PRs, so each poll enriches them
+# concurrently (BOU-1637 #4) instead of awaiting one PR's gh calls before the
+# next. The semaphore bounds in-flight enrichments so a large PR pool doesn't
+# burst the gh API into a rate-limit wall.
+ENRICHMENT_CONCURRENCY = 6
+
 
 def _parse_session_timestamp(value: str | None) -> datetime | None:
     if not value:
@@ -291,6 +298,11 @@ class Orchestrator:
                     level="success",
                 )
 
+        # Get-or-create every PR object up front (cheap, mutates the shared
+        # ``self.prs`` map serially to avoid races), then enrich the independent
+        # per-PR REST/GraphQL work CONCURRENTLY below (BOU-1637 #4). Each PR's
+        # enrichment only touches its own ``PRData``, so gathering them is safe.
+        to_enrich: list[tuple[PRData, dict]] = []
         for raw in raw_prs:
             num = raw.get("number")
             if not isinstance(num, int):
@@ -315,194 +327,231 @@ class Orchestrator:
                 self.prs[key] = pr
                 self.log(f"Discovered PR #{num}: {pr.title}", pr_number=num)
             self._pr_root[key] = root
+            to_enrich.append((pr, raw))
 
-            # Update metadata
-            pr.title = raw.get("title", pr.title)
-            pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
-            pr.review_decision = raw.get("reviewDecision", "") or "none"
-            pr.labels = [
-                label.get("name", "")
-                for label in raw.get("labels", [])
-                if isinstance(label, dict) and label.get("name")
-            ]
+        # Enrich each PR concurrently, bounded by a modest semaphore so a large
+        # pool doesn't hammer the gh API into a rate-limit wall. Per-PR error
+        # isolation: one PR's failed enrichment must not drop the others.
+        sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
 
-            # GitHub computes mergeability lazily: a bulk `gh pr list` often
-            # returns UNKNOWN/blank for both signals right after a push or a
-            # base-branch move. A definite bulk value is authoritative; an
-            # UNKNOWN/blank one is that async-compute window — keep the last-known
-            # value rather than erasing a known conflict, then force a per-PR
-            # re-fetch below (which also triggers the computation). Without this,
-            # a CONFLICTING PR whose next bulk poll returns UNKNOWN would be reset
-            # to "unknown" and, if the refetch then failed, slide back to Clean.
-            bulk_merge_state = raw.get("mergeStateStatus") or ""
-            bulk_mergeable = raw.get("mergeable") or ""
-            if bulk_merge_state and bulk_merge_state != "UNKNOWN":
-                pr.merge_state = bulk_merge_state
-            if bulk_mergeable and bulk_mergeable != "UNKNOWN":
-                pr.mergeable = bulk_mergeable
+        async def _guarded(pr: PRData, raw: dict) -> None:
+            async with sem:
+                await self._enrich_pr(pr, raw, root, now)
 
-            # Find worktree
-            pr.worktree_path = find_worktree_for_branch(pr.branch)
-
-            if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
-                refetched_state, refetched_mergeable = await asyncio.to_thread(
-                    github_api.get_mergeability, num, root
-                )
-                # A successful refetch is authoritative — it also picks up a
-                # conflict that has since been resolved. A failed refetch returns
-                # ("","") and leaves the preserved last-known value intact.
-                if refetched_state:
-                    pr.merge_state = refetched_state
-                if refetched_mergeable:
-                    pr.mergeable = refetched_mergeable
-
-            # Get latest commit info
-            previous_commit_sha = pr.latest_commit_sha
-            sha, date = await asyncio.to_thread(
-                github_api.get_latest_commit, num, root
-            )
-            pr.latest_commit_sha = sha
-            pr.latest_commit_date = date
-            if previous_commit_sha and sha and sha != previous_commit_sha:
-                pr.no_push_comment_retry_count = 0
-
-            # Get CI checks
-            checks = await asyncio.to_thread(
-                github_api.get_ci_checks, num, root
-            )
-            pr.ci_checks = checks
-            if any(c.status in {"queued", "in_progress"} for c in checks):
-                queued_jobs, runner_pool_health, runner_execution_summary = await asyncio.to_thread(
-                    github_api.get_workflow_queue_health, num, root
-                )
-                pr.queued_jobs = queued_jobs
-                pr.runner_pool_health = runner_pool_health
-                pr.runner_execution_summary = runner_execution_summary
-            else:
-                pr.queued_jobs = []
-                pr.runner_pool_health = []
-                pr.runner_execution_summary = pr.runner_execution_summary.__class__()
-
-            # Compute failing checks (code only, not infra)
-            pr.failing_checks = [
-                c.name for c in checks
-                if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
-            ]
-
-            # Get unaddressed comments (filtered by commit date!)
-            comments = await asyncio.to_thread(
-                github_api.get_unaddressed_comments, num, date, root
-            )
-            pr.review_comments = comments
-
-            if not pr.review_comments:
-                pr.no_push_comment_retry_count = 0
-
-            # New unaddressed comment IDs unblock a stuck AGENT_FAILED PR.
-            # Otherwise agent_failure_reason only clears on a fresh commit,
-            # which means fresh review feedback can't re-trigger auto-dispatch.
-            current_comment_ids = {c.id for c in comments}
-            new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
-            if new_comment_ids and num not in self._inflight_prs:
-                if pr.agent_failure_reason:
-                    self.log(
-                        f"New unaddressed comment(s) on PR #{num} — clearing stuck failure state",
-                        pr_number=num,
-                    )
-                    pr.agent_failure_reason = None
-                pr.no_push_comment_retry_count = 0
-            pr.last_seen_comment_ids = current_comment_ids
-
-            # Compute status
-            pr.status = self._compute_status(pr)
-            pr.last_polled = now
-
-            if not pr.worktree_path and pr.status == PRStatus.CLEAN:
-                had_agent_state = (
-                    pr.activity_message is not None
-                    or pr.activity_source is not None
-                    or pr.agent_cli_name is not None
-                    or bool(pr.agent_output)
-                    or pr.agent_failure_reason is not None
-                )
-                pr.activity_message = None
-                pr.activity_source = None
-                pr.agent_cli_name = None
-                pr.agent_output = []
-                pr.agent_failure_reason = None
-                if had_agent_state:
-                    self.log(
-                        f"Cleared stale agent state for clean PR #{num} without a worktree",
-                        pr_number=num,
-                    )
-
-            # When a tracked PR transitions to CLEAN, clear its maintenance
-            # display state so the card stops showing "Delegated". The worker
-            # no longer writes a COMPLETE state; the dashboard owns this lifecycle.
-            if pr.status == PRStatus.CLEAN and pr.maintenance is not None:
-                # Best-effort close the tracked task if we know its id.
-                if pr.maintenance.bead_id and pr.worktree_path:
-                    from .config import load as _load_config  # noqa: PLC0415
-                    from .tracker import get_tracker  # noqa: PLC0415
-
-                    get_tracker(_load_config(pr.worktree_path)).close_task(
-                        pr.maintenance.bead_id, cwd=pr.worktree_path
-                    )
-                # Release any dashboard-held coordinator claim now that the work
-                # is done (a stale claim would otherwise sit until lease expiry).
-                if pr.coordinator_claim_id:
-                    try:
-                        coordinator.release_claim_id(
-                            pr.coordinator_claim_id, DASHBOARD_OWNER_SESSION_ID, "completed"
-                        )
-                    except Exception as exc:  # best-effort; lease bounds it anyway
-                        self.log(
-                            f"Could not release coordinator claim for #{num}: {exc}",
-                            pr_number=num,
-                            level="warn",
-                        )
-                    pr.coordinator_claim_id = None
-                pr.maintenance = None
-                pr.activity_message = None
-                pr.activity_source = None
+        results = await asyncio.gather(
+            *(_guarded(pr, raw) for pr, raw in to_enrich),
+            return_exceptions=True,
+        )
+        for (pr, _raw), result in zip(to_enrich, results):
+            if isinstance(result, Exception):
                 self.log(
-                    f"PR #{num} is clean — cleared delegated maintenance state",
+                    f"Enrichment failed for PR #{pr.number}: {result}",
+                    pr_number=pr.number,
+                    level="error",
+                )
+
+    async def _enrich_pr(
+        self, pr: PRData, raw: dict, root: str | None, now: datetime
+    ) -> None:
+        """Enrich a single PR with its per-PR REST/GraphQL state.
+
+        Only ``pr``'s own fields are mutated here, so multiple ``_enrich_pr``
+        calls run concurrently without sharing state (BOU-1637 #4). ``root`` is
+        the repo cwd passed to every ``github_api.*`` call so the enrichment is
+        scoped to that PR's repo.
+        """
+        num = pr.number
+
+        # Update metadata
+        pr.title = raw.get("title", pr.title)
+        pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
+        pr.review_decision = raw.get("reviewDecision", "") or "none"
+        pr.labels = [
+            label.get("name", "")
+            for label in raw.get("labels", [])
+            if isinstance(label, dict) and label.get("name")
+        ]
+
+        # GitHub computes mergeability lazily: a bulk `gh pr list` often
+        # returns UNKNOWN/blank for both signals right after a push or a
+        # base-branch move. A definite bulk value is authoritative; an
+        # UNKNOWN/blank one is that async-compute window — keep the last-known
+        # value rather than erasing a known conflict, then force a per-PR
+        # re-fetch below (which also triggers the computation). Without this,
+        # a CONFLICTING PR whose next bulk poll returns UNKNOWN would be reset
+        # to "unknown" and, if the refetch then failed, slide back to Clean.
+        bulk_merge_state = raw.get("mergeStateStatus") or ""
+        bulk_mergeable = raw.get("mergeable") or ""
+        if bulk_merge_state and bulk_merge_state != "UNKNOWN":
+            pr.merge_state = bulk_merge_state
+        if bulk_mergeable and bulk_mergeable != "UNKNOWN":
+            pr.mergeable = bulk_mergeable
+
+        # Find worktree — scoped to THIS repo's root so a same-named branch
+        # in a sibling repo can't resolve a multi-repo PR to the wrong
+        # checkout (BOU-1720). ``root`` is None only in the legacy
+        # single-repo/no-cwd path, which restores the unscoped behavior.
+        pr.worktree_path = find_worktree_for_branch(pr.branch, root=root)
+
+        if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
+            refetched_state, refetched_mergeable = await asyncio.to_thread(
+                github_api.get_mergeability, num, root
+            )
+            # A successful refetch is authoritative — it also picks up a
+            # conflict that has since been resolved. A failed refetch returns
+            # ("","") and leaves the preserved last-known value intact.
+            if refetched_state:
+                pr.merge_state = refetched_state
+            if refetched_mergeable:
+                pr.mergeable = refetched_mergeable
+
+        # Get latest commit info
+        previous_commit_sha = pr.latest_commit_sha
+        sha, date = await asyncio.to_thread(
+            github_api.get_latest_commit, num, root
+        )
+        pr.latest_commit_sha = sha
+        pr.latest_commit_date = date
+        if previous_commit_sha and sha and sha != previous_commit_sha:
+            pr.no_push_comment_retry_count = 0
+
+        # Get CI checks
+        checks = await asyncio.to_thread(
+            github_api.get_ci_checks, num, root
+        )
+        pr.ci_checks = checks
+        if any(c.status in {"queued", "in_progress"} for c in checks):
+            queued_jobs, runner_pool_health, runner_execution_summary = await asyncio.to_thread(
+                github_api.get_workflow_queue_health, num, root
+            )
+            pr.queued_jobs = queued_jobs
+            pr.runner_pool_health = runner_pool_health
+            pr.runner_execution_summary = runner_execution_summary
+        else:
+            pr.queued_jobs = []
+            pr.runner_pool_health = []
+            pr.runner_execution_summary = pr.runner_execution_summary.__class__()
+
+        # Compute failing checks (code only, not infra)
+        pr.failing_checks = [
+            c.name for c in checks
+            if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
+        ]
+
+        # Get unaddressed comments (filtered by commit date!)
+        comments = await asyncio.to_thread(
+            github_api.get_unaddressed_comments, num, date, root
+        )
+        pr.review_comments = comments
+
+        if not pr.review_comments:
+            pr.no_push_comment_retry_count = 0
+
+        # New unaddressed comment IDs unblock a stuck AGENT_FAILED PR.
+        # Otherwise agent_failure_reason only clears on a fresh commit,
+        # which means fresh review feedback can't re-trigger auto-dispatch.
+        current_comment_ids = {c.id for c in comments}
+        new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
+        if new_comment_ids and num not in self._inflight_prs:
+            if pr.agent_failure_reason:
+                self.log(
+                    f"New unaddressed comment(s) on PR #{num} — clearing stuck failure state",
+                    pr_number=num,
+                )
+                pr.agent_failure_reason = None
+            pr.no_push_comment_retry_count = 0
+        pr.last_seen_comment_ids = current_comment_ids
+
+        # Compute status
+        pr.status = self._compute_status(pr)
+        pr.last_polled = now
+
+        if not pr.worktree_path and pr.status == PRStatus.CLEAN:
+            had_agent_state = (
+                pr.activity_message is not None
+                or pr.activity_source is not None
+                or pr.agent_cli_name is not None
+                or bool(pr.agent_output)
+                or pr.agent_failure_reason is not None
+            )
+            pr.activity_message = None
+            pr.activity_source = None
+            pr.agent_cli_name = None
+            pr.agent_output = []
+            pr.agent_failure_reason = None
+            if had_agent_state:
+                self.log(
+                    f"Cleared stale agent state for clean PR #{num} without a worktree",
                     pr_number=num,
                 )
 
-            # Auto-dispatch for CI failures and unaddressed review comments.
-            #
-            # CI failures get priority when both are present — a CI fix commit
-            # usually obsoletes stale comments, and the next poll will pick up
-            # anything still outstanding as HAS_COMMENTS.
-            can_dispatch = (
-                num not in self._inflight_prs
-                and pr.worktree_path
-                and not pr.agent_failure_reason
-            )
-            if can_dispatch:
-                if pr.status in (
-                    PRStatus.MERGE_CONFLICT,
-                    PRStatus.CI_FAILING,
-                    PRStatus.CI_AND_COMMENTS,
-                    PRStatus.HAS_COMMENTS,
-                ):
-                    # FIX 4: Reload on-disk maintenance state before evaluating the
-                    # already_queued guard. The `complete` CLI writes the state file in
-                    # a separate process, so pr.maintenance can be stale in-memory.
-                    # A COMPLETE/FAILED on-disk state must NOT suppress re-dispatch
-                    # when blockers reappear.
-                    if pr.worktree_path:
-                        reloaded = maintenance.load_state(pr.worktree_path, pr.number)
-                        if reloaded is not None:
-                            pr.maintenance = reloaded
+        # When a tracked PR transitions to CLEAN, clear its maintenance
+        # display state so the card stops showing "Delegated". The worker
+        # no longer writes a COMPLETE state; the dashboard owns this lifecycle.
+        if pr.status == PRStatus.CLEAN and pr.maintenance is not None:
+            # Best-effort close the tracked task if we know its id.
+            if pr.maintenance.bead_id and pr.worktree_path:
+                from .config import load as _load_config  # noqa: PLC0415
+                from .tracker import get_tracker  # noqa: PLC0415
 
-                    coord_decision = coordinator.dispatch_decision_for_pr(pr)
-                    if coord_decision.state == "manual_intervention":
-                        pr.activity_message = coord_decision.reason
-                        pr.activity_source = "agent-coordinator"
-                    if coord_decision.should_dispatch:
-                        asyncio.create_task(self.dispatch_pr_maintenance(pr))
+                get_tracker(_load_config(pr.worktree_path)).close_task(
+                    pr.maintenance.bead_id, cwd=pr.worktree_path
+                )
+            # Release any dashboard-held coordinator claim now that the work
+            # is done (a stale claim would otherwise sit until lease expiry).
+            if pr.coordinator_claim_id:
+                try:
+                    coordinator.release_claim_id(
+                        pr.coordinator_claim_id, DASHBOARD_OWNER_SESSION_ID, "completed"
+                    )
+                except Exception as exc:  # best-effort; lease bounds it anyway
+                    self.log(
+                        f"Could not release coordinator claim for #{num}: {exc}",
+                        pr_number=num,
+                        level="warn",
+                    )
+                pr.coordinator_claim_id = None
+            pr.maintenance = None
+            pr.activity_message = None
+            pr.activity_source = None
+            self.log(
+                f"PR #{num} is clean — cleared delegated maintenance state",
+                pr_number=num,
+            )
+
+        # Auto-dispatch for CI failures and unaddressed review comments.
+        #
+        # CI failures get priority when both are present — a CI fix commit
+        # usually obsoletes stale comments, and the next poll will pick up
+        # anything still outstanding as HAS_COMMENTS.
+        can_dispatch = (
+            num not in self._inflight_prs
+            and pr.worktree_path
+            and not pr.agent_failure_reason
+        )
+        if can_dispatch:
+            if pr.status in (
+                PRStatus.MERGE_CONFLICT,
+                PRStatus.CI_FAILING,
+                PRStatus.CI_AND_COMMENTS,
+                PRStatus.HAS_COMMENTS,
+            ):
+                # FIX 4: Reload on-disk maintenance state before evaluating the
+                # already_queued guard. The `complete` CLI writes the state file in
+                # a separate process, so pr.maintenance can be stale in-memory.
+                # A COMPLETE/FAILED on-disk state must NOT suppress re-dispatch
+                # when blockers reappear.
+                if pr.worktree_path:
+                    reloaded = maintenance.load_state(pr.worktree_path, pr.number)
+                    if reloaded is not None:
+                        pr.maintenance = reloaded
+
+                coord_decision = coordinator.dispatch_decision_for_pr(pr)
+                if coord_decision.state == "manual_intervention":
+                    pr.activity_message = coord_decision.reason
+                    pr.activity_source = "agent-coordinator"
+                if coord_decision.should_dispatch:
+                    asyncio.create_task(self.dispatch_pr_maintenance(pr))
 
     @staticmethod
     def _has_merge_conflict(pr: PRData) -> bool:

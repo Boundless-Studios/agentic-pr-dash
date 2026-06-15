@@ -56,7 +56,7 @@ def _stub_enrichment(monkeypatch):
         lambda num, latest_commit_date, cwd=None: [],
     )
     # No worktree → no auto-dispatch; keeps the poll a pure read.
-    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch: None)
+    monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: None)
 
 
 def test_polls_anchor_and_sibling_roots_aggregated_and_tagged(monkeypatch):
