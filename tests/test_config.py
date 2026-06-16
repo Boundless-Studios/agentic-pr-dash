@@ -62,6 +62,34 @@ def test_toml_file(tmp_path):
     assert c.discovery_names == ("claude", "aider")
 
 
+def test_fallback_executor_from_toml(tmp_path):
+    # BOU-1734: the loop's secondary executor is configured alongside `executor`.
+    (tmp_path / "agentic-pr-dash.toml").write_text(
+        '[project]\n'
+        'executor = "codex exec --full-auto {prompt}"\n'
+        'fallback_executor = "claude --dangerously-skip-permissions -p {prompt}"\n',
+        encoding="utf-8",
+    )
+    config.load.cache_clear()
+    c = config.load(str(tmp_path))
+    assert c.executor == "codex exec --full-auto {prompt}"
+    assert c.fallback_executor == "claude --dangerously-skip-permissions -p {prompt}"
+
+
+def test_fallback_executor_defaults_empty(tmp_path):
+    # Absent config ⇒ no fallback ⇒ legacy single-executor behavior.
+    config.load.cache_clear()
+    c = config.load(str(tmp_path))
+    assert c.fallback_executor == ""
+
+
+def test_fallback_executor_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTIC_PR_DASH_FALLBACK_EXECUTOR", "aider --message {prompt} --yes")
+    config.load.cache_clear()
+    c = config.load(str(tmp_path))
+    assert c.fallback_executor == "aider --message {prompt} --yes"
+
+
 def test_per_worktree_marker_paths(tmp_path):
     c = config.load(str(tmp_path))
     assert c.watch_marker_for("/tmp/wt") == Path("/tmp/wt/.agentic-pr-dash/pr-watch.armed")

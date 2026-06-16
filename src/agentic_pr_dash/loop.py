@@ -220,7 +220,50 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
     return subprocess.run(parts, cwd=cwd).returncode
 
 
+def _try_run(executor: str, prompt: str, cwd: str) -> int | None:
+    """Run an executor; return its exit code, or ``None`` if it couldn't spawn.
+
+    The executor binary may be missing from PATH (OSError/FileNotFoundError) or
+    otherwise fail to launch. Returning ``None`` lets the caller treat "couldn't
+    launch" the same as "ran and failed" for fallback purposes, without killing
+    the whole loop on one bad spawn.
+    """
+    try:
+        return _run_executor(executor, prompt, cwd)
+    except Exception as exc:
+        print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
+        return None
+
+
+def _dispatch_with_fallback(primary: str, fallback: str, prompt: str, cwd: str, pr: int | None) -> bool:
+    """Dispatch the fix to the primary executor, falling back on any failure.
+
+    Chain (BOU-1734): run ``primary``; if it fails (non-zero exit or a failed
+    spawn) and a ``fallback`` is configured, run the same prompt through the
+    fallback; if BOTH fail, report a clear error rather than silently leaving the
+    PR. Returns ``True`` when some executor serviced the PR (exit 0).
+    """
+    rc = _try_run(primary, prompt, cwd)
+    if rc == 0:
+        return True
+    if not fallback:
+        # Legacy single-executor behavior: leave the PR for the next tick.
+        print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
+        return False
+    print(f"[agentic-pr-dash] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
+    rc2 = _try_run(fallback, prompt, cwd)
+    if rc2 == 0:
+        return True
+    print(
+        f"[agentic-pr-dash] ERROR: both executors failed for PR #{pr} "
+        f"(primary={rc}, fallback={rc2}); leaving for next tick",
+        file=sys.stderr,
+    )
+    return False
+
+
 def _tick(args, executor: str) -> None:
+    fallback = getattr(args, "fallback_executor", "") or ""
     for cwd in _discover_cwds(args):
         if not Path(cwd).is_dir():
             continue
@@ -239,21 +282,12 @@ def _tick(args, executor: str) -> None:
         session = args.session_id or f"pid:{_loop_pid()}"
         if claim_id:
             coordinator.heartbeat_claim_id(claim_id, session)
-        try:
-            rc = _run_executor(executor, prompt, cwd)
-        except Exception as exc:
-            # The executor binary may be missing from PATH (OSError/FileNotFoundError)
-            # or otherwise fail to spawn. Release the claim so the PR is not left
-            # wrongly owned until the lease expires (codex P2), then move on to the
-            # next worktree rather than killing the whole loop on one bad spawn.
-            print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
+        if not _dispatch_with_fallback(executor, fallback, prompt, cwd, pr):
+            # Primary (and fallback, if any) failed. Release the claim so the PR
+            # is not left wrongly owned until the lease expires, then move on.
             if claim_id:
-                coordinator.release_claim_id(claim_id, session, "executor_failed")
-            continue
-        if rc != 0:
-            print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
-            if claim_id:
-                coordinator.release_claim_id(claim_id, session, "executor_failed")
+                reason = "all_executors_failed" if fallback else "executor_failed"
+                coordinator.release_claim_id(claim_id, session, reason)
             continue
         complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
         if pr is not None:
@@ -298,8 +332,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--no-discover-worktrees", action="store_true", help="Use only --cwd values; don't enumerate worktrees.")
     parser.add_argument("--once", action="store_true", help="Run a single tick and exit.")
     parser.add_argument("--executor", default=None, help="Override the configured executor command.")
+    parser.add_argument("--fallback-executor", default=None,
+                        help="Executor to run when the primary fails (per PR). Defaults to config fallback_executor.")
     args = parser.parse_args(argv)
     args.cwd = args.cwd or ["."]
+    args.fallback_executor = args.fallback_executor or cfg.fallback_executor
 
     executor = args.executor or cfg.executor
     if not executor:
@@ -319,6 +356,15 @@ def main(argv: list[str] | None = None) -> int:
     if executor_error:
         print(f"agentic-pr-dash loop: {executor_error}", file=sys.stderr)
         return 2
+
+    # Validate the fallback the same way when one is configured, so a broken
+    # fallback (typo, uninstalled agent) is caught at startup rather than only
+    # when the primary first fails and the fallback can't rescue the PR (BOU-1734).
+    if args.fallback_executor:
+        fallback_error = _validate_executor(args.fallback_executor)
+        if fallback_error:
+            print(f"agentic-pr-dash loop (fallback): {fallback_error}", file=sys.stderr)
+            return 2
 
     if args.once:
         _tick(args, executor)
