@@ -113,6 +113,13 @@ class Config:
     """Shell command template the stop-gate surfaces when spawning the in-session
     feedback waiter; ``{cwd}`` and ``{session_id}`` are substituted at render time."""
 
+    fallback_executor: str = ""
+    """Shell command template the loop runs when the primary :attr:`executor`
+    fails for a PR (non-zero exit or a failed spawn); ``{prompt}`` is substituted.
+    Empty (default) means no fallback — the loop leaves a failed PR for the next
+    tick, as before. Lets a rate-limited primary (e.g. codex) hand off to a
+    second agent (e.g. claude) so maintenance keeps flowing (BOU-1734)."""
+
     maintenance_loop_pidfile: Path | None = None
     """Pidfile of the detached ``pr-maintenance-loop`` daemon. When that process
     is live it is sufficient idle coverage, so the stop-gate skips the fragile
@@ -305,6 +312,7 @@ def load(cwd: str | None = None) -> Config:
         state_dir=_resolve_state_dir(proj, root),
         tracker=(_env("TRACKER") or proj.get("tracker") or "none").lower(),
         executor=_env("EXECUTOR") or proj.get("executor") or "",
+        fallback_executor=_env("FALLBACK_EXECUTOR") or proj.get("fallback_executor") or "",
         await_command=await_command,
         maintenance_loop_pidfile=loop_pidfile,
         maintenance_loop_machine_wide=machine_wide,
