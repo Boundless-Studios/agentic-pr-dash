@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import subprocess
 
+from ._common import _current_branch
 
 _GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
 
@@ -26,9 +27,8 @@ def _resolve_pr_for_branch(cwd: str):
     """Find the open PR whose headRefName matches the current branch."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
 
-    branch = _mc._current_branch(cwd)
+    branch = _current_branch(cwd)
     if not branch:
         return None
 

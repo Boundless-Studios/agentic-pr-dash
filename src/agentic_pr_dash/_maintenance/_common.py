@@ -28,8 +28,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _fix_lease_seconds() -> int:
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    return _mc._fix_lease_seconds()
+    from agentic_pr_dash.maintenance_check import _fix_lease_seconds as _mc_fix_lease_seconds  # noqa: PLC0415
+    return _mc_fix_lease_seconds()
 
 
 def _pid_alive(pid_raw: str) -> bool:
@@ -48,28 +48,25 @@ def _pid_alive(pid_raw: str) -> bool:
 
 def _resolve_owner_pid() -> int:
     """Best-effort durable owner pid to stamp into an adopted/armed marker."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    _os = _mc.os
-    _subprocess = _mc.subprocess
-    start = _os.getppid()
+    start = os.getppid()
     pid = start
     for _ in range(8):
         if pid <= 1:
             break
         try:
-            out = _subprocess.run(
+            out = subprocess.run(
                 ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
                 capture_output=True,
                 text=True,
                 timeout=3,
             )
-        except (OSError, _subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired):
             break
         line = out.stdout.strip()
         if not line:
             break
         ppid_str, _sep, comm = line.partition(" ")
-        comm_base = _os.path.basename(comm.strip()).lower()
+        comm_base = os.path.basename(comm.strip()).lower()
         if "claude" in comm_base or "codex" in comm_base:
             return pid
         if not ppid_str.isdigit():

@@ -21,6 +21,9 @@ from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_ledger as sl
 from agentic_pr_dash import github_api
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 
 
 def _git(*args, cwd):
@@ -110,15 +113,15 @@ def test_same_pr_number_in_two_repos_does_not_collide(tmp_path, monkeypatch, cap
     sl.append("sess-X", pr=42, branch="b-sib", worktree=str(tmp_path / "gone-b"),
               repo=repo_sib)
 
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
     # The URL is derived from the per-repo cwd so the two #42 records differ.
     def open_state(pr, cwd):
         slug = mc._repo_slug(cwd) or "unknown"
         return ("open", f"https://github.com/{slug}/pull/{pr}", False, [])
-    monkeypatch.setattr(mc, "_pr_open_state", open_state)
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", open_state)
 
     records = _run_reconcile(anchor, capsys)
     # Two distinct records, both PR #42, but different repo + url.
@@ -145,8 +148,8 @@ def test_legacy_entry_resolves_against_anchor_not_pruned_cross_repo(
     sl.append("sess-X", pr=99, branch="b-legacy", worktree=str(tmp_path / "gone"),
               repo="")
 
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
     repo_anchor = mc._repo_slug(str(anchor))
@@ -156,7 +159,7 @@ def test_legacy_entry_resolves_against_anchor_not_pruned_cross_repo(
         if mc._repo_slug(cwd) == repo_anchor:
             return ("open", f"https://github.com/o/anchor/pull/{pr}", False, [])
         return ("closed", f"https://github.com/o/sib/pull/{pr}", False, [])
-    monkeypatch.setattr(mc, "_pr_open_state", open_state)
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", open_state)
 
     records = _run_reconcile(anchor, capsys)
     # Surfaces exactly once (the open anchor record), not duplicated per root.
@@ -177,9 +180,9 @@ def test_single_root_legacy_merged_pr_is_still_pruned(tmp_path, monkeypatch, cap
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=500, branch="b-merged", worktree=str(tmp_path / "gone"),
               repo="")  # legacy
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state",
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state",
                         lambda pr, cwd: ("merged", "https://x/pull/500", False, []))
 
     records = _run_reconcile(anchor, capsys)
@@ -239,20 +242,20 @@ def test_stop_gate_aggregates_detached_across_roots_p1_first(tmp_path, monkeypat
         if os.path.realpath(cwd) == os.path.realpath(str(anchor)):
             return [rec_anchor]
         return []
-    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
     monkeypatch.setattr(mc, "_check_worktree",
                         lambda worktree, sid, *, claim=False: (0, ""))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees",
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
                         lambda sid, cwd: [os.path.abspath(cwd)])
-    monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: set())
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: set())
 
     captured = {}
-    real_block = mc._build_stop_block
+    real_block = _stop_gate_mod._build_stop_block
 
     def spy_block(pending):
         captured["pending"] = pending
         return real_block(pending)
-    monkeypatch.setattr(mc, "_build_stop_block", spy_block)
+    monkeypatch.setattr(_stop_gate_mod, "_build_stop_block", spy_block)
 
     args = argparse.Namespace(cwd=str(anchor), session_id="sess-X",
                               pid=os.getpid(), no_waiter=True)

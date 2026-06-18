@@ -5,6 +5,7 @@ import os
 import sys
 
 from agentic_pr_dash.config import load as load_config
+from ._common import _parse_iso, _pid_alive, _fix_lease_seconds, _resolve_owner_pid, _current_branch, _repo_slug
 
 # How long an owner's loop heartbeat stays "fresh" (the ownership lease).
 _HEARTBEAT_TTL_SECONDS = 600       # 10 min — alive-and-ticking window (3m loop + slack)
@@ -19,9 +20,8 @@ def _marker_path(cwd: str) -> str:
 
 
 def _read_marker(cwd: str) -> dict[str, str] | None:
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     try:
-        with open(_mc._marker_path(cwd), encoding="utf-8") as fh:
+        with open(_marker_path(cwd), encoding="utf-8") as fh:
             text = fh.read()
     except OSError:
         return None
@@ -50,8 +50,7 @@ def _heartbeat_ttl_seconds(cwd: str | None = None) -> int:
 
 def _heartbeat_fresh(heartbeat: str, cwd: str | None = None) -> bool:
     """True if the owner's loop heartbeat is within the short alive-TTL of now."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    ts = _mc._parse_iso(heartbeat)
+    ts = _parse_iso(heartbeat)
     if ts is None:
         return False
     from datetime import datetime, timezone  # noqa: PLC0415
@@ -61,10 +60,9 @@ def _heartbeat_fresh(heartbeat: str, cwd: str | None = None) -> bool:
 
 def _fix_lease_active(lease_until: str) -> bool:
     """True if an in-progress fix lease has not yet expired."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     if not lease_until:
         return False
-    ts = _mc._parse_iso(lease_until)
+    ts = _parse_iso(lease_until)
     if ts is None:
         print(
             f"[pr-watch] warning: unparseable fix_lease_until={lease_until!r}; "
@@ -79,14 +77,13 @@ def _fix_lease_active(lease_until: str) -> bool:
 
 def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     """Session id of a live, ACTIVELY-LOOPING in-session owner, else None."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    fields = _mc._read_marker(cwd)
+    fields = _read_marker(cwd)
     if fields is None:
         return None
     owner = fields.get("session_id", "")
     if not owner or owner == (self_session_id or ""):
         return None
-    if not _mc._pid_alive(fields.get("pid", "")):
+    if not _pid_alive(fields.get("pid", "")):
         return None
     if _heartbeat_fresh(fields.get("heartbeat", ""), cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
         return owner
@@ -95,14 +92,13 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
 
 def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
     """True if the worktree's marker names a DIFFERENT session whose pid is still alive."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    fields = _mc._read_marker(cwd)
+    fields = _read_marker(cwd)
     if fields is None:
         return False
     owner = fields.get("session_id", "")
     if not owner or owner == (self_session_id or ""):
         return False
-    return _mc._pid_alive(fields.get("pid", ""))
+    return _pid_alive(fields.get("pid", ""))
 
 
 def _heartbeat_min_interval_seconds() -> int:
@@ -114,10 +110,9 @@ def _heartbeat_min_interval_seconds() -> int:
 
 def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> None:
     """Refresh this owner's coordination stamps in the marker (owner-only write)."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     if not self_session_id:
         return
-    fields = _mc._read_marker(cwd)
+    fields = _read_marker(cwd)
     if fields is None or fields.get("session_id", "") != self_session_id:
         return
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
@@ -128,7 +123,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
 
     if not work_found:
         if not had_lease:
-            prior_ts = _mc._parse_iso(prior_heartbeat)
+            prior_ts = _parse_iso(prior_heartbeat)
             if prior_ts is not None:
                 age = (now - prior_ts).total_seconds()
                 if 0 <= age < _heartbeat_min_interval_seconds():
@@ -136,7 +131,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
 
     fields["heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     if work_found:
-        fields["fix_lease_until"] = (now + timedelta(seconds=_mc._fix_lease_seconds())).strftime(
+        fields["fix_lease_until"] = (now + timedelta(seconds=_fix_lease_seconds())).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
         )
     else:
@@ -144,7 +139,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     import tempfile  # noqa: PLC0415
 
     content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = _mc._marker_path(cwd)
+    target = _marker_path(cwd)
     tmp = None
     try:
         fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".pr-watch.armed.")
@@ -163,7 +158,6 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
     """Write the pr-watch.armed ownership marker (the single writer)."""
     import tempfile  # noqa: PLC0415
     from datetime import datetime, timezone  # noqa: PLC0415
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
 
     state_dir = str(load_config(cwd).state_dir_for(cwd))
     try:
@@ -211,9 +205,9 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
                 baseline = rev.stdout.strip() or None
         except (OSError, subprocess.TimeoutExpired):
             baseline = None
-        branch = _mc._current_branch(cwd)
+        branch = _current_branch(cwd)
         session_ledger.append(session_id, pr_number, branch, cwd, baseline,
-                              repo=_mc._repo_slug(cwd))
+                              repo=_repo_slug(cwd))
     except Exception:  # noqa: BLE001
         pass
     return True
@@ -247,29 +241,30 @@ def _read_session_marker(cwd: str) -> str:
 
 def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
     """Remove stale ownership artifacts when a marker's PR is authoritatively closed/merged."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
+    from .pr_state import _pr_open_state  # noqa: PLC0415
+    from .stop_gate import _stop_state_path  # noqa: PLC0415
     pr_raw = marker.get("pr", "")
     if not str(pr_raw).isdigit():
         return
     pr_number = int(pr_raw)
 
-    state, *_ = _mc._pr_open_state(pr_number, cwd)
+    state, *_ = _pr_open_state(pr_number, cwd)
     if state not in ("merged", "closed"):
         return
 
     try:
-        os.remove(_mc._marker_path(cwd))
+        os.remove(_marker_path(cwd))
     except OSError:
         pass
 
     try:
-        os.remove(_mc._stop_state_path(cwd))
+        os.remove(_stop_state_path(cwd))
     except OSError:
         pass
 
     try:
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
-        target_repo = _mc._repo_slug(cwd)
+        target_repo = _repo_slug(cwd)
         session_ledger.prune(session_id, {pr_number}, repo=target_repo)
     except Exception:  # noqa: BLE001
         pass

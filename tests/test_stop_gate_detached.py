@@ -10,6 +10,10 @@ from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_ledger as sl
 from agentic_pr_dash import github_api
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
 
 
 def _thread():
@@ -22,10 +26,10 @@ def test_detached_pr_with_review_comment_blocks_stop(tmp_path, monkeypatch, caps
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     # Session armed PR 777; its worktree was later torn down (gone).
     sl.append("sess-X", pr=777, branch="bou-1-x", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/777", False, []))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
@@ -40,10 +44,10 @@ def test_detached_pr_with_review_level_changes_requested_blocks_stop(
 ):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=779, branch="bou-review", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/779", False, [],
         "CHANGES_REQUESTED", "CLEAN",
     ))
@@ -59,10 +63,10 @@ def test_detached_pr_with_review_level_changes_requested_blocks_stop(
 def test_detached_pr_with_dirty_merge_state_blocks_stop(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=780, branch="bou-conflict", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/780", False, [],
         "", "DIRTY",
     ))
@@ -78,10 +82,10 @@ def test_detached_pr_with_dirty_merge_state_blocks_stop(tmp_path, monkeypatch, c
 def test_detached_pr_with_conflicting_mergeable_blocks_stop(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=782, branch="bou-conflicting", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/782", False, [],
         "", "UNKNOWN", "CONFLICTING",
     ))
@@ -97,16 +101,16 @@ def test_detached_pr_with_conflicting_mergeable_blocks_stop(tmp_path, monkeypatc
 def test_detached_pr_clean_does_not_block(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=778, branch="bou-clean", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: (
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://x/pull/778", False, []))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
     # A clean detached open PR does not trigger the pending-work block. The waiter
     # enforcement is a separate concern (tested in test_codex_p2_fixes.py) — suppress
     # it here to isolate the pending-work assertion (BOU-1632 codex P2 #3).
-    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: True)
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: True)
 
     rc = mc.main(["stop-gate", "--session-id", "sess-X", "--cwd", str(tmp_path)])
     assert rc == 0

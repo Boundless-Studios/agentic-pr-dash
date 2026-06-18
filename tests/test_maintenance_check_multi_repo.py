@@ -11,6 +11,9 @@ import subprocess
 from pathlib import Path
 
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 
 
 def _git(*args, cwd):
@@ -122,9 +125,9 @@ def test_stop_gate_blocks_when_sibling_has_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
     # Each root reports its own worktree as owned.
     monkeypatch.setattr(
-        mc, "_collect_stop_gate_worktrees",
+        _worktrees_mod, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [os.path.abspath(cwd)])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
 
     args = argparse.Namespace(cwd=str(anchor), session_id="sess-1",
                               pid=os.getpid(), no_waiter=True)
@@ -139,11 +142,11 @@ def test_stop_gate_clean_across_roots_exits_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_check_worktree",
                         lambda worktree, sid, *, claim=False: (0, ""))
     monkeypatch.setattr(
-        mc, "_collect_stop_gate_worktrees",
+        _worktrees_mod, "_collect_stop_gate_worktrees",
         lambda sid, cwd: [os.path.abspath(cwd)])
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     # No open PRs → no waiter demand.
-    monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: set())
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: set())
 
     args = argparse.Namespace(cwd=str(anchor), session_id="sess-1",
                               pid=os.getpid(), no_waiter=True)
@@ -178,7 +181,7 @@ def test_detached_records_dedup_by_root_and_number(tmp_path, monkeypatch):
             return [rec_a]
         return []
 
-    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
     recs = mc._detached_records_across_roots("sess-1", str(anchor))
     assert len(recs) == 2
     assert {r["url"] for r in recs} == {"u-a", "u-b"}
@@ -189,7 +192,7 @@ def test_owned_worktrees_across_roots_aggregates(tmp_path, monkeypatch):
     # all roots, so a spawned waiter actually covers sibling-repo PRs.
     sib = _make_repo(tmp_path / "sibling")
     anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees",
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
                         lambda sid, cwd: [os.path.abspath(cwd)])
     owned = [_rp(p) for p in mc._owned_worktrees_across_roots("s", str(anchor))]
     assert _rp(anchor) in owned
@@ -227,7 +230,7 @@ def test_detached_across_roots_reads_legacy_everywhere_never_prunes(tmp_path, mo
         calls[_rp(cwd)] = (include_legacy, prune_legacy)
         return []
 
-    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
     mc._detached_records_across_roots("sess", str(anchor))
     assert calls[_rp(anchor)] == (True, False)
     assert calls[_rp(sib)] == (True, False)
@@ -243,7 +246,7 @@ def test_detached_single_root_still_prunes_legacy(tmp_path, monkeypatch):
         calls[_rp(cwd)] = (include_legacy, prune_legacy)
         return []
 
-    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
     mc._detached_records_across_roots("sess", str(anchor))
     assert calls[_rp(anchor)] == (True, True)  # legacy pruning preserved
 

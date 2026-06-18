@@ -5,6 +5,7 @@ import json
 import os
 
 from agentic_pr_dash.config import load as load_config
+from ._common import _pid_alive
 
 
 def _await_pidfile(cwd: str, session_id: str = "") -> str:
@@ -45,19 +46,17 @@ def _remove_await_pidfile(cwd: str, session_id: str = "") -> None:
 
 def _await_alive(cwd: str, session_id: str) -> bool:
     """True if a live waiter pidfile exists with a matching session_id."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     data = _read_await_pidfile(cwd, session_id)
     if not data:
         return False
     return (
         data.get("session_id") == session_id
-        and _mc._pid_alive(str(data.get("pid", "")))
+        and _pid_alive(str(data.get("pid", "")))
     )
 
 
 def _detached_loop_alive(cwd: str) -> bool:
     """True when the detached ``pr-maintenance-loop`` daemon is running."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     cfg = load_config(cwd)
     if not cfg.maintenance_loop_machine_wide:
         return False
@@ -68,7 +67,7 @@ def _detached_loop_alive(cwd: str) -> bool:
         pid_raw = pidfile.read_text(encoding="utf-8").strip()
     except OSError:
         return False
-    return _mc._pid_alive(pid_raw)
+    return _pid_alive(pid_raw)
 
 
 def _detached_pending_entry(r: dict) -> tuple[str, str]:

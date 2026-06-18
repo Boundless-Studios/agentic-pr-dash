@@ -5,6 +5,8 @@ import os
 import subprocess
 
 from agentic_pr_dash.config import load as load_config
+from ._common import _resolve_owner_pid, _current_branch
+from .pr_state import _list_my_open_prs
 
 
 def _iter_worktrees_with_branch(cwd: str):
@@ -96,11 +98,10 @@ def _maint_roots_for(anchor_cwd: str) -> list[str]:
 
 def _owned_worktrees_across_roots(session_id: str, anchor_cwd: str) -> list[str]:
     """Owned worktrees across ``[anchor] + maintenance_repo_roots`` (deduped)."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
     owned: list[str] = []
     seen: set[str] = set()
     for root in _maint_roots_for(anchor_cwd):
-        for wt in _mc._collect_stop_gate_worktrees(session_id, root):
+        for wt in _collect_stop_gate_worktrees(session_id, root):
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)
@@ -109,14 +110,14 @@ def _owned_worktrees_across_roots(session_id: str, anchor_cwd: str) -> list[str]
 
 def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dict]:
     """Detached-ledger records across all roots, deduped by ``(root, pr)``."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
+    from .reconcile import _detached_pr_records  # noqa: PLC0415
     roots = _maint_roots_for(anchor_cwd)
     prune_legacy = len(roots) <= 1
     records: list[dict] = []
     seen: set[tuple[str, int]] = set()
     for root in roots:
-        for r in _mc._detached_pr_records(session_id, root, include_legacy=True,
-                                          prune_legacy=prune_legacy):
+        for r in _detached_pr_records(session_id, root, include_legacy=True,
+                                      prune_legacy=prune_legacy):
             key = (root, r["pr"])
             if key in seen:
                 continue
@@ -150,13 +151,12 @@ def _self_pid_chain(max_depth: int = 16) -> set[int]:
 def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     """Subset of ``paths`` where a LIVE INDEPENDENT session is present."""
     from agentic_pr_dash import agents, session_registry  # noqa: PLC0415
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
 
     candidates = list(dict.fromkeys(os.path.abspath(p) for p in paths if p))
     if not candidates:
         return set()
 
-    self_pids = _mc._self_pid_chain()
+    self_pids = _self_pid_chain()
     reg_of = {c: session_registry.registry_path(c) for c in candidates}
     clis_of = {c: set(load_config(c).discovery_names) for c in candidates}
     owned: set[str] = set()
@@ -208,13 +208,13 @@ def _collect_owned_worktrees(
     session_id: str, cwd: str, pid: int | None
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
+    from .markers import _marker_session_id, _marker_live_foreign_pid, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
-    eff_pid = pid if pid is not None else _mc._resolve_owner_pid()
+    eff_pid = pid if pid is not None else _resolve_owner_pid()
 
-    pr_map = _mc._list_my_open_prs(cwd)
+    pr_map = _list_my_open_prs(cwd)
 
     result: list[str] = []
     seen: set[str] = set()
@@ -224,9 +224,9 @@ def _collect_owned_worktrees(
             seen.add(path)
             result.append(path)
 
-    candidates = list(_mc._iter_worktrees_with_branch(cwd))
+    candidates = list(_iter_worktrees_with_branch(cwd))
 
-    independent = _mc._live_independent_owner_paths(
+    independent = _live_independent_owner_paths(
         [path for path, _branch in candidates], session_id
     )
 
@@ -234,7 +234,7 @@ def _collect_owned_worktrees(
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
             continue
-        if _mc._marker_session_id(worktree_path) == session_id:
+        if _marker_session_id(worktree_path) == session_id:
             _emit(worktree_path)
             continue
         if not pr_map:
@@ -245,22 +245,22 @@ def _collect_owned_worktrees(
         number, is_draft = pr
         if is_draft:
             continue
-        if _mc._marker_live_foreign_pid(worktree_path, session_id):
+        if _marker_live_foreign_pid(worktree_path, session_id):
             continue
-        if _mc._write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
+        if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)
     return result
 
 
 def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
     """Return marker-owned worktrees for passive Stop-hook gating."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
+    from .markers import _marker_session_id  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
 
-    candidates = list(_mc._iter_worktrees_with_branch(cwd))
-    independent = _mc._live_independent_owner_paths(
+    candidates = list(_iter_worktrees_with_branch(cwd))
+    independent = _live_independent_owner_paths(
         [path for path, _branch in candidates], session_id
     )
 
@@ -270,7 +270,7 @@ def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
             continue
-        if _mc._marker_session_id(worktree_path) != session_id:
+        if _marker_session_id(worktree_path) != session_id:
             continue
         if worktree_path not in seen:
             seen.add(worktree_path)
@@ -280,11 +280,11 @@ def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
 
 def _worktree_is_for_entry(path: str, entry) -> bool:
     """True if the worktree at `path` still belongs to this ledger entry's PR."""
-    from agentic_pr_dash import maintenance_check as _mc  # noqa: PLC0415
-    marker = _mc._read_marker(path) or {}
+    from .markers import _read_marker  # noqa: PLC0415
+    marker = _read_marker(path) or {}
     if str(marker.get("pr", "")) == str(entry.pr):
         return True
     if not marker:
         return False
-    branch = _mc._current_branch(path)
+    branch = _current_branch(path)
     return bool(branch) and entry.branch and branch == entry.branch

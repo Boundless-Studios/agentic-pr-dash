@@ -6,6 +6,8 @@ import pytest
 
 from agentic_pr_dash import config, coordinator, maintenance_check
 from agentic_pr_dash.models import PRData, PRStatus, ReviewComment
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import markers as _markers_mod
 
 
 SID = "sess-owned"
@@ -28,28 +30,28 @@ def test_stop_gate_does_not_adopt_unmarked_open_pr_worktrees(
     unrelated.mkdir()
 
     monkeypatch.setattr(
-        maintenance_check,
+        _worktrees_mod,
         "_iter_worktrees_with_branch",
         lambda cwd: [(str(owned), "owned-branch"), (str(unrelated), "unrelated-branch")],
     )
     monkeypatch.setattr(
-        maintenance_check,
+        _markers_mod,
         "_marker_session_id",
         lambda path: SID if Path(path) == owned else None,
     )
     monkeypatch.setattr(
-        maintenance_check,
+        _worktrees_mod,
         "_list_my_open_prs",
         lambda cwd: {"unrelated-branch": (202, False)},
     )
     adopted: list[str] = []
     monkeypatch.setattr(
-        maintenance_check,
+        _markers_mod,
         "_write_arm_marker",
         lambda path, session_id, pid, pr_number: adopted.append(path) or True,
     )
     monkeypatch.setattr(
-        maintenance_check,
+        _worktrees_mod,
         "_live_independent_owner_paths",
         lambda paths, session_id: set(),
     )
@@ -79,14 +81,14 @@ def test_stop_gate_skips_marker_owned_path_with_live_independent_owner(
     owned.mkdir()
 
     monkeypatch.setattr(
-        maintenance_check,
+        _worktrees_mod,
         "_iter_worktrees_with_branch",
         lambda cwd: [(str(owned), "owned-branch")],
     )
-    monkeypatch.setattr(maintenance_check, "_marker_session_id", lambda path: SID)
-    monkeypatch.setattr(maintenance_check, "_list_my_open_prs", lambda cwd: {})
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: SID)
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {})
     monkeypatch.setattr(
-        maintenance_check,
+        _worktrees_mod,
         "_live_independent_owner_paths",
         lambda paths, session_id: {str(owned)},
     )

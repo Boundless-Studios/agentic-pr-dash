@@ -20,6 +20,9 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +316,7 @@ def test_heartbeat_rewritten_when_stale(tmp_path, monkeypatch):
     stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_marker(marker, {"pr": "5", "session_id": "S1", "pid": "1", "heartbeat": stale})
 
-    monkeypatch.setattr(mc, "_marker_path", lambda cwd: str(marker))
+    monkeypatch.setattr(_markers_mod, "_marker_path", lambda cwd: str(marker))
     mc._touch_owner_heartbeat(str(tmp_path), "S1", work_found=False)
 
     fields = mc._read_marker(str(tmp_path))
@@ -327,7 +330,7 @@ def test_heartbeat_work_found_always_writes_lease(tmp_path, monkeypatch):
     fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_marker(marker, {"pr": "5", "session_id": "S1", "pid": "1", "heartbeat": fresh})
 
-    monkeypatch.setattr(mc, "_marker_path", lambda cwd: str(marker))
+    monkeypatch.setattr(_markers_mod, "_marker_path", lambda cwd: str(marker))
     mc._touch_owner_heartbeat(str(tmp_path), "S1", work_found=True)
 
     fields = mc._read_marker(str(tmp_path))

@@ -9,6 +9,7 @@ from agentic_pr_dash import agents
 from agentic_pr_dash import config
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_registry
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 
 @pytest.fixture(autouse=True)
@@ -188,7 +189,7 @@ def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
     owned = tmp_path / "owned"
     owned.mkdir()
 
-    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555, 42})
+    monkeypatch.setattr(_worktrees_mod, "_self_pid_chain", lambda: {555, 42})
     _no_process(monkeypatch)
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
     monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary(_state(42, str(owned))))
@@ -267,16 +268,16 @@ def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
     assert mc._marker_session_id(str(stolen)) == "claude-uuid-X"
 
     monkeypatch.setattr(
-        mc,
+        _worktrees_mod,
         "_iter_worktrees_with_branch",
         lambda cwd: [(str(orphan), "br-orphan"), (str(stolen), "br-stolen")],
     )
     monkeypatch.setattr(
-        mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
+        _worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
     )
     # The stolen worktree has a live INDEPENDENT owner now; the orphan has none.
     monkeypatch.setattr(
-        mc,
+        _worktrees_mod,
         "_live_independent_owner_paths",
         lambda paths, sid, config_cwd=None: {os.path.abspath(str(stolen))},
     )
@@ -292,10 +293,10 @@ def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeyp
     orphan = tmp_path / "orphan"
     orphan.mkdir()
     monkeypatch.setattr(
-        mc, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
+        _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
     )
-    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
     assert str(orphan) in result

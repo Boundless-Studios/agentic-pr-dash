@@ -16,6 +16,9 @@ from pathlib import Path
 import pytest
 
 from agentic_pr_dash import config, maintenance_check as mc, session_ledger as sl
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 
 
 SID = "sess-prune-test"
@@ -56,7 +59,7 @@ def test_prune_stale_marker_on_merged_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: None)  # no open PR
     monkeypatch.setattr(mc, "_read_marker", lambda cwd: {"pr": "42", "session_id": SID, "pid": str(os.getpid())})
     # gh answers authoritatively: PR 42 is merged
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: ("merged", "https://x/pull/42", False, [], "", "", ""))
+    monkeypatch.setattr(_pr_state_mod, "_pr_open_state", lambda pr, cwd: ("merged", "https://x/pull/42", False, [], "", "", ""))
 
     # Trigger pruning via _prune_stale_marker
     mc._prune_stale_marker(str(wt), {"pr": "42", "session_id": SID}, SID)
@@ -73,7 +76,7 @@ def test_prune_stale_marker_on_closed_pr(tmp_path, monkeypatch):
     sl.append(SID, pr=55, branch="bou-55", worktree=str(wt))
     marker_path = Path(mc._marker_path(str(wt)))
 
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: ("closed", "https://x/pull/55", False, [], "", "", ""))
+    monkeypatch.setattr(_pr_state_mod, "_pr_open_state", lambda pr, cwd: ("closed", "https://x/pull/55", False, [], "", "", ""))
 
     mc._prune_stale_marker(str(wt), {"pr": "55", "session_id": SID}, SID)
 
@@ -142,16 +145,16 @@ def test_stop_gate_prunes_stale_marker_for_merged_pr_and_exits_0(
     assert marker_path.exists()
 
     # gh returns 'no open PR' for this worktree's branch (PR 101 was merged)
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     # _check_worktree is NOT stubbed — it will call _resolve_pr_for_branch
     # Stub _resolve_pr_for_branch to return None (no open PR, gh answered)
     monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: None)
     # _live_foreign_owner returns None (no foreign owner)
     monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
-    # _pr_open_state returns 'merged' so _prune_stale_marker fires
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    # _pr_open_state returns 'merged' so _prune_stale_marker fires (_prune_stale_marker uses function-level import from pr_state)
     monkeypatch.setattr(
-        mc, "_pr_open_state",
+        _pr_state_mod, "_pr_open_state",
         lambda pr, cwd: ("merged", "https://x/pull/101", False, [], "", "", "")
     )
 
