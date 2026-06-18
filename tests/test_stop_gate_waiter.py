@@ -21,6 +21,7 @@ from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
+from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
 
 
 SID = "sess-waiter-test"
@@ -55,7 +56,7 @@ def test_stop_gate_blocks_with_spawn_prompt_when_owned_pr_and_no_waiter(
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     # PR 42 is open, non-draft
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
@@ -73,7 +74,7 @@ def test_stop_gate_clean_exit_when_waiter_alive(tmp_path, monkeypatch, capsys):
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: True)
@@ -87,7 +88,7 @@ def test_stop_gate_no_waiter_flag_suppresses(tmp_path, monkeypatch, capsys):
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
@@ -105,7 +106,7 @@ def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, c
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
@@ -125,7 +126,7 @@ def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypat
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(
         _reconcile_mod,
         "_detached_pr_records",
@@ -190,7 +191,7 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
@@ -212,7 +213,7 @@ def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(
-        mc, "_check_worktree",
+        _worktree_check_mod, "_check_worktree",
         lambda path, sid, *, claim=True: (10, "needs review\nPR_NUMBER=99")
     )
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
@@ -230,7 +231,7 @@ def test_stop_gate_no_open_prs_exits_cleanly(tmp_path, monkeypatch, capsys):
     wt = _make_armed_worktree(tmp_path, SID, 42)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     # No open PRs
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: set())
@@ -249,7 +250,7 @@ def test_stop_gate_await_command_rendered_from_config(tmp_path, monkeypatch, cap
     config.load.cache_clear()
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
-    monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)

@@ -2,6 +2,9 @@ from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import github_api
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 from agentic_pr_dash.models import PRData, PRStatus
+from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 
 def _thread(resolved=False, outdated=False):
@@ -20,10 +23,10 @@ def _clean_pr(**kw):
 
 def _patch_check_env(monkeypatch):
     """Neutralize ownership/heartbeat side effects so _check_worktree is pure."""
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
-    monkeypatch.setattr(mc, "_marker_session_id", lambda cwd: None)
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda cwd: None)
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda *a, **k: None)
 
 
 def test_unresolved_nonoutdated_thread_blocks(monkeypatch):
@@ -63,7 +66,7 @@ def test_get_unaddressed_comments_skips_outdated_thread(monkeypatch):
 
 def test_check_outdated_only_thread_stays_clean(monkeypatch):
     _patch_check_env(monkeypatch)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
     # Authoritative thread check sees only an outdated thread -> not actionable.
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda pr, cwd=None: [_thread(outdated=True)])
@@ -77,7 +80,7 @@ def test_check_outdated_only_thread_stays_clean(monkeypatch):
 def test_check_unresolved_thread_blocks_with_details(monkeypatch):
     _patch_check_env(monkeypatch)
     # PR resolves clean (get_unaddressed_comments missed the old thread).
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda pr, cwd=None: [_thread()])
     code, text = mc._check_worktree("/wt", "sess-A")

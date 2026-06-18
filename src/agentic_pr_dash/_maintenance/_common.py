@@ -28,8 +28,12 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _fix_lease_seconds() -> int:
-    from agentic_pr_dash.maintenance_check import _fix_lease_seconds as _mc_fix_lease_seconds  # noqa: PLC0415
-    return _mc_fix_lease_seconds()
+    from agentic_pr_dash.config import load as load_config  # noqa: PLC0415
+
+    raw = os.environ.get("GAIA_PR_WATCH_LEASE_SECONDS", "")
+    if raw.isdigit() and int(raw) > 0:
+        return int(raw)
+    return load_config().lease_seconds
 
 
 def _pid_alive(pid_raw: str) -> bool:

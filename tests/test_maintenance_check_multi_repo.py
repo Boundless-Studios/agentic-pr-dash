@@ -14,6 +14,7 @@ from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
+from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
 
 
 def _git(*args, cwd):
@@ -122,7 +123,7 @@ def test_stop_gate_blocks_when_sibling_has_pending(tmp_path, monkeypatch):
             return 10, "PR #200 has 3 unresolved review threads"
         return 0, ""
 
-    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", fake_check)
     # Each root reports its own worktree as owned.
     monkeypatch.setattr(
         _worktrees_mod, "_collect_stop_gate_worktrees",
@@ -139,7 +140,7 @@ def test_stop_gate_clean_across_roots_exits_zero(tmp_path, monkeypatch):
     sib = _make_repo(tmp_path / "sibling")
     anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
 
-    monkeypatch.setattr(mc, "_check_worktree",
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
                         lambda worktree, sid, *, claim=False: (0, ""))
     monkeypatch.setattr(
         _worktrees_mod, "_collect_stop_gate_worktrees",

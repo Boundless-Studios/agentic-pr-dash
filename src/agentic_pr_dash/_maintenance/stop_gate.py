@@ -101,7 +101,7 @@ def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
 
 
 def _stop_gate_impl(args) -> int:
-    from agentic_pr_dash.maintenance_check import _check_worktree  # noqa: PLC0415
+    from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _detached_records_across_roots  # noqa: PLC0415
     from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry  # noqa: PLC0415
     import time  # noqa: PLC0415
