@@ -13,6 +13,9 @@ from pathlib import Path
 import pytest
 
 from agentic_pr_dash import config, maintenance_check as mc, session_ledger as sl
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 
 
 @pytest.fixture(autouse=True)
@@ -80,7 +83,7 @@ def test_await_alive_session_a_not_affected_by_session_b_waiter(tmp_path, monkey
     mc._write_await_pidfile(str(tmp_path), {"pid": 3002, "session_id": sid_b}, sid_b)
 
     # Both pids alive
-    monkeypatch.setattr(mc, "_pid_alive", lambda p: True)
+    monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda p: True)
 
     assert mc._await_alive(str(tmp_path), sid_a) is True
     assert mc._await_alive(str(tmp_path), sid_b) is True
@@ -104,10 +107,10 @@ def test_stop_gate_demands_waiter_for_detached_open_pr(tmp_path, monkeypatch, ca
                worktree=str(tmp_path / "gone"))
 
     # No live worktrees for this session
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
     # Detached record: PR 201 is open, no current blockers
     monkeypatch.setattr(
-        mc, "_detached_pr_records",
+        _reconcile_mod, "_detached_pr_records",
         lambda sid, cwd, include_legacy=True, prune_legacy=True: [{
             "pr": 201, "url": "https://x/pull/201", "branch": "bou-201",
             "worktree_present": False, "unresolved_threads": 0,
@@ -117,7 +120,7 @@ def test_stop_gate_demands_waiter_for_detached_open_pr(tmp_path, monkeypatch, ca
             "p1": False, "state": "open",
         }]
     )
-    monkeypatch.setattr(mc, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
 
     rc = mc.main([
         "stop-gate",
@@ -169,9 +172,9 @@ def test_await_keeps_ticking_when_owned_empty_but_detached_prs_exist(
             "p1": False, "state": "open",
         }]
 
-    monkeypatch.setattr(mc, "_pid_alive", fake_pid_alive)
-    monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", fake_collect_worktrees)
-    monkeypatch.setattr(mc, "_detached_pr_records", fake_detached)
+    monkeypatch.setattr(mc, "_pid_alive", fake_pid_alive)  # for _cmd_await owner-pid check
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", fake_collect_worktrees)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
     # Speed up the loop
     monkeypatch.setattr(mc.time, "sleep", lambda s: None)  # type: ignore[attr-defined]
 

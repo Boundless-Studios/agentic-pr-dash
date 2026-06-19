@@ -9,6 +9,9 @@ from agentic_pr_dash import agents
 from agentic_pr_dash import config
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_registry
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 
 
 @pytest.fixture(autouse=True)
@@ -188,7 +191,7 @@ def test_live_independent_owner_paths_excludes_self(tmp_path, monkeypatch):
     owned = tmp_path / "owned"
     owned.mkdir()
 
-    monkeypatch.setattr(mc, "_self_pid_chain", lambda: {555, 42})
+    monkeypatch.setattr(_worktrees_mod, "_self_pid_chain", lambda: {555, 42})
     _no_process(monkeypatch)
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
     monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary(_state(42, str(owned))))
@@ -267,16 +270,16 @@ def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
     assert mc._marker_session_id(str(stolen)) == "claude-uuid-X"
 
     monkeypatch.setattr(
-        mc,
+        _worktrees_mod,
         "_iter_worktrees_with_branch",
         lambda cwd: [(str(orphan), "br-orphan"), (str(stolen), "br-stolen")],
     )
     monkeypatch.setattr(
-        mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
+        _worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
     )
     # The stolen worktree has a live INDEPENDENT owner now; the orphan has none.
     monkeypatch.setattr(
-        mc,
+        _worktrees_mod,
         "_live_independent_owner_paths",
         lambda paths, sid, config_cwd=None: {os.path.abspath(str(stolen))},
     )
@@ -292,10 +295,10 @@ def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeyp
     orphan = tmp_path / "orphan"
     orphan.mkdir()
     monkeypatch.setattr(
-        mc, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
+        _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
     )
-    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
     assert str(orphan) in result
@@ -310,24 +313,24 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
         number=7, is_draft=False, failing_checks=[], latest_commit_sha="abc",
     )
     heartbeats = []
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
     monkeypatch.setattr(
-        mc, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work)
+        _markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work)
     )
     from agentic_pr_dash import maintenance as _maint
     monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: ["review_comments"])
 
     # Foreign owner present → defer, and DO NOT refresh the heartbeat/lease (else a
     # stolen marker would pin the PR; PR #7 review, P2).
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "independent owner" in text
     assert heartbeats == []  # no heartbeat/lease write while deferring
 
     # No foreign owner → work is surfaced AND the fix lease is stamped.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 10
@@ -342,22 +345,22 @@ def test_check_worktree_clean_tick_does_not_refresh_stolen_marker(tmp_path, monk
     A clean tick on a marker that is genuinely ours still refreshes."""
     pr = types.SimpleNamespace(number=7, is_draft=False, failing_checks=[], latest_commit_sha="abc")
     heartbeats = []
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr)
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work))
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work))
     from agentic_pr_dash import maintenance as _maint
     monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: [])  # CLEAN
-    monkeypatch.setattr(mc, "_marker_session_id", lambda cwd: "sess-self")  # marker is ours
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda cwd: "sess-self")  # marker is ours
 
     # Stolen: a live independent owner is present → defer, no heartbeat refresh.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "stale stolen marker" in text
     assert heartbeats == []
 
     # Genuinely ours (no independent owner) → refresh the alive heartbeat.
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 0
     assert text2 == "nothing pending"

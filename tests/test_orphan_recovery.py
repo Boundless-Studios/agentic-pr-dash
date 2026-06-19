@@ -4,6 +4,7 @@ from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_ledger as sl
 from agentic_pr_dash import session_registry, github_api
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 
 
 def _thread():
@@ -17,13 +18,13 @@ def _setup_orphan(tmp_path, monkeypatch):
     monkeypatch.setenv("GAIA_PR_CLAIM_DIR", str(tmp_path / "claims"))
     # A DEAD session (sess-DEAD) armed PR 555; worktree later gone.
     sl.append("sess-DEAD", pr=555, branch="bou-orphan", worktree=str(tmp_path / "gone"))
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_pr_open_state",
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state",
                         lambda pr, cwd: ("open", "https://x/pull/555", False, []))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
     # sess-DEAD is not live; everything else is.
-    monkeypatch.setattr(mc, "_session_is_live", lambda sid, cwd=None: sid != "sess-DEAD")
+    monkeypatch.setattr(_reconcile_mod, "_session_is_live", lambda sid, cwd=None: sid != "sess-DEAD")
 
 
 def test_running_session_claims_orphan(tmp_path, monkeypatch, capsys):
@@ -38,7 +39,7 @@ def test_running_session_claims_orphan(tmp_path, monkeypatch, capsys):
 
 def test_orphan_not_claimed_when_owner_still_live(tmp_path, monkeypatch, capsys):
     _setup_orphan(tmp_path, monkeypatch)
-    monkeypatch.setattr(mc, "_session_is_live", lambda sid, cwd=None: True)  # owner alive
+    monkeypatch.setattr(_reconcile_mod, "_session_is_live", lambda sid, cwd=None: True)  # owner alive
     mc.main(["reconcile-prs", "--session-id", "sess-LIVE", "--cwd",
              str(tmp_path), "--adopt-orphans"])
     assert 555 not in {e.pr for e in sl.read("sess-LIVE")}  # not stolen from a live owner

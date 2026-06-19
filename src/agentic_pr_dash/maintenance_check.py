@@ -15,763 +15,149 @@ functions so that ``--help`` works without the project venv's heavy deps.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
-import re
-import subprocess
+import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
 import sys
 import time
 
 from .config import load as load_config
 
-
 # ---------------------------------------------------------------------------
-# Branch/PR resolution
+# Re-exports from maintenance subpackage (facade — keeps mc.X patchable by tests)
 # ---------------------------------------------------------------------------
 
+# _common
+from ._maintenance._common import (  # noqa: F401, E402
+    _parse_iso,
+    _env_int,
+    _fix_lease_seconds,
+    _pid_alive,
+    _resolve_owner_pid,
+    _current_branch,
+    _repo_slug,
+)
 
-def _current_branch(cwd: str) -> str:
-    """Return the current git branch name, or empty string on failure."""
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        return result.stdout.strip() if result.returncode == 0 else ""
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
+# pr_state
+from ._maintenance.pr_state import (  # noqa: F401, E402
+    _GH_UNAVAILABLE,
+    _gh_unavailable_message,
+    _resolve_pr_for_branch,
+    _resolve_pr_by_number,
+    _pr_draft_status,
+    _pr_head_branch,
+    _gh_pr_list_json,
+    _resolve_open_pr_for_branch,
+    _list_my_open_prs,
+    _unresolved_review_threads,
+    pr_has_unresolved_review_threads,
+    _pr_open_state,
+    _unpack_pr_open_state,
+    _thread_is_p1,
+)
 
+# markers
+from ._maintenance.markers import (  # noqa: F401, E402
+    _HEARTBEAT_TTL_SECONDS,
+    _DEFAULT_FIX_LEASE_SECONDS,
+    _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS,
+    _marker_path,
+    _read_marker,
+    _heartbeat_ttl_seconds,
+    _heartbeat_fresh,
+    _fix_lease_active,
+    _live_foreign_owner,
+    _marker_live_foreign_pid,
+    _heartbeat_min_interval_seconds,
+    _touch_owner_heartbeat,
+    _write_arm_marker,
+    _marker_session_id,
+    _read_session_marker,
+    _prune_stale_marker,
+    _session_is_live,
+    _claim_pr,
+)
 
-_GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
+# worktrees
+from ._maintenance.worktrees import (  # noqa: F401, E402
+    _iter_worktrees_with_branch,
+    _iter_worktree_paths,
+    _resolve_maintenance_roots,
+    _maint_roots_for,
+    _owned_worktrees_across_roots,
+    _detached_records_across_roots,
+    _self_pid_chain,
+    _live_independent_owner_paths,
+    _collect_owned_worktrees,
+    _collect_stop_gate_worktrees,
+    _worktree_is_for_entry,
+)
 
+# stop_gate
+from ._maintenance.stop_gate import (  # noqa: F401, E402
+    _stop_state_path,
+    _load_stop_state,
+    _save_stop_state,
+    _stop_fingerprint,
+    _extract_pr_number,
+    _build_stop_block,
+    _owned_open_pr_numbers,
+    _build_waiter_block,
+    _stop_gate_impl,
+    _record_has_blockers,
+)
 
-def _gh_unavailable_message(cwd: str | None = None) -> str:
-    """Operator-facing message for a failed ``list_open_prs`` resolution.
+# completion
+from ._maintenance.completion import (  # noqa: F401, E402
+    _commit_subject,
+    _completion_reply_body,
+    _mark_maintenance_complete,
+    _review_comments_from_threads,
+    _candidate_file_refs,
+    _ref_matches_touched,
+    _thread_points_elsewhere,
+    _FILE_REF_RE,
+    _MODULE_REF_STOPWORDS,
+)
 
-    Surfaces the real diagnostics (failing command, exit code, stderr) plus a
-    remediation hint and self-check command captured by
-    ``github_api.last_list_open_prs_failure``, instead of a bare
-    "gh unavailable" that hides whether this was a real outage, an auth lapse,
-    or a PATH/env difference in the Python subprocess (BOU-1638 / BOU-1694).
-    """
-    from . import github_api  # noqa: PLC0415
+# reconcile
+from ._maintenance.reconcile import (  # noqa: F401, E402
+    _adopt_orphan_prs,
+    _detached_pr_records,
+    _owned_pr_records,
+    _owned_pr_records_all_roots,
+)
 
-    failure = github_api.last_list_open_prs_failure()
-    if failure is None:
-        # No structured diagnostic (e.g. the failure predates this code path or
-        # was cleared) — degrade to the legacy string but keep it actionable.
-        where = f" in {cwd}" if cwd else ""
-        return (
-            "could not list PRs (gh unavailable): no diagnostics were captured. "
-            f"Re-run `gh pr list --author @me --state open`{where} from the same "
-            "cwd and check `gh auth status`."
-        )
-    return "could not list PRs (gh unavailable)\n" + failure.describe()
-
-
-def _repo_slug(cwd: str) -> str:
-    """GitHub ``owner/name`` for the checkout at ``cwd``, or "" if undetectable.
-
-    Used to scope ledger/claim records so a session that spans multiple repos
-    (different ``--cwd`` checkouts) never has a same-number PR in one repo
-    clobber or mis-resolve another's (PR #16 review round 2, P1). Best-effort:
-    an empty slug degrades to the legacy repo-less (unscoped) behavior.
-    """
-    from pathlib import Path  # noqa: PLC0415
-    from .config import _detect_repo  # noqa: PLC0415
-    try:
-        return _detect_repo(Path(cwd)) or ""
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _resolve_pr_for_branch(cwd: str):
-    """Find the open PR whose headRefName matches the current branch.
-
-    Returns a populated PRData, None (no PR), or _GH_UNAVAILABLE sentinel.
-    """
-    from . import github_api  # noqa: PLC0415
-    from .models import PRData, PRStatus  # noqa: PLC0415
-
-    branch = _current_branch(cwd)
-    if not branch:
-        return None
-
-    prs = github_api.list_open_prs(cwd)
-    if prs is None:
-        return _GH_UNAVAILABLE
-    if not prs:
-        return None
-
-    raw: dict | None = None
-    for entry in prs:
-        if entry.get("headRefName") == branch:
-            raw = entry
-            break
-    if raw is None:
-        return None
-
-    pr_number = int(raw["number"])
-    latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
-    failing = [
-        c.name
-        for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
-    ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    merge_state = raw.get("mergeStateStatus", "unknown")
-    mergeable = raw.get("mergeable", "unknown")
-
-    return PRData(
-        number=pr_number,
-        title=raw.get("title", ""),
-        branch=branch,
-        base_branch=raw.get("baseRefName", "main"),
-        url=raw.get("url", ""),
-        is_draft=bool(raw.get("isDraft", False)),
-        merge_state=merge_state,
-        mergeable=mergeable,
-        ci_checks=checks,
-        failing_checks=failing,
-        review_comments=review_comments,
-        latest_commit_sha=latest_sha,
-        latest_commit_date=latest_date,
-        worktree_path=cwd,
-        status=PRStatus.CLEAN,
-    )
-
-
-def _resolve_pr_by_number(pr_number: int, cwd: str):
-    """Resolve a PR by explicit number (for --pr override).
-
-    Returns a populated PRData, or the _GH_UNAVAILABLE sentinel when the gh CLI
-    failed (outage/rate-limit).
-    """
-    from . import github_api  # noqa: PLC0415
-    from .models import PRData, PRStatus  # noqa: PLC0415
-
-    prs = github_api.list_open_prs(cwd)
-    if prs is None:
-        return _GH_UNAVAILABLE
-    raw: dict | None = None
-    if prs:
-        for entry in prs:
-            if entry.get("number") == pr_number:
-                raw = entry
-                break
-
-    latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
-    failing = [
-        c.name
-        for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
-    ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    merge_state = (raw or {}).get("mergeStateStatus", "unknown")
-    mergeable = (raw or {}).get("mergeable", "unknown")
-
-    return PRData(
-        number=pr_number,
-        title=(raw or {}).get("title", ""),
-        branch=(raw or {}).get("headRefName", ""),
-        base_branch=(raw or {}).get("baseRefName", "main"),
-        url=(raw or {}).get("url", ""),
-        is_draft=bool((raw or {}).get("isDraft", False)),
-        merge_state=merge_state,
-        mergeable=mergeable,
-        ci_checks=checks,
-        failing_checks=failing,
-        review_comments=review_comments,
-        latest_commit_sha=latest_sha,
-        latest_commit_date=latest_date,
-        worktree_path=cwd,
-        status=PRStatus.CLEAN,
-    )
+# waiter
+from ._maintenance.waiter import (  # noqa: F401, E402
+    _await_pidfile,
+    _read_await_pidfile,
+    _write_await_pidfile,
+    _remove_await_pidfile,
+    _await_alive,
+    _detached_loop_alive,
+    _detached_pending_entry,
+)
 
 
 # ---------------------------------------------------------------------------
-# Subcommands
+# worktree_check
+# ---------------------------------------------------------------------------
+from ._maintenance.worktree_check import _check_worktree  # noqa: F401, E402
+
+
+# ---------------------------------------------------------------------------
+# CLI functions (stay in maintenance_check.py)
 # ---------------------------------------------------------------------------
 
 
-# How long an owner's loop heartbeat stays "fresh" (the ownership lease).
-#
-# The heartbeat is stamped at the START of each `check`, but when `check` finds
-# work the owning session then spends the whole fix phase (resolve conflicts /
-# fix CI / run tests / push) BEFORE its next `/loop` tick re-stamps it — easily
-# tens of minutes. So the lease MUST comfortably exceed the maximum expected
-# maintenance runtime, or the detached loop would treat a still-busy owner as
-# stale mid-fix and dispatch a competing runtime — the exact double-fix race this
-# coordination prevents (ownership-coordination review).
-#
-# A generous lease is safe because it is NOT the dead-session signal: pid-liveness
-# (`_pid_alive`) is, and it reaps a crashed/exited owner immediately regardless of
-# this value. The lease only bounds the rare "owner alive but loop genuinely
-# stopped" case. Override with GAIA_PR_WATCH_LEASE_SECONDS.
-# Two ownership windows (PR #1909 review). The detached loop defers to a live
-# in-session owner while EITHER is current:
-#   * heartbeat  — "the loop is alive and ticking". Stamped on EVERY owner check
-#     (incl. clean ones), SHORT TTL (~a few loop ticks). A clean check therefore
-#     only holds ownership briefly, so a stopped-but-alive loop releases quickly
-#     instead of pinning the long lease.
-#   * fix lease  — "a fix is actively in progress". Stamped ONLY when a check
-#     finds work (the owner is about to spend a long, tick-less fix phase), long
-#     enough to cover it. A clean check never grants this long lease.
-# pid-liveness (`_pid_alive`) still reaps a crashed owner immediately regardless.
-_HEARTBEAT_TTL_SECONDS = 600       # 10 min — alive-and-ticking window (3m loop + slack)
-_DEFAULT_FIX_LEASE_SECONDS = 1800  # 30 min — covers a long fix phase; override via env
-
-
-def _fix_lease_seconds() -> int:
-    raw = os.environ.get("GAIA_PR_WATCH_LEASE_SECONDS", "")
-    if raw.isdigit() and int(raw) > 0:
-        return int(raw)
-    return load_config().lease_seconds
-
-
-def _marker_path(cwd: str) -> str:
-    return str(load_config(cwd).watch_marker_for(cwd))
-
-
-def _read_marker(cwd: str) -> dict[str, str] | None:
-    try:
-        with open(_marker_path(cwd), encoding="utf-8") as fh:
-            text = fh.read()
-    except OSError:
-        return None
-    fields: dict[str, str] = {}
-    for line in text.splitlines():
-        key, sep, value = line.partition("=")
-        if sep:
-            fields[key.strip()] = value.strip()
-    return fields
-
-
-def _pid_alive(pid_raw: str) -> bool:
-    if not pid_raw.isdigit():
-        return False
-    try:
-        os.kill(int(pid_raw), 0)  # signal 0: existence probe only
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # alive, owned by another uid
-    except OSError:
-        return False
-    return True
-
-
-def _resolve_owner_pid() -> int:
-    """Best-effort durable owner pid to stamp into an adopted/armed marker.
-
-    When `--pid` is omitted, `os.getppid()` is the SHORT-LIVED shell that ran this
-    CLI — it exits the instant the command returns, so the marker would instantly
-    look dead to the ownership gate and a sibling/detached loop could grab the
-    same PR (PR #1949 review, P2). Walk up the process ancestry to the nearest
-    `claude` process (the session that owns the in-session loop) and use that
-    durable pid; fall back to `os.getppid()` when no such ancestor is found (e.g.
-    the detached codex loop, which should pass `--pid $$` explicitly).
-    """
-    start = os.getppid()
-    pid = start
-    for _ in range(8):
-        if pid <= 1:
-            break
-        try:
-            out = subprocess.run(
-                ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
-                capture_output=True,
-                text=True,
-                timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            break
-        line = out.stdout.strip()
-        if not line:
-            break
-        ppid_str, _sep, comm = line.partition(" ")
-        comm_base = os.path.basename(comm.strip()).lower()
-        if "claude" in comm_base or "codex" in comm_base:
-            return pid
-        if not ppid_str.isdigit():
-            break
-        pid = int(ppid_str)
-    return start
-
-
-def _pr_draft_status(cwd: str, pr_number: int):
-    """Optional[bool]: True=draft, False=non-draft, None=could-not-determine
-    (gh unavailable / error / malformed JSON / field absent).
-
-    The explicit `arm --pr <N>` path FAILS CLOSED on None — it never arms a PR
-    whose non-draft status can't be positively confirmed, so the "drafts are
-    never armed" guarantee holds even when gh is down or unauthenticated
-    (PR #1949 review follow-up). This mirrors the gh-resolved path, which also
-    declines to arm when it cannot list the PR.
-    """
-    import json  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "isDraft"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout or "")
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or "isDraft" not in data:
-        return None
-    return bool(data["isDraft"])
-
-
-def _pr_head_branch(cwd: str, pr_number: int):
-    """The PR's head branch name (``headRefName``), or ``None`` if gh can't say.
-
-    Used to refuse an explicit ``arm --pr <N>`` when the cwd isn't on PR N's
-    head branch: the marker/ledger are written for cwd, but later ``check --cwd``
-    resolves the PR from the cwd's current branch, so a marker for a PR that
-    isn't checked out here would shadow the real one.
-    """
-    import json  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "headRefName"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout or "")
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    head = data.get("headRefName")
-    return head if isinstance(head, str) and head else None
-
-
-def _parse_iso(value: str):
-    if not value:
-        return None
-    from datetime import datetime, timezone  # noqa: PLC0415
-
-    try:
-        ts = datetime.fromisoformat(value)
-    except ValueError:
-        return None
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts
-
-
-def _heartbeat_ttl_seconds(cwd: str | None = None) -> int:
-    """How long an owner's heartbeat counts as 'fresh'. Configurable so the
-    recovery latency can be tuned for the turn-driven era (BOU-1478).
-
-    Precedence: the modern AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS env wins, then
-    the per-worktree config (agentic-pr-dash.toml at ``cwd``), and only when no
-    modern setting exists does the legacy GAIA_PR_WATCH_HEARTBEAT_TTL apply — so
-    setting the new knob always takes effect even with stale legacy env around.
-    """
-    cfg = load_config(cwd) if cwd else load_config()
-    # 1. Modern env wins.
-    modern = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "")
-    if modern.isdigit() and int(modern) > 0:
-        return int(modern)
-    # 2. The CHECKED worktree's config (agentic-pr-dash.toml) beats the legacy
-    #    env — a per-repo setting must not be overridden by stale shell state.
-    #    The loop runs `check --cwd <worktree>` without changing subprocess cwd,
-    #    so cfg is loaded for the target worktree.
-    toml_ttl = cfg.extra.get("heartbeat_ttl_seconds")
-    if isinstance(toml_ttl, int) and toml_ttl > 0:
-        return toml_ttl
-    # 3. Legacy env fallback, then the config default.
-    legacy = os.environ.get("GAIA_PR_WATCH_HEARTBEAT_TTL", "")
-    if legacy.isdigit() and int(legacy) > 0:
-        return int(legacy)
-    return cfg.heartbeat_ttl_seconds
-
-
-def _heartbeat_fresh(heartbeat: str, cwd: str | None = None) -> bool:
-    """True if the owner's loop heartbeat is within the short alive-TTL of now —
-    proof the in-session loop is still ticking, not merely armed or stopped.
-    """
-    ts = _parse_iso(heartbeat)
-    if ts is None:
-        return False
-    from datetime import datetime, timezone  # noqa: PLC0415
-
-    return (datetime.now(timezone.utc) - ts).total_seconds() <= _heartbeat_ttl_seconds(cwd)
-
-
-def _fix_lease_active(lease_until: str) -> bool:
-    """True if an in-progress fix lease (an absolute future timestamp the owner
-    stamps when a check finds work) has not yet expired — the owner is mid-fix and
-    not ticking, so the detached loop must keep deferring through the fix phase.
-
-    Fail-safe on a CORRUPT lease (BOU-1637): an empty value means "no lease" and
-    returns False, but a present-but-unparseable timestamp is treated as ACTIVE
-    (defer) rather than expired. The old behavior parsed a corrupt lease as "no
-    lease" → not-deferring, opening a double-dispatch window where both the owner
-    (mid-fix) and the detached loop fix the same PR. Deferring instead is bounded:
-    pid-liveness still reaps a genuinely-dead owner, so a corrupt lease on a dead
-    session does not strand the PR forever.
-    """
-    if not lease_until:
-        return False  # no lease stamped at all → not deferring
-    ts = _parse_iso(lease_until)
-    if ts is None:
-        # Present but unparseable — fail safe: treat as an active lease so we keep
-        # deferring instead of racing the (presumed) live owner mid-fix.
-        print(
-            f"[pr-watch] warning: unparseable fix_lease_until={lease_until!r}; "
-            f"treating as ACTIVE (deferring) to avoid a double-dispatch race",
-            file=sys.stderr,
-        )
-        return True
-    from datetime import datetime, timezone  # noqa: PLC0415
-
-    return datetime.now(timezone.utc) < ts
-
-
-def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
-    """Session id of a live, ACTIVELY-LOOPING in-session owner, else None.
-
-    Coordination (ownership-coordination): the detached pr-maintenance loop must not
-    service a worktree that a live in-session `/pr-maintenance-check` loop is
-    already working, or they apply simultaneous conflicting fixes. Ownership is
-    the `pr-watch.armed` marker. Defers ONLY when the owner is (a) a
-    different session, (b) its pid is alive, AND (c) its loop `heartbeat=` is
-    fresh — proof a loop is actually running, not merely armed. So a dead owner,
-    a stale/absent heartbeat (armed-but-never-looped, or an ignored advisory
-    nudge), an unowned worktree, or the caller itself never strands the detached
-    fallback. Stdlib only: keeps `check` dependency-free.
-    """
-    fields = _read_marker(cwd)
-    if fields is None:
-        return None
-    owner = fields.get("session_id", "")
-    if not owner or owner == (self_session_id or ""):
-        return None
-    if not _pid_alive(fields.get("pid", "")):
-        return None
-    # Defer while the loop is provably engaged: actively ticking (heartbeat) OR
-    # mid-fix (fix lease). A merely-armed marker (no heartbeat, no lease) or a
-    # stopped loop does NOT block the detached fallback.
-    if _heartbeat_fresh(fields.get("heartbeat", ""), cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
-        return owner
-    return None
-
-
-def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
-    """True if the worktree's marker names a DIFFERENT session whose pid is still
-    alive — even before that session has stamped its first heartbeat.
-
-    The reconciliation ADOPTION path must treat such a worktree as OWNED. This is
-    deliberately STRICTER than `_live_foreign_owner` (which also requires a fresh
-    heartbeat / fix-lease): when another session has JUST opened/readied a PR, its
-    hook writes a marker with a live pid but no heartbeat yet, and we must never
-    overwrite that live session's marker and steal its PR (PR #1949 review, P1).
-    A dead pid (crashed/exited session) is NOT a live owner, so genuine orphans
-    and sub-agent worktrees (no marker at all) are still adopted.
-    """
-    fields = _read_marker(cwd)
-    if fields is None:
-        return False
-    owner = fields.get("session_id", "")
-    if not owner or owner == (self_session_id or ""):
-        return False
-    return _pid_alive(fields.get("pid", ""))
-
-
-# Heartbeat write coalescing window (BOU-1637). A clean tick refreshes the
-# heartbeat, but the freshness gate (`_heartbeat_fresh`) only cares whether the
-# stamp is within a multi-minute TTL, so re-stamping every few-second tick — each
-# an atomic tempfile+rename of every owned marker — is wasted I/O for a large
-# worktree pool. Skip the rewrite when the existing heartbeat is already newer
-# than now-minus-this-window AND no other field would change. Override via
-# AGENTIC_PR_DASH_HEARTBEAT_MIN_INTERVAL_SECONDS.
-_DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS = 60
-
-
-def _heartbeat_min_interval_seconds() -> int:
-    raw = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_MIN_INTERVAL_SECONDS", "")
-    if raw.isdigit() and int(raw) >= 0:
-        return int(raw)
-    return _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS
-
-
-def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> None:
-    """Refresh this owner's coordination stamps in the marker (owner-only write).
-
-    `check`'s only write — coordination stamps, not PR state. ALWAYS refresh
-    `heartbeat` (proof the loop is alive and ticking). When the check found work,
-    ALSO set `fix_lease_until` = now + fix-lease (the owner is about to spend a
-    tick-less fix phase, so the detached loop must keep deferring through it); a
-    clean check CLEARS any prior `fix_lease_until`, so a stopped-but-alive loop
-    never pins the long lease without a fix in progress (PR #1909 review).
-
-    WRITE COALESCING (BOU-1637): the actual marker rewrite is skipped when nothing
-    the ownership gate cares about would change — the existing heartbeat is still
-    within the coalescing window and the fix-lease state is unchanged. This avoids
-    an atomic tempfile+rename of every owned marker on every few-second tick for a
-    large worktree pool, while still re-stamping promptly enough that the multi-
-    minute freshness TTL never lapses. A work-found tick (which sets a fresh fix
-    lease the detached loop relies on) ALWAYS writes.
-    """
-    if not self_session_id:
-        return
-    fields = _read_marker(cwd)
-    if fields is None or fields.get("session_id", "") != self_session_id:
-        return
-    from datetime import datetime, timedelta, timezone  # noqa: PLC0415
-
-    now = datetime.now(timezone.utc)
-    prior_heartbeat = fields.get("heartbeat", "")
-    had_lease = "fix_lease_until" in fields
-
-    # Decide whether a write is even necessary BEFORE mutating `fields`.
-    if not work_found:
-        # Clean tick: a write is needed only if (a) we'd be clearing a stale fix
-        # lease, or (b) the heartbeat is older than the coalescing window (or
-        # absent/corrupt). Otherwise the marker already reflects a fresh-enough
-        # alive stamp and re-writing it buys nothing.
-        if not had_lease:
-            prior_ts = _parse_iso(prior_heartbeat)
-            if prior_ts is not None:
-                age = (now - prior_ts).total_seconds()
-                if 0 <= age < _heartbeat_min_interval_seconds():
-                    return  # heartbeat still fresh; skip the rewrite
-
-    fields["heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    if work_found:
-        fields["fix_lease_until"] = (now + timedelta(seconds=_fix_lease_seconds())).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-    else:
-        fields.pop("fix_lease_until", None)
-    # Write atomically (temp file in the same dir + os.replace) so a concurrent
-    # detached-loop reader never observes a truncated/partial marker — a torn read
-    # would make _live_foreign_owner return None and let it dispatch a second
-    # fixer for the same PR (ownership-coordination review).
-    import tempfile  # noqa: PLC0415
-
-    content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = _marker_path(cwd)
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".pr-watch.armed.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp, target)  # atomic on POSIX (same filesystem)
-    except OSError:
-        if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-
-
-def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bool:
-    """Write the pr-watch.armed ownership marker (the single writer).
-
-    Produces the EXACT same marker `.claude/hooks/arm-pr-watch.sh` writes
-    (pr=/armed_at=/session_id=/pid=), atomically (tempfile + os.replace) so a
-    concurrent reader never sees a torn marker. Also writes pr-watch.session
-    so the worktree self-identifies. Reused by both the explicit `arm` subcommand
-    and `list-owned` reconciliation (BOU-1442). Returns True on success.
-    """
-    import tempfile  # noqa: PLC0415
-    from datetime import datetime, timezone  # noqa: PLC0415
-
-    state_dir = str(load_config(cwd).state_dir_for(cwd))
-    try:
-        os.makedirs(state_dir, exist_ok=True)
-    except OSError:
-        return False
-
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    fields = {
-        "pr": str(pr_number),
-        "armed_at": now,
-        "session_id": session_id,
-        "pid": str(pid),
-    }
-    content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = os.path.join(state_dir, "pr-watch.armed")
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp, target)  # atomic on POSIX (same filesystem)
-    except OSError:
-        if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        return False
-
-    # Self-identify so the in-session loop / a later list-owned can read the owner.
-    try:
-        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
-            fh.write(session_id + "\n")
-    except OSError:
-        pass
-
-    # Durably record the session->PR membership OUTSIDE the worktree so teardown
-    # never drops it from monitoring (BOU-1587). Non-fatal: the marker remains the
-    # live source of truth if this fails.
-    try:
-        from . import session_ledger  # noqa: PLC0415
-        baseline = None
-        try:
-            rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                                 capture_output=True, text=True, timeout=10)
-            if rev.returncode == 0:
-                baseline = rev.stdout.strip() or None
-        except (OSError, subprocess.TimeoutExpired):
-            baseline = None
-        branch = _current_branch(cwd)
-        session_ledger.append(session_id, pr_number, branch, cwd, baseline,
-                              repo=_repo_slug(cwd))
-    except Exception:  # noqa: BLE001 — ledger is best-effort
-        pass
-    return True
-
-
-def _gh_pr_list_json(cwd: str, extra_args: list[str], fields: str) -> list | None:
-    """Run `gh pr list --author @me --state open --json <fields> <extra>` and
-    return the parsed JSON list, or None when gh is unavailable / errors.
-
-    Stdlib only (subprocess + json) so the subcommands stay dependency-free —
-    no `--jq` (bash-jq parity is brittle); we parse the raw JSON in Python.
-    """
-    import json  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--author", "@me", "--state", "open", *extra_args, "--json", fields],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout or "[]")
-    except ValueError:
-        return None
-    return data if isinstance(data, list) else None
-
-
-def _resolve_open_pr_for_branch(cwd: str, branch: str):
-    """(pr_number, is_draft) for this branch's open @me PR, or None if there is none."""
-    data = _gh_pr_list_json(cwd, ["--head", branch], "number,isDraft")
-    if not data:
-        return None
-    entry = data[0]
-    return int(entry.get("number")), bool(entry.get("isDraft", False))
-
-
-def _list_my_open_prs(cwd: str) -> dict[str, tuple[int, bool]]:
-    """Map branch -> (pr_number, is_draft) for the user's open PRs; {} on gh failure."""
-    data = _gh_pr_list_json(cwd, [], "number,headRefName,isDraft")
-    if not data:
-        return {}
-    out: dict[str, tuple[int, bool]] = {}
-    for entry in data:
-        branch = entry.get("headRefName")
-        if not branch:
-            continue
-        number = int(entry.get("number"))
-        is_draft = bool(entry.get("isDraft", False))
-        existing = out.get(branch)
-        if existing is not None and not existing[1] and is_draft:
-            continue
-        out[branch] = (number, is_draft)
-    return out
-
-
-def _unresolved_review_threads(pr_number: int, cwd: str):
-    """Non-outdated, unresolved review threads for a PR (BOU-1587 AC #4).
-
-    Outdated threads (the code they pointed at changed) and resolved threads are
-    excluded — they are not actionable feedback.
-    """
-    from . import github_api  # noqa: PLC0415
-
-    threads = github_api.get_review_threads(pr_number, cwd)
-    return [t for t in threads if not t.is_resolved and not t.is_outdated]
-
-
-def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
-    """True if the PR has at least one non-outdated, unresolved review thread.
-
-    Used to keep a PR out of any ready-to-merge batch even when CI is green
-    (BOU-1587 AC #4). Outdated threads (the code they pointed at changed) and
-    resolved threads do not count.
-    """
-    return bool(_unresolved_review_threads(pr_number, cwd))
-
-
-def _review_comments_from_threads(threads) -> list:
-    """Build ReviewComment records from review threads so the maintenance prompt
-    can render file/line/body details (PR #16 review round 2, P2).
-
-    Mirrors the inline-thread shape `github_api.get_unaddressed_comments`
-    produces, so a thread surfaced by the authoritative `_unresolved_review_threads`
-    check is hydrated identically to one that came through the normal path.
-    """
-    from .models import ReviewComment  # noqa: PLC0415
-
-    out = []
-    for t in threads:
-        top = t.top
-        out.append(ReviewComment(
-            id=top.database_id,
-            author=top.author,
-            body=top.body,
-            path=top.path,
-            line=top.line,
-            created_at=top.created_at,
-            is_inline=True,
-            thread_id=t.node_id,
-        ))
-    return out
+def _cmd_check(args: argparse.Namespace) -> int:
+    code, text = _check_worktree(args.cwd, args.session_id or "")
+    print(text)
+    return code
 
 
 def _cmd_arm(args: argparse.Namespace) -> int:
-    """Explicitly register a worktree's open non-draft PR under a session.
-
-    The deterministic counterpart to the PostToolUse hook for PRs opened by
-    DISPATCHED SUB-AGENTS (whose `gh pr create` never fires the parent's hook):
-    an orchestrator calls this for each sub-agent worktree so the parent's
-    `/pr-maintenance-check` loop picks it up via `list-owned` (BOU-1442).
-    """
+    """Explicitly register a worktree's open non-draft PR under a session."""
     cwd = os.path.abspath(args.cwd)
     session_id = args.session_id
     pid = args.pid if args.pid is not None else _resolve_owner_pid()
@@ -780,15 +166,9 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     if pr_number is None:
         explicit_branch = getattr(args, "branch", None)
         if explicit_branch:
-            # `gh` accepts `<owner>:<branch>` for --head, but `gh pr list --head`
-            # rejects the owner qualifier — strip it before resolving.
             explicit_branch = explicit_branch.split(":", 1)[-1]
         current_branch = _current_branch(cwd)
         if explicit_branch and explicit_branch != current_branch:
-            # The marker/ledger are written for THIS cwd, whose checked-out
-            # branch resolves the PR on later `check --cwd`. Arming a branch that
-            # isn't checked out here would mark the wrong worktree, so decline —
-            # the worktree that actually holds the branch will arm it.
             print(
                 f"branch {explicit_branch} is not checked out in {cwd}; not arming"
             )
@@ -806,10 +186,6 @@ def _cmd_arm(args: argparse.Namespace) -> int:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
     else:
-        # Explicit --pr honors the draft gate, FAIL CLOSED: only arm when gh
-        # positively confirms the PR is NOT a draft. If the status can't be
-        # determined (gh down / unauthenticated), decline rather than risk arming
-        # a draft (PR #1949 review follow-up).
         status = _pr_draft_status(cwd, int(pr_number))
         if status is None:
             print(f"could not verify PR #{pr_number} is non-draft (gh unavailable); not arming")
@@ -817,10 +193,6 @@ def _cmd_arm(args: argparse.Namespace) -> int:
         if status:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
-        # The marker is written for cwd, whose current branch resolves the PR on
-        # later `check --cwd`. Only arm an explicit --pr when the cwd is actually
-        # on that PR's head branch; otherwise a `gh pr ready 123` from an
-        # unrelated checkout would shadow the real owner (codex PR #21 review).
         head_branch = _pr_head_branch(cwd, int(pr_number))
         if head_branch is None:
             print(f"could not verify PR #{pr_number}'s head branch (gh unavailable); not arming")
@@ -834,416 +206,24 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     if _write_arm_marker(cwd, session_id, int(pid), int(pr_number)):
         print(f"armed PR #{pr_number} for session {session_id} in {cwd}")
         return 0
-    # A failed marker write means the registration did NOT take — exit non-zero
-    # so the calling automation can detect it and retry/stop (PR #1949 review).
     print(f"could not write arm marker in {cwd}", file=sys.stderr)
     return 1
 
 
-def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tuple[int, str]:
-    """Read-only blocker check for ONE worktree. Returns ``(exit_code, text)``.
-
-    The single shared core of the ``check`` CLI and the ``stop-gate`` Stop hook:
-      * 0  — clean / deferred-to-live-owner / no PR / draft (``text`` explains).
-      * 2  — gh unavailable.
-      * 10 — work pending; ``text`` is the self-contained maintenance prompt
-             (ending in ``PR_NUMBER=<n>``).
-
-    READ-ONLY except for the owner heartbeat/lease stamp (same as before the
-    extraction). ``check`` prints ``text`` and returns the code; ``stop-gate``
-    aggregates the exit-10 texts across owned worktrees.
-
-    ``claim`` controls whether a found-work path creates an agent-coordinator
-    claim. The ``check`` CLI (loop dispatch) claims so the loop owns the fix and
-    later heartbeats/releases it. The Stop-hook ``stop-gate`` path is PASSIVE —
-    it only prints a prompt to the interactive session and never releases — so it
-    passes ``claim=False``; a stop-gate-created claim would survive the idle
-    session and suppress the very work it just surfaced on the next Stop attempt
-    (codex P1). When ``claim=False`` the active-claim suppression check below is
-    also skipped so the passive probe always reports the pending work.
-    """
-    from . import coordinator, github_api, maintenance  # noqa: PLC0415
-
-    cwd = os.path.abspath(cwd)
-
-    # Ownership gate — defer to a live, actively-looping in-session owner before
-    # doing any work (cheap, before resolving the PR). See _live_foreign_owner.
-    owner = _live_foreign_owner(cwd, self_session_id)
-    if owner is not None:
-        return 0, f"deferring to live PR-watch owner session {owner}"
-
-    # Resolve PR
-    pr = _resolve_pr_for_branch(cwd)
-
-    if pr is _GH_UNAVAILABLE:
-        return 2, _gh_unavailable_message(cwd)
-    if pr is None:
-        return 0, "no open PR for this branch"
-
-    # Never service a DRAFT — the author marked it not-ready. This guards the
-    # case where a PR was armed while open and later converted to draft
-    # (arm/reconcile already refuse to arm a draft in the first place; this is
-    # defense-in-depth on the read path, PR #1949 review).
-    if pr.is_draft:
-        return 0, "PR is a draft; nothing pending"
-
-    # Check for blockers — no state written, purely read
-    blockers = maintenance.blockers_for_pr(pr)
-
-    # `blockers_for_pr` derives review_comments from get_unaddressed_comments
-    # (comments since the latest commit), which misses an OLD non-outdated
-    # unresolved review thread on a PR with green CI and no new comments — that PR
-    # would read as CLEAN despite needing work (PR #16 review, P2). Consult review
-    # threads directly when nothing else flags it, so the ready/clean path honors
-    # AC #4. Gated on `not blockers` so it adds at most one gh call on a
-    # would-be-clean tick. Outdated threads are already filtered out of
-    # review_comments at the source (get_unaddressed_comments), so an outdated-only
-    # thread leaves `blockers` empty here and `_unresolved_review_threads` (which
-    # also drops outdated) returns nothing — the PR stays clean (PR #16 review
-    # round 2, P2).
-    if not blockers:
-        unresolved_threads = _unresolved_review_threads(pr.number, cwd)
-        if unresolved_threads:
-            # Hydrate the threads into review_comments so build_maintenance_prompt
-            # renders the file/line/body the agent needs — otherwise the stop gate
-            # blocks with an empty Review Comments section (PR #16 review round 2,
-            # P2).
-            pr.review_comments = _review_comments_from_threads(unresolved_threads)
-            blockers = ["review_comments"]
-
-    if not blockers:
-        # Clean check: refresh the alive heartbeat (hold ownership) and clear any
-        # stale fix lease. But if THIS marker is ours yet a live independent owner
-        # is present, it's a stolen marker — refreshing its heartbeat would force
-        # the real owner through `_live_foreign_owner` to defer to us until the
-        # TTL, so review/CI that arrives just after this tick isn't healed
-        # promptly (PR #7 review, P2). Skip the refresh so the stolen marker goes
-        # stale. The scan runs only when the marker is ours (the sole case
-        # `_touch_owner_heartbeat` would write), so a clean tick on someone
-        # else's worktree stays cheap.
-        if _marker_session_id(cwd) == self_session_id and _live_independent_owner_paths(
-            [cwd], self_session_id
-        ):
-            return 0, "stale stolen marker; deferring to live independent owner"
-        _touch_owner_heartbeat(cwd, self_session_id, False)
-        return 0, "nothing pending"
-
-    # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
-    # heartbeat/lease (BOU-1540). A live independent session may own this
-    # worktree without a fresh marker (arming is opt-in, and the marker/registry
-    # id namespaces are disjoint), so `_live_foreign_owner` above (marker-only)
-    # misses it. This also HEALS an already-stolen marker (our id wrongly on a
-    # sibling) and makes a mistaken loop fallback to a foreign cwd safe — both
-    # defer here. Crucially this runs BEFORE the heartbeat/lease write: stamping
-    # a fresh heartbeat on a stolen marker and THEN deferring would make the real
-    # owner / detached loop defer to the session that just declined to work,
-    # pinning the PR every tick (PR #7 review, P2). The ps/lsof scan runs only on
-    # this work-found path; the owner set excludes us, so our own worktree falls
-    # through and IS serviced.
-    if _live_independent_owner_paths([cwd], self_session_id):
-        return 0, "deferring to live independent owner of this worktree"
-
-    owner_session_id = self_session_id or f"pid:{_resolve_owner_pid()}"
-
-    coordinator_claim_id: str | None = None
-    coordinator_fingerprint: str | None = None
-    if claim:
-        # Claim-FINGERPRINT gating (BOU-1637): a same-fingerprint active claim is
-        # the same blocker set already in flight — defer. But NEW feedback (a
-        # different blocker fingerprint: round-2 review threads, a fresh CI break)
-        # must NOT be suppressed by the round-1 claim. The coordinator keys claims
-        # by the FULL task identity (task_id + fingerprint), so look up the active
-        # claim by task_id alone and compare: only defer when the in-flight claim's
-        # fingerprint EQUALS the live one. Observed: round-2 Codex threads arrived
-        # while the round-1 dispatch claim was still leased, and `check` deferred
-        # with "claim is active" for up to the 30-min lease.
-        #
-        # The fingerprint hashes pr.review_comments, but the unresolved-thread
-        # hydration above ran ONLY when the PR was otherwise clean (`not blockers`).
-        # When round-1 left another blocker active (CI / merge conflict), a newly-
-        # arrived review thread never entered review_comments, so the fingerprint
-        # didn't change and the round-1 claim masked it — the exact observed bug.
-        # Merge the live unresolved threads in here (by comment id, last wins) so
-        # the fingerprint always reflects new review feedback regardless of which
-        # other blockers are present.
-        thread_comments = _review_comments_from_threads(
-            _unresolved_review_threads(pr.number, cwd)
-        )
-        if thread_comments:
-            merged = {c.id: c for c in pr.review_comments}
-            for c in thread_comments:
-                merged.setdefault(c.id, c)
-            pr.review_comments = list(merged.values())
-
-        live_fingerprint = coordinator.fingerprint_for_pr(pr)
-        active_fingerprint = coordinator.active_claim_fingerprint_for_pr(pr)
-        new_feedback = (
-            active_fingerprint is not None and active_fingerprint != live_fingerprint
-        )
-
-        coord_decision = coordinator.dispatch_decision_for_pr(pr)
-        if not coord_decision.should_dispatch and not new_feedback:
-            return 0, f"deferring to agent-coordinator {coord_decision.state}: {coord_decision.reason}"
-
-        claimed = coordinator.claim_pr(
-            pr,
-            session_id=owner_session_id,
-            pid=_resolve_owner_pid(),
-            agent="agentic-pr-dash-check",
-            lease_seconds=_fix_lease_seconds(),
-        )
-        if claimed is None and not new_feedback:
-            return 0, "deferring to active agent-coordinator claim"
-        if claimed is not None:
-            coordinator_claim_id = claimed.claim_id
-            coordinator_fingerprint = claimed.task.fingerprint
-
-        # We will service: refresh the heartbeat and set the long fix lease (a
-        # tick-less fix phase is about to start).
-        _touch_owner_heartbeat(cwd, self_session_id, True)
-
-    # Fetch failed CI logs
-    logs: dict[str, str] = {}
-    if pr.failing_checks:
-        logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
-
-    prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    text = f"{prompt}\nPR_NUMBER={pr.number}"
-    if coordinator_claim_id is not None:
-        text += (
-            f"\nCOORDINATOR_CLAIM_ID={coordinator_claim_id}"
-            f"\nCOORDINATOR_TASK_FINGERPRINT={coordinator_fingerprint}"
-        )
-    return 10, text
-
-
-def _cmd_check(args: argparse.Namespace) -> int:
-    code, text = _check_worktree(args.cwd, args.session_id or "")
-    # Preserve the historical stdout shape: the prompt is printed with a single
-    # trailing newline (print adds it); the non-10 messages are one-liners.
-    print(text)
-    return code
-
-
-def _iter_worktrees_with_branch(cwd: str):
-    """Yield (path, branch) for non-bare, non-locked worktrees from `git worktree list`.
-
-    Stdlib only — no heavy imports — so the subcommand runs deps-free. Each
-    porcelain block is delimited by a blank line; ``bare`` and ``locked`` lines
-    mark entries we must skip (the bare repo and agent-locked worktrees are not
-    candidates for session ownership). ``branch`` is the short name (``refs/heads/``
-    stripped), or "" for a detached HEAD.
-    """
-    try:
-        result = subprocess.run(
-            ["git", "-C", cwd, "worktree", "list", "--porcelain"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return
-    if result.returncode != 0:
-        return
-
-    path: str | None = None
-    branch = ""
-    bare = False
-    locked = False
-    for line in result.stdout.splitlines():
-        if line.startswith("worktree "):
-            path = line[len("worktree ") :]
-            branch = ""
-            bare = False
-            locked = False
-        elif line.startswith("branch "):
-            ref = line[len("branch ") :]
-            branch = ref[len("refs/heads/") :] if ref.startswith("refs/heads/") else ref
-        elif line == "bare":
-            bare = True
-        elif line == "locked" or line.startswith("locked "):
-            locked = True
-        elif line == "":
-            if path and not bare and not locked:
-                yield path, branch
-            path = None
-            branch = ""
-            bare = False
-            locked = False
-    if path and not bare and not locked:
-        yield path, branch
-
-
-def _iter_worktree_paths(cwd: str):
-    """Yield non-bare, non-locked worktree paths (branch-agnostic wrapper)."""
-    for path, _branch in _iter_worktrees_with_branch(cwd):
-        yield path
-
-
-def _marker_session_id(worktree_path: str) -> str | None:
-    """Return the ``session_id=`` value from a worktree's pr-watch marker.
-
-    Returns None when the marker is absent/unreadable or carries no session_id
-    line (legacy markers written before session stamping count as unowned).
-    """
-    marker = _marker_path(worktree_path)
-    try:
-        with open(marker, encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.strip()
-                if line.startswith("session_id="):
-                    return line[len("session_id=") :]
-    except OSError:
-        return None
-    return None
-
-
-def _resolve_maintenance_roots(anchor_cwd: str) -> list[str]:
-    """``[anchor] + configured maintenance_repo_roots``, existing git repos only.
-
-    The anchor (the super-repo, e.g. gaia) supplies the root list via its own
-    ``agentic-pr-dash.toml`` (``maintenance_repo_roots``). Each returned root is
-    then discovered with its OWN ``git worktree list`` and — at the per-worktree
-    layer — resolves its OWN per-repo config, so state/markers never bleed across
-    repos (BOU-1546, extends the BOU-1540 ``config_cwd`` pattern).
-
-    Roots that don't exist or aren't git worktrees are skipped (a registered repo
-    that isn't checked out on this machine must not abort the others). Order is
-    anchor-first, then config order; duplicates are collapsed.
-    """
-    anchor = os.path.abspath(os.path.expanduser(anchor_cwd))
-    cfg = load_config(anchor)
-    out: list[str] = []
-    seen: set[str] = set()
-    for cand in (anchor, *getattr(cfg, "maintenance_repo_roots", ())):
-        ab = os.path.abspath(os.path.expanduser(str(cand)))
-        if ab in seen:
-            continue
-        try:
-            probe = subprocess.run(
-                ["git", "-C", ab, "worktree", "list", "--porcelain"],
-                capture_output=True, text=True, timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            continue
-        if probe.returncode != 0:
-            continue
-        seen.add(ab)
-        out.append(ab)
-    return out
-
-
-def _maint_roots_for(anchor_cwd: str) -> list[str]:
-    """Roots to service from ``anchor_cwd``, with the anchor ALWAYS included.
-
-    ``_resolve_maintenance_roots`` existence-filters every candidate (so an
-    unregistered/uncloned sibling is skipped), but the anchor must be serviced
-    even when it isn't a git worktree — its own discovery handles that — so the
-    single-repo behavior is preserved when no roots are configured (BOU-1546).
-    """
-    cwd = os.path.abspath(os.path.expanduser(anchor_cwd))
-    resolved = _resolve_maintenance_roots(cwd)
-    return resolved if cwd in resolved else [cwd, *resolved]
-
-
-def _owned_worktrees_across_roots(session_id: str, anchor_cwd: str) -> list[str]:
-    """Owned worktrees across ``[anchor] + maintenance_repo_roots`` (deduped).
-
-    Shared by the stop-gate and the feedback waiter so a super-repo (gaia)
-    surfaces — and the spawned waiter actually polls — PRs it owns in sibling
-    repos, not just the anchor checkout (BOU-1546; codex PR #30 review P1)."""
-    owned: list[str] = []
-    seen: set[str] = set()
-    for root in _maint_roots_for(anchor_cwd):
-        for wt in _collect_stop_gate_worktrees(session_id, root):
-            if wt not in seen:
-                seen.add(wt)
-                owned.append(wt)
-    return owned
-
-
-def _detached_records_across_roots(session_id: str, anchor_cwd: str) -> list[dict]:
-    """Detached-ledger records across all roots, deduped by ``(root, pr)``.
-
-    Each repo's ledger is queried per root. PR numbers are unique only WITHIN a
-    repo, so dedupe on ``(root, pr)`` — a blocking ``#42`` in one repo must not
-    suppress a different ``#42`` in a sibling (codex PR #30 review, P2)."""
-    roots = _maint_roots_for(anchor_cwd)
-    # Legacy pruning is only UNSAFE when more than one root is probed: with a
-    # single root the repo is unambiguous, so a merged/closed legacy row should
-    # still be pruned (preserving the pre-BOU-1546 single-root behavior — a normal
-    # checkout must not accumulate stale legacy rows re-queried every tick, codex
-    # PR #32 P3). With multiple roots a same-number closed PR on one remote must
-    # not delete a row open on another, so legacy is never pruned.
-    prune_legacy = len(roots) <= 1
-    records: list[dict] = []
-    seen: set[tuple[str, int]] = set()
-    for root in roots:
-        # A repo-less LEGACY entry's true repo is unknown, so it must be checked
-        # against EVERY root to surface a sibling-owned PR (anchor-only reads hide a
-        # sibling PR when the anchor has the same number closed — codex PR #32 P2b).
-        # Dedup by (root, pr) — numbers are unique only within a repo, so the SAME
-        # number in two repos stays distinct (codex PR #30, P2).
-        for r in _detached_pr_records(session_id, root, include_legacy=True,
-                                      prune_legacy=prune_legacy):
-            key = (root, r["pr"])
-            if key in seen:
-                continue
-            seen.add(key)
-            records.append(r)
-    return records
-
-
 def _cmd_list_owned(args: argparse.Namespace) -> int:
-    """Print worktree paths this session owns — markered OR reconciled-and-adopted.
-
-    The single shared, unit-testable home for "which worktrees does THIS session
-    own". Both the standalone codex loop and the in-session Claude skill consume
-    it to scope discovery, so one session's loop never services another's PRs.
-
-    Two sources (BOU-1442):
-      1. worktrees already carrying our `session_id=` marker (the original
-         behavior — PRs the arming hook stamped for us).
-      2. RECONCILIATION: sibling worktrees under the same worktrees-root whose
-         branch has an open NON-DRAFT @me PR but are UNOWNED (no live foreign
-         owner). These are adopted — we stamp the marker with our session id/pid,
-         then print them. This is the auto/crash-recovery path that catches PRs
-         opened by dispatched sub-agents, whose `gh pr create` never fired the
-         parent session's PostToolUse arming hook so no marker was ever written.
-
-    Adoption only ever targets UNOWNED worktrees (the same condition `check` uses
-    to decide it may service one), so the pid/heartbeat ownership gate still
-    yields exactly one executor per PR — no cross-session double-servicing.
-
-    BOU-1546: when the anchor config registers ``maintenance_repo_roots``, this
-    aggregates owned worktrees across ``[anchor] + roots`` — each root discovered
-    with its own ``git worktree list`` — so a super-repo (gaia) surfaces PRs it
-    owns in sibling repos. The anchor's exit-code contract is preserved (rc 3 only
-    when the ANCHOR itself isn't a git worktree, so the loop's per-cwd fallback
-    still fires); a sibling-root discovery failure warns but does not abort.
-    """
+    """Print worktree paths this session owns — markered OR reconciled-and-adopted."""
     anchor = os.path.abspath(os.path.expanduser(args.cwd))
     seen: set[str] = set()
     anchor_failed = False
-    # Always ATTEMPT the anchor (even if it's not a git worktree) so its failure
-    # yields rc 3 and the loop's per-cwd fallback fires; _resolve_maintenance_roots
-    # would otherwise silently drop a failing anchor.
     resolved = _resolve_maintenance_roots(args.cwd)
     roots = resolved if anchor in resolved else [anchor, *resolved]
     for root in roots:
-        # Surface a REAL discovery failure (root is missing / not a git worktree).
-        # Otherwise `_iter_worktrees_with_branch` swallows the git error and yields
-        # nothing, so an empty result is indistinguishable from "owns nothing" —
-        # and the loop, which treats rc-0-empty as authoritative, would service
-        # nothing for that repo instead of falling back to its root (PR #7, P2).
         try:
             probe = subprocess.run(
                 ["git", "-C", root, "worktree", "list", "--porcelain"],
                 capture_output=True, text=True, timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
-            # A hung/unresponsive git invocation is itself a discovery failure —
-            # match the 10s bound `_iter_worktrees_with_branch` uses.
             print(f"list-owned: worktree probe failed/timed out: {root}", file=sys.stderr)
             if root == anchor:
                 anchor_failed = True
@@ -1257,408 +237,7 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
             if path not in seen:
                 seen.add(path)
                 print(path)
-    # rc 3 only when the ANCHOR itself failed (the loop's per-cwd fallback relies
-    # on it); sibling-root failures are non-fatal and already warned above.
     return 3 if anchor_failed else 0
-
-
-def _self_pid_chain(max_depth: int = 16) -> set[int]:
-    """PIDs of this process and its ancestors (toward init).
-
-    Used to recognize OUR OWN session among discovered worktree owners,
-    independent of session-id namespace or process `comm`: the in-session
-    stop-gate / loop runs `check` as a descendant of the very Claude/Codex
-    session that owns the worktree, so that session's pid is in this chain.
-    Comparing against a single resolved owner pid is unreliable — the wrapper
-    (`node …/claude`) and `comm`-walk pid sources disagree (PR #7 review, P2).
-    """
-    pids: set[int] = set()
-    pid = os.getpid()
-    for _ in range(max_depth):
-        if pid <= 1 or pid in pids:
-            break
-        pids.add(pid)
-        try:
-            out = subprocess.run(
-                ["ps", "-o", "ppid=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=3,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            break
-        parent = out.stdout.strip()
-        if not parent.isdigit():
-            break
-        pid = int(parent)
-    return pids
-
-
-def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
-    """Subset of ``paths`` where a LIVE INDEPENDENT session is present.
-
-    This is the liveness signal the marker gates MISS: an independent session
-    that is alive on the worktree but whose pr-watch marker is absent, stale, or
-    not looping. The pr-watch MARKER is deliberately NOT consulted here:
-
-      * an armed-and-looping marker is already handled by `_live_foreign_owner`
-        (called first in `_check_worktree`) and `_marker_live_foreign_pid` (in
-        the reconciliation branch); and
-      * a live-pid-but-stale/idle marker is intentionally TAKEOVER-ABLE per the
-        existing contract (`_live_foreign_owner` / test_stale_heartbeat_no_lease
-        _takes_over) — treating it as owned here would let an armed-but-not-
-        looping editor session pin its blockers forever (PR #7 review, P2).
-
-    Two signals, correlated by ``worktree_path``:
-
-      1. a registry session for the path, non-terminal + pid-alive (NOT CPU-gated,
-         so an idle owner still counts) whose pid/session isn't ours;
-      2. an interactive feature-pipeline process whose cwd is the path, alive but
-         possibly idle (`min_cpu=0.0`) — catches a session that never registered.
-
-    Config (registry path + CLI ``discovery_names``) is resolved from EACH
-    CANDIDATE worktree's own ``agentic-pr-dash.toml``, not the caller's cwd, so a
-    sibling worktree that points its registry elsewhere or recognizes a custom
-    CLI is still checked correctly (PR #7 review, P2). To keep this O(registry)
-    rather than O(worktrees × registry), registry summaries are cached per
-    distinct registry path and indexed by worktree_path. Our own session is
-    excluded via the ancestor-pid chain AND an exact session-id match, so a
-    genuinely-orphaned worktree (sub-agent PR / crashed session) is never treated
-    as owned — preserving BOU-1442 pickup and crash recovery.
-    """
-    from . import agents, session_registry  # noqa: PLC0415
-
-    candidates = list(dict.fromkeys(os.path.abspath(p) for p in paths if p))
-    if not candidates:
-        return set()
-
-    self_pids = _self_pid_chain()
-    # Per-candidate config (load_config is lru-cached): registry path + allow-list.
-    reg_of = {c: session_registry.registry_path(c) for c in candidates}  # Path objects
-    clis_of = {c: set(load_config(c).discovery_names) for c in candidates}
-    owned: set[str] = set()
-
-    # 1) registry — summarize each DISTINCT registry path once (dedupe by string,
-    #    pass the Path), index live candidate-eligible states by worktree_path
-    #    (path-independent filters only), then apply the per-candidate CLI
-    #    allow-list at lookup.
-    distinct_regs = {str(reg_of[c]): reg_of[c] for c in candidates}
-    index_by_reg: dict[str, dict[str, list]] = {}
-    for reg_str, reg_path in distinct_regs.items():
-        summary = session_registry.summarize_sessions(path=reg_path)
-        idx: dict[str, list] = {}
-        for state in summary.sessions.values():
-            if state.is_terminal:
-                continue
-            if state.launch_source in session_registry.DASHBOARD_LAUNCH_SOURCES:
-                continue
-            if not state.is_feature_pipeline:
-                continue
-            if self_session_id and state.session_id == self_session_id:
-                continue
-            if state.pid in self_pids:
-                continue
-            if not session_registry.pid_is_live(state.pid):
-                continue
-            if state.worktree_path:
-                idx.setdefault(os.path.abspath(state.worktree_path), []).append(state)
-        index_by_reg[reg_str] = idx
-    for c in candidates:
-        states = index_by_reg[str(reg_of[c])].get(c, [])
-        if any(s.cli in clis_of[c] for s in states):
-            owned.add(c)
-
-    # 2) a live interactive feature-pipeline PROCESS sitting on the worktree —
-    #    catches a session that never registered. Liveness, not activity
-    #    (min_cpu=0.0). ONE batched ps/lsof scan with the UNION of candidate
-    #    allow-lists, then filter the returned agents by EACH candidate's own
-    #    allow-list (AgentProcess carries cli_name) so a custom-CLI owner isn't
-    #    missed and an excluded one isn't counted (PR #7 review, P2).
-    remaining = [p for p in candidates if p not in owned]
-    if remaining:
-        union_clis: set[str] = set()
-        for c in remaining:
-            union_clis |= clis_of[c]
-        by_path = agents.discover_primary_feature_pipeline_agents(
-            remaining, min_cpu=0.0, discovery_names=union_clis
-        )
-        for path, agent_list in by_path.items():
-            abs_path = os.path.abspath(path)
-            allow = clis_of.get(abs_path, union_clis)
-            if any(a.pid not in self_pids and a.cli_name in allow for a in agent_list):
-                owned.add(abs_path)
-
-    return owned
-
-
-def _collect_owned_worktrees(
-    session_id: str, cwd: str, pid: int | None
-) -> list[str]:
-    """Return the worktree paths this session owns — markered OR adopted.
-
-    Extracted from ``_cmd_list_owned`` so the ``stop-gate`` Stop hook can scope
-    its block to the same set the CLI prints. Behavior is unchanged: emit order
-    is `git worktree list` order, with reconciliation adopting unowned sibling
-    PR worktrees (BOU-1442). Returns [] when no session_id is given.
-    """
-    cwd = os.path.abspath(cwd)
-    if not session_id:
-        return []
-    eff_pid = pid if pid is not None else _resolve_owner_pid()
-
-    # One repo-wide gh call; {} when gh is unavailable → reconciliation is simply
-    # skipped (the markered pass below still works deps-free).
-    pr_map = _list_my_open_prs(cwd)
-
-    result: list[str] = []
-    seen: set[str] = set()
-
-    def _emit(path: str) -> None:
-        if path not in seen:
-            seen.add(path)
-            result.append(path)
-
-    # `git worktree list` is already scoped to THIS repo's worktree pool (wherever
-    # they live on disk — a sibling `<repo>-worktrees/` dir for bug-bash, or
-    # alongside the launch worktree for feature-pipeline), so it is the correct
-    # candidate set. We deliberately do NOT additionally filter by the caller's
-    # parent directory: bug-bash runs this from the MAIN repo while its sub-agent
-    # worktrees live under `<repo>-worktrees/`, so a dirname filter would silently
-    # skip exactly the PRs we must adopt. Cross-session safety comes from the
-    # live-independent-owner gate below, not from paths.
-    candidates = list(_iter_worktrees_with_branch(cwd))
-
-    # Compute the live-independent-owner set ONCE for every candidate path (not
-    # per-path) so a large worktree pool doesn't multiply the ps/lsof scan
-    # (BOU-1540, PR #7 review, P2).
-    independent = _live_independent_owner_paths(
-        [path for path, _branch in candidates], session_id
-    )
-
-    for worktree_path, branch in candidates:
-        abs_path = os.path.abspath(worktree_path)
-        # A live INDEPENDENT session owns this worktree (registry/process/marker,
-        # path-correlated). Never list it — even when our own marker is on it:
-        # that marker is a prior bad adoption (the observed stuck state), and
-        # emitting it here would keep us servicing a sibling ticket's PR
-        # (BOU-1540, PR #7 review, P1). The owner set already excludes us.
-        if abs_path in independent:
-            continue
-        # 1) already ours (and not contested above)
-        if _marker_session_id(worktree_path) == session_id:
-            _emit(worktree_path)
-            continue
-        # 2) reconciliation — adopt an unowned PR worktree
-        if not pr_map:
-            continue
-        pr = pr_map.get(branch)
-        if pr is None:
-            continue
-        number, is_draft = pr
-        if is_draft:
-            continue
-        # UNOWNED = no marker with a LIVE foreign pid. Use the strict pid check
-        # (not _live_foreign_owner, which also wants a fresh heartbeat) so we do
-        # NOT steal a session that JUST armed its PR but hasn't ticked yet
-        # (PR #1949 review, P1). A dead pid (crashed session) or no marker at all
-        # (sub-agent PR) is still adopted.
-        if _marker_live_foreign_pid(worktree_path, session_id):
-            continue
-        if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
-            _emit(worktree_path)
-    return result
-
-
-def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
-    """Return marker-owned worktrees for passive Stop-hook gating.
-
-    Unlike `_collect_owned_worktrees`, this does NOT reconcile/adopt unmarked
-    open `@me` PR worktrees. Adoption is an explicit orchestration/recovery
-    action for `list-owned`; a Stop hook runs when a session is trying to go
-    idle and must only block on PRs already armed by that same session.
-    """
-    cwd = os.path.abspath(cwd)
-    if not session_id:
-        return []
-
-    candidates = list(_iter_worktrees_with_branch(cwd))
-    independent = _live_independent_owner_paths(
-        [path for path, _branch in candidates], session_id
-    )
-
-    result: list[str] = []
-    seen: set[str] = set()
-    for worktree_path, _branch in candidates:
-        abs_path = os.path.abspath(worktree_path)
-        if abs_path in independent:
-            continue
-        if _marker_session_id(worktree_path) != session_id:
-            continue
-        if worktree_path not in seen:
-            seen.add(worktree_path)
-            result.append(worktree_path)
-    return result
-
-
-def _mark_maintenance_complete(maintenance, cwd: str, pr_number: int) -> None:  # type: ignore[no-untyped-def]
-    """Best-effort: write COMPLETE to the on-disk maintenance state.
-
-    Allows the orchestrator's already_queued guard to see a non-QUEUED state
-    on the next poll and re-dispatch PIPELINE_HANDOFF.md when blockers remain
-    (BOU-1408).  Swallows all errors — completion marking is advisory; missing
-    it delays (but does not prevent) re-dispatch via blocker-set changes.
-    """
-    try:
-        from .models import MaintenanceStatus  # noqa: PLC0415
-
-        state = maintenance.load_state(cwd, pr_number)
-        if state is not None:
-            maintenance.mark_state(state, MaintenanceStatus.COMPLETE)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _commit_subject(message: str) -> str:
-    """First non-empty line of a commit message, trimmed."""
-    for line in message.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped
-    return message.strip()
-
-
-def _completion_reply_body(
-    marker: str,
-    path: str | None,
-    commits_by_file: dict[str, list[tuple[str, str]]],
-    all_commits: list[tuple[str, str]],
-) -> str:
-    """Build a substantive completion reply that cites the fixing commit(s).
-
-    Instead of a generic "addressed", name the commit(s) that touched the
-    thread's file (falling back to all of this round's commits for non-inline
-    threads) with their subject lines, so a reviewer can see WHAT addressed the
-    comment, not merely that the thread was closed (ownership-coordination).
-    """
-    cites = commits_by_file.get(path, []) if path else []
-    if not cites:
-        cites = all_commits
-    seen: set[str] = set()
-    unique = [(sha, msg) for sha, msg in cites if not (sha in seen or seen.add(sha))]
-    lines = [marker]
-    if len(unique) == 1:
-        sha, msg = unique[0]
-        lines.append(f"Addressed by the local maintenance loop in {sha[:9]} — {_commit_subject(msg)}.")
-    elif unique:
-        lines.append("Addressed by the local maintenance loop in:")
-        lines.extend(f"- `{sha[:9]}` {_commit_subject(msg)}" for sha, msg in unique[:6])
-    else:
-        lines.append("Addressed by the local maintenance loop.")
-    return "\n".join(lines)
-
-
-# A token that looks like a Python module path (`gaia.api.worker_app`) or a
-# concrete source filename (`worker_app.py`, `backend/src/foo.py`). Used to
-# detect when a review thread asks for a change in a file OTHER than the one it
-# is anchored to (BOU-1641).
-_FILE_REF_RE = re.compile(
-    r"""
-    (?:
-        # Backtick/quote-wrapped or bare path with a source extension.
-        (?P<path>[\w./-]+\.(?:py|pyi|ts|tsx|js|jsx|gd|go|rs|java|kt|rb|c|h|cpp|hpp|sql|sh))
-      |
-        # Dotted module path with >=2 segments, e.g. gaia.api.worker_app.
-        (?P<module>[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*){1,})
-    )
-    """,
-    re.VERBOSE,
-)
-
-# Module-ish tokens that are almost always prose ("e.g.", "i.e.") or punctuation
-# artifacts, not real module references — skip them so they don't make every
-# thread look ambiguous.
-_MODULE_REF_STOPWORDS = frozenset({"e.g", "i.e", "etc"})
-
-
-def _candidate_file_refs(body: str) -> list[str]:
-    """Extract file/module references from a review-thread body.
-
-    Returns a list of normalized candidate tokens — concrete source filenames
-    (``worker_app.py``) and dotted module paths (``gaia.api.worker_app``). Used
-    to decide whether a thread points at a file other than the one it is
-    anchored to.
-    """
-    refs: list[str] = []
-    for m in _FILE_REF_RE.finditer(body or ""):
-        path = m.group("path")
-        if path:
-            refs.append(path)
-            continue
-        module = m.group("module")
-        if module and module.lower() not in _MODULE_REF_STOPWORDS:
-            # A dotted module reference (>=1 dot) only — single-token names like
-            # `foo` are too ambiguous (could be a var/method) to gate on.
-            refs.append(module)
-    return refs
-
-
-def _ref_matches_touched(ref: str, touched: set[str]) -> bool:
-    """True if a body file/module reference plausibly matches a touched path."""
-    if not touched:
-        return False
-    if "/" in ref or ref.endswith(
-        (".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".gd", ".go", ".rs",
-         ".java", ".kt", ".rb", ".c", ".h", ".cpp", ".hpp", ".sql", ".sh")
-    ):
-        # Concrete path/filename: match on suffix or basename.
-        base = ref.rsplit("/", 1)[-1]
-        for t in touched:
-            if t == ref or t.endswith("/" + ref) or t.rsplit("/", 1)[-1] == base:
-                return True
-        return False
-    # Dotted module path: map `a.b.c` -> the file fragment `a/b/c` and the last
-    # segment `c`, and see if any touched file embeds either.
-    segments = ref.split(".")
-    frag = "/".join(segments)
-    last = segments[-1]
-    for t in touched:
-        no_ext = t.rsplit(".", 1)[0]
-        if frag in no_ext:
-            return True
-        if no_ext.rsplit("/", 1)[-1] == last:
-            return True
-    return False
-
-
-def _thread_points_elsewhere(body: str, anchor_path: str | None,
-                             touched: set[str]) -> bool:
-    """True if the thread body references a file/module NOT among ``touched``.
-
-    Such a thread is AMBIGUOUS: a post-baseline commit touched its anchor file,
-    but the requested change plausibly lives in a different (untouched) file. We
-    prefer to leave it OPEN rather than false-resolve real feedback (BOU-1641).
-
-    A reference that resolves to the anchor file itself does not count — the
-    anchor is already implied and (for an inline thread) is in ``touched``.
-    """
-    anchor_base = anchor_path.rsplit("/", 1)[-1] if anchor_path else None
-    for ref in _candidate_file_refs(body):
-        if _ref_matches_touched(ref, touched):
-            continue
-        # Reference to the anchor file itself is not "elsewhere".
-        if anchor_base:
-            ref_base = ref.rsplit("/", 1)[-1]
-            if ref_base == anchor_base:
-                continue
-            if "." in ref and not ref_base.endswith(
-                tuple(f".{ext}" for ext in
-                      ("py", "pyi", "ts", "tsx", "js", "jsx", "gd", "go",
-                       "rs", "java", "kt", "rb", "c", "h", "cpp", "hpp",
-                       "sql", "sh"))
-            ):
-                # Dotted module whose last segment matches the anchor stem.
-                if ref.split(".")[-1] == anchor_base.rsplit(".", 1)[0]:
-                    continue
-        return True
-    return False
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -1669,7 +248,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     cwd = os.path.abspath(args.cwd)
     pr_number_arg = args.pr
 
-    # Resolve PR
     if pr_number_arg is not None:
         pr = _resolve_pr_by_number(int(pr_number_arg), cwd)
     else:
@@ -1685,22 +263,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     resolved_pr_number = pr.number
     head_sha = pr.latest_commit_sha
     head_date = pr.latest_commit_date
-    # The API's view of the head, captured BEFORE the local override below, so
-    # the local-range helper can detect a stale origin/<branch> ref (one that
-    # doesn't yet contain a commit the API already knows) and fall back (BOU-1479).
     api_head_sha = pr.latest_commit_sha
 
-    # Prefer the LOCAL PR-branch head (origin/<branch>, updated on push) over the
-    # GitHub API's lagging view, so resolving works the instant after a push
-    # instead of waiting for the API to index the new head (BOU-1479). The
-    # per-thread `head_date > created_at` guard below otherwise stays false in
-    # that race even when the fix is already pushed.
     local_head_sha, local_head_date = github_api.get_local_pr_head(pr.branch, cwd)
-    # Adopt the local head only when origin/<branch> is FRESH — i.e. it already
-    # contains the API's reported head (the just-pushed case BOU-1479 targets). A
-    # stale local ref (behind a push made elsewhere / not fetched here) would drag
-    # head_date BACKWARDS, leaving threads created after the stale ref but before
-    # the true API head open; in that case keep the API head/date.
     local_is_fresh = bool(local_head_sha) and (
         not api_head_sha
         or github_api._is_ancestor(api_head_sha, local_head_sha, cwd)
@@ -1710,20 +275,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         if local_head_date:
             head_date = local_head_date
 
-    # Verify a fixing push actually landed before resolving anything. The loop
-    # passes --baseline = the PR head SHA captured BEFORE the agent ran, so
-    # `new_commits` is exactly what the agent pushed; without it we fall back to
-    # all PR commits + the per-thread timestamp guard below. This keeps the
-    # worker stateless (no stored ledger) while refusing to resolve threads when
-    # the runtime exited 0 without pushing a fix (or pushed an unrelated change).
     baseline = args.baseline or ""
     new_commits = github_api.get_new_pr_commits(
         resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch,
         api_head_sha=api_head_sha)
     touched: set[str] = set()
-    # file path -> fixing commits that touched it, so the completion reply can
-    # cite the actual commit(s) that addressed each thread (not just a generic
-    # "addressed"), making it clear to the reviewer WHAT changed.
     commits_by_file: dict[str, list[tuple[str, str]]] = {}
     for sha, msg in new_commits:
         try:
@@ -1734,15 +290,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             touched.add(changed)
             commits_by_file.setdefault(changed, []).append((sha, msg))
 
-    # Re-fetch unresolved review threads statelessly from GitHub.
     threads = github_api.get_review_threads(resolved_pr_number, cwd)
     for thread in threads:
         if thread.is_resolved:
             continue
         path = thread.top.path
-        # Addressed only if a commit landed after this comment AND (for inline
-        # threads) touched the commented file. Otherwise leave it open — a
-        # green runtime exit is not proof the feedback was handled.
         addressed = (
             bool(new_commits)
             and head_date > thread.top.created_at
@@ -1750,12 +302,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         )
         if not addressed:
             continue
-        # BOU-1641: touching the ANCHOR file is not proof the requested change
-        # landed. If the thread body asks for a change in a DIFFERENT file/module
-        # that no post-baseline commit touched, the resolution is ambiguous —
-        # leave the thread OPEN (it stays counted by the unresolved-thread check
-        # and re-surfaces in the maintenance prompt) rather than false-resolve
-        # real feedback behind a touched anchor file.
         if _thread_points_elsewhere(thread.top.body, path, touched):
             print(
                 f"info: leaving thread {thread.node_id} open — body references a "
@@ -1764,10 +310,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
             continue
-        # Resolve FIRST; only post the completion marker if resolution actually
-        # succeeded. resolve_review_thread returns False on a rejected/timed-out
-        # mutation — posting COMPLETE_MARKER then would make later `check` calls
-        # skip a thread GitHub still shows open, stranding it.
         try:
             if not github_api.resolve_review_thread(thread.node_id, cwd):
                 print(
@@ -1790,27 +332,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
 
-    # Re-check live blockers AFTER resolving threads. Close the maintenance bead
-    # only when nothing remains — closing it while CI is still failing (or other
-    # comments are unaddressed) would orphan the remaining work with no open bead
-    # for `bd ready` to surface.
     fresh = _resolve_pr_by_number(resolved_pr_number, cwd)
     if fresh is _GH_UNAVAILABLE or fresh is None:
-        remaining = ["unknown"]  # can't confirm cleared → don't close
+        remaining = ["unknown"]
     else:
         remaining = maintenance.blockers_for_pr(fresh)
 
-    # Mark the maintenance state COMPLETE so the orchestrator's already_queued
-    # guard sees a non-QUEUED state on the next poll and re-dispatches when
-    # blockers remain.  Without this the state stays QUEUED indefinitely and the
-    # orchestrator never refreshes PIPELINE_HANDOFF.md (BOU-1408).
     _mark_maintenance_complete(maintenance, cwd, resolved_pr_number)
 
     if remaining:
         print(f"completed (bead left open; blockers remain: {', '.join(remaining)})")
         return 0
 
-    # Best-effort close the open maintenance bead
     branch = pr.branch
     if branch:
         try:
@@ -1827,860 +360,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
-
-
-# ---------------------------------------------------------------------------
-# stop-gate — block-to-address Stop hook core
-# ---------------------------------------------------------------------------
-#
-# Replaces the old model-armed `/loop 3m /pr-maintenance-check` nudge. A Stop
-# hook runs this; on pending review/CI work it prints the maintenance prompt to
-# stderr and returns 2 (the harness surfaces that as a non-ignorable "keep
-# going"), so the SAME session addresses its PR feedback before going idle —
-# deterministic, session-scoped, no cron, no directive the model can ignore.
-# Two guards keep it from over-firing (mirroring pre-completion-pr-status.py):
-#   * a TIME rate-limit (GAIA_PR_WATCH_STOP_INTERVAL, default 180s) so the
-#     expensive gh check runs at most once per window, not every turn; and
-#   * a LOOP-BREAK counter (GAIA_PR_WATCH_STOP_LOOP_THRESHOLD, default 3) that
-#     releases the gate (exit 0) after N identical pending states, so an item
-#     the agent cannot resolve does not trap the session — it can then ask the
-#     user. State lives in <cwd>/<state-dir>/pr-watch.stop-loop.json.
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get("PR_AGENT_OPS_" + name) or os.environ.get("GAIA_PR_WATCH_" + name) or ""
-    try:
-        return int(raw) if raw else default
-    except (TypeError, ValueError):
-        return default
-
-
-def _stop_state_path(cwd: str) -> str:
-    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.stop-loop.json")
-
-
-def _load_stop_state(cwd: str) -> dict:
-    try:
-        with open(_stop_state_path(cwd), encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _save_stop_state(cwd: str, state: dict) -> None:
-    try:
-        path = _stop_state_path(cwd)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(state, fh)
-    except OSError:
-        pass
-
-
-def _read_session_marker(cwd: str) -> str:
-    """Best-effort: read the owning session id from pr-watch.session."""
-    try:
-        with open(
-            str(load_config(cwd).session_marker_for(cwd)),
-            encoding="utf-8",
-        ) as fh:
-            return fh.read().strip()
-    except OSError:
-        return ""
-
-
-def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
-    """Stable hash of the pending (worktree, prompt) set — identical pending
-    state across stops yields the same fingerprint so the loop-break counter can
-    detect "no progress"."""
-    h = hashlib.sha256()
-    for path, text in sorted(pending):
-        h.update(path.encode("utf-8"))
-        h.update(b"\0")
-        h.update(text.encode("utf-8"))
-        h.update(b"\0")
-    return h.hexdigest()
-
-
-def _extract_pr_number(text: str) -> str:
-    """Pull the trailing PR_NUMBER=<n> the check appends, or '' if absent."""
-    for line in reversed(text.splitlines()):
-        if line.startswith("PR_NUMBER="):
-            return line[len("PR_NUMBER=") :].strip()
-    return ""
-
-
-def _build_stop_block(pending: list[tuple[str, str]]) -> str:
-    lines = [
-        "[pr-watch] Open PR(s) you own have pending review/CI work. Address it "
-        "before stopping — commit and push to the EXISTING branch (do not open a "
-        "new PR), then re-stop:\n"
-    ]
-    for path, text in pending:
-        lines.append(f"───── worktree: {path} ─────")
-        lines.append(text)
-        # Detached PRs (worktree torn down) have no real cwd — emitting a
-        # `gh ... --cwd "(no worktree) PR #N"` / `complete --cwd <fake>` command
-        # would be non-executable. The detached text already carries recreate /
-        # hand-off guidance, so skip the per-worktree completion block (PR #16
-        # review, P2).
-        if path.startswith("(no worktree)"):
-            lines.append("")
-            continue
-        # Per-worktree completion command with the EXPLICIT --cwd so a sibling PR
-        # resolved from the launch cwd doesn't mark maintenance state / close the
-        # bead against the wrong worktree path (codex P2).
-        pr_ref = _extract_pr_number(text) or "<N>"
-        lines.append(
-            f"FIRST, before changing anything, capture this worktree's pre-fix "
-            f"baseline head: `gh pr view --json headRefOid -q .headRefOid` (run "
-            f"from {path}). THEN fix + commit + push, and finally:\n"
-            f"  agentic-pr-dash complete "
-            f"--pr {pr_ref} --baseline <that-pre-fix-sha> --cwd {path}\n"
-            f"(Passing the post-fix head as --baseline leaves threads unresolved.)"
-        )
-        lines.append("")
-    return "\n".join(lines)
-
-
-def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
-    """Remove stale ownership artifacts when a marker's PR is authoritatively closed/merged.
-
-    Removes:
-    - The .armed marker file
-    - The pr-watch.stop-loop.json state file
-    - The session ledger entry for this PR (and its claim file)
-    - The persisted maintenance state file (pr-<n>.json) for this PR (BOU-1637)
-
-    ONLY fires when gh answered authoritatively (state in 'merged'|'closed').
-    A network blip (state 'unknown') must NOT prune — that would destroy ownership
-    during a transient gh outage.
-    """
-    pr_raw = marker.get("pr", "")
-    if not str(pr_raw).isdigit():
-        return
-    pr_number = int(pr_raw)
-
-    state, *_ = _pr_open_state(pr_number, cwd)
-    if state not in ("merged", "closed"):
-        return  # open, draft, unknown — do not prune
-
-    # Remove the armed marker (best-effort).
-    try:
-        os.remove(_marker_path(cwd))
-    except OSError:
-        pass
-
-    # Remove the stop-loop state file (best-effort).
-    try:
-        os.remove(_stop_state_path(cwd))
-    except OSError:
-        pass
-
-    # Prune the ledger entry for this PR (best-effort). This also removes the
-    # entry's exclusive-claim file (BOU-1637).
-    try:
-        from . import session_ledger  # noqa: PLC0415
-        target_repo = _repo_slug(cwd)
-        session_ledger.prune(session_id, {pr_number}, repo=target_repo)
-    except Exception:  # noqa: BLE001
-        pass
-
-    # Prune the persisted maintenance state file for the now-closed PR so the
-    # maintenance dir doesn't accumulate a pr-<n>.json per closed PR (BOU-1637).
-    try:
-        from . import maintenance  # noqa: PLC0415
-        maintenance.prune_state(cwd, pr_number)
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _owned_open_pr_numbers(owned: list[str]) -> set[int]:
-    """Collect PR numbers from the armed markers of owned worktrees.
-
-    Used by the stop-gate waiter branch to determine whether the session has
-    any open PRs that need a waiter. Reads markers only — no gh call needed
-    because stale markers are pruned by Task A3 and the stop-gate collects
-    from markers it already trusts.
-    """
-    numbers: set[int] = set()
-    for wt in owned:
-        marker = _read_marker(wt) or {}
-        pr_raw = marker.get("pr", "")
-        if str(pr_raw).isdigit():
-            numbers.add(int(pr_raw))
-    return numbers
-
-
-def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
-    """Render the spawn-waiter prompt shown by the stop-gate when no pending work
-    but the session owns at least one open non-draft PR and no live waiter exists.
-    """
-    pr_list = ", ".join(f"#{n}" for n in sorted(open_prs))
-    cmd = load_config(cwd).await_command.format(cwd=cwd, session_id=session_id)
-    return (
-        f"[pr-watch] You own open PR(s) {pr_list} with no pending feedback right now. "
-        f"Start the feedback waiter IN THE BACKGROUND (run_in_background / detached) so "
-        f"arriving review comments wake this session, then stop again:\n"
-        f"  {cmd}"
-    )
-
-
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
-    # Fail SAFE: this runs on every Stop. A transient git/gh error must never
-    # block the stop (exit 2) or spew a traceback each turn — degrade to exit 0.
     try:
         return _stop_gate_impl(args)
     except Exception:  # noqa: BLE001
         return 0
 
 
-def _stop_gate_impl(args: argparse.Namespace) -> int:
-    cwd = os.path.abspath(args.cwd)
-
-    # --- time rate-limit: skip the expensive gh check if we ran recently -------
-    # ONLY when the previous run was CLEAN. If the last run found blockers
-    # (state carries a fingerprint), a within-window stop must NOT release —
-    # _check_worktree already refreshed this session's fix lease, so going idle
-    # would leave the detached loop deferring to us while the work sits unhandled
-    # (codex P1). Re-check instead (the loop-break counter still bounds blocking).
-    interval = _env_int("STOP_INTERVAL", 180)
-    state = _load_stop_state(cwd)
-    now = time.time()
-    last_pending = bool(state.get("fingerprint"))
-    if interval > 0 and not last_pending and (now - float(state.get("ts", 0) or 0)) < interval:
-        return 0
-    # Record this run's timestamp up-front; preserve any loop counter.
-    _save_stop_state(cwd, {**state, "ts": now})
-
-    # --- scope to owned worktrees ----------------------------------------------
-    # When this session has an identity, service ONLY what it owns. Do NOT fall
-    # back to [cwd]: an empty result can mean the cwd is owned by another LIVE
-    # session (collection skipped it on the foreign-pid check), and servicing it
-    # would let two sessions fix the same PR (codex P2). Fall back to cwd only
-    # when ownership is genuinely unknown (no session identity at all).
-    session_id = args.session_id or _read_session_marker(cwd)
-    # BOU-1546: a super-repo (gaia) aggregates across [anchor] + the configured
-    # maintenance_repo_roots, each root discovered with its own discovery, so PRs
-    # owned in sibling repos still block the stop. The anchor is ALWAYS included
-    # even if it's not a git worktree (its own discovery handles that), so the
-    # existing single-repo behavior is unchanged when no roots are configured.
-    if session_id:
-        owned = _owned_worktrees_across_roots(session_id, cwd)
-    else:
-        owned = [cwd]
-
-    pending: list[tuple[str, str]] = []
-    for worktree in owned:
-        # Passive probe: the stop-gate only prints a prompt back to the
-        # interactive session and never releases a claim, so it must NOT create
-        # an agent-coordinator claim (codex P1) — that claim would outlive the
-        # idle session and suppress this same work on the next Stop attempt.
-        code, text = _check_worktree(worktree, session_id, claim=False)
-        if code == 10:
-            pending.append((worktree, text))
-        elif code == 0 and session_id:
-            # gh answered authoritatively: no open PR for this branch. Prune any
-            # stale armed marker so _owned_open_pr_numbers doesn't demand a waiter
-            # for a merged/closed PR (BOU-1632 codex P2 finding 1).
-            marker = _read_marker(worktree) or {}
-            if str(marker.get("pr", "")).isdigit():
-                _prune_stale_marker(worktree, marker, session_id)
-
-    # BOU-1587/1612: owned PRs whose worktree was torn down are STILL mandatory
-    # work. They have no worktree to _check_worktree, so reconcile them from the
-    # durable ledger and block on any detached blocker with live-path parity.
-    if session_id:
-        # Detached records live in each repo's own ledger, so collect per root
-        # (BOU-1546) — a torn-down sibling PR must still surface. Dedupe by pr.
-        detached = [r for r in _detached_records_across_roots(session_id, cwd)
-                    if _record_has_blockers(r)]
-        detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
-        for r in detached:
-            pending.append(_detached_pending_entry(r))
-
-    if not pending:
-        # Waiter enforcement (BOU-1632): when no pending work but this session
-        # owns open PRs and no live waiter exists, prompt to spawn one. The
-        # loop-break counter reuses the same "need-waiter:<prs>" fingerprint
-        # so 3 identical no-progress states release the gate.
-        if (not getattr(args, "no_waiter", False)) and session_id:
-            # A live machine-wide detached loop services WORKTREE-backed PRs, so
-            # a per-session waiter is redundant for those (BOU-1653).
-            worktree_prs = (
-                set() if _detached_loop_alive(cwd) else _owned_open_pr_numbers(owned)
-            )
-            # Detached-ledger PRs (worktree torn down) are NOT serviced by the
-            # loop — it only polls worktree dirs — so they ALWAYS need a waiter,
-            # even when the loop is live (BOU-1632 codex P2 #3; codex PR #21).
-            # Span all roots so a sibling repo's detached PR still demands a
-            # waiter (codex PR #30 review, P2).
-            detached_prs = set()
-            for _dr in _detached_records_across_roots(session_id, cwd):
-                if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
-                    detached_prs.add(_dr["pr"])
-            open_prs = worktree_prs | detached_prs
-            if open_prs and not _await_alive(cwd, session_id):
-                fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
-                count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
-                _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
-                threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
-                if count < threshold:
-                    print(_build_waiter_block(open_prs, cwd, session_id), file=sys.stderr)
-                    return 2
-                _save_stop_state(cwd, {"ts": now})  # release after threshold
-                return 0
-        # Clear the loop counter but KEEP the timestamp so a clean idle session
-        # does not re-run gh on every single turn.
-        _save_stop_state(cwd, {"ts": now})
-        return 0
-
-    fingerprint = _stop_fingerprint(pending)
-    count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
-    _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
-
-    print(_build_stop_block(pending), file=sys.stderr)
-
-    threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
-    if count >= threshold:
-        print(
-            f"[pr-watch] Same pending PR state seen {count}× with no progress — "
-            f"releasing the stop gate so you can ask the user or take a safe "
-            f"action. A later stop will re-enforce it.",
-            file=sys.stderr,
-        )
-        _save_stop_state(cwd, {"ts": now})  # reset counter, keep the rate-limit ts
-        return 0
-
-    print(
-        "[pr-watch] Address the items above (commit + push to each EXISTING "
-        "branch), run the per-worktree `complete` command shown in that section, "
-        "then try stopping again. If you cannot resolve an item yourself, tell "
-        "the user.",
-        file=sys.stderr,
-    )
-    return 2
-
-
-def _iter_worktree_paths(cwd: str):
-    """Yield abspaths of every worktree in this repo's pool (porcelain)."""
-    try:
-        out = subprocess.run(["git", "-C", cwd, "worktree", "list", "--porcelain"],
-                             capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return
-    if out.returncode != 0:
-        return
-    for line in out.stdout.splitlines():
-        if line.startswith("worktree "):
-            yield os.path.abspath(line[len("worktree "):].strip())
-
-
-def _pr_open_state(pr_number: int, cwd: str):
-    """(state, url, has_failing_ci, failing_checks, review_decision, merge_state, mergeable) for a PR.
-
-    state is 'open' | 'merged' | 'closed' | 'unknown'. Detached-PR live state for
-    reconcile-prs / stop-gate (BOU-1587). gh-unavailable returns empty blocker state.
-    """
-    from . import github_api  # noqa: PLC0415
-    import json as _json  # noqa: PLC0415
-
-    unavailable = ("unknown", "", False, [], "", "", "")
-    try:
-        res = subprocess.run(
-            [
-                "gh", "pr", "view", str(pr_number),
-                "--json", "state,url,isDraft,reviewDecision,mergeStateStatus,mergeable",
-            ],
-            cwd=cwd, capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        return unavailable
-    if res.returncode != 0:
-        return unavailable
-    try:
-        d = _json.loads(res.stdout or "{}")
-    except ValueError:
-        return unavailable
-    state = str(d.get("state", "unknown")).lower()  # OPEN/MERGED/CLOSED
-    # A PR armed while open but later converted to draft is not-ready: surface it
-    # as 'draft' so the detached path skips it, mirroring the live-worktree path's
-    # draft guard (PR #16 review, P2).
-    if state == "open" and bool(d.get("isDraft", False)):
-        state = "draft"
-    url = str(d.get("url", ""))
-    checks = github_api.get_ci_checks(pr_number, cwd)
-    failing = [c.name for c in checks
-               if c.conclusion == "failure" and not github_api._is_infra_check(c.name)]
-    review_decision = str(d.get("reviewDecision") or "")
-    merge_state = str(d.get("mergeStateStatus") or "")
-    mergeable = str(d.get("mergeable") or "")
-    return (state, url, bool(failing), failing, review_decision, merge_state, mergeable)
-
-
-def _unpack_pr_open_state(raw):
-    """Normalize legacy tuples from tests/callers to the current 7-field shape."""
-    if len(raw) == 4:
-        state, url, has_fail, failing = raw
-        return state, url, has_fail, failing, "", "", ""
-    if len(raw) == 6:
-        state, url, has_fail, failing, review_decision, merge_state = raw
-        return state, url, has_fail, failing, review_decision, merge_state, ""
-    state, url, has_fail, failing, review_decision, merge_state, mergeable = raw
-    return state, url, has_fail, failing, review_decision, merge_state, mergeable
-
-
-def _record_has_blockers(record: dict) -> bool:
-    return bool(
-        record["unresolved_threads"]
-        or record["ci_failing"]
-        or record.get("changes_requested")
-        or record.get("merge_conflict")
-    )
-
-
-def _thread_is_p1(thread) -> bool:
-    bodies = [thread.top.body] + [r.body for r in getattr(thread, "replies", [])]
-    return any("p1" in (b or "").lower() for b in bodies)
-
-
-def _session_is_live(session_id: str, cwd: str | None = None) -> bool:
-    """True if `session_id` has a non-terminal, pid-live registry entry.
-
-    Resolves the session registry from the TARGET `cwd` (not the process cwd) so
-    a repo that configures its own `session_registry_path` is read correctly —
-    otherwise a still-running owner in that repo can be missed and its PR wrongly
-    adopted (PR #16 review, P2).
-    """
-    from . import session_registry  # noqa: PLC0415
-    try:
-        reg = session_registry.registry_path(cwd) if cwd else None
-        summary = session_registry.summarize_sessions(path=reg)
-    except Exception:  # noqa: BLE001
-        return False
-    state = summary.sessions.get(session_id)
-    if state is None or state.is_terminal:
-        return False
-    return session_registry.pid_is_live(state.pid)
-
-
-def _claim_pr(pr_number: int, session_id: str, pid: int, repo: str = "") -> bool:
-    """Win an exclusive claim on an orphan PR. One live claimant wins; a claim
-    held by a dead pid is taken over. Returns True on win (BOU-1587 Component G).
-
-    The claim is scoped by ``repo`` so two repos' same-number PRs don't share one
-    claim file (PR #16 review round 2, P1). The read-decide-write runs under an
-    exclusive lock so two concurrent live claimants can't both observe "no claim"
-    and both adopt the same PR (PR #16 review, P1)."""
-    from . import session_ledger, session_registry  # noqa: PLC0415
-    with session_ledger.claim_lock(pr_number, repo):
-        existing = session_ledger.read_claim(pr_number, repo)
-        if existing:
-            if existing.get("session_id") == session_id:
-                return True
-            holder_pid = existing.get("pid")
-            try:
-                holder_pid = int(holder_pid)
-            except (TypeError, ValueError):
-                holder_pid = None
-            if session_registry.pid_is_live(holder_pid):
-                return False  # a live session owns it
-        session_ledger.write_claim(pr_number, session_id, pid, repo)
-        return True
-
-
-def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
-    """Claim PRs orphaned by DEAD sessions and adopt them into THIS session's ledger.
-
-    Orphan = ledger entry of another session that is no longer live, whose worktree
-    is gone and whose PR is still open with unresolved work. Exactly one live session
-    wins each PR via an exclusive claim file (BOU-1587 Component G).
-    """
-    from . import session_ledger, github_api  # noqa: PLC0415
-
-    eff_pid = pid if pid is not None else _resolve_owner_pid()
-    present = set(_iter_worktree_paths(cwd))
-    # Only consider other sessions' entries that belong to THIS repo: each entry
-    # is queried via gh against `cwd`, so a PR from another repo would be resolved
-    # against the wrong remote (PR #16 review round 2, P1). Legacy repo-less
-    # entries pass the filter and degrade to the prior unscoped behavior.
-    target_repo = _repo_slug(cwd)
-    adopted = []
-    for other in session_ledger.list_session_ids():
-        if other == session_id:
-            continue
-        if _session_is_live(other, cwd):
-            continue  # owner still alive — its own loop handles it
-        for e in session_ledger.read(other, repo=target_repo):
-            abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
-            if abs_wt and abs_wt in present and _worktree_is_for_entry(abs_wt, e):
-                continue  # still THIS PR's live worktree → not orphaned
-            state, url, has_fail, failing, review_decision, merge_state, mergeable = (
-                _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
-            )
-            if state in ("merged", "closed", "unknown", "draft"):
-                continue
-            threads = github_api.get_review_threads(e.pr, cwd)
-            unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
-            changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
-            merge_conflict = (
-                str(merge_state).upper() == "DIRTY"
-                or str(mergeable).upper() == "CONFLICTING"
-            )
-            if not unresolved and not has_fail and not changes_requested and not merge_conflict:
-                continue  # nothing to do
-            if not _claim_pr(e.pr, session_id, int(eff_pid), e.repo):
-                continue  # another live session won it
-            session_ledger.append(session_id, e.pr, e.branch, e.worktree,
-                                  e.baseline_sha, repo=e.repo)
-            adopted.append({
-                "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
-                "worktree_present": False, "unresolved_threads": len(unresolved),
-                "ci_failing": has_fail, "failing_checks": failing,
-                "changes_requested": changes_requested,
-                "review_decision": review_decision,
-                "merge_conflict": merge_conflict,
-                "merge_state": merge_state,
-                "mergeable": mergeable,
-                "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
-                "adopted_from": other,
-            })
-    return adopted
-
-
-def _worktree_is_for_entry(path: str, entry) -> bool:
-    """True if the worktree at `path` still belongs to this ledger entry's PR.
-
-    A path-only "is it present?" check is wrong when bug-bash tears down a lane
-    and later creates a DIFFERENT worktree at the same directory: the old PR would
-    be treated as still-live and silently dropped from monitoring. Confirm the
-    worktree's marker PR (or its current branch) matches the entry before
-    suppressing the ledger record (PR #16 review, P1).
-    """
-    marker = _read_marker(path) or {}
-    if str(marker.get("pr", "")) == str(entry.pr):
-        return True
-    if not marker:
-        return False
-    branch = _current_branch(path)
-    return bool(branch) and entry.branch and branch == entry.branch
-
-
-def _detached_pr_records(session_id: str, cwd: str,
-                         include_legacy: bool = True,
-                         prune_legacy: bool = True) -> list[dict]:
-    """Records for this session's ledger PRs whose worktree is GONE, with live
-    GitHub state. Does NO worktree adoption, so it is safe for the Stop hook
-    (which must never adopt unmarked worktrees). Prunes merged/closed PRs.
-
-    ``include_legacy=False`` skips the repo-less legacy ledger entries entirely —
-    set when iterating multiple roots so legacy entries are read against exactly
-    one repo (the anchor), not replayed per sibling (codex PR #30 review, P2).
-
-    ``prune_legacy=False`` reads legacy entries (for surfacing) but NEVER prunes
-    them. A repo-less entry's true repo is unknown, so a same-number merged/closed
-    PR on the queried (anchor) remote must not delete it — a torn-down sibling PR
-    would silently stop being monitored. Used for the anchor pass in cross-root
-    mode (codex PR #32, P2).
-    """
-    from . import session_ledger, github_api  # noqa: PLC0415
-
-    present_worktrees = set(_iter_worktree_paths(cwd))
-    independent_worktrees = _live_independent_owner_paths(present_worktrees, session_id)
-    # Scope to THIS repo: each ledger PR is queried with gh against `cwd`, so a PR
-    # from another repo would be checked against the wrong remote (and pruned when
-    # `cwd`'s same-number PR is closed). Legacy repo-less entries still pass
-    # (PR #16 review round 2, P1) unless include_legacy is False.
-    target_repo = _repo_slug(cwd)
-    records: list[dict] = []
-    prune: set[int] = set()
-    for e in session_ledger.read(session_id, repo=target_repo, include_legacy=include_legacy):
-        abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
-        if (
-            abs_wt
-            and abs_wt in independent_worktrees
-            and not _read_marker(abs_wt)
-            and _current_branch(abs_wt) == e.branch
-        ):
-            continue  # marker-less same-branch worktree is owned by a live session
-        if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e):
-            continue  # still THIS PR's live worktree; handled by the worktree pass
-        state, url, has_fail, failing, review_decision, merge_state, mergeable = (
-            _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
-        )
-        if state in ("merged", "closed"):
-            prune.add(e.pr)
-            continue
-        if state == "draft":
-            continue  # not-ready; skip but keep the ledger entry (may reopen)
-        threads = github_api.get_review_threads(e.pr, cwd)
-        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
-        changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
-        merge_conflict = (
-            str(merge_state).upper() == "DIRTY"
-            or str(mergeable).upper() == "CONFLICTING"
-        )
-        records.append({
-            "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
-            "worktree_present": False, "unresolved_threads": len(unresolved),
-            "ci_failing": has_fail, "failing_checks": failing,
-            "changes_requested": changes_requested,
-            "review_decision": review_decision,
-            "merge_conflict": merge_conflict,
-            "merge_state": merge_state,
-            "mergeable": mergeable,
-            "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
-        })
-    if prune:
-        session_ledger.prune(session_id, prune, repo=target_repo,
-                             include_legacy=(include_legacy and prune_legacy))
-    return records
-
-
-def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool,
-                      include_legacy: bool = True, prune_legacy: bool = True):
-    """Union of live-worktree PRs and detached ledger PRs, each with live state.
-
-    Single-REPO primitive: every gh/worktree query runs against ``cwd``, so PR
-    numbers are unique here and the result dict is keyed by bare ``pr``. The
-    cross-root wrapper (:func:`_owned_pr_records_all_roots`) keys the MERGED set by
-    ``(repo, pr)`` so a same-number PR in a sibling repo doesn't collide.
-
-    Returns a list of dict records sorted severity-first (P1 -> thread count).
-    Side effect: prunes merged/closed PRs from this session's ledger.
-
-    ``include_legacy=False`` / ``prune_legacy=False`` are threaded straight to
-    :func:`_detached_pr_records` so the cross-root wrapper can keep the legacy
-    repo-less anchor-pass invariant: a repo-less ledger entry resolves against the
-    anchor exactly once (not replayed per sibling), and is never pruned by a
-    sibling's same-number closed PR (codex PR #30 / PR #32 review).
-    """
-    from . import github_api  # noqa: PLC0415
-
-    records: dict[int, dict] = {}
-
-    # 1) Detached ledger PRs (worktree gone).
-    for rec in _detached_pr_records(session_id, cwd, include_legacy=include_legacy,
-                                    prune_legacy=prune_legacy):
-        records[rec["pr"]] = rec
-
-    # 2) Live worktree-owned PRs (unchanged ownership semantics).
-    for wt in _collect_owned_worktrees(session_id, cwd, pid):
-        marker = _read_marker(wt) or {}
-        pr_raw = marker.get("pr")
-        if not pr_raw or not str(pr_raw).isdigit():
-            continue
-        pr = int(pr_raw)
-        if pr in records:
-            records[pr]["worktree_present"] = True
-            continue
-        state, url, has_fail, failing, review_decision, merge_state, mergeable = (
-            _unpack_pr_open_state(_pr_open_state(pr, wt))
-        )
-        if state in ("merged", "closed"):
-            continue
-        threads = github_api.get_review_threads(pr, wt)
-        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
-        changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
-        merge_conflict = (
-            str(merge_state).upper() == "DIRTY"
-            or str(mergeable).upper() == "CONFLICTING"
-        )
-        records[pr] = {
-            "pr": pr, "url": url or f"(pr {pr})", "branch": _current_branch(wt),
-            "worktree_present": True, "unresolved_threads": len(unresolved),
-            "ci_failing": has_fail, "failing_checks": failing,
-            "changes_requested": changes_requested,
-            "review_decision": review_decision,
-            "merge_conflict": merge_conflict,
-            "merge_state": merge_state,
-            "mergeable": mergeable,
-            "p1": any(_thread_is_p1(t) for t in unresolved), "state": state,
-        }
-
-    # 3) Orphan recovery (Component G) — claim PRs from dead sessions.
-    if adopt_orphans:
-        for rec in _adopt_orphan_prs(session_id, cwd, pid):
-            records.setdefault(rec["pr"], rec)
-
-    ordered = sorted(records.values(),
-                     key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
-    return ordered
-
-
-def _owned_pr_records_all_roots(session_id: str, anchor_cwd: str, pid: int | None,
-                                adopt_orphans: bool):
-    """Owned-PR records across ``[anchor] + maintenance_repo_roots``, keyed by repo.
-
-    The per-session reconcile counterpart of :func:`_detached_records_across_roots`
-    (BOU-1596). Runs the single-repo :func:`_owned_pr_records` primitive once per
-    root — each root supplies its own gh/worktree cwd so CI / review-thread / draft
-    / merge checks hit the correct remote — then MERGES the per-root records keyed
-    by ``(repo, pr)`` so a same-number PR in two repos stays two distinct records.
-
-    Legacy repo-less anchor-pass invariant (codex PR #30 / PR #32, mirrored from
-    :func:`_detached_records_across_roots`): legacy pruning is only safe when a
-    single root is probed (the repo is then unambiguous). With more than one root,
-    every root READS legacy repo-less entries — a legacy row's true repo is unknown,
-    so it must be checked against every root to surface a sibling-owned PR — but NO
-    root PRUNES it (``prune_legacy=False``), so a sibling's same-number closed PR
-    can't delete a legacy entry whose real PR is still open on another remote. The
-    merge dedups by ``(repo, pr)``, so a legacy PR open on exactly one root yields
-    exactly one record there; a sibling's same-number CLOSED PR is skipped (state
-    merged/closed), so it doesn't manufacture a phantom duplicate.
-    """
-    roots = _maint_roots_for(anchor_cwd)
-    # Legacy pruning is unsafe across more than one root (codex PR #32 P3): a
-    # same-number closed PR on one remote must not delete a row open on another.
-    prune_legacy = len(roots) <= 1
-    merged: dict[tuple[str, int], dict] = {}
-    for root in roots:
-        repo = _repo_slug(root)
-        for rec in _owned_pr_records(session_id, root, pid, adopt_orphans,
-                                     include_legacy=True, prune_legacy=prune_legacy):
-            key = (repo, rec["pr"])
-            existing = merged.get(key)
-            if existing is None:
-                # Tag the record with its repo so callers can disambiguate.
-                rec = {**rec, "repo": repo}
-                merged[key] = rec
-            elif rec.get("worktree_present") and not existing.get("worktree_present"):
-                existing["worktree_present"] = True
-    ordered = sorted(merged.values(),
-                     key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
-    return ordered
-
-
 def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     import json as _json  # noqa: PLC0415
-    # BOU-1596: aggregate the owned-PR queue across [anchor] + maintenance_repo_roots
-    # so a session reconciles every PR it opened across all repos it touched, in one
-    # pass, keyed by (repo, pr). P1-first ordering preserved.
     records = _owned_pr_records_all_roots(args.session_id, os.path.abspath(args.cwd),
                                           args.pid, adopt_orphans=args.adopt_orphans)
     for r in records:
         print(_json.dumps(r))
     return 0
-
-
-# ---------------------------------------------------------------------------
-# await — in-session background feedback waiter (BOU-1632)
-# ---------------------------------------------------------------------------
-#
-# Spawned by the stop-gate when it has no pending work but the session owns at
-# least one open non-draft PR. Polls owned worktrees for pending feedback and
-# stamps the ownership heartbeat each tick (keeps the detached loop deferring
-# while the waiter is alive). On finding work it exits 10 with the same
-# stop-block the interactive stop-gate renders — the harness wakes the
-# owning session so it can address the feedback in-context.
-#
-# Single-instance per session: pidfile ``pr-watch.await.pid`` in the state dir.
-# A live same-session pidfile → exit 3. Dead pidfile → proceed (stale).
-# Pidfile written on entry, removed on every exit path.
-
-
-def _await_pidfile(cwd: str, session_id: str = "") -> str:
-    """Per-session pidfile path. Each session gets its own file so two sessions
-    sharing a cwd don't clobber each other's waiter record (BOU-1632 codex P2 #2).
-    """
-    from . import session_ledger as _sl  # noqa: PLC0415
-    safe = _sl._safe_session(session_id) if session_id else "unknown"
-    return str(load_config(cwd).state_dir_for(cwd) / f"pr-watch.await.{safe}.pid")
-
-
-def _read_await_pidfile(cwd: str, session_id: str = "") -> dict:
-    """Return the pidfile contents as a dict, or {} on missing/corrupt."""
-    try:
-        with open(_await_pidfile(cwd, session_id), encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def _write_await_pidfile(cwd: str, data: dict, session_id: str = "") -> None:
-    """Write the await pidfile atomically (best-effort)."""
-    path = _await_pidfile(cwd, session_id)
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(data, fh)
-    except OSError:
-        pass
-
-
-def _remove_await_pidfile(cwd: str, session_id: str = "") -> None:
-    """Remove the await pidfile (best-effort)."""
-    try:
-        os.remove(_await_pidfile(cwd, session_id))
-    except OSError:
-        pass
-
-
-def _await_alive(cwd: str, session_id: str) -> bool:
-    """True if a live waiter pidfile exists with a matching session_id."""
-    data = _read_await_pidfile(cwd, session_id)
-    if not data:
-        return False
-    return (
-        data.get("session_id") == session_id
-        and _pid_alive(str(data.get("pid", "")))
-    )
-
-
-def _detached_loop_alive(cwd: str) -> bool:
-    """True when the detached ``pr-maintenance-loop`` daemon is running.
-
-    When the loop is live it is sufficient idle coverage for PR feedback, so the
-    stop-gate can skip prompting for a fragile per-session in-session waiter
-    (BOU-1653) — the loop wakes/dispatches on arriving review/CI work instead.
-    Reads the daemon pidfile resolved by config (``maintenance_loop_pidfile`` /
-    ``daemon_dir``, default ``~/.claude/daemons/pr-maintenance-loop.pid``).
-    """
-    cfg = load_config(cwd)
-    # Only a machine-wide loop is proof of coverage for an arbitrary session; a
-    # session/repo-scoped loop on a shared pidfile must NOT suppress this
-    # session's waiter (codex PR #21 review).
-    if not cfg.maintenance_loop_machine_wide:
-        return False
-    pidfile = cfg.maintenance_loop_pidfile
-    if pidfile is None:
-        return False
-    try:
-        pid_raw = pidfile.read_text(encoding="utf-8").strip()
-    except OSError:
-        return False
-    return _pid_alive(pid_raw)
-
-
-def _detached_pending_entry(r: dict) -> tuple[str, str]:
-    """Build the (label, text) pending entry for a detached PR record.
-
-    Extracted from _stop_gate_impl so both stop-gate and await render
-    detached-PR entries identically (DRY).
-    """
-    why = []
-    if r["unresolved_threads"]:
-        why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
-    if r["ci_failing"]:
-        why.append("failing CI")
-    if r.get("changes_requested"):
-        why.append("review-level CHANGES_REQUESTED")
-    if r.get("merge_conflict"):
-        why.append("merge conflict")
-    tag = " [P1]" if r["p1"] else ""
-    text = (
-        f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
-        f"  needs: {', '.join(why)}\n"
-        f"  This PR's worktree was torn down. Recreate it from the branch "
-        f"({r['branch'] or '<branch>'}) to fix, or explicitly hand it off — "
-        f"do NOT leave it unmonitored.\n"
-        f"PR_NUMBER={r['pr']}"
-    )
-    return (f"(no worktree) PR #{r['pr']}", text)
 
 
 def _cmd_await(args: argparse.Namespace) -> int:
@@ -2689,7 +382,6 @@ def _cmd_await(args: argparse.Namespace) -> int:
     session_id = args.session_id or _read_session_marker(cwd)
     owner_pid = args.owner_pid if args.owner_pid else _resolve_owner_pid()
 
-    # Single-instance guard: abort if a live waiter for this session already exists.
     existing = _read_await_pidfile(cwd, session_id)
     if (
         existing
@@ -2700,24 +392,18 @@ def _cmd_await(args: argparse.Namespace) -> int:
         return 3
 
     _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id}, session_id)
-    # max_wait == 0 means "one tick then exit" — set deadline to now so the
-    # expiry check fires immediately after the first tick.
     now = time.time()
     if args.max_wait == 0:
-        deadline: float | None = now  # expire immediately after the first tick
+        deadline: float | None = now
     elif args.max_wait > 0:
         deadline = now + args.max_wait
     else:
-        deadline = None  # run forever until work found or pid dead
+        deadline = None
     try:
         while True:
-            # Exit if the owning session pid is dead.
             if not _pid_alive(str(owner_pid)):
                 return 0
 
-            # Span [anchor] + maintenance_repo_roots so a waiter spawned with
-            # --cwd <super-repo> actually polls sibling-repo PRs it was demanded
-            # to cover (codex PR #30 review, P1; parity with the stop-gate).
             owned = _owned_worktrees_across_roots(session_id, cwd) if session_id else [cwd]
 
             pending: list[tuple[str, str]] = []
@@ -2725,16 +411,8 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     pending.append((worktree, text))
-                # Stamp the heartbeat for each owned worktree on every tick,
-                # regardless of whether work was found — this is the coordination
-                # contract that keeps the detached loop deferring while the waiter
-                # is alive. _check_worktree already stamps it when claim=False and
-                # the marker is ours, but stamp explicitly here too so that worktrees
-                # where _check_worktree exits early (no PR, draft, etc.) are still
-                # covered.
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
-            # Include detached-ledger PRs (parity with stop-gate).
             _detached_this_tick: list[dict] = []
             if session_id:
                 _detached_this_tick = _detached_records_across_roots(session_id, cwd)
@@ -2751,8 +429,6 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 )
                 return 10
 
-            # Keep ticking when owned is empty but the session has open detached
-            # ledger PRs that may develop blockers (BOU-1632 codex P2 #3).
             has_open_detached = any(
                 r.get("state") not in ("merged", "closed", "draft", "unknown")
                 for r in _detached_this_tick
@@ -2770,6 +446,11 @@ def _cmd_await(args: argparse.Namespace) -> int:
             time.sleep(max(args.interval, 1))
     finally:
         _remove_await_pidfile(cwd, session_id)
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -20,6 +20,9 @@ import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +316,7 @@ def test_heartbeat_rewritten_when_stale(tmp_path, monkeypatch):
     stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_marker(marker, {"pr": "5", "session_id": "S1", "pid": "1", "heartbeat": stale})
 
-    monkeypatch.setattr(mc, "_marker_path", lambda cwd: str(marker))
+    monkeypatch.setattr(_markers_mod, "_marker_path", lambda cwd: str(marker))
     mc._touch_owner_heartbeat(str(tmp_path), "S1", work_found=False)
 
     fields = mc._read_marker(str(tmp_path))
@@ -327,7 +330,7 @@ def test_heartbeat_work_found_always_writes_lease(tmp_path, monkeypatch):
     fresh = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _write_marker(marker, {"pr": "5", "session_id": "S1", "pid": "1", "heartbeat": fresh})
 
-    monkeypatch.setattr(mc, "_marker_path", lambda cwd: str(marker))
+    monkeypatch.setattr(_markers_mod, "_marker_path", lambda cwd: str(marker))
     mc._touch_owner_heartbeat(str(tmp_path), "S1", work_found=True)
 
     fields = mc._read_marker(str(tmp_path))
@@ -387,11 +390,11 @@ def test_check_surfaces_new_fingerprint_feedback(tmp_path, monkeypatch):
     pr2 = _pr([11, 22])
 
     # Stub out everything _check_worktree touches except the coordinator gate.
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr2)
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
-    monkeypatch.setattr(mc, "_unresolved_review_threads", lambda pr, cwd: [])
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr2)
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda pr, cwd: [])
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda *a, **k: None)
     import agentic_pr_dash.github_api as gh
     monkeypatch.setattr(gh, "get_failed_logs", lambda *a, **k: {})
 
@@ -437,11 +440,11 @@ def test_check_surfaces_new_thread_when_other_blocker_present(tmp_path, monkeypa
     # does NOT appear in get_unaddressed_comments (so review_comments stays empty).
     pr_round2 = _pr([], failing_checks=["unit"])
 
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: pr_round2)
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
-    monkeypatch.setattr(mc, "_unresolved_review_threads", lambda pr, cwd: [_FakeThread(99)])
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr_round2)
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda pr, cwd: [_FakeThread(99)])
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda *a, **k: None)
     import agentic_pr_dash.github_api as gh
     monkeypatch.setattr(gh, "get_failed_logs", lambda *a, **k: {})
 
@@ -459,11 +462,11 @@ def test_check_defers_same_fingerprint_claim(tmp_path, monkeypatch):
     pr1 = _pr([11])
     coordinator.claim_pr(pr1, session_id="OTHER", pid=os.getpid(), agent="a", lease_seconds=1800)
 
-    monkeypatch.setattr(mc, "_live_foreign_owner", lambda cwd, sid: None)
-    monkeypatch.setattr(mc, "_resolve_pr_for_branch", lambda cwd: _pr([11]))
-    monkeypatch.setattr(mc, "_live_independent_owner_paths", lambda paths, sid: set())
-    monkeypatch.setattr(mc, "_unresolved_review_threads", lambda pr, cwd: [])
-    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda *a, **k: None)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _pr([11]))
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda pr, cwd: [])
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda *a, **k: None)
 
     code, text = mc._check_worktree(str(tmp_path), "SELF", claim=True)
     assert code == 0, "same-fingerprint in-flight work must defer"

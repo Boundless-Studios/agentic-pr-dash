@@ -20,6 +20,7 @@ import argparse
 import subprocess
 
 from agentic_pr_dash import github_api, maintenance_check
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 
 
 def _cp(stdout: str = "", returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
@@ -132,7 +133,8 @@ def test_cmd_complete_surfaces_underlying_stderr(monkeypatch, capsys):
 def test_check_worktree_surfaces_underlying_stderr(monkeypatch):
     _simulate_gh_connectivity_failure(monkeypatch)
     # Force a non-empty branch so resolution proceeds to list_open_prs.
-    monkeypatch.setattr(maintenance_check, "_current_branch", lambda cwd: "feature/x")
+    # _resolve_pr_for_branch lives in pr_state and uses _current_branch from pr_state's namespace.
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
     monkeypatch.setattr(maintenance_check, "_live_foreign_owner", lambda *a, **k: None)
 
     code, text = maintenance_check._check_worktree(".", "self-session")
