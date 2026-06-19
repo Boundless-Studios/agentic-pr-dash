@@ -81,8 +81,9 @@ Those choices belong in the consuming repo's config or local hook wrappers.
 Read the code as four cooperating layers:
 
 1. `cli.py` chooses which subsystem should handle a command.
-2. `github_api.py`, `maintenance_check.py`, and `models.py` answer: "what is
-   true about this PR right now?"
+2. `github_api.py`, `maintenance_check.py` (a thin CLI over the `_maintenance/`
+   behavior package), and `models.py` answer: "what is true about this PR right
+   now?"
 3. `loop.py`, `coordinator.py`, `session_ledger.py`, and `session_registry.py`
    answer: "who is allowed to work on it?"
 4. `orchestrator.py`, `app.py`, and `server.py` answer: "what should humans see
@@ -260,6 +261,12 @@ or Claude hook payloads and call package functionality. These modules should
 stay generic. Repo-specific policy can be invoked by configuration or by a local
 wrapper script in the downstream repo.
 
+The hook entrypoints stay small and declarative: pure shell-command parsing
+(segment splitting, `cd`/`gh pr` arm-target/`git push` detection, effective-git-cwd
+resolution) lives in `command_parser.py` and is shared by `run_arm_pr_watch.py`
+and `run_post_push_watch.py`, so the entrypoints only load the payload, call the
+parser, and write markers.
+
 ## Code Map
 
 | Path | Responsibility |
@@ -268,7 +275,8 @@ wrapper script in the downstream repo.
 | `src/agentic_pr_dash/config.py` | Config discovery, env fallback, resolved config dataclass, derived paths. |
 | `src/agentic_pr_dash/models.py` | Pydantic models for PRs, cards, checks, maintenance state, sessions, events. |
 | `src/agentic_pr_dash/github_api.py` | GitHub CLI/API access, PR metadata, CI checks, review threads, runner health. |
-| `src/agentic_pr_dash/maintenance_check.py` | Stateless executor commands, stop-gate logic, arm/list/reconcile/complete flows. |
+| `src/agentic_pr_dash/maintenance_check.py` | Thin CLI layer: `main`, the `_cmd_*` subcommand dispatchers, arg parsing, and a re-export facade over `_maintenance/` (so `maintenance_check.X` keeps resolving for consumers and tests). |
+| `src/agentic_pr_dash/_maintenance/` | Behavior package the CLI delegates to (split out of `maintenance_check.py`): `pr_state.py` (PR resolution + GitHub reads + review threads), `markers.py` (ownership/session markers, heartbeats, leases, claims), `worktrees.py` (worktree iteration + maintenance-root resolution), `worktree_check.py` (the shared per-worktree blocker engine used by both `check` and `stop-gate`), `stop_gate.py` (stop-state, fingerprinting, prompt/waiter rendering), `completion.py` (completion replies + review-comment extraction), `reconcile.py` (orphan adoption + PR records), `waiter.py` (await pidfiles + liveness), `_common.py` (shared primitives). Cross-module calls are module-qualified so the owning module is the single monkeypatch seam. |
 | `src/agentic_pr_dash/maintenance.py` | Durable maintenance queue/state helpers. |
 | `src/agentic_pr_dash/loop.py` | Continuous check/fix/complete loop and executor dispatch. |
 | `src/agentic_pr_dash/orchestrator.py` | Dashboard polling, PR state machine, queue suppression, card enrichment. |
@@ -280,8 +288,9 @@ wrapper script in the downstream repo.
 | `src/agentic_pr_dash/session_registry.py` | Session event log ingestion and summary. |
 | `src/agentic_pr_dash/session_ledger.py` | Durable session-owned PR ledger. |
 | `src/agentic_pr_dash/tracker.py` | Task tracker adapters. |
-| `src/agentic_pr_dash/ci_watch.py` | Post-push CI watcher and results snapshots. |
-| `src/agentic_pr_dash/codex_hooks/` | Hook adapters and shared hook runtime helpers. |
+| `src/agentic_pr_dash/ci_watch.py` | Thin module kept for the `python -m agentic_pr_dash.ci_watch` background-watcher entrypoint: `arm_post_push_watch`, `spawn_background_watcher`, `main`, plus a re-export facade over `_ci_watch/`. |
+| `src/agentic_pr_dash/_ci_watch/` | CI-watch behavior package: `config.py` (constants + `CIWatchConfig`/`from_env` + `eprint`), `repo.py` (git/PR helpers), `checks.py` (check snapshot/classification), `adapter.py` (status/complete adapter rendering+invocation), `results.py` (results-file serialization), `watcher.py` (background poll lifecycle). |
+| `src/agentic_pr_dash/codex_hooks/` | Hook adapters and shared hook runtime helpers, including `command_parser.py` (pure shell-command parsing: segment splitting, `cd`/`gh pr`/`git push` parsing, effective-git-cwd) shared by `run_arm_pr_watch.py` and `run_post_push_watch.py`. |
 
 ## Data Model
 
