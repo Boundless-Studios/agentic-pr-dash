@@ -18,6 +18,7 @@ from pathlib import Path
 ZERO_COMMIT_STALE_SECS = 86400
 AGENT_STALE_SECS = 3 * 86400
 OTHER_STALE_SECS = 7 * 86400
+PR_LOOKUP_UNKNOWN = "__PR_LOOKUP_UNKNOWN__"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -182,7 +183,7 @@ def _is_main_or_protected_worktree(worktree: dict, main_repo: str | None = None)
 def _branch_pr_state(branch: str, main_repo: str) -> str | None:
     if not branch:
         return None
-    output = _run_text(
+    result = _run(
         [
             "gh",
             "pr",
@@ -200,6 +201,9 @@ def _branch_pr_state(branch: str, main_repo: str) -> str | None:
         ],
         cwd=main_repo,
     )
+    if result.returncode != 0:
+        return PR_LOOKUP_UNKNOWN
+    output = result.stdout.strip()
     return output or None
 
 
@@ -229,6 +233,8 @@ def _worktree_branch_stale_reason(path: str, branch: str, main_repo: str) -> str
             birth_epoch = int(raw_birth or "0")
         except ValueError:
             birth_epoch = 0
+        if birth_epoch <= 0:
+            return None
         age_secs = now - birth_epoch if birth_epoch > 0 else ZERO_COMMIT_STALE_SECS
         if age_secs >= ZERO_COMMIT_STALE_SECS:
             return "orphan with no commits beyond main"
@@ -267,6 +273,8 @@ def selected_worktree_cleanup_reason(
         return False, "local changes present"
 
     pr_state = _branch_pr_state(branch, resolved_main)
+    if pr_state == PR_LOOKUP_UNKNOWN:
+        return False, "PR lookup unavailable"
     if pr_state == "OPEN":
         return False, "open PR exists"
     if pr_state in {"MERGED", "CLOSED"}:

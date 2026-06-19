@@ -5,6 +5,7 @@ import subprocess
 import types
 
 from agentic_pr_dash import loop
+from agentic_pr_dash import worktrees
 
 
 def _git(cwd, *args):
@@ -188,7 +189,7 @@ def test_tick_cleans_stale_no_pr_worktree_without_running_pr_check(monkeypatch, 
     monkeypatch.setattr(
         loop,
         "_cleanup_stale_no_pr_worktree",
-        lambda cwd: calls.append(("cleanup", cwd)) or cwd == str(stale_worktree),
+        lambda cwd, session_id="": calls.append(("cleanup", cwd)) or cwd == str(stale_worktree),
     )
 
     def fake_run(cmd, *a, **k):
@@ -205,6 +206,80 @@ def test_tick_cleans_stale_no_pr_worktree_without_running_pr_check(monkeypatch, 
     assert ("cleanup", str(active_worktree)) in calls
     assert ("check", str(stale_worktree)) not in calls
     assert ("check", str(active_worktree)) in calls
+
+
+def test_cleanup_reason_fails_closed_when_pr_lookup_errors(monkeypatch, tmp_path):
+    worktree = tmp_path / "stale-with-hidden-pr"
+    worktree.mkdir()
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["git", "-C"] and cmd[2] == str(worktree) and "status" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[0] == "gh":
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="auth expired")
+        if cmd[:2] == ["git", "-C"] and "merge-base" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="base-sha\n", stderr="")
+        if cmd[:2] == ["git", "-C"] and "rev-list" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="1\n", stderr="")
+        if cmd[:2] == ["git", "-C"] and "log" in cmd:
+            old = worktrees._now_epoch() - (worktrees.OTHER_STALE_SECS + 60)
+            return types.SimpleNamespace(returncode=0, stdout=f"{old}\n", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(worktrees.subprocess, "run", fake_run)
+
+    eligible, reason = worktrees.selected_worktree_cleanup_reason(
+        {"path": str(worktree), "branch": "feature/hidden-pr"},
+        [],
+        main_repo=str(tmp_path),
+    )
+
+    assert eligible is False
+    assert "PR lookup" in reason
+
+
+def test_zero_commit_unknown_birth_time_is_not_stale(monkeypatch, tmp_path):
+    worktree = tmp_path / "fresh-zero-commit"
+    worktree.mkdir()
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["git", "-C"] and cmd[2] == str(worktree) and "status" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[0] == "gh":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:2] == ["git", "-C"] and "merge-base" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="base-sha\n", stderr="")
+        if cmd[:2] == ["git", "-C"] and "rev-list" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        if cmd[0] == "stat":
+            return types.SimpleNamespace(returncode=0, stdout="0\n", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(worktrees.subprocess, "run", fake_run)
+
+    eligible, reason = worktrees.selected_worktree_cleanup_reason(
+        {"path": str(worktree), "branch": "feature/fresh-zero"},
+        [],
+        main_repo=str(tmp_path),
+    )
+
+    assert eligible is False
+    assert "not stale" in reason
+
+
+def test_cleanup_skips_live_idle_feature_pipeline_owner(monkeypatch, tmp_path):
+    worktree = tmp_path / "idle-owned"
+    worktree.mkdir()
+    removed = []
+
+    monkeypatch.setattr(loop, "find_worktree_for_path", lambda cwd: {"path": cwd, "branch": "feature/idle-owned"})
+    monkeypatch.setattr(loop, "discover_active_agents", lambda paths: {})
+    monkeypatch.setattr(loop, "selected_worktree_cleanup_reason", lambda worktree, active_agents: (True, "stale orphan"))
+    monkeypatch.setattr(loop, "_live_independent_owner_paths", lambda paths, session_id: {str(worktree)}, raising=False)
+    monkeypatch.setattr(loop, "remove_worktree", lambda cwd: removed.append(cwd) or (True, ""))
+
+    assert loop._cleanup_stale_no_pr_worktree(str(worktree), session_id="loop-session") is False
+    assert removed == []
 
 
 def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
@@ -228,7 +303,7 @@ def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
         raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
     monkeypatch.setattr(loop, "_discover_cwds", fake_discover)
-    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd: False)
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0)
@@ -263,7 +338,7 @@ def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
         raise FileNotFoundError("codex: command not found")
 
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
-    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd: False)
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", boom)

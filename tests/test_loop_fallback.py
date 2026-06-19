@@ -43,7 +43,7 @@ def _wire(monkeypatch, worktree, *, run_executor):
         raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
-    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd: False)
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor",
