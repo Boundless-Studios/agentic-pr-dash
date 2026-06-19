@@ -19,13 +19,15 @@ import sys
 from pathlib import Path
 
 from agentic_pr_dash import ci_watch
-from agentic_pr_dash.codex_hooks.run_arm_pr_watch import (
+from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
     is_git_push,
+    split_command_segments,
+)
+from agentic_pr_dash.codex_hooks.run_arm_pr_watch import (
     load_payload,
     normalized_payload,
-    split_command_segments,
 )
 
 
