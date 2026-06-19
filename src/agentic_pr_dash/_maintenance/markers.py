@@ -83,10 +83,27 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     owner = fields.get("session_id", "")
     if not owner or owner == (self_session_id or ""):
         return None
-    if not _pid_alive(fields.get("pid", "")):
-        return None
-    if _heartbeat_fresh(fields.get("heartbeat", ""), cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
+    heartbeat_fresh = any(
+        _heartbeat_fresh(value, cwd)
+        for value in (fields.get("last_heartbeat", ""), fields.get("heartbeat", ""))
+        if value
+    )
+    if heartbeat_fresh:
         return owner
+    lease_until = fields.get("fix_lease_until", "")
+    if lease_until:
+        ts = _parse_iso(lease_until)
+        if ts is None:
+            print(
+                f"[pr-watch] warning: unparseable fix_lease_until={lease_until!r}; "
+                "treating as STALE because no fresh heartbeat remains",
+                file=sys.stderr,
+            )
+            return None
+        from datetime import datetime, timezone  # noqa: PLC0415
+
+        if datetime.now(timezone.utc) < ts:
+            return owner
     return None
 
 
@@ -118,7 +135,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
 
     now = datetime.now(timezone.utc)
-    prior_heartbeat = fields.get("heartbeat", "")
+    prior_heartbeat = fields.get("last_heartbeat", "") or fields.get("heartbeat", "")
     had_lease = "fix_lease_until" in fields
 
     if not work_found:
@@ -129,7 +146,9 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
                 if 0 <= age < _heartbeat_min_interval_seconds():
                     return
 
-    fields["heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    heartbeat = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields["last_heartbeat"] = heartbeat
+    fields["heartbeat"] = heartbeat
     if work_found:
         fields["fix_lease_until"] = (now + timedelta(seconds=_fix_lease_seconds())).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
