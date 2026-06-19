@@ -23,6 +23,7 @@ import sys
 from pathlib import Path
 
 from agentic_pr_dash import ci_watch, github_api
+from agentic_pr_dash._ci_watch import config as _ci_config, repo as _ci_repo, watcher as _ci_watcher
 from agentic_pr_dash.codex_hooks import run_post_push_watch as hook
 
 
@@ -128,7 +129,9 @@ def test_kill_previous_watcher_kills_our_watcher(monkeypatch, tmp_path):
     cfg = _cfg(tmp_path)
     cfg.pid_file.parent.mkdir(parents=True, exist_ok=True)
     cfg.pid_file.write_text("4242")
-    monkeypatch.setattr(ci_watch, "_is_our_watcher", lambda pid: True)
+    # Patch the owning module (_ci_watcher) — kill_previous_watcher calls
+    # _is_our_watcher from watcher.py, not from ci_watch.
+    monkeypatch.setattr(_ci_watcher, "_is_our_watcher", lambda pid: True)
     killed: list[int] = []
     monkeypatch.setattr(ci_watch.os, "kill", lambda pid, sig: killed.append(pid))
     ci_watch.kill_previous_watcher(cfg)
@@ -140,9 +143,12 @@ def test_kill_previous_watcher_kills_our_watcher(monkeypatch, tmp_path):
 def test_background_watch_no_checks_is_not_blocking(monkeypatch, tmp_path):
     monkeypatch.setattr(ci_watch.github_api, "get_check_runs_for_commit", lambda sha, cwd=None: [])
     monkeypatch.setattr(ci_watch.github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
-    monkeypatch.setattr(ci_watch, "_unaddressed_comments", lambda pr, sha, d: [])
+    # Patch the owning modules — watcher._background_watch calls
+    # _ci_watcher._unaddressed_comments, and checks.poll_checks_for_commit reads
+    # _ci_config.NO_CHECKS_GRACE_S.
+    monkeypatch.setattr(_ci_watcher, "_unaddressed_comments", lambda pr, sha, d: [])
     # NO_CHECKS_GRACE_S=0 so empty checks resolve to no_checks on the second look.
-    monkeypatch.setattr(ci_watch, "NO_CHECKS_GRACE_S", 0)
+    monkeypatch.setattr(_ci_config, "NO_CHECKS_GRACE_S", 0)
     cfg = _cfg(tmp_path, initial_delay_s=0, poll_interval_s=0, watch_timeout_s=5)
     ci_watch.background_watch("deadbeef", 3, "feat", cfg)
     results = json.loads(cfg.results_file.read_text())
@@ -206,7 +212,9 @@ def test_absolute_path_override_is_respected(tmp_path):
 # --- #9: review-comment freshness keys off the pushed sha ------------------
 
 def test_unaddressed_comments_uses_pushed_sha_date(monkeypatch, tmp_path):
-    monkeypatch.setattr(ci_watch, "commit_date", lambda d, sha: "2026-06-01T00:00:00Z")
+    # Patch the owning module (_ci_repo) — watcher._unaddressed_comments calls
+    # _repo.commit_date(...), so the seam is _ci_repo, not ci_watch.
+    monkeypatch.setattr(_ci_repo, "commit_date", lambda d, sha: "2026-06-01T00:00:00Z")
     seen: dict = {}
 
     def fake_get(pr, since, cwd=None):
@@ -222,7 +230,9 @@ def test_unaddressed_comments_uses_pushed_sha_date(monkeypatch, tmp_path):
 
 
 def test_unaddressed_comments_falls_back_to_latest_commit(monkeypatch, tmp_path):
-    monkeypatch.setattr(ci_watch, "commit_date", lambda d, sha: "")
+    # Patch the owning module (_ci_repo) — watcher._unaddressed_comments calls
+    # _repo.commit_date(...), so the seam is _ci_repo, not ci_watch.
+    monkeypatch.setattr(_ci_repo, "commit_date", lambda d, sha: "")
     monkeypatch.setattr(ci_watch.github_api, "get_latest_commit", lambda pr, cwd=None: ("sha", "2026-05-01T00:00:00Z"))
     seen: dict = {}
     monkeypatch.setattr(ci_watch.github_api, "get_unaddressed_comments",

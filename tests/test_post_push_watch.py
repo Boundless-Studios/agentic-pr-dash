@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 from agentic_pr_dash import ci_watch
+from agentic_pr_dash._ci_watch import adapter as _ci_adapter
 from agentic_pr_dash.codex_hooks import run_post_push_watch as hook
 
 
@@ -206,7 +207,9 @@ def test_background_watch_passing_writes_results_and_calls_complete(monkeypatch,
     monkeypatch.setattr(ci_watch.github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
 
     complete_calls: list[dict] = []
-    monkeypatch.setattr(ci_watch, "run_adapter",
+    # Patch the owning module (_ci_adapter) — watcher._background_watch calls
+    # _adapter.run_adapter(...), so the seam is _ci_adapter, not ci_watch.
+    monkeypatch.setattr(_ci_adapter, "run_adapter",
                         lambda tmpl, fields, cwd: complete_calls.append(fields) if tmpl == "C" else None)
 
     cfg = _cfg(tmp_path, initial_delay_s=0, poll_interval_s=0, complete_command="C", status_command="S")
