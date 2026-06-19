@@ -2,6 +2,7 @@
 
 import os
 import types
+from datetime import datetime, timezone
 
 import pytest
 
@@ -32,6 +33,8 @@ def test_arm_marker_roundtrip(tmp_path):
     assert fields["pr"] == "7"
     assert fields["session_id"] == "sess-1"
     assert fields["pid"] == "4242"
+    assert "last_heartbeat" not in fields
+    assert "heartbeat" not in fields
 
     session = tmp_path / ".agentic-pr-dash" / "pr-watch.session"
     assert session.read_text(encoding="utf-8").strip() == "sess-1"
@@ -303,6 +306,41 @@ def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeyp
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
     assert str(orphan) in result
     assert mc._marker_session_id(str(orphan)) == "claude-uuid-X"
+
+
+def test_collect_owned_skips_foreign_owner_with_fresh_heartbeat_even_dead_pid(tmp_path, monkeypatch):
+    """The adoption path must use the same heartbeat liveness as _check_worktree.
+
+    A dead PID from a short-lived arming shell is not enough to steal a marker
+    while the owning session heartbeat is fresh.
+    """
+    foreign = tmp_path / "foreign"
+    foreign.mkdir()
+    marker = config.load(str(foreign)).watch_marker_for(str(foreign))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        "\n".join(
+            [
+                "pr=101",
+                "session_id=foreign-session",
+                "pid=2147480000",
+                f"last_heartbeat={datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(foreign), "br-foreign")]
+    )
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-foreign": (101, False)})
+    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+
+    result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
+
+    assert result == []
+    assert mc._marker_session_id(str(foreign)) == "foreign-session"
 
 
 def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):

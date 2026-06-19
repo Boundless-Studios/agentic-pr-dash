@@ -208,7 +208,7 @@ def _collect_owned_worktrees(
     session_id: str, cwd: str, pid: int | None
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted."""
-    from .markers import _marker_session_id, _marker_live_foreign_pid, _write_arm_marker  # noqa: PLC0415
+    from .markers import _live_foreign_owner, _marker_session_id, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
@@ -245,7 +245,7 @@ def _collect_owned_worktrees(
         number, is_draft = pr
         if is_draft:
             continue
-        if _marker_live_foreign_pid(worktree_path, session_id):
+        if _live_foreign_owner(worktree_path, session_id):
             continue
         if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)
