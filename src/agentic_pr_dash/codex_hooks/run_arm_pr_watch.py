@@ -92,8 +92,11 @@ def pr_watch_autoloop_enabled() -> bool:
 
 # Command parsing lives in command_parser.py; re-exported here so existing
 # importers (run_post_push_watch, tests) and this module's ``main`` keep
-# resolving these names from ``run_arm_pr_watch``.
-from .command_parser import (  # noqa: E402
+# resolving these names from ``run_arm_pr_watch``. Absolute import (matching the
+# module-top imports) so the hook still works when invoked as a script path
+# (``python src/agentic_pr_dash/codex_hooks/run_arm_pr_watch.py``), where
+# ``__package__`` is unset and a relative import would raise ImportError.
+from agentic_pr_dash.codex_hooks.command_parser import (  # noqa: E402
     _names_explicit_repo,
     _skip_command_prefixes,
     cd_target,
