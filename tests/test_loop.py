@@ -177,6 +177,36 @@ def test_discover_iterates_all_configured_cwds(monkeypatch):
     assert result == ["/repo/a/wt1", "/repo/b", "/repo/c/wt2"]
 
 
+def test_tick_cleans_stale_no_pr_worktree_without_running_pr_check(monkeypatch, tmp_path):
+    stale_worktree = tmp_path / "stale-no-pr"
+    active_worktree = tmp_path / "active-pr"
+    stale_worktree.mkdir()
+    active_worktree.mkdir()
+    calls = []
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(stale_worktree), str(active_worktree)])
+    monkeypatch.setattr(
+        loop,
+        "_cleanup_stale_no_pr_worktree",
+        lambda cwd: calls.append(("cleanup", cwd)) or cwd == str(stale_worktree),
+    )
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            calls.append(("check", cmd[cmd.index("--cwd") + 1]))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+
+    loop._tick(_args(cwd=["/repo/root"], session_id=""), "codex {prompt}")
+
+    assert ("cleanup", str(stale_worktree)) in calls
+    assert ("cleanup", str(active_worktree)) in calls
+    assert ("check", str(stale_worktree)) not in calls
+    assert ("check", str(active_worktree)) in calls
+
+
 def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
     calls = []
     worktree = tmp_path / "wt"
@@ -198,6 +228,7 @@ def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
         raise AssertionError(f"unexpected subprocess.run call: {cmd}")
 
     monkeypatch.setattr(loop, "_discover_cwds", fake_discover)
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd: False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0)
@@ -232,6 +263,7 @@ def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
         raise FileNotFoundError("codex: command not found")
 
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd: False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", boom)

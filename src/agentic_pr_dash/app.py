@@ -7,7 +7,6 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
 import os
-import platform
 from pathlib import Path
 import subprocess
 import time
@@ -37,7 +36,13 @@ from .models import (
 from .orchestrator import Orchestrator
 from .runner_monitor import get_runner_fleet_load
 from . import session_registry
-from .worktrees import discover_worktrees, get_main_repo_root
+from . import worktrees as _worktrees
+from .worktrees import (
+    _now_epoch as _worktree_now_epoch,
+    discover_worktrees,
+    get_main_repo_root,
+    selected_worktree_cleanup_reason,
+)
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
@@ -285,118 +290,16 @@ def _format_last_updated(value: str | None) -> str | None:
 
 
 def _now_epoch() -> int:
-    return int(datetime.now().timestamp())
-
-
-def _run_text(cmd: list[str], *, cwd: str | None = None, timeout: int = 10) -> str | None:
-    try:
-        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
-def _is_main_or_protected_worktree(worktree: dict) -> bool:
-    path = worktree.get("path") or ""
-    branch = worktree.get("branch") or ""
-    if branch in {"", "main", "master", "detached"}:
-        return True
-    try:
-        return Path(path).resolve() == Path(get_main_repo_root()).resolve()
-    except OSError:
-        return path == get_main_repo_root()
-
-
-def _branch_pr_state(branch: str) -> str | None:
-    if not branch:
-        return None
-    output = _run_text(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "number,state",
-            "--template",
-            "{{range .}}{{.state}}{{end}}",
-        ],
-        cwd=get_main_repo_root(),
-    )
-    return output or None
-
-
-def _worktree_is_dirty(path: str) -> bool:
-    output = _run_text(["git", "-C", path, "status", "--porcelain"])
-    return bool(output)
-
-
-def _worktree_branch_stale_reason(path: str, branch: str) -> str | None:
-    main_repo = get_main_repo_root()
-    fork_point = _run_text(["git", "-C", main_repo, "merge-base", branch, "origin/main"])
-    if not fork_point:
-        fork_point = _run_text(["git", "-C", main_repo, "merge-base", branch, "main"])
-    if not fork_point:
-        return None
-
-    raw_count = _run_text(["git", "-C", main_repo, "rev-list", "--count", f"{fork_point}..{branch}"])
-    try:
-        commit_count = int(raw_count or "0")
-    except ValueError:
-        return None
-
-    now = _now_epoch()
-    if commit_count == 0:
-        stat_args = ["stat", "-f", "%B", path] if platform.system() == "Darwin" else ["stat", "-c", "%W", path]
-        raw_birth = _run_text(stat_args)
-        try:
-            birth_epoch = int(raw_birth or "0")
-        except ValueError:
-            birth_epoch = 0
-        age_secs = now - birth_epoch if birth_epoch > 0 else ZERO_COMMIT_STALE_SECS
-        if age_secs >= ZERO_COMMIT_STALE_SECS:
-            return "orphan with no commits beyond main"
-        return None
-
-    raw_last = _run_text(["git", "-C", main_repo, "log", "-1", "--format=%ct", branch])
-    try:
-        last_epoch = int(raw_last or "0")
-    except ValueError:
-        return None
-    threshold = AGENT_STALE_SECS if Path(path).name.startswith(("worktree-agent-", "agent-")) or branch.startswith("worktree-agent-") else OTHER_STALE_SECS
-    age_secs = now - last_epoch
-    if age_secs >= threshold:
-        return f"stale orphan ({age_secs // 86400}d old, no PR)"
-    return None
+    return _worktree_now_epoch()
 
 
 def _selected_worktree_cleanup_reason(worktree: dict, active_agents: list[AgentProcess]) -> tuple[bool, str]:
-    path = worktree.get("path") or ""
-    branch = worktree.get("branch") or ""
-    if _is_main_or_protected_worktree(worktree):
-        return False, "protected worktree"
-    if active_agents:
-        return False, "active agent detected"
-    if _worktree_is_dirty(path):
-        return False, "local changes present"
-
-    pr_state = _branch_pr_state(branch)
-    if pr_state == "OPEN":
-        return False, "open PR exists"
-    if pr_state in {"MERGED", "CLOSED"}:
-        return True, f"{pr_state.lower()} PR branch"
-
-    stale_reason = _worktree_branch_stale_reason(path, branch)
-    if stale_reason:
-        return True, stale_reason
-    return False, "selected worktree is not stale enough"
+    original_subprocess = _worktrees.subprocess
+    _worktrees.subprocess = subprocess
+    try:
+        return selected_worktree_cleanup_reason(worktree, active_agents, main_repo=get_main_repo_root())
+    finally:
+        _worktrees.subprocess = original_subprocess
 
 
 def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[WorktreeCard], int, int]:

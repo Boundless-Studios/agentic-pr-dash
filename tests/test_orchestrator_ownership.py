@@ -596,7 +596,7 @@ def test_build_cards_terminal_session_does_not_leave_clean_pr_working(monkeypatc
     monkeypatch.setattr(
         dashboard_app.session_registry,
         "summarize_sessions",
-        lambda: session_registry.SessionSummary(
+        lambda path=None: session_registry.SessionSummary(
             sessions={"s1": runtime_session},
             by_worktree={str(worktree): runtime_session},
         ),
@@ -772,7 +772,7 @@ def test_build_cards_terminal_hidden_agent_worktree_does_not_leave_clean_pr_work
     monkeypatch.setattr(
         dashboard_app.session_registry,
         "summarize_sessions",
-        lambda: session_registry.SessionSummary(
+        lambda path=None: session_registry.SessionSummary(
             sessions={"s1": runtime_session},
             by_worktree={str(worktree): runtime_session},
         ),

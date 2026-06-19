@@ -28,7 +28,9 @@ import time
 from pathlib import Path
 
 from . import coordinator
+from .agents import discover_active_agents
 from .config import load as load_config
+from .worktrees import find_worktree_for_path, remove_worktree, selected_worktree_cleanup_reason
 
 CHECK_WORK_FOUND = 10
 
@@ -262,10 +264,30 @@ def _dispatch_with_fallback(primary: str, fallback: str, prompt: str, cwd: str, 
     return False
 
 
+def _cleanup_stale_no_pr_worktree(cwd: str) -> bool:
+    """Remove a stale worktree with no open PR; return True when removed."""
+    worktree = find_worktree_for_path(cwd)
+    if not worktree:
+        return False
+    active_agents = discover_active_agents([cwd]).get(cwd, [])
+    eligible, reason = selected_worktree_cleanup_reason(worktree, active_agents)
+    if not eligible:
+        return False
+    removed, detail = remove_worktree(cwd)
+    name = Path(cwd).name
+    if removed:
+        print(f"[agentic-pr-dash] cleaned stale no-PR worktree {name}: {reason}", file=sys.stderr)
+        return True
+    print(f"[agentic-pr-dash] failed to clean stale no-PR worktree {name}: {detail}", file=sys.stderr)
+    return False
+
+
 def _tick(args, executor: str) -> None:
     fallback = getattr(args, "fallback_executor", "") or ""
     for cwd in _discover_cwds(args):
         if not Path(cwd).is_dir():
+            continue
+        if _cleanup_stale_no_pr_worktree(cwd):
             continue
         check = subprocess.run(
             [sys.executable, "-m", "agentic_pr_dash", "check",
