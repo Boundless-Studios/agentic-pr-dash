@@ -126,3 +126,5 @@ def test_dirty_released_owner_blocks_unsafe_takeover(tmp_path, monkeypatch):
 
     assert decision.should_dispatch is False
     assert decision.state == "manual_intervention"
+    assert "PR #123 has 2 unaddressed review comments" in decision.reason
+    assert owner_worktree in decision.reason

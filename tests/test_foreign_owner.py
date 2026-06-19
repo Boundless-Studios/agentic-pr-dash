@@ -43,10 +43,16 @@ def test_self_session_is_never_foreign(tmp_path):
     assert mc._live_foreign_owner(str(tmp_path), "me") is None
 
 
-def test_dead_pid_takes_over(tmp_path):
+def test_dead_pid_with_fresh_heartbeat_still_defers(tmp_path):
     _write_marker(tmp_path, session_id="owner-A", pid="2147480000",
                   heartbeat=_iso(datetime.now(timezone.utc)))
-    assert mc._live_foreign_owner(str(tmp_path), "me") is None
+    assert mc._live_foreign_owner(str(tmp_path), "me") == "owner-A"
+
+
+def test_last_heartbeat_field_counts_as_fresh(tmp_path):
+    _write_marker(tmp_path, session_id="owner-A", pid="2147480000",
+                  last_heartbeat=_iso(datetime.now(timezone.utc)))
+    assert mc._live_foreign_owner(str(tmp_path), "me") == "owner-A"
 
 
 def test_modern_ttl_env_beats_legacy(monkeypatch):

@@ -83,9 +83,8 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     owner = fields.get("session_id", "")
     if not owner or owner == (self_session_id or ""):
         return None
-    if not _pid_alive(fields.get("pid", "")):
-        return None
-    if _heartbeat_fresh(fields.get("heartbeat", ""), cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
+    heartbeat = fields.get("last_heartbeat", "") or fields.get("heartbeat", "")
+    if _heartbeat_fresh(heartbeat, cwd) or _fix_lease_active(fields.get("fix_lease_until", "")):
         return owner
     return None
 
@@ -118,7 +117,7 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
 
     now = datetime.now(timezone.utc)
-    prior_heartbeat = fields.get("heartbeat", "")
+    prior_heartbeat = fields.get("last_heartbeat", "") or fields.get("heartbeat", "")
     had_lease = "fix_lease_until" in fields
 
     if not work_found:
@@ -129,7 +128,9 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
                 if 0 <= age < _heartbeat_min_interval_seconds():
                     return
 
-    fields["heartbeat"] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    heartbeat = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    fields["last_heartbeat"] = heartbeat
+    fields["heartbeat"] = heartbeat
     if work_found:
         fields["fix_lease_until"] = (now + timedelta(seconds=_fix_lease_seconds())).strftime(
             "%Y-%m-%dT%H:%M:%SZ"
@@ -171,6 +172,8 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
         "armed_at": now,
         "session_id": session_id,
         "pid": str(pid),
+        "last_heartbeat": now,
+        "heartbeat": now,
     }
     content = "".join(f"{k}={v}\n" for k, v in fields.items())
     target = os.path.join(state_dir, "pr-watch.armed")

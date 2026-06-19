@@ -123,11 +123,19 @@ def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> Disp
     claim = decision.claim
     if decision.reclaimable and claim and claim.owner.worktree_path:
         if worktree_has_dirty_or_unpushed_changes(claim.owner.worktree_path):
+            comment_count = len(getattr(pr, "review_comments", []) or [])
+            comment_label = "comment" if comment_count == 1 else "comments"
+            pending_context = (
+                f"PR #{pr.number} has {comment_count} unaddressed review {comment_label}; "
+                if comment_count
+                else f"PR #{pr.number} has reclaimable maintenance work; "
+            )
             return DispatchDecision(
                 should_dispatch=False,
                 state="manual_intervention",
                 reason=(
-                    "claim is reclaimable but owner worktree has dirty or "
+                    pending_context
+                    + "claim is reclaimable but owner worktree has dirty or "
                     f"unpushed changes: {claim.owner.worktree_path}"
                 ),
                 claim_id=claim.claim_id,
