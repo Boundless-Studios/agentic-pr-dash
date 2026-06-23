@@ -287,3 +287,92 @@ def test_arm_spawns_when_pr_present(monkeypatch, tmp_path):
     assert ci_watch.arm_post_push_watch(_cfg(tmp_path)) == 0
     assert len(spawned) == 1
     assert spawned[0][:3] == ("abc123", 55, "feature-x")
+
+
+# ---------------------------------------------------------------------------
+# Post-push waiter nudge (BOU-1786)
+# ---------------------------------------------------------------------------
+
+def _run_hook_capture(monkeypatch, capsys, payload, *, argv=("PostToolUse",)):
+    """Run hook.main with arming stubbed; return (rc, stdout-as-dict-or-None)."""
+    monkeypatch.setattr(ci_watch, "arm_post_push_watch", lambda cfg: 0)
+    monkeypatch.setattr(sys, "argv", ["run_post_push_watch.py", *argv])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+    rc = hook.main()
+    out = capsys.readouterr().out.strip()
+    parsed = json.loads(out) if out else None
+    return rc, parsed
+
+
+def _stub_owned_open_nondraft_pr(monkeypatch, tmp_path):
+    """Make the nudge gates all pass: Bash push, branch w/ open non-draft PR, no waiter."""
+    monkeypatch.setattr(hook, "current_branch", lambda p: "feature/x")
+    monkeypatch.setattr(hook, "head_sha", lambda p: "abc1234def567")
+    monkeypatch.setattr(hook, "get_pr_number", lambda b, p: 2290)
+    monkeypatch.setattr(hook, "_pr_is_draft", lambda n, c: False)
+    monkeypatch.setattr(hook, "_read_session_marker", lambda c: "sess-1")
+    monkeypatch.setattr(hook, "_await_alive", lambda c, s: False)
+
+
+def test_nudge_emitted_for_claude_push_with_owned_nondraft_pr(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push origin HEAD"},
+               "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0
+    assert out["hookSpecificOutput"]["hookEventName"] == "PostToolUse"
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "#2290" in ctx
+    assert "abc1234" in ctx          # short sha
+    assert "await" in ctx            # rendered await_command
+    assert "sess-1" in ctx
+
+
+def test_no_nudge_for_codex_exec_push(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    payload = {"tool_name": "exec_command", "tool_input": {"cmd": "git push"},
+               "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_for_draft_pr(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "_pr_is_draft", lambda n, c: True)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_when_no_pr(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "get_pr_number", lambda b, p: None)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_when_waiter_already_alive(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "_await_alive", lambda c, s: True)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_for_rejected_push(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path),
+               "tool_response": {"exit_code": 1}}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None   # find_push_cwd → None, hook returns before nudge
+
+
+def test_nudge_construction_error_is_advisory(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    def boom(b, p):
+        raise RuntimeError("gh down")
+    monkeypatch.setattr(hook, "get_pr_number", boom)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None   # swallowed; push never blocked
