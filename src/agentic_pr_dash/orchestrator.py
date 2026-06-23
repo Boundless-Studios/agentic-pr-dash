@@ -462,6 +462,21 @@ class Orchestrator:
             pr.no_push_comment_retry_count = 0
         pr.last_seen_comment_ids = current_comment_ids
 
+        # Read escalation marker (best-effort): if the maintenance loop has
+        # repeatedly failed to fix this PR, flag it so the dashboard can surface
+        # a badge and title-bar banner.
+        try:
+            from ._maintenance.stop_gate import _read_escalation_marker  # noqa: PLC0415
+            esc = _read_escalation_marker(root or ".")
+            if str(num) in esc:
+                pr.escalated = True
+                pr.escalated_reason = esc[str(num)].get("last_error")
+            else:
+                pr.escalated = False
+                pr.escalated_reason = None
+        except Exception:  # noqa: BLE001
+            pass
+
         # Compute status
         pr.status = self._compute_status(pr)
         pr.last_polled = now

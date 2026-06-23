@@ -11,6 +11,13 @@
              {% if card.worktree_path %}data-worktree-path="{{ card.worktree_path }}"{% endif %}
              {% if card.worktree_path %}tabindex="0" role="button" aria-label="Focus {{ card.worktree_name }} in iTerm"{% endif %}>
 
+            {# ── Escalation badge (shown above card header when executor streak triggered) ── #}
+            {% if card.escalated %}
+            <div class="card-escalation-badge" title="{{ card.escalated_reason or 'Executor repeatedly failed' }}">
+                ⚠ ESCALATED — executor failed repeatedly. Manual intervention required.
+            </div>
+            {% endif %}
+
             {# ── Card header: name + branch + single state badge ── #}
             <div class="card-top">
                 <div>

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time as _time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _env_int
@@ -151,6 +152,25 @@ def _stop_gate_impl(args) -> int:
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
                     detached_prs.add(_dr["pr"])
             open_prs = worktree_prs | detached_prs
+            # Check for escalated PRs — if any owned PR is escalated, surface it
+            # as an exit-2 block (distinct from the waiter prompt) before the
+            # normal waiter check.
+            escalation_marker = _read_escalation_marker(cwd)
+            escalated_owned = {
+                int(k): v for k, v in escalation_marker.items()
+                if str(k).isdigit() and int(k) in open_prs
+            }
+            if escalated_owned and not _await_alive(cwd, session_id):
+                escalation_text = _build_escalation_block(escalated_owned)
+                fingerprint = "escalated:" + ",".join(str(n) for n in sorted(escalated_owned))
+                count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+                _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+                threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
+                if count < threshold:
+                    print(escalation_text, file=sys.stderr)
+                    return 2
+                _save_stop_state(cwd, {"ts": now})
+                return 0
             if open_prs and not _await_alive(cwd, session_id):
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -189,6 +209,42 @@ def _stop_gate_impl(args) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _read_escalation_marker(cwd: str) -> dict:
+    """Return the escalation marker dict, or {} if not present/corrupt."""
+    cfg = load_config(cwd)
+    if cfg.maintenance_loop_pidfile is not None:
+        daemon_dir = cfg.maintenance_loop_pidfile.parent
+    else:
+        import pathlib  # noqa: PLC0415
+        daemon_dir = pathlib.Path.home() / ".claude" / "daemons"
+    marker_path = daemon_dir / "pr-maintenance-loop.escalated.json"
+    try:
+        with open(marker_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _build_escalation_block(escalated_prs: dict[int, dict]) -> str:
+    """Build the escalation block text for escaped PRs."""
+    lines = [
+        "[pr-watch] ESCALATION: The maintenance loop has repeatedly failed to fix "
+        "PR(s) you own. Manual intervention is required:\n"
+    ]
+    for pr_num, info in sorted(escalated_prs.items()):
+        streak = info.get("streak", "?")
+        last_error = info.get("last_error", "unknown error")
+        lines.append(f"  PR #{pr_num}: {streak} consecutive executor failures")
+        lines.append(f"    Last error: {last_error[:200]}")
+        lines.append("")
+    lines.append(
+        "Fix the PR manually or reconfigure the executor, then run the complete "
+        "command for each PR above."
+    )
+    return "\n".join(lines)
 
 
 def _record_has_blockers(record: dict) -> bool:

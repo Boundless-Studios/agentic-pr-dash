@@ -245,6 +245,8 @@ class WorktreeCard(BaseModel):
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
     cleanup_candidate: bool = False
+    escalated: bool = False
+    escalated_reason: str | None = None
     runtime_session_id: str | None = None
     agent_name: str | None = None
     docker_mode: str | None = None

@@ -557,6 +557,8 @@ def _build_card_for_worktree(
         last_agent_dispatch=pr.last_agent_dispatch if pr else None,
         maintenance=pr.maintenance if pr else None,
         cleanup_candidate=cleanup_candidate,
+        escalated=pr.escalated if pr else False,
+        escalated_reason=pr.escalated_reason if pr else None,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
         agent_name=runtime_session.agent_name if runtime_session else None,
         docker_mode=runtime_session.docker_mode if runtime_session else None,
@@ -640,6 +642,8 @@ def _build_unassigned_pr_card(
         last_polled=pr.last_polled,
         last_agent_dispatch=pr.last_agent_dispatch,
         maintenance=pr.maintenance,
+        escalated=pr.escalated,
+        escalated_reason=pr.escalated_reason,
         pr_created_at=pr.created_at,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
         agent_name=runtime_session.agent_name if runtime_session else None,
@@ -691,6 +695,7 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
     runner_issues = _runner_issues(cards)
     running_github_jobs = _running_github_jobs(cards)
     desktop_docker_instances = _desktop_docker_instances(cards)
+    escalated_prs = [c for c in cards if c.escalated]
     return {
         "columns": build_columns(cards),
         "runner_summary": runner_summary,
@@ -705,6 +710,7 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
         "hidden_agent_worktree_count": hidden_agent_worktree_count,
         "bug_bash_ready_count": _bug_bash_ready_count(cards),
         "show_agent_worktrees": show_agent_worktrees,
+        "escalated_prs": escalated_prs,
         "active_tab": active_tab if active_tab in {"board", "runner_issues"} else "board",
         "board_tab_url": "/?tab=board&show_agents=1" if show_agent_worktrees else "/?tab=board",
         "runner_issues_tab_url": "/?tab=runner_issues&show_agents=1" if show_agent_worktrees else "/?tab=runner_issues",

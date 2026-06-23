@@ -117,10 +117,7 @@ def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     if not _detached_loop_alive(cwd):
         return False
     cfg = load_config(cwd)
-    threshold = int(
-        os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "") or
-        getattr(cfg, "escalation_failure_threshold", None) or 3
-    )
+    threshold = cfg.escalation_failure_threshold
     return executor_failure_streak(cwd, pr) < threshold
 
 
@@ -132,8 +129,7 @@ def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
     """
     from .config import load as _load_config  # noqa: PLC0415
     cfg = _load_config(cwd)
-    threshold = int(os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "") or
-                    getattr(cfg, "escalation_failure_threshold", None) or 3)
+    threshold = cfg.escalation_failure_threshold
     if streak != threshold:
         return  # only fire once at the crossing point
 

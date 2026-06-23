@@ -135,6 +135,15 @@ class Config:
     multi-repo/multi-session machines safe — a foreign-scoped loop never
     suppresses another session's waiter (codex PR #21 review)."""
 
+    escalation_failure_threshold: int = 3
+    """Number of consecutive executor failures for a PR before escalating.
+
+    When the failure streak reaches this value the loop is considered no longer
+    capable of covering the PR autonomously, the stop-gate forces a per-session
+    waiter, and an iTerm2 notification is sent. Resolved from:
+    ``AGENTIC_PR_DASH_ESCALATION_THRESHOLD`` env > toml ``escalation_failure_threshold`` > 3.
+    """
+
     maintenance_repo_roots: tuple[str, ...] = ()
     """Additional repo MAIN-CHECKOUT paths this (super-)repo services PR
     maintenance for, beyond its own checkout (BOU-1546). The stop-gate /
@@ -307,6 +316,15 @@ def load(cwd: str | None = None) -> Config:
             seen_roots.add(ab)
             maintenance_repo_roots.append(ab)
 
+    # escalation_failure_threshold: env > toml > 3
+    esc_threshold_raw = (
+        os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD")
+        or os.environ.get("GAIA_PR_WATCH_ESCALATION_THRESHOLD")
+    )
+    esc_threshold = int(esc_threshold_raw) if esc_threshold_raw else int(
+        proj.get("escalation_failure_threshold", 3)
+    )
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
@@ -317,6 +335,7 @@ def load(cwd: str | None = None) -> Config:
         maintenance_loop_pidfile=loop_pidfile,
         maintenance_loop_machine_wide=machine_wide,
         maintenance_repo_roots=tuple(maintenance_repo_roots),
+        escalation_failure_threshold=esc_threshold,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,

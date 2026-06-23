@@ -104,6 +104,8 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _build_waiter_block,
     _stop_gate_impl,
     _record_has_blockers,
+    _read_escalation_marker,
+    _build_escalation_block,
 )
 
 # completion

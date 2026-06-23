@@ -7,6 +7,29 @@ import subprocess
 from pathlib import Path
 
 
+def notify(title: str, message: str) -> bool:
+    """Send a macOS notification with the given title and message via osascript.
+
+    Best-effort — swallows all errors. Returns True on success, False otherwise.
+    """
+    script = (
+        f'display notification {_osa_quote(message)} with title {_osa_quote(title)}'
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+        return proc.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _osa_quote(s: str) -> str:
+    """Escape a string for use inside an osascript string literal."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
 def focus_or_open_worktree(path: str) -> bool:
     """Focus an iTerm tab for a worktree if found, otherwise open a new tab."""
     worktree_path = Path(path).expanduser()
