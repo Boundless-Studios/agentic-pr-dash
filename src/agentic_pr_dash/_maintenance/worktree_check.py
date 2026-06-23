@@ -17,6 +17,45 @@ import os
 from . import _common, completion, markers, pr_state, worktrees
 
 
+def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str) -> str:
+    """Warn-only defer text for a NON-owning checker that sees a blocked owned PR.
+
+    The invariant (BOU-1785/1788): no defer path may emit a clean-looking no-op
+    while the owned PR has known blockers. This names the PR, the blockers, and
+    the owner so loop logs / sibling output / manual ``check`` can't be mistaken
+    for ``nothing pending``. The caller stays exit 0 and does NOT dispatch a fix
+    (the live owner is responsible) — preserving the don't-double-fix invariant.
+    """
+    return (
+        f"owned PR #{pr_number} has blockers {sorted(blockers)}; "
+        f"deferring to {owner_desc} — NOT clean (no fix dispatched)"
+    )
+
+
+def _resolve_and_blockers(cwd: str):
+    """Resolve the worktree's branch→PR and compute its live blockers.
+
+    Returns ``(pr, blockers)``. ``pr`` may be the ``_GH_UNAVAILABLE`` sentinel,
+    ``None`` (no PR), or a draft ``PRData`` — ``blockers`` is ``[]`` for all of
+    those non-actionable cases. For a real, non-draft PR the blockers include a
+    thread-aware fallback (an OLD unresolved review thread that ``blockers_for_pr``
+    misses). Shared by the owner-defer paths and the main service path so a
+    deferral can name the blockers without re-deriving them.
+    """
+    from agentic_pr_dash import maintenance  # noqa: PLC0415 — avoid import cycle
+
+    pr = pr_state._resolve_pr_for_branch(cwd)
+    if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
+        return pr, []
+    blockers = maintenance.blockers_for_pr(pr)
+    if not blockers:
+        unresolved_threads = pr_state._unresolved_review_threads(pr.number, cwd)
+        if unresolved_threads:
+            pr.review_comments = completion._review_comments_from_threads(unresolved_threads)
+            blockers = ["review_comments"]
+    return pr, blockers
+
+
 def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tuple[int, str]:
     """Read-only blocker check for ONE worktree. Returns ``(exit_code, text)``.
 
@@ -44,13 +83,23 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     cwd = os.path.abspath(cwd)
 
     # Ownership gate — defer to a live, actively-looping in-session owner before
-    # doing any work (cheap, before resolving the PR). See _live_foreign_owner.
+    # doing the claim/dispatch work. See _live_foreign_owner. We DO still resolve
+    # the PR + compute blockers here so a deferral to a live owner cannot report
+    # a blocked owned PR as a clean no-op (BOU-1788): the owner is responsible for
+    # the fix, but every checker must still SURFACE that the PR is blocked.
     owner = markers._live_foreign_owner(cwd, self_session_id)
     if owner is not None:
+        owner_pr, owner_blockers = _resolve_and_blockers(cwd)
+        if owner_blockers:
+            return 0, _blocked_defer_text(
+                pr_number=owner_pr.number,
+                blockers=owner_blockers,
+                owner_desc=f"live PR-watch owner session {owner}",
+            )
         return 0, f"deferring to live PR-watch owner session {owner}"
 
-    # Resolve PR
-    pr = pr_state._resolve_pr_for_branch(cwd)
+    # Resolve PR + blockers (thread-aware). Purely read, no state written.
+    pr, blockers = _resolve_and_blockers(cwd)
 
     if pr is pr_state._GH_UNAVAILABLE:
         return 2, pr_state._gh_unavailable_message(cwd)
@@ -60,16 +109,6 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # Never service a DRAFT — the author marked it not-ready.
     if pr.is_draft:
         return 0, "PR is a draft; nothing pending"
-
-    # Check for blockers — no state written, purely read
-    blockers = maintenance.blockers_for_pr(pr)
-
-    # Consult review threads directly when nothing else flags it.
-    if not blockers:
-        unresolved_threads = pr_state._unresolved_review_threads(pr.number, cwd)
-        if unresolved_threads:
-            pr.review_comments = completion._review_comments_from_threads(unresolved_threads)
-            blockers = ["review_comments"]
 
     if not blockers:
         # Clean check: refresh the alive heartbeat (hold ownership) and clear any
@@ -82,9 +121,14 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         return 0, "nothing pending"
 
     # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
-    # heartbeat/lease (BOU-1540).
+    # heartbeat/lease (BOU-1540). Blockers are known here, so name them rather
+    # than emitting a clean-looking no-op (BOU-1788 family).
     if worktrees._live_independent_owner_paths([cwd], self_session_id):
-        return 0, "deferring to live independent owner of this worktree"
+        return 0, _blocked_defer_text(
+            pr_number=pr.number,
+            blockers=blockers,
+            owner_desc="live independent owner of this worktree",
+        )
 
     owner_session_id = self_session_id or f"pid:{_common._resolve_owner_pid()}"
 
@@ -107,9 +151,25 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             active_fingerprint is not None and active_fingerprint != live_fingerprint
         )
 
+        # A claim owned by THIS session must be SERVICED, not deferred to: the
+        # caller already holds it and the blockers are confirmed, so deferring to
+        # one's own active claim hides the work for the whole lease window
+        # (BOU-1785 repro). `new_feedback` only catches a CHANGED fingerprint; a
+        # claim made for the SAME still-unresolved blockers slips through it.
+        active_owner = coordinator.active_claim_owner_for_pr(pr)
+        self_owned = active_owner is not None and active_owner.session_id == owner_session_id
+
         coord_decision = coordinator.dispatch_decision_for_pr(pr)
-        if not coord_decision.should_dispatch and not new_feedback:
-            return 0, f"deferring to agent-coordinator {coord_decision.state}: {coord_decision.reason}"
+        if not coord_decision.should_dispatch and not new_feedback and not self_owned:
+            return 0, _blocked_defer_text(
+                pr_number=pr.number,
+                blockers=blockers,
+                owner_desc=(
+                    f"active agent-coordinator claim {coord_decision.claim_id} "
+                    f"(owner session {coord_decision.owner_session_id}, "
+                    f"pid {coord_decision.owner_pid})"
+                ),
+            )
 
         claimed = coordinator.claim_pr(
             pr,
@@ -118,8 +178,12 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             agent="agentic-pr-dash-check",
             lease_seconds=_common._fix_lease_seconds(),
         )
-        if claimed is None and not new_feedback:
-            return 0, "deferring to active agent-coordinator claim"
+        if claimed is None and not new_feedback and not self_owned:
+            return 0, _blocked_defer_text(
+                pr_number=pr.number,
+                blockers=blockers,
+                owner_desc="active agent-coordinator claim",
+            )
         if claimed is not None:
             coordinator_claim_id = claimed.claim_id
             coordinator_fingerprint = claimed.task.fingerprint

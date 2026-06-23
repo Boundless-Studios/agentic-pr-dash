@@ -36,6 +36,8 @@ class DispatchDecision:
     state: str
     reason: str
     claim_id: str | None = None
+    owner_session_id: str | None = None
+    owner_pid: int | None = None
 
 
 def store_path() -> Path:
@@ -139,26 +141,29 @@ def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> Disp
                     f"unpushed changes: {claim.owner.worktree_path}"
                 ),
                 claim_id=claim.claim_id,
+                owner_session_id=claim.owner.session_id,
+                owner_pid=claim.owner.pid,
             )
     return DispatchDecision(
         should_dispatch=decision.reclaimable,
         state=decision.state.value,
         reason=decision.reason,
         claim_id=claim.claim_id if claim else None,
+        owner_session_id=claim.owner.session_id if claim else None,
+        owner_pid=claim.owner.pid if claim else None,
     )
 
 
-def active_claim_fingerprint_for_pr(pr: PRData, *, now: datetime | None = None) -> str | None:
-    """Fingerprint of the latest ACTIVE claim for this PR's task_id, ignoring the
-    PR's CURRENT fingerprint (BOU-1637).
+def _best_active_claim_for_pr(pr: PRData, *, now: datetime | None = None) -> ClaimRecord | None:
+    """The latest live, unexpired, unreleased ACTIVE claim for this PR's task_id,
+    ignoring the PR's CURRENT fingerprint (BOU-1637).
 
     ``TaskCoordinator.status`` keys a claim by the FULL task identity (task_id +
     fingerprint), so a status() lookup with the round-2 fingerprint can't see a
-    still-active round-1 claim whose fingerprint differs. To gate ``check`` on
-    "is the in-flight claim for the SAME blocker set?", we must look up the active
-    claim by task_id alone and compare fingerprints ourselves. Returns None when
-    no live, unexpired, unreleased claim exists for the PR's task_id — i.e. there
-    is nothing to defer to.
+    still-active round-1 claim whose fingerprint differs. To answer "is the
+    in-flight claim for the SAME blocker set?" and "who owns it?", we look up the
+    active claim by task_id alone. Returns None when no live, unexpired,
+    unreleased claim exists for the PR's task_id — i.e. nothing to defer to.
     """
     coord = _coordinator()
     timestamp = now or datetime.now(timezone.utc)
@@ -177,7 +182,23 @@ def active_claim_fingerprint_for_pr(pr: PRData, *, now: datetime | None = None) 
         key = (claim.claimed_at, claim.heartbeat_at, claim.claim_id)
         if best_key is None or key > best_key:
             best, best_key = claim, key
+    return best
+
+
+def active_claim_fingerprint_for_pr(pr: PRData, *, now: datetime | None = None) -> str | None:
+    """Fingerprint of the latest ACTIVE claim for this PR's task_id (see
+    ``_best_active_claim_for_pr``). None when there is no claim to defer to."""
+    best = _best_active_claim_for_pr(pr, now=now)
     return best.task.fingerprint if best is not None else None
+
+
+def active_claim_owner_for_pr(pr: PRData, *, now: datetime | None = None) -> OwnerIdentity | None:
+    """Owner of the latest ACTIVE claim for this PR's task_id, fingerprint-
+    agnostic (see ``_best_active_claim_for_pr``). Lets ``check`` tell a claim it
+    OWNS itself (service the known blockers) from a foreign session's claim
+    (warn-only defer). None when there is no claim to defer to."""
+    best = _best_active_claim_for_pr(pr, now=now)
+    return best.owner if best is not None else None
 
 
 def claim_pr(
