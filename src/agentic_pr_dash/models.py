@@ -194,6 +194,12 @@ class PRData(BaseModel):
     # agent-coordinator claim the dashboard holds after handing maintenance off
     # to the local agent; released when the PR goes clean.
     coordinator_claim_id: str | None = None
+    # True when at least one required CI check is still queued/in_progress.
+    # Set by _check_worktree for non-draft PRs via github_api.required_checks_pending.
+    ci_watch_pending: bool = False
+    # True when this PR has been escalated due to repeated executor failures.
+    escalated: bool = False
+    escalated_reason: str | None = None
 
 
 class AgentProcess(BaseModel):
