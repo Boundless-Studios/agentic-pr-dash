@@ -979,6 +979,29 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     return checks
 
 
+def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
+    """True iff a required CI check is still queued/in_progress.
+
+    Runs ``gh pr checks <n> --required --json name,bucket,state`` and returns
+    ``True`` when any check's ``bucket`` is ``"pending"`` (in_progress).
+    Returns ``False`` on gh non-zero exit, empty result, or JSON parse error.
+    """
+    r = _run(
+        ["gh", "pr", "checks", str(pr_number), "--required",
+         "--json", "name,bucket,state"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode != 0:
+        return False
+    try:
+        raw = json.loads(r.stdout or "[]")
+        if not isinstance(raw, list):
+            return False
+    except json.JSONDecodeError:
+        return False
+    return any(c.get("bucket") == "pending" for c in raw if isinstance(c, dict))
+
+
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
     """Snapshot GitHub status for a specific commit ``sha``.
 
