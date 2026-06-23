@@ -97,13 +97,60 @@ def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     return new_streak
 
 
+def _escalated_marker_path(cwd: str) -> Path:
+    """Path to the escalation marker JSON (same daemon dir as the health file)."""
+    cfg = load_config(cwd)
+    if cfg.maintenance_loop_pidfile is not None:
+        daemon_dir = cfg.maintenance_loop_pidfile.parent
+    else:
+        daemon_dir = Path.home() / ".claude" / "daemons"
+    return daemon_dir / "pr-maintenance-loop.escalated.json"
+
+
+def _clear_escalation_entry(cwd: str, pr: int | None) -> None:
+    """Drop ``pr`` from the escalation marker so a recovered PR stops nagging.
+
+    Without this, a PR that escalated and was then fixed (but is still open,
+    awaiting merge) would re-fire the stop-gate escalation block forever — the
+    streak resets but the marker would otherwise persist.
+    """
+    import json as _json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    marker_path = _escalated_marker_path(cwd)
+    try:
+        existing = _json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(existing, dict) or str(pr) not in existing:
+        return
+    del existing[str(pr)]
+    try:
+        if existing:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=marker_path.parent,
+                delete=False, suffix=".tmp",
+            ) as fh:
+                _json.dump(existing, fh)
+                tmp = fh.name
+            os.replace(tmp, marker_path)
+        else:
+            marker_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def reset_executor_failure(cwd: str, pr: int | None) -> None:
-    """Reset the executor-failure streak for ``pr`` after a successful dispatch."""
+    """Reset the executor-failure streak for ``pr`` after a successful dispatch.
+
+    Also clears any escalation marker for ``pr`` so a recovered PR stops
+    surfacing the stop-gate escalation block.
+    """
     key = str(pr)
     data = _load_health(cwd)
     if key in data:
         del data[key]
         _save_health(cwd, data)
+    _clear_escalation_entry(cwd, pr)
 
 
 def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
@@ -138,11 +185,8 @@ def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
     from . import iterm  # noqa: PLC0415
 
     # Write escalation marker
-    if cfg.maintenance_loop_pidfile is not None:
-        daemon_dir = cfg.maintenance_loop_pidfile.parent
-    else:
-        daemon_dir = Path.home() / ".claude" / "daemons"
-    marker_path = daemon_dir / "pr-maintenance-loop.escalated.json"
+    marker_path = _escalated_marker_path(cwd)
+    daemon_dir = marker_path.parent
     try:
         existing: dict = {}
         try:

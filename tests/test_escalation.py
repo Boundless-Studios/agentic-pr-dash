@@ -126,3 +126,23 @@ def test_pr_data_escalated_field_default():
     pr = PRData(number=1, title="T", branch="b", url="http://x.com/1")
     assert pr.escalated is False
     assert pr.escalated_reason is None
+
+
+def test_reset_executor_failure_clears_escalation_marker(tmp_path, monkeypatch):
+    """A recovered PR must drop out of the escalation marker so the stop-gate
+    stops surfacing the escalation block (BOU-1789 false-positive-after-recovery)."""
+    cwd = str(tmp_path)
+    monkeypatch.setattr(iterm, "notify", lambda title, msg: True)
+
+    # Escalate two PRs, then recover only #42.
+    loop._maybe_escalate(cwd, 42, "boom", 3)
+    loop._maybe_escalate(cwd, 99, "boom", 3)
+    marker = _escalation_marker_path(tmp_path)
+    assert set(json.loads(marker.read_text())) == {"42", "99"}
+
+    loop.reset_executor_failure(cwd, 42)
+    assert set(json.loads(marker.read_text())) == {"99"}, "Only #42 should be cleared"
+
+    # Recovering the last PR removes the marker file entirely.
+    loop.reset_executor_failure(cwd, 99)
+    assert not marker.exists(), "Marker file should be removed when empty"
