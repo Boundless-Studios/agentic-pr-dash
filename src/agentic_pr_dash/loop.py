@@ -36,6 +36,129 @@ from .worktrees import find_worktree_for_path, remove_worktree, selected_worktre
 CHECK_WORK_FOUND = 10
 
 
+# ---------------------------------------------------------------------------
+# Per-PR executor-failure streak tracking (BOU-1789 Task 5)
+# ---------------------------------------------------------------------------
+
+
+def _health_file(cwd: str) -> Path:
+    """Path to the per-loop health JSON file."""
+    cfg = load_config(cwd)
+    if cfg.maintenance_loop_pidfile is not None:
+        daemon_dir = cfg.maintenance_loop_pidfile.parent
+    else:
+        daemon_dir = Path.home() / ".claude" / "daemons"
+    return daemon_dir / "pr-maintenance-loop.health.json"
+
+
+def _load_health(cwd: str) -> dict:
+    """Load the health JSON, or {} on missing/corrupt."""
+    try:
+        raw = _health_file(cwd).read_text(encoding="utf-8")
+        data = __import__("json").loads(raw)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_health(cwd: str, data: dict) -> None:
+    """Atomically write the health JSON."""
+    import json as _json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    hf = _health_file(cwd)
+    try:
+        hf.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=hf.parent, delete=False, suffix=".tmp"
+        ) as fh:
+            _json.dump(data, fh)
+            tmp_path = fh.name
+        os.replace(tmp_path, hf)
+    except OSError:
+        pass
+
+
+def executor_failure_streak(cwd: str, pr: int | None) -> int:
+    """Return the current executor-failure streak for PR ``pr`` (0 if unknown)."""
+    key = str(pr)
+    data = _load_health(cwd)
+    entry = data.get(key, {})
+    return int(entry.get("streak", 0))
+
+
+def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
+    """Record a new executor failure for ``pr``; return the new streak count."""
+    key = str(pr)
+    data = _load_health(cwd)
+    entry = data.get(key, {})
+    new_streak = int(entry.get("streak", 0)) + 1
+    data[key] = {"streak": new_streak, "last_error": err, "updated": time.time()}
+    _save_health(cwd, data)
+    return new_streak
+
+
+def reset_executor_failure(cwd: str, pr: int | None) -> None:
+    """Reset the executor-failure streak for ``pr`` after a successful dispatch."""
+    key = str(pr)
+    data = _load_health(cwd)
+    if key in data:
+        del data[key]
+        _save_health(cwd, data)
+
+
+def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
+    """Edge-triggered escalation at streak == threshold (fires once per threshold crossing).
+
+    Writes an escalation marker, calls iterm.notify, and sets a dashboard flag.
+    Wired in from _tick after record_executor_failure.
+    """
+    from .config import load as _load_config  # noqa: PLC0415
+    cfg = _load_config(cwd)
+    threshold = int(os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "") or
+                    getattr(cfg, "escalation_failure_threshold", None) or 3)
+    if streak != threshold:
+        return  # only fire once at the crossing point
+
+    import json as _json  # noqa: PLC0415
+    import tempfile  # noqa: PLC0415
+    from . import iterm  # noqa: PLC0415
+
+    # Write escalation marker
+    if cfg.maintenance_loop_pidfile is not None:
+        daemon_dir = cfg.maintenance_loop_pidfile.parent
+    else:
+        daemon_dir = Path.home() / ".claude" / "daemons"
+    marker_path = daemon_dir / "pr-maintenance-loop.escalated.json"
+    try:
+        existing: dict = {}
+        try:
+            existing = _json.loads(marker_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        existing[str(pr)] = {
+            "streak": streak, "last_error": err, "escalated_at": time.time(),
+        }
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=daemon_dir, delete=False, suffix=".tmp"
+        ) as fh:
+            _json.dump(existing, fh)
+            tmp = fh.name
+        os.replace(tmp, marker_path)
+    except OSError:
+        pass
+
+    iterm.notify(
+        f"PR #{pr} escalated",
+        f"Executor failed {streak} times in a row: {err[:120]}",
+    )
+    print(
+        f"[agentic-pr-dash] ESCALATION: PR #{pr} executor failed {streak} times "
+        f"(threshold={threshold}); notified user and wrote escalation marker.",
+        file=sys.stderr,
+    )
+
+
 def _discover_cwds(args) -> list[str]:
     """Worktrees to service this tick."""
     if args.no_discover_worktrees:
@@ -308,8 +431,12 @@ def _tick(args, executor: str) -> None:
         if claim_id:
             coordinator.heartbeat_claim_id(claim_id, session)
         if not _dispatch_with_fallback(executor, fallback, prompt, cwd, pr):
-            # Primary (and fallback, if any) failed. Release the claim so the PR
-            # is not left wrongly owned until the lease expires, then move on.
+            # Primary (and fallback, if any) failed. Record the failure streak,
+            # then release the claim so the PR is not left wrongly owned until
+            # the lease expires, then move on.
+            err_summary = f"executor exit non-zero or spawn-failed for PR #{pr}"
+            new_streak = record_executor_failure(cwd, pr, err_summary)
+            _maybe_escalate(cwd, pr, err_summary, new_streak)
             if claim_id:
                 reason = "all_executors_failed" if fallback else "executor_failed"
                 coordinator.release_claim_id(claim_id, session, reason)
@@ -321,6 +448,8 @@ def _tick(args, executor: str) -> None:
         if claim_id:
             reason = "completed" if complete.returncode == 0 else "complete_failed"
             coordinator.release_claim_id(claim_id, session, reason)
+        # Reset the failure streak on a successful dispatch + complete.
+        reset_executor_failure(cwd, pr)
 
 
 def _write_loop_pidfile(pidfile: Path | None) -> None:
