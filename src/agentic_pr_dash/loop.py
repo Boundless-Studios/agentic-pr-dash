@@ -106,6 +106,24 @@ def reset_executor_failure(cwd: str, pr: int | None) -> None:
         _save_health(cwd, data)
 
 
+def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
+    """True when the detached loop is alive AND the failure streak < threshold.
+
+    When the streak reaches the threshold the loop has repeatedly failed to fix
+    the PR, so it no longer counts as coverage — the stop-gate must force a
+    per-session waiter to bring the issue to the user.
+    """
+    from ._maintenance.waiter import _detached_loop_alive  # noqa: PLC0415
+    if not _detached_loop_alive(cwd):
+        return False
+    cfg = load_config(cwd)
+    threshold = int(
+        os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "") or
+        getattr(cfg, "escalation_failure_threshold", None) or 3
+    )
+    return executor_failure_streak(cwd, pr) < threshold
+
+
 def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
     """Edge-triggered escalation at streak == threshold (fires once per threshold crossing).
 

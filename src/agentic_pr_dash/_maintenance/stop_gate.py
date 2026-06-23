@@ -141,9 +141,11 @@ def _stop_gate_impl(args) -> int:
 
     if not pending:
         if (not getattr(args, "no_waiter", False)) and session_id:
-            worktree_prs = (
-                set() if _detached_loop_alive(cwd) else _owned_open_pr_numbers(owned)
-            )
+            from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+            worktree_prs = {
+                n for n in _owned_open_pr_numbers(owned)
+                if not _loop_mod._loop_covers_pr(cwd, n)
+            }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
