@@ -1019,6 +1019,22 @@ def _ctx_is_pending(ctx: dict) -> bool:
     return False
 
 
+def _repo_for_cwd(cwd: str | None) -> str | None:
+    """``owner/name`` for the repo at ``cwd``, preferring the cwd's OWN remote.
+
+    ``resolved_repo`` returns a pinned/global ``repo`` (e.g. from
+    ``AGENTIC_PR_DASH_REPO`` or a shared config) without consulting ``cwd``, so
+    in a multi-repo session it would resolve a sibling worktree's PR against the
+    anchor repo. Detect from the cwd's git remote first and only fall back to the
+    config-resolved repo (codex PR #50 review)."""
+    from .config import _detect_repo  # noqa: PLC0415
+    if cwd:
+        detected = _detect_repo(Path(cwd))
+        if detected:
+            return detected
+    return load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
+
+
 def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     """True iff a required/merge-gating check is still non-terminal.
 
@@ -1031,7 +1047,7 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     pending context past the first 100 isn't missed. Returns ``False`` on any
     error or when no required check is pending (fail-safe).
     """
-    repo = load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
+    repo = _repo_for_cwd(cwd)
     if not repo or "/" not in repo:
         return False
     owner, name = repo.split("/", 1)

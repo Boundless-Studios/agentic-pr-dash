@@ -152,31 +152,43 @@ def _stop_gate_impl(args) -> int:
         for r in detached:
             pending.append(_detached_pending_entry(r))
 
-    # Map each owned PR to ITS OWN worktree cwd so the repo-scoped
+    # Map each owned PR to ALL of its worktree cwds so the repo-scoped
     # health/escalation lookups (loop._loop_covers_pr / the escalation marker)
-    # hit the PR's own repo — owned worktrees can span several repos
-    # (maintenance_repo_roots) and using the anchor cwd would read the wrong file
+    # hit the PR's own repo. Owned worktrees can span several repos
+    # (maintenance_repo_roots) and the SAME PR number can exist in two repos, so
+    # never collapse to a bare-number→single-worktree dict — keep a per-number
+    # list and treat a PR as covered only when covered in EVERY repo that has it
     # (codex PR #50 review). Falls back to the anchor cwd for PRs with no
     # resolvable worktree (e.g. mocked/detached).
-    pr_to_wt = {pr: wt for wt, pr in _owned_open_pr_pairs(owned)}
-    # Escalation markers, read from each PR's OWN repo. Computed BEFORE the
+    pr_to_wts: dict[int, list[str]] = {}
+    for wt, pr in _owned_open_pr_pairs(owned):
+        pr_to_wts.setdefault(pr, []).append(wt)
+
+    def _wts_for(pr: int) -> list[str]:
+        return pr_to_wts.get(pr) or [cwd]
+
+    # Escalation markers, read from each PR's OWN repo(s). Computed BEFORE the
     # pending split so an escalated PR that STILL has blockers (the usual state
     # after the loop failed to fix it → it lands in `pending`) surfaces the
     # escalation explanation + last executor error, not just the generic pending
     # prompt (codex PR #50 review).
     escalated_owned: dict[int, dict] = {}
     if session_id:
-        for pr, wt in pr_to_wt.items():
-            info = _read_escalation_marker(wt).get(str(pr))
-            if info is not None:
-                escalated_owned[pr] = info
+        for pr, wts in pr_to_wts.items():
+            for wt in wts:
+                info = _read_escalation_marker(wt).get(str(pr))
+                if info is not None:
+                    escalated_owned[pr] = info
+                    break
 
     if not pending:
         if (not getattr(args, "no_waiter", False)) and session_id:
             from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+            # A PR is loop-covered only if covered in EVERY repo that owns it; if
+            # any repo's instance is uncovered/escalated, force the waiter.
             worktree_prs = {
                 n for n in _owned_open_pr_numbers(owned)
-                if not _loop_mod._loop_covers_pr(pr_to_wt.get(n, cwd), n)
+                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))
             }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):
