@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 from . import coordinator
+from ._maintenance import worktree_check
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
 from .config import load as load_config
@@ -298,7 +299,15 @@ def _tick(args, executor: str) -> None:
             capture_output=True, text=True,
         )
         if check.returncode != CHECK_WORK_FOUND:
-            continue  # 0 = clean/deferred, 2 = gh unavailable
+            # 0 = clean/deferred, 2 = gh unavailable. A warn-only defer (a blocked
+            # owned PR we deferred to its live owner without dispatching) is exit 0
+            # by design, but must still be VISIBLE in loop output — otherwise the
+            # detached loop's coverage looks clean while the PR is red (BOU-1788,
+            # codex PR #48 review).
+            notice = check.stdout.strip()
+            if notice and worktree_check.WARN_ONLY_MARKER in notice:
+                print(f"[agentic-pr-dash] {notice}", file=sys.stderr)
+            continue
         pr = _parse_pr_number(check.stdout)
         claim_id = _parse_coordinator_claim_id(check.stdout)
         prompt = check.stdout
