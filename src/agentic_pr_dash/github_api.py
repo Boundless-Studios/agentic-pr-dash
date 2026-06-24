@@ -979,33 +979,62 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     return checks
 
 
+# GraphQL statusCheckRollup: per-context required-ness + non-terminal state.
+# Used instead of ``gh pr checks --required`` because the CLI (a) exits 8 while
+# checks are pending and (b) OMITS required checks that are merely *expected*
+# (configured by branch protection but not yet reported — cli/cli#8855), both of
+# which misclassify the exact "CI hasn't started / is running" case BOU-1789
+# must keep watching to a terminal state.
+_REQUIRED_ROLLUP_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{"
+    "__typename "
+    "... on CheckRun{status isRequired(pullRequestNumber:$number)} "
+    "... on StatusContext{state isRequired(pullRequestNumber:$number)}"
+    "}}}}}}}}}"
+)
+
+
 def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
-    """True iff a required CI check is still queued/in_progress.
+    """True iff a required/merge-gating check is still non-terminal.
 
-    Runs ``gh pr checks <n> --required --json name,bucket,state`` and returns
-    ``True`` when any check's ``bucket`` is ``"pending"`` (in_progress).
-
-    ``gh pr checks`` does NOT exit 0 while checks are pending — it exits **8**
-    (documented in ``gh pr checks --help``); a failing check exits 1. With
-    ``--json`` the checks array is still printed to stdout in each of those
-    cases, so parse stdout regardless of the exit code and only fall back to the
-    exit code when there is no parseable JSON (a real error / no required
-    checks). Returns ``False`` on no required checks or unparseable output.
+    Reads the GraphQL ``statusCheckRollup`` and inspects per-context
+    ``isRequired``. A required context is pending when a ``CheckRun`` is not yet
+    ``COMPLETED`` (queued/in_progress/waiting/requested) or a ``StatusContext``
+    is ``EXPECTED``/``PENDING`` — the ``EXPECTED`` state covers required checks
+    configured by branch protection that have not reported yet (the cli/cli#8855
+    gap that ``gh pr checks`` misses). Returns ``False`` on any error or when no
+    required check is pending (fail-safe).
     """
+    repo = load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
+    if not repo or "/" not in repo:
+        return False
+    owner, name = repo.split("/", 1)
     r = _run(
-        ["gh", "pr", "checks", str(pr_number), "--required",
-         "--json", "name,bucket,state"],
+        ["gh", "api", "graphql",
+         "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
+         "-f", f"query={_REQUIRED_ROLLUP_QUERY}"],
         cwd=cwd, timeout_s=30,
     )
+    if r.returncode != 0:
+        return False
     try:
-        raw = json.loads(r.stdout or "")
-    except (json.JSONDecodeError, TypeError):
-        raw = None
-    if isinstance(raw, list):
-        return any(c.get("bucket") == "pending" for c in raw if isinstance(c, dict))
-    # No parseable JSON (e.g. "no checks reported"). gh exits 8 when required
-    # checks are pending — trust that as a last-resort signal.
-    return r.returncode == 8
+        data = json.loads(r.stdout or "{}")
+        nodes = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
+                 ["commit"]["statusCheckRollup"]["contexts"]["nodes"])
+    except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+        return False
+    for ctx in nodes:
+        if not isinstance(ctx, dict) or not ctx.get("isRequired"):
+            continue
+        if ctx.get("__typename") == "CheckRun":
+            if ctx.get("status") != "COMPLETED":
+                return True
+        elif ctx.get("__typename") == "StatusContext":
+            if ctx.get("state") in ("EXPECTED", "PENDING"):
+                return True
+    return False
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
