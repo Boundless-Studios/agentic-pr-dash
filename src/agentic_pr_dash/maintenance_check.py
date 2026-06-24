@@ -463,7 +463,19 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 return 0
 
             if deadline is not None and time.time() >= deadline:
-                watch_pending = _collect_await_watch_pending(owned, cwd, session_id)
+                # Watch-pending across BOTH live worktrees and detached
+                # (ledger-only) PRs — a session can own a PR solely through the
+                # ledger, so `owned` may be empty while its required CI is still
+                # running (codex PR #50 review).
+                detached_watch_pending = any(
+                    r.get("ci_watch_pending")
+                    and r.get("state") not in ("merged", "closed", "draft", "unknown")
+                    for r in _detached_this_tick
+                )
+                watch_pending = (
+                    detached_watch_pending
+                    or _collect_await_watch_pending(owned, cwd, session_id)
+                )
                 if not watch_pending:
                     print(
                         "[pr-watch] waiter max-wait reached with no feedback; "

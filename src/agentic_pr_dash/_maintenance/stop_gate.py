@@ -80,13 +80,25 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
 
 def _owned_open_pr_numbers(owned: list[str]) -> set[int]:
     """Collect PR numbers from the armed markers of owned worktrees."""
-    numbers: set[int] = set()
+    return {pr for _wt, pr in _owned_open_pr_pairs(owned)}
+
+
+def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
+    """``(worktree, pr)`` pairs from the armed markers of owned worktrees.
+
+    The worktree path is preserved so per-PR, repo-scoped lookups
+    (``loop._loop_covers_pr`` / ``_read_escalation_marker``) hit the PR's OWN
+    repo's health/escalation file — owned worktrees can span several repos
+    (``maintenance_repo_roots``), and the repo-scoped state files would
+    otherwise be read against the stop-gate anchor's repo (codex PR #50 review).
+    """
+    pairs: list[tuple[str, int]] = []
     for wt in owned:
         marker = _read_marker(wt) or {}
         pr_raw = marker.get("pr", "")
         if str(pr_raw).isdigit():
-            numbers.add(int(pr_raw))
-    return numbers
+            pairs.append((wt, int(pr_raw)))
+    return pairs
 
 
 def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
@@ -143,23 +155,30 @@ def _stop_gate_impl(args) -> int:
     if not pending:
         if (not getattr(args, "no_waiter", False)) and session_id:
             from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+            # Map each owned PR to ITS OWN worktree cwd so the repo-scoped
+            # health/escalation lookups (loop._loop_covers_pr / the escalation
+            # marker) hit the PR's own repo — owned worktrees can span several
+            # repos (maintenance_repo_roots) and using the anchor cwd would read
+            # the wrong file (codex PR #50 review). Falls back to the anchor cwd
+            # for PRs with no resolvable worktree (e.g. mocked/detached).
+            pr_to_wt = {pr: wt for wt, pr in _owned_open_pr_pairs(owned)}
             worktree_prs = {
                 n for n in _owned_open_pr_numbers(owned)
-                if not _loop_mod._loop_covers_pr(cwd, n)
+                if not _loop_mod._loop_covers_pr(pr_to_wt.get(n, cwd), n)
             }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
                     detached_prs.add(_dr["pr"])
             open_prs = worktree_prs | detached_prs
-            # Check for escalated PRs — if any owned PR is escalated, surface it
-            # as an exit-2 block (distinct from the waiter prompt) before the
-            # normal waiter check.
-            escalation_marker = _read_escalation_marker(cwd)
-            escalated_owned = {
-                int(k): v for k, v in escalation_marker.items()
-                if str(k).isdigit() and int(k) in open_prs
-            }
+            # Escalated PRs — surface as an exit-2 block (distinct from the
+            # waiter prompt) before the normal waiter check. Read each PR's
+            # marker from its own repo so a sibling-repo escalation isn't missed.
+            escalated_owned: dict[int, dict] = {}
+            for pr in open_prs:
+                info = _read_escalation_marker(pr_to_wt.get(pr, cwd)).get(str(pr))
+                if info is not None:
+                    escalated_owned[pr] = info
             if escalated_owned and not _await_alive(cwd, session_id):
                 escalation_text = _build_escalation_block(escalated_owned)
                 fingerprint = "escalated:" + ",".join(str(n) for n in sorted(escalated_owned))

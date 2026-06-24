@@ -934,19 +934,27 @@ def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
 
 
 def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
-    """Get CI check status for a PR."""
+    """Get CI check status for a PR.
+
+    ``gh pr checks`` exits **non-zero** precisely when there is something to
+    report — 8 while checks are pending, 1 when a check has failed — yet still
+    prints the full ``--json`` array to stdout in those cases. Returning ``[]``
+    on any non-zero rc therefore DROPPED exactly the failing/pending checks the
+    maintenance gate needs (a pending→fail flip would read as "no checks", so
+    ``failing_checks`` stayed empty and the await waiter never woke on failure —
+    codex PR #50 review). Parse stdout regardless of the exit code; fall back to
+    ``[]`` only when stdout is genuinely unparseable (a real gh error).
+    """
     r = _run(
         ["gh", "pr", "checks", str(pr_number),
          "--json", "name,bucket,state"],
         cwd=cwd, timeout_s=30,
     )
-    if r.returncode != 0:
-        return []
     try:
-        raw = json.loads(r.stdout or "[]")
-        if not isinstance(raw, list):
-            return []
-    except json.JSONDecodeError:
+        raw = json.loads(r.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        raw = None
+    if not isinstance(raw, list):
         return []
 
     # Dedup by name (keep latest)
