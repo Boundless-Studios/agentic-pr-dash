@@ -117,6 +117,7 @@ from ._maintenance.completion import (  # noqa: F401, E402
     _candidate_file_refs,
     _ref_matches_touched,
     _thread_points_elsewhere,
+    _thread_elsewhere_refs,
     _FILE_REF_RE,
     _MODULE_REF_STOPWORDS,
 )
@@ -328,14 +329,35 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         )
         if not addressed:
             continue
-        if _thread_points_elsewhere(thread.top.body, path, touched):
+        elsewhere = _thread_elsewhere_refs(thread.top.body, path, touched)
+        if elsewhere:
+            # BOU-1748: the body mentions a file/module the fixing commits did not
+            # touch. Normally that is ambiguous (BOU-1641: a thread anchored on
+            # file A whose real ask is an untouched file B must not auto-resolve
+            # just because A was incidentally touched). BUT when the anchored file
+            # itself was changed by the fix AND GitHub now marks the thread
+            # outdated, the anchored lines were edited — the anchor-touch evidence
+            # outweighs a mere contextual mention of another file, so resolve.
+            anchor_touched_and_outdated = (
+                path is not None and path in touched and thread.is_outdated
+            )
+            if not anchor_touched_and_outdated:
+                print(
+                    f"info: leaving thread {thread.node_id} open — body references "
+                    f"{', '.join(elsewhere)} (not touched by the fixing commits) "
+                    f"and the anchored file was not conclusively addressed "
+                    f"(anchor={path or '<none>'}, outdated={thread.is_outdated}); "
+                    f"ambiguous resolution, needs manual confirmation",
+                    file=sys.stderr,
+                )
+                continue
             print(
-                f"info: leaving thread {thread.node_id} open — body references a "
-                f"file/module not touched by the fixing commits (ambiguous "
-                f"resolution); needs manual confirmation",
+                f"info: resolving thread {thread.node_id} on anchor evidence — "
+                f"body also mentions {', '.join(elsewhere)} (not touched), but the "
+                f"anchored file {path} was changed by the fix and the thread is "
+                f"outdated",
                 file=sys.stderr,
             )
-            continue
         try:
             if not github_api.resolve_review_thread(thread.node_id, cwd):
                 print(

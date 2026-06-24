@@ -20,12 +20,12 @@ from agentic_pr_dash.models import PRData, PRStatus
 ANCHOR = "backend/src/gaia/api/app.py"
 
 
-def _thread(body, *, path=ANCHOR, created="2026-01-01T00:00:00Z"):
+def _thread(body, *, path=ANCHOR, created="2026-01-01T00:00:00Z", outdated=False):
     c = ReviewThreadComment(
         database_id=42, path=path, line=7, body=body,
         author="rev", created_at=created,
     )
-    return ReviewThread(node_id="t1", is_resolved=False, is_outdated=False, top=c)
+    return ReviewThread(node_id="t1", is_resolved=False, is_outdated=outdated, top=c)
 
 
 def _pr():
@@ -162,3 +162,77 @@ def test_thread_points_elsewhere_helper():
     # Prose dotted token (e.g.) must not trip the gate.
     assert mc._thread_points_elsewhere(
         "do this, e.g. add a guard", ANCHOR, touched) is False
+
+
+# --- BOU-1748: anchor touched AND thread outdated -> anchor evidence wins ------
+
+DECK_CONF = "worktree-deck.conf"
+OTHER_PY = "scripts/cleanup-orphan-worktrees.py"
+
+
+def test_bou1748_anchor_conf_touched_and_outdated_body_mentions_other_resolves(monkeypatch):
+    # Exact reproduction context: thread anchored on worktree-deck.conf, the fix
+    # touched worktree-deck.conf, GitHub marks the thread outdated, and the body
+    # also mentions scripts/cleanup-orphan-worktrees.py (contextual, untouched).
+    thread = _thread(
+        "Bump the orphan-sweep age here; this is what "
+        "`scripts/cleanup-orphan-worktrees.py` reads.",
+        path=DECK_CONF,
+        outdated=True,
+    )
+    resolved = _wire(monkeypatch, thread=thread, touched_files=[DECK_CONF])
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    # Anchor file changed + thread outdated -> the body mention of another file
+    # no longer blocks; the thread resolves.
+    assert resolved == ["t1"]
+
+
+def test_bou1748_anchor_touched_but_not_outdated_body_points_elsewhere_stays_open(monkeypatch):
+    # Same shape but the thread is NOT outdated: the BOU-1641 guard must still
+    # hold so a real "fix belongs in the other file" comment is not lost.
+    thread = _thread(
+        "Bump the orphan-sweep age here; this is what "
+        "`scripts/cleanup-orphan-worktrees.py` reads.",
+        path=DECK_CONF,
+        outdated=False,
+    )
+    resolved = _wire(monkeypatch, thread=thread, touched_files=[DECK_CONF])
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+
+
+def test_bou1748_leaving_open_message_names_the_conflicting_path(monkeypatch, capsys):
+    thread = _thread(
+        "The real change belongs in backend/src/gaia/api/worker_app.py",
+        outdated=False,
+    )
+    _wire(monkeypatch, thread=thread, touched_files=[ANCHOR])
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    # AC: when still left open, the message explains the specific conflicting path.
+    assert "backend/src/gaia/api/worker_app.py" in err
+    assert "ambiguous resolution" in err
+
+
+def test_thread_elsewhere_refs_helper_returns_conflicting_refs():
+    touched = {ANCHOR}
+    # Untouched module reference is reported.
+    assert mc._thread_elsewhere_refs(
+        "see gaia.api.worker_app", ANCHOR, touched) == ["gaia.api.worker_app"]
+    # Only the anchor / touched refs -> nothing points elsewhere.
+    assert mc._thread_elsewhere_refs("fix app.py here", ANCHOR, touched) == []
+    assert mc._thread_elsewhere_refs("add a docstring", ANCHOR, touched) == []
+    # De-duplicated, in body order.
+    assert mc._thread_elsewhere_refs(
+        "scripts/a.py then scripts/a.py then scripts/b.py",
+        DECK_CONF, {DECK_CONF},
+    ) == ["scripts/a.py", "scripts/b.py"]

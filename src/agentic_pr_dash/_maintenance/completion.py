@@ -126,10 +126,18 @@ def _ref_matches_touched(ref: str, touched: set[str]) -> bool:
     return False
 
 
-def _thread_points_elsewhere(body: str, anchor_path: str | None,
-                             touched: set[str]) -> bool:
-    """True if the thread body references a file/module NOT among ``touched``."""
+def _thread_elsewhere_refs(body: str, anchor_path: str | None,
+                           touched: set[str]) -> list[str]:
+    """Body file/module refs that point at something NOT among ``touched``.
+
+    Returns the concrete references (in body order, de-duplicated) that neither
+    match a touched path nor resolve to the thread's own anchor. An empty list
+    means the body points only at touched files / the anchor — i.e. it does not
+    point elsewhere. Surfacing the refs lets the caller name the specific
+    conflicting paths when it declines to auto-resolve (BOU-1748).
+    """
     anchor_base = anchor_path.rsplit("/", 1)[-1] if anchor_path else None
+    elsewhere: list[str] = []
     for ref in _candidate_file_refs(body):
         if _ref_matches_touched(ref, touched):
             continue
@@ -145,5 +153,12 @@ def _thread_points_elsewhere(body: str, anchor_path: str | None,
             ):
                 if ref.split(".")[-1] == anchor_base.rsplit(".", 1)[0]:
                     continue
-        return True
-    return False
+        if ref not in elsewhere:
+            elsewhere.append(ref)
+    return elsewhere
+
+
+def _thread_points_elsewhere(body: str, anchor_path: str | None,
+                             touched: set[str]) -> bool:
+    """True if the thread body references a file/module NOT among ``touched``."""
+    return bool(_thread_elsewhere_refs(body, anchor_path, touched))
