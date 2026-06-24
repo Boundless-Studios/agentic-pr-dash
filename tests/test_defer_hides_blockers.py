@@ -202,3 +202,83 @@ def test_live_independent_owner_with_blockers_warns(
     assert code == 0, text
     assert "NOT clean" in text
     assert "ci_failure" in text
+
+
+def test_claim_defer_preserves_coordinator_reason(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The warn-only claim defer must carry the coordinator's own state+reason
+    (e.g. a manual_intervention 'dirty/unpushed owner worktree: <path>') rather
+    than hard-coding 'active agent-coordinator claim' — else the actionable
+    manual-intervention guidance is lost (codex PR #48 review)."""
+    from agentic_pr_dash import coordinator
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    pr = _review_pr(worktree)
+    _stub_gauntlet(monkeypatch, pr)
+
+    reason = (
+        "PR #42 has 2 unaddressed review comments; claim is reclaimable but "
+        "owner worktree has dirty or unpushed changes: /Users/ilya/code/other-wt"
+    )
+    monkeypatch.setattr(
+        coordinator,
+        "dispatch_decision_for_pr",
+        lambda p, **k: coordinator.DispatchDecision(
+            should_dispatch=False,
+            state="manual_intervention",
+            reason=reason,
+            claim_id="claim-x",
+            owner_session_id="other-sess",
+            owner_pid=4321,
+        ),
+    )
+    # No live active claim by task_id, and no fingerprint change.
+    monkeypatch.setattr(coordinator, "active_claim_owner_for_pr", lambda p, **k: None)
+    monkeypatch.setattr(coordinator, "active_claim_fingerprint_for_pr", lambda p, **k: None)
+
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+
+    assert code == 0, text
+    assert "NOT clean" in text
+    assert "manual_intervention" in text
+    assert "dirty or unpushed changes: /Users/ilya/code/other-wt" in text
+
+
+def test_loop_tick_logs_warn_only_defer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The detached loop must LOG a warn-only defer (exit 0) so a blocked owned
+    PR is visible in loop output, not silently dropped (codex PR #48 review)."""
+    import types
+
+    from agentic_pr_dash import loop
+    from agentic_pr_dash._maintenance import worktree_check as _wc
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    warn_text = _wc._blocked_defer_text(
+        pr_number=99,
+        blockers=["ci_failure"],
+        owner_desc="live PR-watch owner session sess-owner",
+    )
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            return types.SimpleNamespace(returncode=0, stdout=warn_text + "\n", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+
+    args = types.SimpleNamespace(
+        no_discover_worktrees=False, session_id="sess-loop", cwd=[str(worktree)],
+        fallback_executor="",
+    )
+    loop._tick(args, "codex {prompt}")
+
+    err = capsys.readouterr().err
+    assert "owned PR #99 has blockers" in err
+    assert _wc.WARN_ONLY_MARKER in err

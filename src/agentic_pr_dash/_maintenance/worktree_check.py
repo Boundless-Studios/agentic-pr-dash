@@ -17,6 +17,12 @@ import os
 from . import _common, completion, markers, pr_state, worktrees
 
 
+# Stable suffix on every warn-only defer text. The detached loop (loop._tick)
+# matches on it to LOG these exit-0 notices instead of dropping them, so a
+# blocked owned PR is visible in loop output too (BOU-1788, codex PR #48 review).
+WARN_ONLY_MARKER = "NOT clean (no fix dispatched)"
+
+
 def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str) -> str:
     """Warn-only defer text for a NON-owning checker that sees a blocked owned PR.
 
@@ -28,7 +34,7 @@ def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str)
     """
     return (
         f"owned PR #{pr_number} has blockers {sorted(blockers)}; "
-        f"deferring to {owner_desc} — NOT clean (no fix dispatched)"
+        f"deferring to {owner_desc} — {WARN_ONLY_MARKER}"
     )
 
 
@@ -161,12 +167,18 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
 
         coord_decision = coordinator.dispatch_decision_for_pr(pr)
         if not coord_decision.should_dispatch and not new_feedback and not self_owned:
+            # Preserve the coordinator's own state + reason (e.g. the
+            # manual_intervention "owner worktree has dirty/unpushed changes:
+            # <path>" guidance, or the active-claim "claim is active") so the
+            # operator still learns WHY this defers — wrapping it in the
+            # blockers + NOT-clean framing rather than replacing it (codex PR #48).
             return 0, _blocked_defer_text(
                 pr_number=pr.number,
                 blockers=blockers,
                 owner_desc=(
-                    f"active agent-coordinator claim {coord_decision.claim_id} "
-                    f"(owner session {coord_decision.owner_session_id}, "
+                    f"agent-coordinator {coord_decision.state}: {coord_decision.reason} "
+                    f"(claim {coord_decision.claim_id}, "
+                    f"owner session {coord_decision.owner_session_id}, "
                     f"pid {coord_decision.owner_pid})"
                 ),
             )
