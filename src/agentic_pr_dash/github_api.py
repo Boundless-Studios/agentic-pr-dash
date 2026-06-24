@@ -994,14 +994,29 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
 # which misclassify the exact "CI hasn't started / is running" case BOU-1789
 # must keep watching to a terminal state.
 _REQUIRED_ROLLUP_QUERY = (
-    "query($owner:String!,$name:String!,$number:Int!){"
+    "query($owner:String!,$name:String!,$number:Int!,$after:String){"
     "repository(owner:$owner,name:$name){pullRequest(number:$number){"
-    "commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100){nodes{"
+    "commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$after){"
+    "pageInfo{hasNextPage endCursor} nodes{"
     "__typename "
     "... on CheckRun{status isRequired(pullRequestNumber:$number)} "
     "... on StatusContext{state isRequired(pullRequestNumber:$number)}"
     "}}}}}}}}}"
 )
+
+# A PR with hundreds of contexts is pathological; cap pages so a malformed
+# never-ending cursor can't spin.
+_ROLLUP_MAX_PAGES = 20
+
+
+def _ctx_is_pending(ctx: dict) -> bool:
+    if not isinstance(ctx, dict) or not ctx.get("isRequired"):
+        return False
+    if ctx.get("__typename") == "CheckRun":
+        return ctx.get("status") != "COMPLETED"
+    if ctx.get("__typename") == "StatusContext":
+        return ctx.get("state") in ("EXPECTED", "PENDING")
+    return False
 
 
 def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
@@ -1012,36 +1027,37 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     ``COMPLETED`` (queued/in_progress/waiting/requested) or a ``StatusContext``
     is ``EXPECTED``/``PENDING`` — the ``EXPECTED`` state covers required checks
     configured by branch protection that have not reported yet (the cli/cli#8855
-    gap that ``gh pr checks`` misses). Returns ``False`` on any error or when no
-    required check is pending (fail-safe).
+    gap that ``gh pr checks`` misses). Paginates the contexts so a required
+    pending context past the first 100 isn't missed. Returns ``False`` on any
+    error or when no required check is pending (fail-safe).
     """
     repo = load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
     if not repo or "/" not in repo:
         return False
     owner, name = repo.split("/", 1)
-    r = _run(
-        ["gh", "api", "graphql",
-         "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
-         "-f", f"query={_REQUIRED_ROLLUP_QUERY}"],
-        cwd=cwd, timeout_s=30,
-    )
-    if r.returncode != 0:
-        return False
-    try:
-        data = json.loads(r.stdout or "{}")
-        nodes = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
-                 ["commit"]["statusCheckRollup"]["contexts"]["nodes"])
-    except (json.JSONDecodeError, KeyError, TypeError, IndexError):
-        return False
-    for ctx in nodes:
-        if not isinstance(ctx, dict) or not ctx.get("isRequired"):
-            continue
-        if ctx.get("__typename") == "CheckRun":
-            if ctx.get("status") != "COMPLETED":
-                return True
-        elif ctx.get("__typename") == "StatusContext":
-            if ctx.get("state") in ("EXPECTED", "PENDING"):
-                return True
+    after: str | None = None
+    for _ in range(_ROLLUP_MAX_PAGES):
+        cmd = ["gh", "api", "graphql",
+               "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
+               "-f", f"query={_REQUIRED_ROLLUP_QUERY}"]
+        if after:
+            cmd += ["-F", f"after={after}"]
+        r = _run(cmd, cwd=cwd, timeout_s=30)
+        if r.returncode != 0:
+            return False
+        try:
+            data = json.loads(r.stdout or "{}")
+            rollup = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
+                      ["commit"]["statusCheckRollup"])
+            contexts = rollup["contexts"]
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            return False
+        if any(_ctx_is_pending(ctx) for ctx in contexts.get("nodes", [])):
+            return True
+        page = contexts.get("pageInfo") or {}
+        if not page.get("hasNextPage") or not page.get("endCursor"):
+            return False
+        after = page["endCursor"]
     return False
 
 

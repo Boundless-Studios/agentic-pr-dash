@@ -316,14 +316,22 @@ def load(cwd: str | None = None) -> Config:
             seen_roots.add(ab)
             maintenance_repo_roots.append(ab)
 
-    # escalation_failure_threshold: env > toml > 3
+    # escalation_failure_threshold: env > toml > 3. Clamp to a positive int and
+    # fall back to the default on invalid input — a mistyped value must not make
+    # load() raise (breaking every config read), and 0/negative would make
+    # _loop_covers_pr treat the live loop as never-covering while _maybe_escalate
+    # never fires (codex PR #50 review).
     esc_threshold_raw = (
         os.environ.get("AGENTIC_PR_DASH_ESCALATION_THRESHOLD")
         or os.environ.get("GAIA_PR_WATCH_ESCALATION_THRESHOLD")
+        or proj.get("escalation_failure_threshold", 3)
     )
-    esc_threshold = int(esc_threshold_raw) if esc_threshold_raw else int(
-        proj.get("escalation_failure_threshold", 3)
-    )
+    try:
+        esc_threshold = int(esc_threshold_raw)
+    except (TypeError, ValueError):
+        esc_threshold = 3
+    if esc_threshold < 1:
+        esc_threshold = 3
 
     return Config(
         repo=_env("REPO") or proj.get("repo"),

@@ -104,20 +104,32 @@ def _save_health(cwd: str, data: dict) -> None:
         pass
 
 
+def _entry_streak(entry: object) -> int:
+    """Streak from a per-PR health entry, coercing malformed content to 0.
+
+    A health file can be hand-edited or partially written, so a per-PR entry
+    may not be a dict, or ``streak`` may not parse as an int. Raising here would
+    propagate into _loop_covers_pr / record_executor_failure; in the stop-gate
+    path that exception is swallowed and the session releases with NO waiter even
+    though the PR may be at the escalation threshold (codex PR #50 review)."""
+    if not isinstance(entry, dict):
+        return 0
+    try:
+        return int(entry.get("streak", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def executor_failure_streak(cwd: str, pr: int | None) -> int:
     """Return the current executor-failure streak for PR ``pr`` (0 if unknown)."""
-    key = str(pr)
-    data = _load_health(cwd)
-    entry = data.get(key, {})
-    return int(entry.get("streak", 0))
+    return _entry_streak(_load_health(cwd).get(str(pr), {}))
 
 
 def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     """Record a new executor failure for ``pr``; return the new streak count."""
     key = str(pr)
     data = _load_health(cwd)
-    entry = data.get(key, {})
-    new_streak = int(entry.get("streak", 0)) + 1
+    new_streak = _entry_streak(data.get(key, {})) + 1
     data[key] = {"streak": new_streak, "last_error": err, "updated": time.time()}
     _save_health(cwd, data)
     return new_streak

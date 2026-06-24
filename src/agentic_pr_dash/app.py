@@ -1195,10 +1195,15 @@ async def pr_dashboard_proof_fixture_runner_issues(request: Request, scenario: s
 @app.get("/partials/board", response_class=HTMLResponse)
 async def board_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees)
+    # board_oob: emit the out-of-band escalation-banner swap only for the HTMX
+    # partial poll, so the title-bar banner refreshes with the board (the
+    # full-page include must NOT duplicate the slot id) — codex PR #50 review.
+    ctx["board_oob"] = True
     return templates.TemplateResponse(
         request=request,
         name="partials/board.html",
-        context=await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees),
+        context=ctx,
     )
 
 

@@ -1,3 +1,11 @@
+{% if board_oob %}
+{# Out-of-band refresh of the title-bar escalation banner alongside the board
+   poll. Only emitted for the HTMX partial (board_oob) so the full-page include
+   doesn't duplicate the #escalation-banner-slot id. #}
+<div id="escalation-banner-slot" hx-swap-oob="true">
+    {% include 'partials/escalation_banner.html' %}
+</div>
+{% endif %}
 {% for col in columns %}
 <div class="kanban-column col-{{ col.id }}" id="col-{{ col.id }}">
     <div class="column-header">

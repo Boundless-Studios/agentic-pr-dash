@@ -29,15 +29,12 @@
             });
         }
     </script>
-    {% if escalated_prs %}
-    <div class="escalation-banner">
-        ⚠ ESCALATION: Executor repeatedly failed for PR(s)
-        {% for card in escalated_prs %}
-            <strong>#{{ card.pr_number }}</strong>{% if not loop.last %}, {% endif %}
-        {% endfor %}
-        — manual intervention required.
+    {# Escalation banner — refreshed via an hx-swap-oob element in the board
+       partial (the board polls every 5s), so an escalation recorded after the
+       page loaded appears without a full reload (codex PR #50 review). #}
+    <div id="escalation-banner-slot">
+        {% include 'partials/escalation_banner.html' %}
     </div>
-    {% endif %}
     <header>
         <div class="header-left">
             <h1>Worktree Dashboard</h1>

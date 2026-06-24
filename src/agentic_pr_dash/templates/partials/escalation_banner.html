@@ -1,0 +1,9 @@
+{% if escalated_prs %}
+<div class="escalation-banner">
+    ⚠ ESCALATION: Executor repeatedly failed for PR(s)
+    {% for card in escalated_prs %}
+        <strong>#{{ card.pr_number }}</strong>{% if not loop.last %}, {% endif %}
+    {% endfor %}
+    — manual intervention required.
+</div>
+{% endif %}
