@@ -984,22 +984,28 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
 
     Runs ``gh pr checks <n> --required --json name,bucket,state`` and returns
     ``True`` when any check's ``bucket`` is ``"pending"`` (in_progress).
-    Returns ``False`` on gh non-zero exit, empty result, or JSON parse error.
+
+    ``gh pr checks`` does NOT exit 0 while checks are pending — it exits **8**
+    (documented in ``gh pr checks --help``); a failing check exits 1. With
+    ``--json`` the checks array is still printed to stdout in each of those
+    cases, so parse stdout regardless of the exit code and only fall back to the
+    exit code when there is no parseable JSON (a real error / no required
+    checks). Returns ``False`` on no required checks or unparseable output.
     """
     r = _run(
         ["gh", "pr", "checks", str(pr_number), "--required",
          "--json", "name,bucket,state"],
         cwd=cwd, timeout_s=30,
     )
-    if r.returncode != 0:
-        return False
     try:
-        raw = json.loads(r.stdout or "[]")
-        if not isinstance(raw, list):
-            return False
-    except json.JSONDecodeError:
-        return False
-    return any(c.get("bucket") == "pending" for c in raw if isinstance(c, dict))
+        raw = json.loads(r.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        raw = None
+    if isinstance(raw, list):
+        return any(c.get("bucket") == "pending" for c in raw if isinstance(c, dict))
+    # No parseable JSON (e.g. "no checks reported"). gh exits 8 when required
+    # checks are pending — trust that as a last-resort signal.
+    return r.returncode == 8
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:

@@ -212,14 +212,12 @@ def _stop_gate_impl(args) -> int:
 
 
 def _read_escalation_marker(cwd: str) -> dict:
-    """Return the escalation marker dict, or {} if not present/corrupt."""
-    cfg = load_config(cwd)
-    if cfg.maintenance_loop_pidfile is not None:
-        daemon_dir = cfg.maintenance_loop_pidfile.parent
-    else:
-        import pathlib  # noqa: PLC0415
-        daemon_dir = pathlib.Path.home() / ".claude" / "daemons"
-    marker_path = daemon_dir / "pr-maintenance-loop.escalated.json"
+    """Return the (repo-scoped) escalation marker dict, or {} if absent/corrupt.
+
+    Routes through ``loop._escalated_marker_path`` so the reader and the loop's
+    writer agree on the per-repo filename (keys stay bare PR numbers)."""
+    from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+    marker_path = _loop_mod._escalated_marker_path(cwd)
     try:
         with open(marker_path, encoding="utf-8") as fh:
             data = json.load(fh)

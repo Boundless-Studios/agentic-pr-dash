@@ -55,6 +55,33 @@ def test_required_checks_pending_false_empty_list(monkeypatch):
     assert github_api.required_checks_pending(42) is False
 
 
+def test_required_checks_pending_true_on_exit_8_with_json(monkeypatch):
+    """gh exits 8 (not 0) while required checks are pending — must still parse
+    stdout and return True (the core regression: a False here would leave
+    ci_watch_pending unset for the exact case the feature exists for)."""
+    checks = [{"name": "Integration Tests", "bucket": "pending", "state": "IN_PROGRESS"}]
+    monkeypatch.setattr(github_api, "_run",
+                        lambda cmd, **kw: _make_result(8, json.dumps(checks)))
+    assert github_api.required_checks_pending(42) is True
+
+
+def test_required_checks_pending_true_on_exit_8_without_json(monkeypatch):
+    """Last-resort: gh's pending exit code (8) is trusted even with no parseable
+    stdout."""
+    monkeypatch.setattr(github_api, "_run",
+                        lambda cmd, **kw: _make_result(8, ""))
+    assert github_api.required_checks_pending(42) is True
+
+
+def test_required_checks_pending_false_on_exit_1_failure_json(monkeypatch):
+    """A failing (rc 1) required check with no pending bucket is NOT watch-pending
+    (the failure is handled by the ci_failure blocker path)."""
+    checks = [{"name": "test", "bucket": "fail", "state": "completed"}]
+    monkeypatch.setattr(github_api, "_run",
+                        lambda cmd, **kw: _make_result(1, json.dumps(checks)))
+    assert github_api.required_checks_pending(42) is False
+
+
 def test_required_checks_pending_uses_required_flag(monkeypatch):
     """The gh command includes --required flag."""
     captured_cmd = {}

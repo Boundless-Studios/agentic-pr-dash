@@ -186,6 +186,9 @@ def test_tick_cleans_stale_no_pr_worktree_without_running_pr_check(monkeypatch, 
     calls = []
 
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(stale_worktree), str(active_worktree)])
+    # Repo-scoped streak path: stub the gh-backed slug. The clean check now runs
+    # _clear_recovered_streak, which no-ops here (no recorded state).
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(
         loop,
         "_cleanup_stale_no_pr_worktree",
@@ -305,6 +308,7 @@ def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_discover_cwds", fake_discover)
     monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0)
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: calls.append(("heartbeat", claim_id, session_id)))
@@ -340,6 +344,7 @@ def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
     monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", boom)
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: calls.append(("heartbeat", claim_id, session_id)))

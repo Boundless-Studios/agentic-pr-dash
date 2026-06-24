@@ -22,7 +22,8 @@ def _isolate_config(monkeypatch, tmp_path):
 
 
 def _health_file(tmp_path: Path) -> Path:
-    return tmp_path / "daemons" / "pr-maintenance-loop.health.json"
+    # Repo-scoped filename — resolve through the real path helper.
+    return loop._health_file(str(tmp_path))
 
 
 def test_executor_failure_streak_starts_at_zero(tmp_path):
@@ -186,3 +187,47 @@ def test_tick_resets_streak_on_success(monkeypatch, tmp_path):
     )
     loop._tick(args, "codex {prompt}")
     assert any(pr == 9 for _, pr in reset_calls), "Should reset streak on success"
+
+
+def test_streak_is_namespaced_by_repo(tmp_path):
+    """Two repos sharing the daemon dir must NOT collide on a bare PR number —
+    repo A's PR #42 streak is invisible to repo B's PR #42 (review P2)."""
+    repo_a = tmp_path / "repo-a"; repo_a.mkdir()
+    repo_b = tmp_path / "repo-b"; repo_b.mkdir()
+
+    loop.record_executor_failure(str(repo_a), 42, "boom")
+    loop.record_executor_failure(str(repo_a), 42, "boom")
+
+    assert loop.executor_failure_streak(str(repo_a), 42) == 2
+    assert loop.executor_failure_streak(str(repo_b), 42) == 0, "repo B must not see repo A's streak"
+    # Distinct on-disk files.
+    assert loop._health_file(str(repo_a)) != loop._health_file(str(repo_b))
+
+
+def test_clear_recovered_streak_clears_when_pr_clean(tmp_path, monkeypatch):
+    """On a clean check, a recorded streak/marker for the worktree's PR is
+    dropped without an executor dispatch (review P2: external recovery)."""
+    cwd = str(tmp_path)
+    loop.record_executor_failure(cwd, 42, "boom")
+    assert loop.executor_failure_streak(cwd, 42) == 1
+
+    # gh pr view --json number resolves the worktree's current (now-clean) PR.
+    monkeypatch.setattr(
+        loop.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout='{"number": 42}', stderr=""),
+    )
+    loop._clear_recovered_streak(cwd)
+    assert loop.executor_failure_streak(cwd, 42) == 0
+
+
+def test_clear_recovered_streak_skips_pr_resolution_without_state(tmp_path, monkeypatch):
+    """No `gh pr view` PR-resolution when this repo has no recorded streak/
+    escalation state (repo-slug detection may still run, and is cheap/cached)."""
+    cmds = []
+    def _spy(cmd, *a, **k):
+        cmds.append(cmd)
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+    monkeypatch.setattr(loop.subprocess, "run", _spy)
+    loop._clear_recovered_streak(str(tmp_path))
+    assert not any("pr" in c and "view" in c for c in cmds), \
+        "must not resolve the PR via `gh pr view` when there is no recorded state"

@@ -45,6 +45,9 @@ def _wire(monkeypatch, worktree, *, run_executor):
     monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
     monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    # Streak files are repo-scoped; stub the (gh-backed) slug so this dispatch
+    # test doesn't shell out to resolve the repo name.
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor",
                         lambda executor, prompt, cwd: run_executor(executor, calls))

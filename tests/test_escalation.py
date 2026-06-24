@@ -23,7 +23,9 @@ def _isolation(monkeypatch, tmp_path):
 
 
 def _escalation_marker_path(tmp_path: Path) -> Path:
-    return tmp_path / "daemons" / "pr-maintenance-loop.escalated.json"
+    # Repo-scoped filename — resolve through the real path helper so the test
+    # tracks the namespacing instead of hardcoding the bare name.
+    return loop._escalated_marker_path(str(tmp_path))
 
 
 def test_maybe_escalate_fires_at_threshold(tmp_path, monkeypatch):
@@ -146,3 +148,19 @@ def test_reset_executor_failure_clears_escalation_marker(tmp_path, monkeypatch):
     # Recovering the last PR removes the marker file entirely.
     loop.reset_executor_failure(cwd, 99)
     assert not marker.exists(), "Marker file should be removed when empty"
+
+
+def test_maybe_escalate_handles_non_dict_marker(tmp_path, monkeypatch):
+    """A valid-JSON-but-non-dict marker (e.g. `[]` from a bad write) must not
+    raise TypeError and abort the loop at the escalation moment (review P2)."""
+    cwd = str(tmp_path)
+    monkeypatch.setattr(iterm, "notify", lambda title, msg: True)
+    marker = _escalation_marker_path(tmp_path)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("[]", encoding="utf-8")  # non-dict content
+
+    # Must not raise.
+    loop._maybe_escalate(cwd, 42, "boom", 3)
+
+    data = json.loads(marker.read_text())
+    assert isinstance(data, dict) and "42" in data

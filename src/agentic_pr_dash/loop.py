@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 import time
+from functools import lru_cache
 from pathlib import Path
 
 from . import coordinator
@@ -41,14 +42,38 @@ CHECK_WORK_FOUND = 10
 # ---------------------------------------------------------------------------
 
 
-def _health_file(cwd: str) -> Path:
-    """Path to the per-loop health JSON file."""
+def _daemon_dir(cwd: str) -> Path:
     cfg = load_config(cwd)
     if cfg.maintenance_loop_pidfile is not None:
-        daemon_dir = cfg.maintenance_loop_pidfile.parent
-    else:
-        daemon_dir = Path.home() / ".claude" / "daemons"
-    return daemon_dir / "pr-maintenance-loop.health.json"
+        return cfg.maintenance_loop_pidfile.parent
+    return Path.home() / ".claude" / "daemons"
+
+
+@lru_cache(maxsize=64)
+def _repo_slug(cwd: str) -> str:
+    """Filesystem-safe identifier for the repo a worktree belongs to.
+
+    The machine-wide loop services worktrees across several repos
+    (``maintenance_repo_roots``) but shares one daemon dir, so the streak /
+    escalation state must be namespaced by repo — otherwise repo A's PR #42 and
+    repo B's PR #42 collide on a bare ``"42"`` key and one repo's failures
+    escalate (or suppress loop-coverage for) the other's unrelated PR. Scoping
+    the *filename* by repo keeps the JSON keys as bare PR numbers, so the
+    stop-gate / dashboard readers (which parse ``int(key)``) stay valid.
+
+    Uses ``resolved_repo`` (canonical ``owner/name``) so the loop writer and the
+    stop-gate / orchestrator readers derive the SAME slug regardless of whether
+    they run from the worktree or the main checkout. Cached because that resolve
+    can shell out to ``gh``/``git`` and is hit on every streak read.
+    """
+    repo = load_config(cwd).resolved_repo(Path(cwd))
+    raw = repo or Path(cwd).resolve().name or "repo"
+    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+
+
+def _health_file(cwd: str) -> Path:
+    """Path to the per-repo loop health JSON file."""
+    return _daemon_dir(cwd) / f"pr-maintenance-loop.health.{_repo_slug(cwd)}.json"
 
 
 def _load_health(cwd: str) -> dict:
@@ -98,13 +123,12 @@ def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
 
 
 def _escalated_marker_path(cwd: str) -> Path:
-    """Path to the escalation marker JSON (same daemon dir as the health file)."""
-    cfg = load_config(cwd)
-    if cfg.maintenance_loop_pidfile is not None:
-        daemon_dir = cfg.maintenance_loop_pidfile.parent
-    else:
-        daemon_dir = Path.home() / ".claude" / "daemons"
-    return daemon_dir / "pr-maintenance-loop.escalated.json"
+    """Path to the per-repo escalation marker JSON (same daemon dir as health).
+
+    Repo-scoped for the same reason as :func:`_health_file` — so PRs with the
+    same number in different repos don't share an escalation marker.
+    """
+    return _daemon_dir(cwd) / f"pr-maintenance-loop.escalated.{_repo_slug(cwd)}.json"
 
 
 def _clear_escalation_entry(cwd: str, pr: int | None) -> None:
@@ -153,6 +177,47 @@ def reset_executor_failure(cwd: str, pr: int | None) -> None:
     _clear_escalation_entry(cwd, pr)
 
 
+def _load_escalation(cwd: str) -> dict:
+    """Load the escalation marker JSON for this repo, or {} on missing/corrupt."""
+    import json as _json  # noqa: PLC0415
+    try:
+        data = _json.loads(_escalated_marker_path(cwd).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _clear_recovered_streak(cwd: str) -> None:
+    """Drop a worktree's streak/escalation entry when its check comes back clean.
+
+    The streak/marker is only reset on the executor-success path. If a PR is
+    fixed manually (following the escalation prompt) or recovers externally
+    (CI/comments resolved), the next tick's ``check`` returns 0 and continues
+    BEFORE any dispatch — leaving the marker in place so the stop-gate/dashboard
+    keep treating the now-clean PR as escalated. Clearing on a clean result
+    closes that gap. Cheap-guarded: only resolves the PR via ``gh`` when this
+    repo actually has recorded streak/escalation state.
+    """
+    if not _load_health(cwd) and not _load_escalation(cwd):
+        return
+    import json as _json  # noqa: PLC0415
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", "--json", "number"],
+            cwd=cwd, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if r.returncode != 0:
+        return
+    try:
+        pr = _json.loads(r.stdout or "{}").get("number")
+    except ValueError:
+        return
+    if isinstance(pr, int):
+        reset_executor_failure(cwd, pr)
+
+
 def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     """True when the detached loop is alive AND the failure streak < threshold.
 
@@ -193,6 +258,13 @@ def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
             existing = _json.loads(marker_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             pass
+        # A valid-JSON-but-non-dict marker (e.g. ``[]`` from a bad write/manual
+        # edit) would make the key assignment below raise TypeError — which the
+        # outer ``except OSError`` does NOT catch — aborting the loop exactly at
+        # the escalation moment, before the coordinator claim is released. Treat
+        # any non-dict content as empty, mirroring the reader.
+        if not isinstance(existing, dict):
+            existing = {}
         existing[str(pr)] = {
             "streak": streak, "last_error": err, "escalated_at": time.time(),
         }
@@ -479,7 +551,13 @@ def _tick(args, executor: str) -> None:
             capture_output=True, text=True,
         )
         if check.returncode != CHECK_WORK_FOUND:
-            continue  # 0 = clean/deferred, 2 = gh unavailable
+            # 0 = clean/deferred, 2 = gh unavailable. On a genuinely clean
+            # result, drop any stale streak/escalation marker for this PR (it
+            # recovered without an executor dispatch). Skip rc 2 — gh failure
+            # is not evidence of recovery.
+            if check.returncode == 0:
+                _clear_recovered_streak(cwd)
+            continue
         pr = _parse_pr_number(check.stdout)
         claim_id = _parse_coordinator_claim_id(check.stdout)
         prompt = check.stdout
