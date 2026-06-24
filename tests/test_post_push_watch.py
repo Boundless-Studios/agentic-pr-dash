@@ -305,12 +305,15 @@ def _run_hook_capture(monkeypatch, capsys, payload, *, argv=("PostToolUse",)):
 
 
 def _stub_owned_open_nondraft_pr(monkeypatch, tmp_path):
-    """Make the nudge gates all pass: Bash push, branch w/ open non-draft PR, no waiter."""
+    """Make the nudge gates all pass: Bash push, session-owned worktree, open
+    non-draft PR, no waiter, no Codex no-wake-channel env."""
+    monkeypatch.delenv("PR_WATCH_NO_WAITER", raising=False)
     monkeypatch.setattr(hook, "current_branch", lambda p: "feature/x")
     monkeypatch.setattr(hook, "head_sha", lambda p: "abc1234def567")
     monkeypatch.setattr(hook, "get_pr_number", lambda b, p: 2290)
     monkeypatch.setattr(hook, "_pr_is_draft", lambda n, c: False)
     monkeypatch.setattr(hook, "_read_session_marker", lambda c: "sess-1")
+    monkeypatch.setattr(hook, "_read_marker", lambda c: {"session_id": "sess-1", "pr": "2290"})
     monkeypatch.setattr(hook, "_await_alive", lambda c, s: False)
 
 
@@ -366,6 +369,36 @@ def test_no_nudge_for_rejected_push(monkeypatch, tmp_path, capsys):
                "tool_response": {"exit_code": 1}}
     rc, out = _run_hook_capture(monkeypatch, capsys, payload)
     assert rc == 0 and out is None   # find_push_cwd → None, hook returns before nudge
+
+
+def test_no_nudge_when_no_session_marker(monkeypatch, tmp_path, capsys):
+    # Codex review #49: an empty session id renders an invalid `--session-id `.
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "_read_session_marker", lambda c: "")
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_when_worktree_not_owned_by_session(monkeypatch, tmp_path, capsys):
+    # Codex review #49: the await waiter only watches worktrees this session owns
+    # (armed marker). Without ownership the waiter exits immediately → no wake.
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "_read_marker", lambda c: {"session_id": "other-sess"})
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
+
+
+def test_no_nudge_when_no_waiter_env_set(monkeypatch, tmp_path, capsys):
+    # Codex review #49: a host wiring this hook via run_shared_hook normalizes
+    # exec_command→Bash; PR_WATCH_NO_WAITER=1 suppresses the nudge for runtimes
+    # with no background-task wake channel, regardless of payload normalization.
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setenv("PR_WATCH_NO_WAITER", "1")
+    payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0 and out is None
 
 
 def test_nudge_construction_error_is_advisory(monkeypatch, tmp_path, capsys):
