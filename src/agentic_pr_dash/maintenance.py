@@ -49,6 +49,17 @@ def blockers_for_pr(pr: PRData) -> list[str]:
     return blockers
 
 
+def watch_pending_for_pr(pr: PRData) -> bool:
+    """True when required CI is still running and there are no actionable blockers.
+
+    A PR is watch-pending when:
+    - ci_watch_pending is True (a required check is still queued/in_progress), AND
+    - there are no current actionable blockers (merge conflict, failing CI, review
+      comments) — i.e. nothing for an executor to fix right now, just waiting on CI.
+    """
+    return bool(pr.ci_watch_pending) and not blockers_for_pr(pr)
+
+
 def build_maintenance_state(
     *,
     pr_number: int,

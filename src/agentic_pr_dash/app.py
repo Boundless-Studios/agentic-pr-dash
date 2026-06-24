@@ -557,6 +557,8 @@ def _build_card_for_worktree(
         last_agent_dispatch=pr.last_agent_dispatch if pr else None,
         maintenance=pr.maintenance if pr else None,
         cleanup_candidate=cleanup_candidate,
+        escalated=pr.escalated if pr else False,
+        escalated_reason=pr.escalated_reason if pr else None,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
         agent_name=runtime_session.agent_name if runtime_session else None,
         docker_mode=runtime_session.docker_mode if runtime_session else None,
@@ -640,6 +642,8 @@ def _build_unassigned_pr_card(
         last_polled=pr.last_polled,
         last_agent_dispatch=pr.last_agent_dispatch,
         maintenance=pr.maintenance,
+        escalated=pr.escalated,
+        escalated_reason=pr.escalated_reason,
         pr_created_at=pr.created_at,
         runtime_session_id=runtime_session.session_id if runtime_session else None,
         agent_name=runtime_session.agent_name if runtime_session else None,
@@ -691,6 +695,7 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
     runner_issues = _runner_issues(cards)
     running_github_jobs = _running_github_jobs(cards)
     desktop_docker_instances = _desktop_docker_instances(cards)
+    escalated_prs = [c for c in cards if c.escalated]
     return {
         "columns": build_columns(cards),
         "runner_summary": runner_summary,
@@ -705,6 +710,7 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
         "hidden_agent_worktree_count": hidden_agent_worktree_count,
         "bug_bash_ready_count": _bug_bash_ready_count(cards),
         "show_agent_worktrees": show_agent_worktrees,
+        "escalated_prs": escalated_prs,
         "active_tab": active_tab if active_tab in {"board", "runner_issues"} else "board",
         "board_tab_url": "/?tab=board&show_agents=1" if show_agent_worktrees else "/?tab=board",
         "runner_issues_tab_url": "/?tab=runner_issues&show_agents=1" if show_agent_worktrees else "/?tab=runner_issues",
@@ -1189,10 +1195,15 @@ async def pr_dashboard_proof_fixture_runner_issues(request: Request, scenario: s
 @app.get("/partials/board", response_class=HTMLResponse)
 async def board_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees)
+    # board_oob: emit the out-of-band escalation-banner swap only for the HTMX
+    # partial poll, so the title-bar banner refreshes with the board (the
+    # full-page include must NOT duplicate the slot id) — codex PR #50 review.
+    ctx["board_oob"] = True
     return templates.TemplateResponse(
         request=request,
         name="partials/board.html",
-        context=await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees),
+        context=ctx,
     )
 
 

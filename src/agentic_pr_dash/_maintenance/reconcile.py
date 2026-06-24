@@ -106,6 +106,12 @@ def _detached_pr_records(session_id: str, cwd: str,
             "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
             "worktree_present": False, "unresolved_threads": len(unresolved),
             "ci_failing": has_fail, "failing_checks": failing,
+            # BOU-1789: required CI still running on a detached (no-worktree) PR
+            # is a watch condition the await waiter must honour, since `owned`
+            # may be empty for a ledger-only PR (codex PR #50 review).
+            "ci_watch_pending": (
+                not has_fail and github_api.required_checks_pending(e.pr, cwd)
+            ),
             "changes_requested": changes_requested,
             "review_decision": review_decision,
             "merge_conflict": merge_conflict,

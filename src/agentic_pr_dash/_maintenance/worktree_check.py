@@ -116,6 +116,10 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     if pr.is_draft:
         return 0, "PR is a draft; nothing pending"
 
+    # Populate ci_watch_pending for non-draft PRs (best-effort; False on gh
+    # error). BOU-1789: required-checks-in-progress as a watch condition.
+    pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
+
     if not blockers:
         # Clean check: refresh the alive heartbeat (hold ownership) and clear any
         # stale fix lease.

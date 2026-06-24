@@ -934,19 +934,27 @@ def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
 
 
 def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
-    """Get CI check status for a PR."""
+    """Get CI check status for a PR.
+
+    ``gh pr checks`` exits **non-zero** precisely when there is something to
+    report — 8 while checks are pending, 1 when a check has failed — yet still
+    prints the full ``--json`` array to stdout in those cases. Returning ``[]``
+    on any non-zero rc therefore DROPPED exactly the failing/pending checks the
+    maintenance gate needs (a pending→fail flip would read as "no checks", so
+    ``failing_checks`` stayed empty and the await waiter never woke on failure —
+    codex PR #50 review). Parse stdout regardless of the exit code; fall back to
+    ``[]`` only when stdout is genuinely unparseable (a real gh error).
+    """
     r = _run(
         ["gh", "pr", "checks", str(pr_number),
          "--json", "name,bucket,state"],
         cwd=cwd, timeout_s=30,
     )
-    if r.returncode != 0:
-        return []
     try:
-        raw = json.loads(r.stdout or "[]")
-        if not isinstance(raw, list):
-            return []
-    except json.JSONDecodeError:
+        raw = json.loads(r.stdout or "")
+    except (json.JSONDecodeError, TypeError):
+        raw = None
+    if not isinstance(raw, list):
         return []
 
     # Dedup by name (keep latest)
@@ -977,6 +985,96 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
             status = state or "unknown"
         checks.append(CICheck(name=c.get("name", "?"), status=status, conclusion=conclusion))
     return checks
+
+
+# GraphQL statusCheckRollup: per-context required-ness + non-terminal state.
+# Used instead of ``gh pr checks --required`` because the CLI (a) exits 8 while
+# checks are pending and (b) OMITS required checks that are merely *expected*
+# (configured by branch protection but not yet reported — cli/cli#8855), both of
+# which misclassify the exact "CI hasn't started / is running" case BOU-1789
+# must keep watching to a terminal state.
+_REQUIRED_ROLLUP_QUERY = (
+    "query($owner:String!,$name:String!,$number:Int!,$after:String){"
+    "repository(owner:$owner,name:$name){pullRequest(number:$number){"
+    "commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$after){"
+    "pageInfo{hasNextPage endCursor} nodes{"
+    "__typename "
+    "... on CheckRun{status isRequired(pullRequestNumber:$number)} "
+    "... on StatusContext{state isRequired(pullRequestNumber:$number)}"
+    "}}}}}}}}}"
+)
+
+# A PR with hundreds of contexts is pathological; cap pages so a malformed
+# never-ending cursor can't spin.
+_ROLLUP_MAX_PAGES = 20
+
+
+def _ctx_is_pending(ctx: dict) -> bool:
+    if not isinstance(ctx, dict) or not ctx.get("isRequired"):
+        return False
+    if ctx.get("__typename") == "CheckRun":
+        return ctx.get("status") != "COMPLETED"
+    if ctx.get("__typename") == "StatusContext":
+        return ctx.get("state") in ("EXPECTED", "PENDING")
+    return False
+
+
+def _repo_for_cwd(cwd: str | None) -> str | None:
+    """``owner/name`` for the repo at ``cwd``, preferring the cwd's OWN remote.
+
+    ``resolved_repo`` returns a pinned/global ``repo`` (e.g. from
+    ``AGENTIC_PR_DASH_REPO`` or a shared config) without consulting ``cwd``, so
+    in a multi-repo session it would resolve a sibling worktree's PR against the
+    anchor repo. Detect from the cwd's git remote first and only fall back to the
+    config-resolved repo (codex PR #50 review)."""
+    from .config import _detect_repo  # noqa: PLC0415
+    if cwd:
+        detected = _detect_repo(Path(cwd))
+        if detected:
+            return detected
+    return load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
+
+
+def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
+    """True iff a required/merge-gating check is still non-terminal.
+
+    Reads the GraphQL ``statusCheckRollup`` and inspects per-context
+    ``isRequired``. A required context is pending when a ``CheckRun`` is not yet
+    ``COMPLETED`` (queued/in_progress/waiting/requested) or a ``StatusContext``
+    is ``EXPECTED``/``PENDING`` — the ``EXPECTED`` state covers required checks
+    configured by branch protection that have not reported yet (the cli/cli#8855
+    gap that ``gh pr checks`` misses). Paginates the contexts so a required
+    pending context past the first 100 isn't missed. Returns ``False`` on any
+    error or when no required check is pending (fail-safe).
+    """
+    repo = _repo_for_cwd(cwd)
+    if not repo or "/" not in repo:
+        return False
+    owner, name = repo.split("/", 1)
+    after: str | None = None
+    for _ in range(_ROLLUP_MAX_PAGES):
+        cmd = ["gh", "api", "graphql",
+               "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
+               "-f", f"query={_REQUIRED_ROLLUP_QUERY}"]
+        if after:
+            cmd += ["-F", f"after={after}"]
+        r = _run(cmd, cwd=cwd, timeout_s=30)
+        if r.returncode != 0:
+            return False
+        try:
+            data = json.loads(r.stdout or "{}")
+            rollup = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
+                      ["commit"]["statusCheckRollup"])
+            contexts = rollup["contexts"]
+        except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            return False
+        if any(_ctx_is_pending(ctx) for ctx in contexts.get("nodes", [])):
+            return True
+        page = contexts.get("pageInfo") or {}
+        if not page.get("hasNextPage") or not page.get("endCursor"):
+            return False
+        after = page["endCursor"]
+    return False
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:

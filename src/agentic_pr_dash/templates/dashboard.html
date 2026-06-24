@@ -29,6 +29,12 @@
             });
         }
     </script>
+    {# Escalation banner — refreshed via an hx-swap-oob element in the board
+       partial (the board polls every 5s), so an escalation recorded after the
+       page loaded appears without a full reload (codex PR #50 review). #}
+    <div id="escalation-banner-slot">
+        {% include 'partials/escalation_banner.html' %}
+    </div>
     <header>
         <div class="header-left">
             <h1>Worktree Dashboard</h1>

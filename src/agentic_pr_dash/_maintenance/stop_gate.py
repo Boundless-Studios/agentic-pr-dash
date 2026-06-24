@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time as _time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _env_int
@@ -79,13 +80,25 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
 
 def _owned_open_pr_numbers(owned: list[str]) -> set[int]:
     """Collect PR numbers from the armed markers of owned worktrees."""
-    numbers: set[int] = set()
+    return {pr for _wt, pr in _owned_open_pr_pairs(owned)}
+
+
+def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
+    """``(worktree, pr)`` pairs from the armed markers of owned worktrees.
+
+    The worktree path is preserved so per-PR, repo-scoped lookups
+    (``loop._loop_covers_pr`` / ``_read_escalation_marker``) hit the PR's OWN
+    repo's health/escalation file — owned worktrees can span several repos
+    (``maintenance_repo_roots``), and the repo-scoped state files would
+    otherwise be read against the stop-gate anchor's repo (codex PR #50 review).
+    """
+    pairs: list[tuple[str, int]] = []
     for wt in owned:
         marker = _read_marker(wt) or {}
         pr_raw = marker.get("pr", "")
         if str(pr_raw).isdigit():
-            numbers.add(int(pr_raw))
-    return numbers
+            pairs.append((wt, int(pr_raw)))
+    return pairs
 
 
 def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
@@ -139,16 +152,64 @@ def _stop_gate_impl(args) -> int:
         for r in detached:
             pending.append(_detached_pending_entry(r))
 
+    # Map each owned PR to ALL of its worktree cwds so the repo-scoped
+    # health/escalation lookups (loop._loop_covers_pr / the escalation marker)
+    # hit the PR's own repo. Owned worktrees can span several repos
+    # (maintenance_repo_roots) and the SAME PR number can exist in two repos, so
+    # never collapse to a bare-number→single-worktree dict — keep a per-number
+    # list and treat a PR as covered only when covered in EVERY repo that has it
+    # (codex PR #50 review). Falls back to the anchor cwd for PRs with no
+    # resolvable worktree (e.g. mocked/detached).
+    pr_to_wts: dict[int, list[str]] = {}
+    for wt, pr in _owned_open_pr_pairs(owned):
+        pr_to_wts.setdefault(pr, []).append(wt)
+
+    def _wts_for(pr: int) -> list[str]:
+        return pr_to_wts.get(pr) or [cwd]
+
+    # Escalation markers, read from each PR's OWN repo(s). Computed BEFORE the
+    # pending split so an escalated PR that STILL has blockers (the usual state
+    # after the loop failed to fix it → it lands in `pending`) surfaces the
+    # escalation explanation + last executor error, not just the generic pending
+    # prompt (codex PR #50 review).
+    escalated_owned: dict[int, dict] = {}
+    if session_id:
+        for pr, wts in pr_to_wts.items():
+            for wt in wts:
+                info = _read_escalation_marker(wt).get(str(pr))
+                if info is not None:
+                    escalated_owned[pr] = info
+                    break
+
     if not pending:
         if (not getattr(args, "no_waiter", False)) and session_id:
-            worktree_prs = (
-                set() if _detached_loop_alive(cwd) else _owned_open_pr_numbers(owned)
-            )
+            from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+            # A PR is loop-covered only if covered in EVERY repo that owns it; if
+            # any repo's instance is uncovered/escalated, force the waiter.
+            worktree_prs = {
+                n for n in _owned_open_pr_numbers(owned)
+                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))
+            }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):
                 if _dr.get("state") not in ("merged", "closed", "draft", "unknown"):
                     detached_prs.add(_dr["pr"])
             open_prs = worktree_prs | detached_prs
+            # Escalated PRs (that are still open + uncovered) — surface as an
+            # exit-2 block distinct from the waiter prompt before the normal
+            # waiter check.
+            escalated_open = {pr: info for pr, info in escalated_owned.items() if pr in open_prs}
+            if escalated_open and not _await_alive(cwd, session_id):
+                escalation_text = _build_escalation_block(escalated_open)
+                fingerprint = "escalated:" + ",".join(str(n) for n in sorted(escalated_open))
+                count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+                _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+                threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
+                if count < threshold:
+                    print(escalation_text, file=sys.stderr)
+                    return 2
+                _save_stop_state(cwd, {"ts": now})
+                return 0
             if open_prs and not _await_alive(cwd, session_id):
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -166,6 +227,11 @@ def _stop_gate_impl(args) -> int:
     count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
     _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
 
+    # An escalated PR almost always still has blockers, so it lands in `pending`
+    # — surface its escalation explanation (consecutive-failure count + last
+    # executor error) ABOVE the generic pending prompt (codex PR #50 review).
+    if escalated_owned:
+        print(_build_escalation_block(escalated_owned), file=sys.stderr)
     print(_build_stop_block(pending), file=sys.stderr)
 
     threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
@@ -187,6 +253,40 @@ def _stop_gate_impl(args) -> int:
         file=sys.stderr,
     )
     return 2
+
+
+def _read_escalation_marker(cwd: str) -> dict:
+    """Return the (repo-scoped) escalation marker dict, or {} if absent/corrupt.
+
+    Routes through ``loop._escalated_marker_path`` so the reader and the loop's
+    writer agree on the per-repo filename (keys stay bare PR numbers)."""
+    from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+    marker_path = _loop_mod._escalated_marker_path(cwd)
+    try:
+        with open(marker_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _build_escalation_block(escalated_prs: dict[int, dict]) -> str:
+    """Build the escalation block text for escaped PRs."""
+    lines = [
+        "[pr-watch] ESCALATION: The maintenance loop has repeatedly failed to fix "
+        "PR(s) you own. Manual intervention is required:\n"
+    ]
+    for pr_num, info in sorted(escalated_prs.items()):
+        streak = info.get("streak", "?")
+        last_error = info.get("last_error", "unknown error")
+        lines.append(f"  PR #{pr_num}: {streak} consecutive executor failures")
+        lines.append(f"    Last error: {last_error[:200]}")
+        lines.append("")
+    lines.append(
+        "Fix the PR manually or reconfigure the executor, then run the complete "
+        "command for each PR above."
+    )
+    return "\n".join(lines)
 
 
 def _record_has_blockers(record: dict) -> bool:

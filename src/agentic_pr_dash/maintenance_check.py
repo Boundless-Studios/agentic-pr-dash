@@ -104,6 +104,8 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _build_waiter_block,
     _stop_gate_impl,
     _record_has_blockers,
+    _read_escalation_marker,
+    _build_escalation_block,
 )
 
 # completion
@@ -148,6 +150,30 @@ from ._maintenance.worktree_check import _check_worktree  # noqa: F401, E402
 # ---------------------------------------------------------------------------
 # CLI functions (stay in maintenance_check.py)
 # ---------------------------------------------------------------------------
+
+
+def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) -> bool:
+    """True when any owned non-draft worktree PR is still watch-pending this tick.
+
+    Resolves the PR for each owned worktree and calls
+    ``maintenance.watch_pending_for_pr`` to determine whether required CI is
+    still running (and there are no current actionable blockers). Used by
+    ``_cmd_await`` to decide whether to stay alive past ``--max-wait`` when
+    CI checks are in-flight.
+    """
+    from agentic_pr_dash import maintenance  # noqa: PLC0415
+    for worktree in owned:
+        pr = _resolve_pr_for_branch(worktree)
+        if pr is _GH_UNAVAILABLE or pr is None:
+            continue
+        if pr.is_draft:
+            continue
+        # Populate ci_watch_pending (best-effort)
+        from agentic_pr_dash import github_api  # noqa: PLC0415
+        pr.ci_watch_pending = github_api.required_checks_pending(pr.number, worktree)
+        if maintenance.watch_pending_for_pr(pr):
+            return True
+    return False
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -437,11 +463,30 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 return 0
 
             if deadline is not None and time.time() >= deadline:
-                print(
-                    "[pr-watch] waiter max-wait reached with no feedback; "
-                    "will re-arm on next stop."
+                # Watch-pending across BOTH live worktrees and detached
+                # (ledger-only) PRs — a session can own a PR solely through the
+                # ledger, so `owned` may be empty while its required CI is still
+                # running (codex PR #50 review).
+                detached_watch_pending = any(
+                    r.get("ci_watch_pending")
+                    and r.get("state") not in ("merged", "closed", "draft", "unknown")
+                    for r in _detached_this_tick
                 )
-                return 0
+                watch_pending = (
+                    detached_watch_pending
+                    or _collect_await_watch_pending(owned, cwd, session_id)
+                )
+                if not watch_pending:
+                    print(
+                        "[pr-watch] waiter max-wait reached with no feedback; "
+                        "will re-arm on next stop."
+                    )
+                    return 0
+                print(
+                    "[pr-watch] waiter max-wait reached but required CI is still "
+                    "running — staying alive until CI completes or fails.",
+                    file=sys.stderr,
+                )
 
             time.sleep(max(args.interval, 1))
     finally:
