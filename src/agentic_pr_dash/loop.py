@@ -29,6 +29,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from . import coordinator
+from ._maintenance import worktree_check
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
 from .config import load as load_config
@@ -551,11 +552,21 @@ def _tick(args, executor: str) -> None:
             capture_output=True, text=True,
         )
         if check.returncode != CHECK_WORK_FOUND:
-            # 0 = clean/deferred, 2 = gh unavailable. On a genuinely clean
-            # result, drop any stale streak/escalation marker for this PR (it
-            # recovered without an executor dispatch). Skip rc 2 — gh failure
-            # is not evidence of recovery.
-            if check.returncode == 0:
+            # 0 = clean/deferred, 2 = gh unavailable. A warn-only defer (a blocked
+            # owned PR we deferred to its live owner without dispatching) is exit 0
+            # by design, but must still be VISIBLE in loop output — otherwise the
+            # detached loop's coverage looks clean while the PR is red (BOU-1788,
+            # codex PR #48 review).
+            notice = check.stdout.strip()
+            is_warn_only = bool(notice and worktree_check.WARN_ONLY_MARKER in notice)
+            if is_warn_only:
+                print(f"[agentic-pr-dash] {notice}", file=sys.stderr)
+            # On a genuinely clean result, drop any stale streak/escalation marker
+            # for this PR (it recovered without an executor dispatch). Skip rc 2
+            # (gh failure is not evidence of recovery) AND skip warn-only defers —
+            # those are a KNOWN-blocked PR deferred to its live owner, not a
+            # recovery, so clearing would hide a still-red PR (BOU-1789/BOU-1788).
+            if check.returncode == 0 and not is_warn_only:
                 _clear_recovered_streak(cwd)
             continue
         pr = _parse_pr_number(check.stdout)

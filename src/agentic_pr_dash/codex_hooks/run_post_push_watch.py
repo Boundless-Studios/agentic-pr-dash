@@ -14,11 +14,15 @@ results-file location) are supplied as configuration via :class:`CIWatchConfig`
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from agentic_pr_dash import ci_watch
+from agentic_pr_dash.ci_watch import current_branch, get_pr_number, head_sha
+from agentic_pr_dash.config import load as load_config
 from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
@@ -29,6 +33,8 @@ from agentic_pr_dash.codex_hooks.run_arm_pr_watch import (
     load_payload,
     normalized_payload,
 )
+from agentic_pr_dash._maintenance.markers import _read_marker, _read_session_marker
+from agentic_pr_dash._maintenance.waiter import _await_alive
 
 
 def _command_failed(payload: dict) -> bool:
@@ -128,6 +134,76 @@ def find_push_cwd(payload: dict) -> str | None:
     return push_cwd
 
 
+def _pr_is_draft(pr_number: int, cwd: str) -> bool:
+    """Best-effort ``isDraft`` lookup; on any failure treat as non-draft (False)."""
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "isDraft"],
+            cwd=cwd, capture_output=True, text=True, timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if r.returncode != 0:
+        return False
+    try:
+        return bool(json.loads(r.stdout or "{}").get("isDraft"))
+    except json.JSONDecodeError:
+        return False
+
+
+def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | None:
+    """Return the ``additionalContext`` nudge text, or None when no nudge should fire.
+
+    The nudge tells the agent to launch the session-scoped ``await`` waiter via
+    ``run_in_background`` — so it must fire ONLY when that waiter will actually
+    wake the session. Gates (ALL must hold):
+
+    * **Wake channel.** The caller is the Claude interactive ``Bash`` path (raw,
+      un-normalized ``tool_name == "Bash"``) AND ``PR_WATCH_NO_WAITER`` is not set.
+      Codex has no background-task wake channel: in gaia it pushes via the direct
+      launcher so the raw tool name is ``exec_command``; if a host instead wires
+      this hook through ``codex_runtime.run_shared_hook`` (which normalizes
+      ``exec_command`` → ``Bash`` before forwarding), that host sets
+      ``PR_WATCH_NO_WAITER=1`` — the same opt-out the Stop-gate honors — so the
+      nudge is suppressed regardless of payload normalization.
+    * **Session scope.** ``pr-watch.session`` is present (non-empty): without it
+      the rendered ``--session-id`` would be blank, an invalid command.
+    * **Owned worktree.** This worktree's ``pr-watch.armed`` marker names this
+      session — i.e. the waiter's ``_owned_worktrees_across_roots`` will actually
+      include it. Otherwise the waiter would find no owned worktree and exit
+      immediately, leaving CI un-watched.
+    * **Live PR.** An owned, non-draft open PR exists for the pushed branch.
+    * **No duplicate.** No waiter is already alive for this session.
+    """
+    if raw_tool_name != "Bash" or os.environ.get("PR_WATCH_NO_WAITER") == "1":
+        return None
+    branch = current_branch(Path(push_cwd))
+    if branch in ("", "main", "master"):
+        return None
+    session_id = _read_session_marker(push_cwd)
+    if not session_id:
+        return None
+    marker = _read_marker(push_cwd) or {}
+    if marker.get("session_id") != session_id:
+        return None
+    pr_number = get_pr_number(branch, Path(push_cwd))
+    if pr_number is None:
+        return None
+    if _pr_is_draft(pr_number, push_cwd):
+        return None
+    if _await_alive(push_cwd, session_id):
+        return None
+    sha = head_sha(Path(push_cwd))
+    await_cmd = load_config(push_cwd).await_command.format(
+        cwd=push_cwd, session_id=session_id
+    )
+    return (
+        f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Launch the "
+        f"CI/feedback waiter in the BACKGROUND now (run_in_background / detached) so "
+        f"a red check wakes this session, then continue:\n  {await_cmd}"
+    )
+
+
 def main() -> int:
     payload = load_payload()
     phase = sys.argv[1] if len(sys.argv) > 1 else payload.get("hook_event_name", "")
@@ -141,7 +217,19 @@ def main() -> int:
     env = dict(os.environ)
     env["CI_WATCH_PROJECT_DIR"] = push_cwd
     cfg = ci_watch.CIWatchConfig.from_env(env)
-    return ci_watch.arm_post_push_watch(cfg)
+    ci_watch.arm_post_push_watch(cfg)
+
+    # Proactively nudge the agent to launch the exit-10 await waiter in the
+    # background so a red check wakes the session this turn (BOU-1786). Advisory:
+    # never block the push — any failure → no stdout, return 0.
+    try:
+        nudge = build_post_push_waiter_nudge(push_cwd, payload.get("tool_name", ""))
+        if nudge:
+            print(json.dumps({"hookSpecificOutput": {
+                "hookEventName": "PostToolUse", "additionalContext": nudge}}))
+    except Exception:  # noqa: BLE001 - advisory hook, must never block the push
+        pass
+    return 0
 
 
 if __name__ == "__main__":
