@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _resolve_owner_pid, _current_branch
@@ -207,14 +208,17 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
 def _collect_owned_worktrees(
     session_id: str, cwd: str, pid: int | None
 ) -> list[str]:
-    """Return the worktree paths this session owns — markered OR adopted."""
+    """Return the worktree paths this session owns — markered OR adopted.
+
+    ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily — only when at least
+    one candidate worktree is unmarked and therefore adoptable — so the common
+    "everything already armed" Stop tick stays cheap (BOU-1787).
+    """
     from .markers import _live_foreign_owner, _marker_session_id, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
     eff_pid = pid if pid is not None else _resolve_owner_pid()
-
-    pr_map = _list_my_open_prs(cwd)
 
     result: list[str] = []
     seen: set[str] = set()
@@ -230,6 +234,7 @@ def _collect_owned_worktrees(
         [path for path, _branch in candidates], session_id
     )
 
+    pr_map: dict | None = None  # lazy: only hit gh when an unmarked candidate appears
     for worktree_path, branch in candidates:
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
@@ -237,6 +242,8 @@ def _collect_owned_worktrees(
         if _marker_session_id(worktree_path) == session_id:
             _emit(worktree_path)
             continue
+        if pr_map is None:
+            pr_map = _list_my_open_prs(cwd)
         if not pr_map:
             continue
         pr = pr_map.get(branch)
@@ -250,6 +257,39 @@ def _collect_owned_worktrees(
         if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
             _emit(worktree_path)
     return result
+
+
+def _reconcile_owned_across_roots(
+    session_id: str, anchor_cwd: str, pid: int | None, deadline: float | None = None
+) -> tuple[list[str], list[str]]:
+    """Adopting ``list-owned``-equivalent reconciliation across all maintenance
+    roots, for Stop-context use.
+
+    Returns ``(owned, newly_adopted)`` where ``newly_adopted`` is the subset of
+    ``owned`` whose ownership marker was written on THIS call (a missed-arm PR
+    just picked up). It is detected by diffing the markered set BEFORE adoption
+    (``_collect_stop_gate_worktrees``) against the markered-or-adopted set after
+    (``_collect_owned_worktrees``) — so ``_collect_owned_worktrees`` keeps its
+    existing 3-arg signature for every other caller.
+
+    ``deadline`` is an optional ``time.monotonic()`` budget — once exceeded,
+    remaining roots are skipped so a slow ``gh``/worktree probe can't blow the
+    Stop-hook deadline. The anchor root is serviced first.
+    """
+    owned: list[str] = []
+    newly_adopted: list[str] = []
+    seen: set[str] = set()
+    for root in _maint_roots_for(anchor_cwd):
+        if deadline is not None and time.monotonic() > deadline:
+            break
+        before = set(_collect_stop_gate_worktrees(session_id, root))
+        for wt in _collect_owned_worktrees(session_id, root, pid):
+            if wt not in seen:
+                seen.add(wt)
+                owned.append(wt)
+            if wt not in before and wt not in newly_adopted:
+                newly_adopted.append(wt)
+    return owned, newly_adopted
 
 
 def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
