@@ -126,6 +126,9 @@ def _stub_check_worktree_to_blockers(monkeypatch: pytest.MonkeyPatch, pr: PRData
     """Stub the pre-claim gauntlet so _check_worktree reaches the claim block."""
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    # The read-only thread-merge now runs in BOTH claim modes (BOU-1783); keep it
+    # hermetic so the passive probe doesn't make a real gh call.
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda n, c: [])
     monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set())
     monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
 

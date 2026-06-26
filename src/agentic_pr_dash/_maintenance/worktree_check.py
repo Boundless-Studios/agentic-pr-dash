@@ -75,14 +75,22 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     extraction). ``check`` prints ``text`` and returns the code; ``stop-gate``
     aggregates the exit-10 texts across owned worktrees.
 
-    ``claim`` controls whether a found-work path creates an agent-coordinator
-    claim. The ``check`` CLI (loop dispatch) claims so the loop owns the fix and
-    later heartbeats/releases it. The Stop-hook ``stop-gate`` path is PASSIVE —
-    it only prints a prompt to the interactive session and never releases — so it
-    passes ``claim=False``; a stop-gate-created claim would survive the idle
-    session and suppress the very work it just surfaced on the next Stop attempt
-    (codex P1). When ``claim=False`` the active-claim suppression check below is
-    also skipped so the passive probe always reports the pending work.
+    ``claim`` controls whether a found-work path CREATES an agent-coordinator
+    claim (a WRITE). The ``check`` CLI (loop dispatch) claims so the loop owns the
+    fix and later heartbeats/releases it. The Stop-hook ``stop-gate`` path is
+    PASSIVE — it only prints a prompt to the interactive session and never
+    releases — so it passes ``claim=False``; a stop-gate-created claim would
+    survive the idle session and suppress the very work it just surfaced on the
+    next Stop attempt (codex P1).
+
+    The READ-ONLY deferral to an EXISTING active claim runs in BOTH modes
+    (BOU-1783): if a LIVE agent-coordinator claim (the detached loop) already owns
+    this PR's current blocker set, the passive probe defers (exit 0) just like the
+    active ``check`` does, so the Stop gate doesn't re-block the idle session for
+    work the loop is already handling. Only the claim-CREATING write below stays
+    gated behind ``claim=True``. A DEAD/expired claim is reclaimable
+    (``should_dispatch``) and so does NOT suppress the work (BOU-1789
+    "pid-alive ≠ working").
     """
     from agentic_pr_dash import coordinator, github_api, maintenance  # noqa: PLC0415
 
@@ -142,51 +150,64 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
 
     owner_session_id = self_session_id or f"pid:{_common._resolve_owner_pid()}"
 
+    # READ-ONLY deferral decision — runs in BOTH modes (BOU-1783). The passive
+    # stop-gate probe (claim=False) must defer to a LIVE active claim the same way
+    # the active check (claim=True) does; only the claim-CREATING write below is
+    # gated on `claim`. None of the calls here mutate the claim store.
+
+    # Merge live unresolved threads into review_comments for accurate
+    # fingerprinting (so both modes compute the SAME defer decision) and a
+    # complete maintenance prompt. Read-only gh query.
+    thread_comments = completion._review_comments_from_threads(
+        pr_state._unresolved_review_threads(pr.number, cwd)
+    )
+    if thread_comments:
+        merged = {c.id: c for c in pr.review_comments}
+        for c in thread_comments:
+            merged.setdefault(c.id, c)
+        pr.review_comments = list(merged.values())
+
+    live_fingerprint = coordinator.fingerprint_for_pr(pr)
+    active_fingerprint = coordinator.active_claim_fingerprint_for_pr(pr)
+    new_feedback = (
+        active_fingerprint is not None and active_fingerprint != live_fingerprint
+    )
+
+    # A claim owned by THIS session must be SERVICED, not deferred to: the caller
+    # already holds it and the blockers are confirmed, so deferring to one's own
+    # active claim hides the work for the whole lease window (BOU-1785 repro).
+    # `new_feedback` only catches a CHANGED fingerprint; a claim made for the SAME
+    # still-unresolved blockers slips through it.
+    active_owner = coordinator.active_claim_owner_for_pr(pr)
+    self_owned = active_owner is not None and active_owner.session_id == owner_session_id
+
+    coord_decision = coordinator.dispatch_decision_for_pr(pr)
+    if not coord_decision.should_dispatch and not new_feedback and not self_owned:
+        # A LIVE foreign claim owns this PR's blocker set — defer (exit 0) in both
+        # modes. Preserve the coordinator's own state + reason (e.g. the
+        # manual_intervention "owner worktree has dirty/unpushed changes: <path>"
+        # guidance, or the active-claim "claim is active") so the operator still
+        # learns WHY this defers — wrapping it in the blockers + NOT-clean framing
+        # rather than replacing it (codex PR #48). A dead/expired claim is
+        # reclaimable (should_dispatch) so it falls through and surfaces below.
+        return 0, _blocked_defer_text(
+            pr_number=pr.number,
+            blockers=blockers,
+            owner_desc=(
+                f"agent-coordinator {coord_decision.state}: {coord_decision.reason} "
+                f"(claim {coord_decision.claim_id}, "
+                f"owner session {coord_decision.owner_session_id}, "
+                f"pid {coord_decision.owner_pid})"
+            ),
+        )
+
     coordinator_claim_id: str | None = None
     coordinator_fingerprint: str | None = None
     if claim:
-        # Merge live unresolved threads into review_comments for accurate fingerprinting.
-        thread_comments = completion._review_comments_from_threads(
-            pr_state._unresolved_review_threads(pr.number, cwd)
-        )
-        if thread_comments:
-            merged = {c.id: c for c in pr.review_comments}
-            for c in thread_comments:
-                merged.setdefault(c.id, c)
-            pr.review_comments = list(merged.values())
-
-        live_fingerprint = coordinator.fingerprint_for_pr(pr)
-        active_fingerprint = coordinator.active_claim_fingerprint_for_pr(pr)
-        new_feedback = (
-            active_fingerprint is not None and active_fingerprint != live_fingerprint
-        )
-
-        # A claim owned by THIS session must be SERVICED, not deferred to: the
-        # caller already holds it and the blockers are confirmed, so deferring to
-        # one's own active claim hides the work for the whole lease window
-        # (BOU-1785 repro). `new_feedback` only catches a CHANGED fingerprint; a
-        # claim made for the SAME still-unresolved blockers slips through it.
-        active_owner = coordinator.active_claim_owner_for_pr(pr)
-        self_owned = active_owner is not None and active_owner.session_id == owner_session_id
-
-        coord_decision = coordinator.dispatch_decision_for_pr(pr)
-        if not coord_decision.should_dispatch and not new_feedback and not self_owned:
-            # Preserve the coordinator's own state + reason (e.g. the
-            # manual_intervention "owner worktree has dirty/unpushed changes:
-            # <path>" guidance, or the active-claim "claim is active") so the
-            # operator still learns WHY this defers — wrapping it in the
-            # blockers + NOT-clean framing rather than replacing it (codex PR #48).
-            return 0, _blocked_defer_text(
-                pr_number=pr.number,
-                blockers=blockers,
-                owner_desc=(
-                    f"agent-coordinator {coord_decision.state}: {coord_decision.reason} "
-                    f"(claim {coord_decision.claim_id}, "
-                    f"owner session {coord_decision.owner_session_id}, "
-                    f"pid {coord_decision.owner_pid})"
-                ),
-            )
-
+        # Creating/refreshing a claim is a WRITE — the passive stop-gate probe
+        # never writes (a stop-gate-created claim would survive the idle session
+        # and suppress the very work it surfaced). Only the active `check` path
+        # claims + heartbeats here.
         claimed = coordinator.claim_pr(
             pr,
             session_id=owner_session_id,
