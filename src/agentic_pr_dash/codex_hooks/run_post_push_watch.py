@@ -26,6 +26,7 @@ from agentic_pr_dash.config import load as load_config
 from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
+    is_gh_pr_open,
     is_git_push,
     split_command_segments,
 )
@@ -134,6 +135,60 @@ def find_push_cwd(payload: dict) -> str | None:
     return push_cwd
 
 
+def find_prcreate_cwd(payload: dict) -> str | None:
+    """Return the worktree of a *successful* ``gh pr create`` (or ``ready``/
+    ``new``), else None.
+
+    A PR opened in-session does not follow a ``git push`` in the *same* command
+    (the push happened in an earlier tool call), so :func:`find_push_cwd` misses
+    it — and the post-push waiter nudge never fires for the freshly-opened PR.
+    This mirrors that segment walk for the PR-opening ``gh pr`` segment so that
+    opening a PR also arms the in-session CI/feedback waiter.
+
+    ``gh`` has no ``-C`` equivalent — it runs in the process cwd — so the
+    effective cwd is whatever ``cd`` relocation precedes the segment. Success
+    gating matches ``find_push_cwd``: act only when the create provably ran
+    (whole command exited 0, or the create is not the trailing failed segment).
+    """
+    normalized = normalized_payload(payload)
+    if normalized.get("tool_name") != "Bash":
+        return None
+    tool_input = normalized.get("tool_input") if isinstance(normalized.get("tool_input"), dict) else {}
+    command = tool_input.get("command", "")
+    if not isinstance(command, str) or not command:
+        return None
+
+    failed = _command_failed(payload)
+    eff_cwd = _normalized_cwd(normalized)
+
+    create_cwd: str | None = None
+    create_is_last = True
+    for op, segment in split_command_segments(command):
+        destination = cd_target(segment)
+        if destination is not None:
+            destination = os.path.expanduser(destination)
+            eff_cwd = (
+                destination
+                if os.path.isabs(destination)
+                else str((Path(eff_cwd) / destination).resolve())
+            )
+            continue
+        if op == "||":
+            continue
+        if is_gh_pr_open(segment):
+            create_cwd = eff_cwd
+            create_is_last = True
+            continue
+        if create_cwd is not None:
+            create_is_last = False
+
+    if create_cwd is None:
+        return None
+    if failed and create_is_last:
+        return None
+    return create_cwd
+
+
 def _pr_is_draft(pr_number: int, cwd: str) -> bool:
     """Best-effort ``isDraft`` lookup; on any failure treat as non-draft (False)."""
     try:
@@ -210,12 +265,17 @@ def main() -> int:
     if phase and phase != "PostToolUse":
         return 0
 
-    push_cwd = find_push_cwd(payload)
-    if push_cwd is None:
+    # A ``git push`` arms the watcher against the pushed worktree; a
+    # ``gh pr create`` (which never follows a push in the SAME command) arms
+    # against the worktree the PR was opened from. Either should launch the
+    # in-session waiter — without the pr-create branch, a PR opened after its
+    # push silently never gets an in-session CI/feedback waiter.
+    watch_cwd = find_push_cwd(payload) or find_prcreate_cwd(payload)
+    if watch_cwd is None:
         return 0
 
     env = dict(os.environ)
-    env["CI_WATCH_PROJECT_DIR"] = push_cwd
+    env["CI_WATCH_PROJECT_DIR"] = watch_cwd
     cfg = ci_watch.CIWatchConfig.from_env(env)
     ci_watch.arm_post_push_watch(cfg)
 
@@ -223,7 +283,7 @@ def main() -> int:
     # background so a red check wakes the session this turn (BOU-1786). Advisory:
     # never block the push — any failure → no stdout, return 0.
     try:
-        nudge = build_post_push_waiter_nudge(push_cwd, payload.get("tool_name", ""))
+        nudge = build_post_push_waiter_nudge(watch_cwd, payload.get("tool_name", ""))
         if nudge:
             print(json.dumps({"hookSpecificOutput": {
                 "hookEventName": "PostToolUse", "additionalContext": nudge}}))
