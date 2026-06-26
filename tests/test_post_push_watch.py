@@ -409,3 +409,47 @@ def test_nudge_construction_error_is_advisory(monkeypatch, tmp_path, capsys):
     payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
     rc, out = _run_hook_capture(monkeypatch, capsys, payload)
     assert rc == 0 and out is None   # swallowed; push never blocked
+
+
+# ---------------------------------------------------------------------------
+# Hook: gh pr create detection (BOU-1791 — PR opened after its push)
+# ---------------------------------------------------------------------------
+
+def test_find_prcreate_cwd_detects_bash_gh_pr_create(tmp_path):
+    payload = {"tool_name": "Bash",
+               "tool_input": {"command": "gh pr create --fill"},
+               "cwd": str(tmp_path)}
+    assert hook.find_prcreate_cwd(payload) == str(tmp_path)
+
+
+def test_find_prcreate_cwd_ignores_non_create(tmp_path):
+    payload = {"tool_name": "Bash",
+               "tool_input": {"command": "gh pr view 123"},
+               "cwd": str(tmp_path)}
+    assert hook.find_prcreate_cwd(payload) is None
+
+
+def test_find_prcreate_cwd_follows_cd(tmp_path):
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    payload = {"tool_name": "exec_command",
+               "tool_input": {"cmd": "cd wt && gh pr create --fill"},
+               "cwd": str(tmp_path)}
+    assert hook.find_prcreate_cwd(payload) == str(worktree.resolve())
+
+
+def test_find_prcreate_cwd_skips_failed_trailing_create(tmp_path):
+    payload = {"tool_name": "Bash",
+               "tool_input": {"command": "gh pr create --fill"},
+               "cwd": str(tmp_path),
+               "tool_response": {"exit_code": 1}}
+    assert hook.find_prcreate_cwd(payload) is None
+
+
+def test_main_arms_on_gh_pr_create(monkeypatch, tmp_path):
+    payload = {"tool_name": "Bash",
+               "tool_input": {"command": "gh pr create --fill"},
+               "cwd": str(tmp_path)}
+    cfg = _arm_via_hook(monkeypatch, payload)
+    assert cfg is not None
+    assert cfg.project_dir == tmp_path
