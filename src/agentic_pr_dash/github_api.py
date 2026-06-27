@@ -1783,8 +1783,12 @@ def _thread_state(
       human_resolved — human replied before any dashboard engagement
       reopened       — human replied AFTER a dashboard marker
 
-    ``top_author`` is accepted for API symmetry but is not used to alter
-    behaviour here; author-based filtering is the next task's job.
+    ``top_author`` is the login of the thread's original (top) comment author.
+    A non-marker reply from that SAME author on an otherwise-untouched thread is
+    the reviewer's own fresh follow-up feedback — NOT a third-party resolution —
+    so it must leave the thread ``open`` (still actionable). Only a reply from a
+    DIFFERENT human resolves an open thread (BOU-1801: the loop was silently
+    dropping reviewers' own follow-up replies as ``human_resolved``).
     """
     now = datetime.now(timezone.utc)
     state = "open"
@@ -1803,12 +1807,18 @@ def _thread_state(
             claim_created = _parse_github_time(str(reply.get("created_at", "")))
         else:
             # Human or third-party reply.
+            reply_author = str(reply.get("author", "")) or None
+            reply_is_thread_author = (
+                top_author is not None and reply_author == top_author
+            )
             if state in ("claimed", "completed", "failed"):
                 state = "reopened"
                 claim_created = None
-            elif state == "open":
+            elif state == "open" and not reply_is_thread_author:
                 state = "human_resolved"
-            # human_resolved and reopened are sticky under further human replies
+            # A same-author follow-up on an open thread stays "open" (fresh
+            # reviewer feedback). human_resolved and reopened are sticky under
+            # further human replies.
 
     claim_age: float | None = None
     if state == "claimed" and claim_created is not None:
