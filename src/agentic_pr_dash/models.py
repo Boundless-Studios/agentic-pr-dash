@@ -136,6 +136,16 @@ class ReviewComment(BaseModel):
     thread_id: str | None = None
 
 
+class ThreadDecision(BaseModel):
+    thread_id: str | None = None
+    author: str
+    created_at: str
+    age_seconds: float | None = None
+    decision: str  # one of: PICKED, SKIP_RESOLVED, SKIP_OUTDATED, SKIP_ADDRESSED, SKIP_CLAIMED_ACTIVE, SKIP_DATE_FILTER, SKIP_HUMAN_RESOLVED
+    marker_state: str | None = None
+    claim_age_seconds: float | None = None
+
+
 class MaintenanceState(BaseModel):
     pr_number: int
     branch: str
