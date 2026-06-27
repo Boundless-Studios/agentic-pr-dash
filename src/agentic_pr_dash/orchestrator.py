@@ -15,6 +15,7 @@ from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
 from .maintenance_check import _resolve_maintenance_roots
 from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
+from .observability import ObservabilityEvent, get_event_store
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
 # Composite key for the tracked-PR map. The dashboard aggregates PRs across any
@@ -159,6 +160,29 @@ class Orchestrator:
         self._poll_task: asyncio.Task | None = None
         self._max_events = 200
 
+    def _emit(
+        self,
+        kind: str,
+        *,
+        pr_number: int | None = None,
+        repo: str | None = None,
+        details: dict | None = None,
+    ) -> None:
+        """Best-effort observability event emission. Never raises."""
+        try:
+            cwd = repo if repo is not None else self.repo_cwd
+            event = ObservabilityEvent(
+                ts=datetime.now(timezone.utc),
+                repo=cwd,
+                pr_number=pr_number,
+                kind=kind,
+                session_id=None,
+                details=details or {},
+            )
+            get_event_store(cwd).append(event)
+        except Exception:  # noqa: BLE001
+            pass
+
     def log(self, message: str, pr_number: int | None = None, level: str = "info") -> None:
         entry = EventEntry(
             timestamp=datetime.now(timezone.utc),
@@ -169,6 +193,11 @@ class Orchestrator:
         self.events.insert(0, entry)
         if len(self.events) > self._max_events:
             self.events = self.events[:self._max_events]
+        self._emit(
+            "state_transition",
+            pr_number=pr_number,
+            details={"message": message, "level": level},
+        )
 
     def get_pr(self, pr_number: int, repo: str | None = None) -> PRData | None:
         """Look up a tracked PR by number (and optionally repo).
@@ -438,11 +467,17 @@ class Orchestrator:
             if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
         ]
 
-        # Get unaddressed comments (filtered by commit date!)
-        comments = await asyncio.to_thread(
-            github_api.get_unaddressed_comments, num, date, root
+        # Get unaddressed comments (filtered by commit date!) with per-thread decisions
+        comments, decisions = await asyncio.to_thread(
+            github_api.scan_review_threads, num, date, root
         )
         pr.review_comments = comments
+        self._emit(
+            "comment_scan",
+            pr_number=num,
+            repo=root,
+            details={"decisions": [d.model_dump() for d in decisions], "picked": len(comments)},
+        )
 
         if not pr.review_comments:
             pr.no_push_comment_retry_count = 0
@@ -567,6 +602,19 @@ class Orchestrator:
                     pr.activity_source = "agent-coordinator"
                 if coord_decision.should_dispatch:
                     asyncio.create_task(self.dispatch_pr_maintenance(pr))
+                    self._emit(
+                        "dispatch",
+                        pr_number=num,
+                        repo=root,
+                        details={"status": str(pr.status), "failing_checks": pr.failing_checks},
+                    )
+
+        self._emit(
+            "poll_tick",
+            pr_number=num,
+            repo=root,
+            details={"status": str(pr.status), "comment_count": len(pr.review_comments)},
+        )
 
     @staticmethod
     def _has_merge_conflict(pr: PRData) -> bool:
