@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .config import load as load_config
-from .models import CICheck, QueuedWorkflowJob, ReviewComment, RunnerExecutionSummary, RunnerPoolHealth
+from .models import CICheck, QueuedWorkflowJob, ReviewComment, RunnerExecutionSummary, RunnerPoolHealth, ThreadDecision
 
 
 def _runner_label() -> str | None:
@@ -1760,35 +1760,188 @@ def _queue_warning(
     return None
 
 
-def get_unaddressed_comments(
+def _parse_github_time(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _thread_state(
+    replies: list[dict],
+    top_author: str | None = None,
+) -> tuple[str, float | None]:
+    """Walk reply history and return (terminal_state, claim_age_seconds_or_None).
+
+    Terminal states:
+      open           — nothing has happened yet
+      claimed        — dashboard is working on it (active, non-stale claim)
+      completed      — dashboard marked the thread done
+      failed         — dashboard's push failed; agent needs to retry
+      human_resolved — human replied before any dashboard engagement
+      reopened       — human replied AFTER a dashboard marker
+
+    ``top_author`` is the login of the thread's original (top) comment author.
+    A non-marker reply from that SAME author on an otherwise-untouched thread is
+    the reviewer's own fresh follow-up feedback — NOT a third-party resolution —
+    so it must leave the thread ``open`` (still actionable). Only a reply from a
+    DIFFERENT human resolves an open thread (BOU-1801: the loop was silently
+    dropping reviewers' own follow-up replies as ``human_resolved``).
+    """
+    now = datetime.now(timezone.utc)
+    state = "open"
+    claim_created: datetime | None = None
+
+    for reply in sorted(replies, key=lambda r: str(r.get("created_at", ""))):
+        body = str(reply.get("body", ""))
+        if COMPLETE_MARKER in body:
+            state = "completed"
+            claim_created = None
+        elif FAILED_MARKER in body:
+            state = "failed"
+            claim_created = None
+        elif CLAIM_MARKER in body:
+            state = "claimed"
+            claim_created = _parse_github_time(str(reply.get("created_at", "")))
+        else:
+            # Human or third-party reply.
+            reply_author = str(reply.get("author", "")) or None
+            reply_is_thread_author = (
+                top_author is not None and reply_author == top_author
+            )
+            if state in ("claimed", "completed", "failed"):
+                state = "reopened"
+                claim_created = None
+            elif state == "open" and not reply_is_thread_author:
+                state = "human_resolved"
+            # A same-author follow-up on an open thread stays "open" (fresh
+            # reviewer feedback). human_resolved and reopened are sticky under
+            # further human replies.
+
+    claim_age: float | None = None
+    if state == "claimed" and claim_created is not None:
+        claim_age = (now - claim_created).total_seconds()
+
+    return state, claim_age
+
+
+def _thread_is_addressed_or_claimed(replies: list[dict]) -> bool:
+    """Return True when a review thread should be skipped by auto-dispatch.
+
+    Walks replies chronologically so a human follow-up after a dashboard
+    marker (e.g. "this was NOT addressed" after a `completed` reply) re-opens
+    the thread. Human replies stay idempotently "handled by human" until a
+    dashboard marker appears; they do not toggle the thread back open based on
+    reply count alone.
+    """
+    if not replies:
+        return False
+
+    state, claim_age = _thread_state(replies)
+
+    if state in ("completed", "human_resolved"):
+        return True
+    if state == "claimed":
+        return bool(claim_age is not None and claim_age < STALE_CLAIM_SECONDS)
+    return False
+
+
+def scan_review_threads(
     pr_number: int,
     latest_commit_date: str,
     cwd: str | None = None,
-) -> list[ReviewComment]:
-    """Get review comments that have no completed or active claim reply.
+) -> tuple[list[ReviewComment], list[ThreadDecision]]:
+    """Return (picked_comments, decisions) for all review threads on a PR.
 
-    Uses the GraphQL reviewThreads API for inline threads, then appends
-    review-level CHANGES_REQUESTED comments from the REST /reviews endpoint.
+    ``picked_comments`` is identical to what :func:`get_unaddressed_comments`
+    returns. ``decisions`` contains one :class:`ThreadDecision` for every
+    inline thread so callers can audit why each thread was picked or skipped.
+    Review-level CHANGES_REQUESTED comments are included in ``picked_comments``
+    but are not reflected in ``decisions`` (they have no thread state machine).
     """
+    now = datetime.now(timezone.utc)
     comments: list[ReviewComment] = []
+    decisions: list[ThreadDecision] = []
 
     # Inline review threads via GraphQL
     threads = get_review_threads(pr_number, cwd)
     for thread in threads:
-        # Skip resolved threads AND outdated ones: an outdated thread points at
-        # code that has since changed, so it is not actionable feedback. Treating
-        # it as unaddressed would make a green-CI PR with only an outdated thread
-        # read as blocked, and would prevent `pr_has_unresolved_review_threads`
-        # from being authoritative (PR #16 review round 2, P2).
-        if thread.is_resolved or thread.is_outdated:
+        top = thread.top
+        created_dt = _parse_github_time(top.created_at)
+        age_seconds: float | None = None
+        if created_dt is not None:
+            age_seconds = (now - created_dt).total_seconds()
+
+        if thread.is_resolved:
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_RESOLVED",
+                marker_state=None,
+                claim_age_seconds=None,
+            ))
             continue
+
+        if thread.is_outdated:
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_OUTDATED",
+                marker_state=None,
+                claim_age_seconds=None,
+            ))
+            continue
+
         replies_as_dicts = [
-            {"body": r.body, "created_at": r.created_at}
+            {"body": r.body, "created_at": r.created_at, "author": r.author}
             for r in thread.replies
         ]
-        if _thread_is_addressed_or_claimed(replies_as_dicts):
+
+        state, claim_age = _thread_state(replies_as_dicts, top_author=top.author)
+
+        if state == "completed":
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_ADDRESSED",
+                marker_state=state,
+                claim_age_seconds=None,
+            ))
             continue
-        top = thread.top
+
+        if state == "human_resolved":
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_HUMAN_RESOLVED",
+                marker_state=state,
+                claim_age_seconds=None,
+            ))
+            continue
+
+        if state == "claimed" and claim_age is not None and claim_age < STALE_CLAIM_SECONDS:
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_CLAIMED_ACTIVE",
+                marker_state=state,
+                claim_age_seconds=claim_age,
+            ))
+            continue
+
+        # Thread is actionable — add to results
         comments.append(ReviewComment(
             id=top.database_id,
             author=top.author,
@@ -1798,6 +1951,15 @@ def get_unaddressed_comments(
             created_at=top.created_at,
             is_inline=True,
             thread_id=thread.node_id,
+        ))
+        decisions.append(ThreadDecision(
+            thread_id=thread.node_id,
+            author=top.author,
+            created_at=top.created_at,
+            age_seconds=age_seconds,
+            decision="PICKED",
+            marker_state=state,
+            claim_age_seconds=None,
         ))
 
     # Review-level comments (CHANGES_REQUESTED with body)
@@ -1825,71 +1987,20 @@ def get_unaddressed_comments(
             except json.JSONDecodeError:
                 continue
 
-    return comments
+    return comments, decisions
 
 
-def _parse_github_time(value: str) -> datetime | None:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
-        return None
+def get_unaddressed_comments(
+    pr_number: int,
+    latest_commit_date: str,
+    cwd: str | None = None,
+) -> list[ReviewComment]:
+    """Get review comments that have no completed or active claim reply.
 
-
-def _thread_is_addressed_or_claimed(replies: list[dict]) -> bool:
-    """Return True when a review thread should be skipped by auto-dispatch.
-
-    Walks replies chronologically so a human follow-up after a dashboard
-    marker (e.g. "this was NOT addressed" after a `completed` reply) re-opens
-    the thread. Human replies stay idempotently "handled by human" until a
-    dashboard marker appears; they do not toggle the thread back open based on
-    reply count alone.
+    Uses the GraphQL reviewThreads API for inline threads, then appends
+    review-level CHANGES_REQUESTED comments from the REST /reviews endpoint.
     """
-    if not replies:
-        return False
-
-    now = datetime.now(timezone.utc)
-    # States:
-    #   open           — nothing has happened yet
-    #   claimed        — dashboard is working on it
-    #   completed      — dashboard marked the thread done
-    #   failed         — dashboard's push failed; agent needs to retry
-    #   human_resolved — human replied before any dashboard engagement
-    #   reopened       — human replied AFTER a dashboard marker; stays sticky
-    #                    so additional human follow-ups don't flip back to
-    #                    "human_resolved"
-    state = "open"
-    claim_created: datetime | None = None
-
-    for reply in sorted(replies, key=lambda r: str(r.get("created_at", ""))):
-        body = str(reply.get("body", ""))
-        if COMPLETE_MARKER in body:
-            state = "completed"
-            claim_created = None
-        elif FAILED_MARKER in body:
-            state = "failed"
-            claim_created = None
-        elif CLAIM_MARKER in body:
-            state = "claimed"
-            claim_created = _parse_github_time(str(reply.get("created_at", "")))
-        else:
-            # Human or third-party reply.
-            if state in ("claimed", "completed", "failed"):
-                state = "reopened"
-                claim_created = None
-            elif state == "open":
-                state = "human_resolved"
-            # human_resolved and reopened are sticky under further human replies
-
-    if state in ("completed", "human_resolved"):
-        return True
-    if state == "claimed":
-        return bool(
-            claim_created
-            and (now - claim_created).total_seconds() < STALE_CLAIM_SECONDS
-        )
-    return False
+    return scan_review_threads(pr_number, latest_commit_date, cwd)[0]
 
 
 def reply_to_review_comment(

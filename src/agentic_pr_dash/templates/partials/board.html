@@ -6,6 +6,20 @@
     {% include 'partials/escalation_banner.html' %}
 </div>
 {% endif %}
+
+{# ── Ownership summary bar ── #}
+{% set ns = namespace(owned_live=0, unowned=0, stale=0) %}
+{% for col in columns %}{% for card in col.cards %}
+    {% if card.owner_pid_alive == true %}{% set ns.owned_live = ns.owned_live + 1 %}
+    {% elif card.owner_session_id %}{% set ns.stale = ns.stale + 1 %}
+    {% else %}{% set ns.unowned = ns.unowned + 1 %}{% endif %}
+{% endfor %}{% endfor %}
+{% if ns.owned_live or ns.stale %}
+<div class="board-ownership-summary">
+    owned-by-live {{ ns.owned_live }} · unowned {{ ns.unowned }} · stale {{ ns.stale }}
+</div>
+{% endif %}
+
 {% for col in columns %}
 <div class="kanban-column col-{{ col.id }}" id="col-{{ col.id }}">
     <div class="column-header">
@@ -39,6 +53,24 @@
                 </div>
                 <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
             </div>
+
+            {# ── Ownership line ── #}
+            {% if card.owner_session_id %}
+            <div class="card-ownership">
+                <span class="owner-session">{{ card.owner_session_id[:8] }}</span>
+                {% if card.owner_pid is not none %}
+                <span class="owner-pid {% if card.owner_pid_alive %}owner-pid-alive{% else %}owner-pid-dead{% endif %}">
+                    pid {{ card.owner_pid }} · {% if card.owner_pid_alive %}alive{% else %}dead{% endif %}
+                </span>
+                {% endif %}
+                {% if card.armed_at %}
+                <span class="owner-armed">armed {{ card.armed_at.strftime('%H:%M:%S') }}</span>
+                {% endif %}
+                {% if card.loop_state %}
+                <span class="owner-loop-state">{{ card.loop_state | replace('_', ' ') }}</span>
+                {% endif %}
+            </div>
+            {% endif %}
 
             {# ── Ordered field rows ── #}
             {% if card.started_at_label %}
@@ -168,6 +200,21 @@
                 {% if card.latest_commit_sha %}
                 <div class="detail-commit">
                     <span>head</span> <code>{{ card.latest_commit_sha[:7] }}</code>
+                </div>
+                {% endif %}
+
+                {% if card.thread_decisions %}
+                <div class="detail-thread-decisions">
+                    <div class="thread-decisions-header">Comment threads</div>
+                    {% for td in card.thread_decisions %}
+                    <div class="thread-decision-row">
+                        <span class="td-decision">{{ td.decision }}</span>
+                        <span class="td-author">{{ td.author }}</span>
+                        {% if td.thread_id %}<code class="td-thread-id">{{ td.thread_id[:8] }}</code>{% endif %}
+                        {% if td.age_seconds is not none %}<span class="td-age">{{ (td.age_seconds / 60) | int }}m ago</span>{% endif %}
+                        {% if td.marker_state %}<span class="td-marker">{{ td.marker_state }}</span>{% endif %}
+                    </div>
+                    {% endfor %}
                 </div>
                 {% endif %}
 

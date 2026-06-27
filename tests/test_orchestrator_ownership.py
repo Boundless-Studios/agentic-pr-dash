@@ -134,7 +134,7 @@ def test_refresh_requeues_matching_active_state_when_owner_session_ended(monkeyp
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
 
     created_tasks = []
 
@@ -210,7 +210,7 @@ def test_refresh_requeues_fresh_queued_state_without_active_coordinator_claim(mo
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
 
     created_tasks = []
 
@@ -276,7 +276,7 @@ def test_refresh_requeues_when_prequeue_owner_session_is_dead(monkeypatch, tmp_p
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
 
     created_tasks = []
 
@@ -374,7 +374,7 @@ def test_refresh_keeps_matching_active_state_when_owner_session_is_live(monkeypa
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
     _claim_current_pr(
         PRData(
             number=123,
@@ -464,7 +464,7 @@ def test_refresh_keeps_matching_active_state_for_process_only_owner(monkeypatch,
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
     _claim_current_pr(
         PRData(
             number=123,
@@ -551,7 +551,7 @@ def test_refresh_reads_session_registry_from_target_worktree_config(monkeypatch,
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_latest_commit", lambda pr_number, cwd=None: ("sha", "2026-06-11T12:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda pr_number, cwd=None: [])
-    monkeypatch.setattr(github_api, "get_unaddressed_comments", lambda pr_number, latest_commit_date, cwd=None: [_comment()])
+    monkeypatch.setattr(github_api, "scan_review_threads", lambda pr_number, latest_commit_date, cwd=None: ([_comment()], []))
 
     created_tasks = []
 

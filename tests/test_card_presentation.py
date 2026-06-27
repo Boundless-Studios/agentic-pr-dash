@@ -20,6 +20,7 @@ from agentic_pr_dash.models import (
     MaintenanceStatus,
     PRStatus,
     ReviewComment,
+    ThreadDecision,
     WorktreeCard,
     humanize_relative,
 )
@@ -457,3 +458,115 @@ def test_template_diagnostics_inside_details():
 
     # The <details> element must carry class "card-details"
     assert "card-details" in html, "Expected class 'card-details' on the details element"
+
+
+# ---------------------------------------------------------------------------
+# 3f. Ownership line rendering
+# ---------------------------------------------------------------------------
+
+def test_template_ownership_line_when_session_id_set():
+    """Card with owner_session_id → ownership line rendered with session prefix and pid state."""
+    now = datetime(2026, 6, 27, 10, 0, 0, tzinfo=timezone.utc)
+    card = _minimal_card(
+        owner_session_id="abc12345-dead-beef-cafe-000000000001",
+        owner_pid=99999,
+        owner_pid_alive=True,
+        armed_at=now,
+        loop_state="running",
+    )
+    html = _render_board([card])
+
+    # Short session id prefix (first 8 chars) must appear
+    assert "abc12345" in html, "Expected short session id prefix in ownership line"
+    # pid alive/dead indicator
+    assert "alive" in html, "Expected 'alive' indicator for live pid"
+    # loop state
+    assert "running" in html, "Expected loop_state in rendered card"
+    # The ownership element class
+    assert "card-ownership" in html, "Expected 'card-ownership' element in rendered HTML"
+
+
+def test_template_ownership_dead_pid():
+    """Card with owner_pid_alive=False → 'dead' shown in ownership line."""
+    now = datetime(2026, 6, 27, 10, 0, 0, tzinfo=timezone.utc)
+    card = _minimal_card(
+        owner_session_id="deadbeef-0000-0000-0000-000000000000",
+        owner_pid=2**20 - 1,
+        owner_pid_alive=False,
+        armed_at=now,
+    )
+    html = _render_board([card])
+    assert "dead" in html, "Expected 'dead' pid indicator for stale ownership"
+    assert "owner-pid-dead" in html or "dead" in html
+
+
+def test_template_no_ownership_line_when_unowned():
+    """Card without owner_session_id → no ownership line rendered."""
+    card = _minimal_card(status=PRStatus.CLEAN)
+    html = _render_board([card])
+    assert "card-ownership" not in html, (
+        "Expected NO ownership line on a card with no owner"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3g. Comment threads block inside <details>
+# ---------------------------------------------------------------------------
+
+def test_template_thread_decisions_in_details():
+    """Card with thread_decisions → comment threads block appears inside <details>."""
+    threads = [
+        ThreadDecision(
+            thread_id="PRRT_abc12345",
+            author="reviewer-x",
+            created_at="2026-06-27T09:00:00Z",
+            age_seconds=3600.0,
+            decision="PICKED",
+            marker_state=None,
+        ),
+        ThreadDecision(
+            thread_id="PRRT_def67890",
+            author="reviewer-y",
+            created_at="2026-06-27T08:00:00Z",
+            age_seconds=7200.0,
+            decision="SKIP_RESOLVED",
+            marker_state="resolved",
+        ),
+    ]
+    card = _minimal_card(
+        status=PRStatus.HAS_COMMENTS,
+        thread_decisions=threads,
+        # Need at least one other detail field so <details> renders
+        latest_commit_sha="aabbccdd1234567",
+    )
+    html = _render_board([card])
+
+    assert "<details" in html, "Expected <details> element in card with thread decisions"
+
+    # Thread section header
+    assert "Comment threads" in html, "Expected 'Comment threads' sub-section header"
+
+    # Thread content inside details
+    first_details = html.index("<details")
+    last_details_close = html.rindex("</details>")
+
+    for needle in ["PICKED", "SKIP_RESOLVED", "reviewer-x", "PRRT_abc"]:
+        assert needle in html, f"Expected {needle!r} in rendered HTML"
+        idx = html.index(needle)
+        assert idx > first_details, f"{needle!r} must be inside <details>"
+        assert idx < last_details_close, f"{needle!r} must be before </details>"
+
+    # marker_state shown
+    assert "resolved" in html, "Expected marker_state 'resolved' in thread decisions"
+
+
+def test_template_no_thread_section_when_empty():
+    """Card with empty thread_decisions → no 'Comment threads' sub-section."""
+    card = _minimal_card(
+        status=PRStatus.CLEAN,
+        latest_commit_sha="aabbccdd1234567",
+    )
+    html = _render_board([card])
+    assert "Comment threads" not in html, (
+        "Expected no 'Comment threads' section when thread_decisions is empty"
+    )

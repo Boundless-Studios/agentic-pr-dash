@@ -11,6 +11,7 @@ Subcommands:
     record        Record a session lifecycle event (for the dashboard's live view).
     loop          Run check/fix/complete continuously, dispatching to a configured agent.
     serve         Run the web dashboard.
+    observe       Inspect the observability event store (comment scans, dispatches, etc.).
 
 ``check/complete/arm/list-owned/stop-gate/reconcile-prs`` route into the stateless maintenance
 executor; ``record`` into the session registry; ``loop`` and ``serve`` are runtime
@@ -23,6 +24,103 @@ import sys
 
 _EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate", "reconcile-prs", "await"}
 _USAGE = __doc__
+
+
+# ---------------------------------------------------------------------------
+# observe subcommand helpers
+# ---------------------------------------------------------------------------
+
+
+def _observe_get_event_store(cwd: str):
+    """Indirection layer so tests can monkeypatch this without re-importing."""
+    from .observability import get_event_store
+    return get_event_store(cwd)
+
+
+def _humanize_age(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h"
+    return f"{s // 86400}d"
+
+
+def _short_detail(details: dict) -> str:
+    if not details:
+        return ""
+    for key in ("executor", "reason", "state", "message", "event", "decisions"):
+        if key in details:
+            v = details[key]
+            if isinstance(v, list):
+                return f"{key}=[{len(v)} items]"
+            return f"{key}={v!r}"
+    k, v = next(iter(details.items()))
+    return f"{k}={v!r}"
+
+
+def _observe_main(argv: list[str]) -> int:
+    import argparse
+    from datetime import datetime, timezone
+
+    parser = argparse.ArgumentParser(prog="agentic-pr-dash observe")
+    parser.add_argument("--pr", type=int, default=None, help="Filter by PR number")
+    parser.add_argument("--kind", type=str, default=None, help="Filter by event kind")
+    parser.add_argument("--since", type=str, default=None, help="ISO 8601 datetime lower bound (inclusive)")
+    parser.add_argument("--limit", type=int, default=50, help="Max events to return (default 50)")
+    parser.add_argument("--cwd", type=str, default=".", help="Worktree directory for config resolution")
+    args = parser.parse_args(argv)
+
+    since_dt = None
+    if args.since:
+        since_dt = datetime.fromisoformat(args.since)
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    store = _observe_get_event_store(args.cwd)
+
+    # Special view: --pr given AND --kind NOT given → show latest comment_scan as a table.
+    if args.pr is not None and args.kind is None:
+        scans = store.query(pr_number=args.pr, kind="comment_scan", limit=1)
+        if not scans:
+            print(f"no comment_scan recorded for PR {args.pr}")
+            return 0
+        ev = scans[0]
+        decisions = ev.details.get("decisions", [])
+        picked = ev.details.get("picked", 0)
+        total = len(decisions)
+        print(f"comment_scan  PR #{args.pr}  {ev.ts.isoformat()}  picked {picked} of {total}")
+        print(f"{'DECISION':<22}  {'AUTHOR':<20}  {'AGE':<8}  {'THREAD':<14}  MARKER_STATE")
+        print("-" * 82)
+        for d in decisions:
+            age_s = d.get("age_seconds") or d.get("claim_age_seconds") or 0
+            age_h = _humanize_age(age_s)
+            thread_id = str(d.get("thread_id", ""))
+            thread_short = thread_id[-12:] if len(thread_id) > 12 else thread_id
+            print(
+                f"{d.get('decision', ''):<22}  "
+                f"{d.get('author', ''):<20}  "
+                f"{age_h:<8}  "
+                f"{thread_short:<14}  "
+                f"{d.get('marker_state', '')}"
+            )
+        print(f"\npicked {picked} of {total}")
+        return 0
+
+    # Generic listing: apply all filters.
+    events = store.query(pr_number=args.pr, kind=args.kind, since=since_dt, limit=args.limit)
+    for ev in events:
+        pr_str = f"PR#{ev.pr_number}" if ev.pr_number is not None else "PR#-"
+        short = _short_detail(ev.details)
+        print(f"{ev.ts.isoformat()}  {ev.kind}  {pr_str}  {short}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main dispatch
+# ---------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -49,6 +147,9 @@ def main(argv: list[str] | None = None) -> int:
         from .server import main as serve_main
         serve_main()
         return 0
+
+    if cmd == "observe":
+        return _observe_main(rest)
 
     print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
