@@ -22,14 +22,24 @@ def _stop_gate_no_rate_limit(monkeypatch: pytest.MonkeyPatch) -> None:
     config.load.cache_clear()
 
 
-def test_stop_gate_does_not_adopt_unmarked_open_pr_worktrees(
+def test_stop_gate_adopts_and_inspects_unmarked_open_pr_worktree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    """BOU-1787 contract: stop-gate now runs list-owned-equivalent reconciliation.
+    An unmarked worktree with the session-user's open non-draft PR and no live
+    foreign/independent owner is ADOPTED and inspected on the same Stop tick (the
+    missed-arm pickup). A worktree we already marker-own is inspected as before.
+    """
     owned = tmp_path / "owned"
     unrelated = tmp_path / "unrelated"
     owned.mkdir()
     unrelated.mkdir()
+
+    # Stateful marker: 'owned' starts ours; 'unrelated' starts unmarked and
+    # becomes ours once adopted (mirrors _write_arm_marker persisting to disk so
+    # the passive owned-worktree re-collection sees the just-armed PR).
+    marker_state: dict[str, str] = {str(owned): SID}
 
     monkeypatch.setattr(
         _worktrees_mod,
@@ -39,19 +49,22 @@ def test_stop_gate_does_not_adopt_unmarked_open_pr_worktrees(
     monkeypatch.setattr(
         _markers_mod,
         "_marker_session_id",
-        lambda path: SID if Path(path) == owned else None,
+        lambda path: marker_state.get(str(Path(path))),
     )
     monkeypatch.setattr(
         _worktrees_mod,
         "_list_my_open_prs",
-        lambda cwd: {"unrelated-branch": (202, False)},
+        lambda cwd, timeout=15: {"unrelated-branch": (202, False)},
     )
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda path, sid: None)
     adopted: list[str] = []
-    monkeypatch.setattr(
-        _markers_mod,
-        "_write_arm_marker",
-        lambda path, session_id, pid, pr_number: adopted.append(path) or True,
-    )
+
+    def _adopt(path: str, session_id: str, pid: int, pr_number: int) -> bool:
+        adopted.append(str(Path(path)))
+        marker_state[str(Path(path))] = session_id
+        return True
+
+    monkeypatch.setattr(_markers_mod, "_write_arm_marker", _adopt)
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_paths",
@@ -70,9 +83,9 @@ def test_stop_gate_does_not_adopt_unmarked_open_pr_worktrees(
 
     rc = maintenance_check.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
 
-    assert rc == 0
-    assert checked == [str(owned)]
-    assert adopted == []
+    assert rc == 2
+    assert checked == [str(owned), str(unrelated)]
+    assert adopted == [str(unrelated)]
 
 
 def test_stop_gate_skips_marker_owned_path_with_live_independent_owner(
@@ -88,7 +101,7 @@ def test_stop_gate_skips_marker_owned_path_with_live_independent_owner(
         lambda cwd: [(str(owned), "owned-branch")],
     )
     monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: SID)
-    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {})
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {})
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_paths",

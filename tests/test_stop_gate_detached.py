@@ -27,7 +27,7 @@ def test_detached_pr_with_review_comment_blocks_stop(tmp_path, monkeypatch, caps
     # Session armed PR 777; its worktree was later torn down (gone).
     sl.append("sess-X", pr=777, branch="bou-1-x", worktree=str(tmp_path / "gone"))
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid, deadline=None: [])
     monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/777", False, []))
@@ -45,7 +45,7 @@ def test_detached_pr_with_review_level_changes_requested_blocks_stop(
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=779, branch="bou-review", worktree=str(tmp_path / "gone"))
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid, deadline=None: [])
     monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/779", False, [],
@@ -64,7 +64,7 @@ def test_detached_pr_with_dirty_merge_state_blocks_stop(tmp_path, monkeypatch, c
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=780, branch="bou-conflict", worktree=str(tmp_path / "gone"))
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid, deadline=None: [])
     monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/780", False, [],
@@ -83,7 +83,7 @@ def test_detached_pr_with_conflicting_mergeable_blocks_stop(tmp_path, monkeypatc
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=782, branch="bou-conflicting", worktree=str(tmp_path / "gone"))
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid, deadline=None: [])
     monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://github.com/o/r/pull/782", False, [],
@@ -102,7 +102,7 @@ def test_detached_pr_clean_does_not_block(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
     sl.append("sess-X", pr=778, branch="bou-clean", worktree=str(tmp_path / "gone"))
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
-    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_owned_worktrees", lambda sid, cwd, pid, deadline=None: [])
     monkeypatch.setattr(_worktrees_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
         "open", "https://x/pull/778", False, []))

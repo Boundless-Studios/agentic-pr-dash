@@ -115,21 +115,43 @@ def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
 
 def _stop_gate_impl(args) -> int:
     from .worktree_check import _check_worktree  # noqa: PLC0415
-    from .worktrees import _owned_worktrees_across_roots, _detached_records_across_roots  # noqa: PLC0415
+    from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
     from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
     cwd = os.path.abspath(args.cwd)
 
+    session_id = args.session_id or _read_session_marker(cwd)
+
+    # Reconcile FIRST: run list-owned-equivalent adoption with the durable owner
+    # pid, bounded by a short shared budget for Stop-hook deadline safety. A PR
+    # created mid-session whose arm hook was missed is adopted here (its marker is
+    # written), so the passive owned-worktree collection below sees it. A FRESH
+    # adoption must NOT stay hidden behind the clean-stop rate-limit, so it
+    # bypasses the early-return for this one tick (BOU-1787). The adoption pass is
+    # cheap on the common "everything already armed" stop: no candidate is
+    # unmarked, so it never makes the gh call.
+    newly_adopted: list[str] = []
+    if session_id:
+        budget = _env_int("STOP_RECONCILE_BUDGET", 8)
+        deadline = time.monotonic() + budget if budget > 0 else None
+        _owned, newly_adopted = _reconcile_owned_across_roots(
+            session_id, cwd, getattr(args, "pid", None), deadline
+        )
+
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
     now = time.time()
     last_pending = bool(state.get("fingerprint"))
-    if interval > 0 and not last_pending and (now - float(state.get("ts", 0) or 0)) < interval:
+    rate_limited = (
+        interval > 0
+        and not last_pending
+        and (now - float(state.get("ts", 0) or 0)) < interval
+    )
+    if rate_limited and not newly_adopted:
         return 0
     _save_stop_state(cwd, {**state, "ts": now})
 
-    session_id = args.session_id or _read_session_marker(cwd)
     if session_id:
         owned = _owned_worktrees_across_roots(session_id, cwd)
     else:
