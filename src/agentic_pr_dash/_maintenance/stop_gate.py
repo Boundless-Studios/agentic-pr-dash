@@ -113,6 +113,18 @@ def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
     )
 
 
+# Explicit capability sentinel for cross-repo probes (gaia PR #2337 review).
+# True iff ``_stop_gate_impl`` below runs list-owned reconciliation/adoption
+# BEFORE its clean-stop rate-limit early-return (so a missed-arm or stale-marker
+# PR is inspected on the same tick). A consumer (e.g. gaia's Stop-hook wrapper)
+# checks THIS flag — not merely the presence of a helper like
+# ``worktrees._reconcile_owned_across_roots`` — to decide whether the package
+# already subsumes its own arm preflight. Keep it in lockstep with the wiring in
+# ``_stop_gate_impl``: if that body ever stops reconciling before the rate-limit,
+# this MUST become False.
+RECONCILES_BEFORE_RATE_LIMIT = True
+
+
 def _stop_gate_impl(args) -> int:
     from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
