@@ -368,6 +368,15 @@ def test_gh_pr_list_skips_subprocess_when_no_budget(
     assert out == {}
 
 
+def test_stop_gate_exposes_reconcile_capability_sentinel() -> None:
+    """gaia PR #2337 probes stop_gate.RECONCILES_BEFORE_RATE_LIMIT to confirm the
+    package actually reconciles before the rate-limit (not just that a helper
+    exists). The sentinel must be exposed and True now that _stop_gate_impl is
+    wired to reconcile first (the behavior is proven by
+    test_stop_gate_inspects_freshly_adopted_pr_within_rate_limit_window)."""
+    assert _stop_gate_mod.RECONCILES_BEFORE_RATE_LIMIT is True
+
+
 def test_stop_gate_rewrites_stale_marker_pr_within_rate_limit_window(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
