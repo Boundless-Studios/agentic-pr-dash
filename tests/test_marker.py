@@ -278,7 +278,7 @@ def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
         lambda cwd: [(str(orphan), "br-orphan"), (str(stolen), "br-stolen")],
     )
     monkeypatch.setattr(
-        _worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False), "br-stolen": (102, False)}
+        _worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {"br-orphan": (101, False), "br-stolen": (102, False)}
     )
     # The stolen worktree has a live INDEPENDENT owner now; the orphan has none.
     monkeypatch.setattr(
@@ -300,7 +300,7 @@ def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeyp
     monkeypatch.setattr(
         _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(orphan), "br-orphan")]
     )
-    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-orphan": (101, False)})
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {"br-orphan": (101, False)})
     monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)
@@ -334,7 +334,7 @@ def test_collect_owned_skips_foreign_owner_with_fresh_heartbeat_even_dead_pid(tm
     monkeypatch.setattr(
         _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(foreign), "br-foreign")]
     )
-    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {"br-foreign": (101, False)})
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {"br-foreign": (101, False)})
     monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
 
     result = mc._collect_owned_worktrees("claude-uuid-X", str(tmp_path), 555)

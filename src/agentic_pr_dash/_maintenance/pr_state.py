@@ -173,8 +173,15 @@ def _pr_head_branch(cwd: str, pr_number: int):
     return head if isinstance(head, str) and head else None
 
 
-def _gh_pr_list_json(cwd: str, extra_args: list[str], fields: str) -> list | None:
-    """Run `gh pr list --author @me --state open --json <fields> <extra>`."""
+def _gh_pr_list_json(
+    cwd: str, extra_args: list[str], fields: str, timeout: float = 15
+) -> list | None:
+    """Run `gh pr list --author @me --state open --json <fields> <extra>`.
+
+    ``timeout`` bounds the gh subprocess; Stop-context callers pass the remaining
+    reconciliation budget so a single slow root cannot blow the Stop-hook
+    deadline (BOU-1787 review).
+    """
     import json  # noqa: PLC0415
 
     try:
@@ -183,7 +190,7 @@ def _gh_pr_list_json(cwd: str, extra_args: list[str], fields: str) -> list | Non
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=15,
+            timeout=max(1.0, timeout),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -205,9 +212,11 @@ def _resolve_open_pr_for_branch(cwd: str, branch: str):
     return int(entry.get("number")), bool(entry.get("isDraft", False))
 
 
-def _list_my_open_prs(cwd: str) -> dict[str, tuple[int, bool]]:
-    """Map branch -> (pr_number, is_draft) for the user's open PRs; {} on failure."""
-    data = _gh_pr_list_json(cwd, [], "number,headRefName,isDraft")
+def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, bool]]:
+    """Map branch -> (pr_number, is_draft) for the user's open PRs; {} on failure.
+
+    ``timeout`` bounds the underlying gh subprocess (BOU-1787 review)."""
+    data = _gh_pr_list_json(cwd, [], "number,headRefName,isDraft", timeout=timeout)
     if not data:
         return {}
     out: dict[str, tuple[int, bool]] = {}

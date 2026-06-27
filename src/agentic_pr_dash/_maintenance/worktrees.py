@@ -206,13 +206,18 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
 
 
 def _collect_owned_worktrees(
-    session_id: str, cwd: str, pid: int | None
+    session_id: str, cwd: str, pid: int | None, deadline: float | None = None
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted.
 
     ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily — only when at least
     one candidate worktree is unmarked and therefore adoptable — so the common
     "everything already armed" Stop tick stays cheap (BOU-1787).
+
+    ``deadline`` is an optional ``time.monotonic()`` reconciliation budget. When
+    set, the gh adoption probe is skipped once the deadline has passed, and the
+    gh subprocess timeout is capped to the remaining budget — so a single slow
+    root cannot blow the Stop-hook deadline even mid-scan (BOU-1787 review).
     """
     from .markers import _live_foreign_owner, _marker_session_id, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
@@ -243,7 +248,15 @@ def _collect_owned_worktrees(
             _emit(worktree_path)
             continue
         if pr_map is None:
-            pr_map = _list_my_open_prs(cwd)
+            # An unmarked candidate exists. Only now do the gh probe — and only
+            # if we still have budget; cap its timeout to the remaining budget.
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                pr_map = {}  # over budget — skip adoption, keep markered owners
+            else:
+                pr_map = _list_my_open_prs(
+                    cwd, timeout=15 if remaining is None else min(15.0, remaining)
+                )
         if not pr_map:
             continue
         pr = pr_map.get(branch)
@@ -283,7 +296,7 @@ def _reconcile_owned_across_roots(
         if deadline is not None and time.monotonic() > deadline:
             break
         before = set(_collect_stop_gate_worktrees(session_id, root))
-        for wt in _collect_owned_worktrees(session_id, root, pid):
+        for wt in _collect_owned_worktrees(session_id, root, pid, deadline):
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)

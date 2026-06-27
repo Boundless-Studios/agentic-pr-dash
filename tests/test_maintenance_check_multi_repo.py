@@ -81,7 +81,7 @@ def test_list_owned_aggregates_across_roots(tmp_path, monkeypatch, capsys):
     _arm(anchor, "sess-1", 100, os.getpid())
     _arm(sib, "sess-1", 200, os.getpid())
     # No gh in tests: reconciliation is skipped, the markered pass still works.
-    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {})
+    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd, timeout=15: {})
 
     args = argparse.Namespace(session_id="sess-1", cwd=str(anchor),
                               pid=os.getpid())
@@ -101,7 +101,7 @@ def test_list_owned_excludes_live_foreign_owner(tmp_path, monkeypatch, capsys):
     # Foreign marker on the sibling, pid alive (this process) but session != ours.
     _arm(sib, "other-sess", 200, os.getpid())
     # Even if a PR exists for the sibling branch, the live foreign owner blocks adoption.
-    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd: {"main": (200, False)})
+    monkeypatch.setattr(mc, "_list_my_open_prs", lambda cwd, timeout=15: {"main": (200, False)})
 
     args = argparse.Namespace(session_id="sess-1", cwd=str(anchor),
                               pid=os.getpid())

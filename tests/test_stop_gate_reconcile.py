@@ -61,7 +61,7 @@ def _wire_unmarked_open_pr_worktree(
     monkeypatch.setattr(
         _worktrees_mod,
         "_list_my_open_prs",
-        lambda cwd: {"feature-branch": (PR_NUMBER, False)},
+        lambda cwd, timeout=15: {"feature-branch": (PR_NUMBER, False)},
     )
     # Default owner-pid resolution (no --pid passed) must yield the durable pid.
     monkeypatch.setattr(_worktrees_mod, "_resolve_owner_pid", lambda: resolved_pid)
@@ -250,3 +250,77 @@ def test_stop_gate_still_idles_when_nothing_adopted_within_window(
     assert rc == 0
     assert adopted == []
     assert checked == [], "rate-limit must still short-circuit when nothing adopted"
+
+
+def test_collect_owned_skips_gh_probe_when_over_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """BOU-1787 review: an already-passed deadline must skip the gh adoption probe
+    entirely (no _list_my_open_prs call), so a single slow root can't blow the
+    Stop-hook deadline. Markered owners are still returned."""
+    import time
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(worktree), "feature-branch")],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set()
+    )
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: None)
+    gh_calls: list[float] = []
+
+    def _list(cwd, timeout=15):
+        gh_calls.append(timeout)
+        return {"feature-branch": (PR_NUMBER, False)}
+
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", _list)
+
+    past = time.monotonic() - 1.0
+    owned = _worktrees_mod._collect_owned_worktrees(SID, str(tmp_path), 4242, past)
+
+    assert gh_calls == [], "gh probe must be skipped once the budget is exhausted"
+    assert owned == []
+
+
+def test_collect_owned_caps_gh_timeout_to_remaining_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A near deadline must cap the gh subprocess timeout to the remaining budget
+    (not the full 15s), bounding a single slow root."""
+    import time
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(worktree), "feature-branch")],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set()
+    )
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: None)
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda path, sid: None)
+    monkeypatch.setattr(
+        _markers_mod, "_write_arm_marker", lambda *a, **k: True
+    )
+    gh_timeouts: list[float] = []
+
+    def _list(cwd, timeout=15):
+        gh_timeouts.append(timeout)
+        return {"feature-branch": (PR_NUMBER, False)}
+
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", _list)
+
+    near = time.monotonic() + 2.0  # ~2s of budget left
+    _worktrees_mod._collect_owned_worktrees(SID, str(tmp_path), 4242, near)
+
+    assert gh_timeouts, "gh probe should run while budget remains"
+    assert gh_timeouts[0] <= 2.0 + 0.5, gh_timeouts
+    assert gh_timeouts[0] < 15.0

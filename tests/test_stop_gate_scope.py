@@ -54,7 +54,7 @@ def test_stop_gate_adopts_and_inspects_unmarked_open_pr_worktree(
     monkeypatch.setattr(
         _worktrees_mod,
         "_list_my_open_prs",
-        lambda cwd: {"unrelated-branch": (202, False)},
+        lambda cwd, timeout=15: {"unrelated-branch": (202, False)},
     )
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda path, sid: None)
     adopted: list[str] = []
@@ -101,7 +101,7 @@ def test_stop_gate_skips_marker_owned_path_with_live_independent_owner(
         lambda cwd: [(str(owned), "owned-branch")],
     )
     monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: SID)
-    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd: {})
+    monkeypatch.setattr(_worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {})
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_paths",
