@@ -180,17 +180,22 @@ def _gh_pr_list_json(
 
     ``timeout`` bounds the gh subprocess; Stop-context callers pass the remaining
     reconciliation budget so a single slow root cannot blow the Stop-hook
-    deadline (BOU-1787 review).
+    deadline (BOU-1787 review). Sub-second budgets are honored verbatim — no 1s
+    floor — so a nearly-exhausted budget times out at the actual remaining time
+    instead of overrunning the deadline. A non-positive budget means "no time
+    left": skip the call entirely (PR #54 review round 2).
     """
     import json  # noqa: PLC0415
 
+    if timeout <= 0:
+        return None
     try:
         result = subprocess.run(
             ["gh", "pr", "list", "--author", "@me", "--state", "open", *extra_args, "--json", fields],
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=max(1.0, timeout),
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
