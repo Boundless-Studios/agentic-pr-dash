@@ -366,3 +366,121 @@ def test_gh_pr_list_skips_subprocess_when_no_budget(
 
     assert calls == [], "no gh subprocess should spawn when the budget is gone"
     assert out == {}
+
+
+def test_stop_gate_rewrites_stale_marker_pr_within_rate_limit_window(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """PR #2337 review (superset parity): a worktree we already marker-own whose
+    marker ``pr`` points at a superseded PR — while the branch now has a DIFFERENT
+    open non-draft PR — must be rewritten and inspected on the same Stop tick,
+    even inside the clean-stop rate-limit window. This is the preflight behavior
+    the package must subsume before the gaia wrapper can drop its preflight."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "180")
+    config.load.cache_clear()
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    old_pr, new_pr = 111, 909
+    marker = {"pr": str(old_pr), "session_id": SID}
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(worktree), "feature-branch")],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set()
+    )
+    # Always ours (markered to SID); the marker's PR is what's stale.
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: SID)
+    # Branch's CURRENT open non-draft PR (909) differs from the marker (111).
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_list_my_open_prs",
+        lambda cwd, timeout=15: {"feature-branch": (new_pr, False)},
+    )
+    monkeypatch.setattr(
+        _markers_mod, "_read_marker", lambda path: dict(marker)
+    )
+
+    rewrites: list[int] = []
+
+    def _rewrite(path, session_id, pid, pr_number):
+        rewrites.append(int(pr_number))
+        marker["pr"] = str(pr_number)  # stateful: the rewrite persists
+        return True
+
+    monkeypatch.setattr(_markers_mod, "_write_arm_marker", _rewrite)
+
+    checked: list[str] = []
+
+    def _check(path, session_id, *, claim=True):
+        checked.append(str(Path(path)))
+        return 10, f"pending review\nPR_NUMBER={new_pr}"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", _check)
+
+    _seed_recent_clean_stop(str(tmp_path))
+
+    rc = maintenance_check.main(
+        ["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]
+    )
+
+    assert rewrites == [new_pr], "stale marker PR must be rewritten to the current PR"
+    assert checked == [str(worktree)], "rewritten worktree must be inspected this tick"
+    assert rc == 2
+
+
+def test_stop_gate_keeps_fresh_marker_pr_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A marker whose ``pr`` already matches the branch's current PR is NOT
+    rewritten (no spurious adoption / rate-limit bypass)."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "180")
+    config.load.cache_clear()
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    cur_pr = 500
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(worktree), "feature-branch")],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set()
+    )
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda path: SID)
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_list_my_open_prs",
+        lambda cwd, timeout=15: {"feature-branch": (cur_pr, False)},
+    )
+    monkeypatch.setattr(
+        _markers_mod, "_read_marker", lambda path: {"pr": str(cur_pr), "session_id": SID}
+    )
+    rewrites: list[int] = []
+    monkeypatch.setattr(
+        _markers_mod,
+        "_write_arm_marker",
+        lambda *a, **k: rewrites.append(1) or True,
+    )
+    checked: list[str] = []
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: checked.append(path) or (0, "clean"),
+    )
+    _seed_recent_clean_stop(str(tmp_path))
+
+    rc = maintenance_check.main(
+        ["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]
+    )
+
+    assert rewrites == [], "a current marker PR must not be rewritten"
+    assert checked == [], "no rewrite → rate-limit still short-circuits this tick"
+    assert rc == 0

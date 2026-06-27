@@ -205,19 +205,30 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     return owned
 
 
+def _marker_pr(worktree_path: str) -> str:
+    """The PR number recorded in a worktree's pr-watch.armed marker ('' if none)."""
+    from .markers import _read_marker  # noqa: PLC0415
+    return str((_read_marker(worktree_path) or {}).get("pr", ""))
+
+
 def _collect_owned_worktrees(
     session_id: str, cwd: str, pid: int | None, deadline: float | None = None
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted.
 
-    ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily — only when at least
-    one candidate worktree is unmarked and therefore adoptable — so the common
-    "everything already armed" Stop tick stays cheap (BOU-1787).
+    Two ownership-marker writes happen here, both forms of reconciliation:
+      * ADOPT an unmarked worktree whose branch has an open non-draft ``@me`` PR
+        with no live foreign/independent owner (a missed-arm pickup), and
+      * REWRITE a marker we already own whose ``pr`` no longer matches the
+        branch's current open non-draft PR (a superseded PR — preflight parity,
+        BOU-1787 PR #2337 review).
 
-    ``deadline`` is an optional ``time.monotonic()`` reconciliation budget. When
-    set, the gh adoption probe is skipped once the deadline has passed, and the
-    gh subprocess timeout is capped to the remaining budget — so a single slow
-    root cannot blow the Stop-hook deadline even mid-scan (BOU-1787 review).
+    ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily and at most once, and
+    only when a candidate actually needs the branch→PR map (an unmarked
+    adoptable worktree, or one of ours to staleness-check). ``deadline`` is an
+    optional ``time.monotonic()`` budget: the gh probe is skipped once it passes,
+    and its subprocess timeout is capped to the remaining budget, so a single
+    slow root cannot blow the Stop-hook deadline mid-scan (BOU-1787 review).
     """
     from .markers import _live_foreign_owner, _marker_session_id, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
@@ -239,27 +250,37 @@ def _collect_owned_worktrees(
         [path for path, _branch in candidates], session_id
     )
 
-    pr_map: dict | None = None  # lazy: only hit gh when an unmarked candidate appears
+    pr_map: dict | None = None  # lazy, budget-bounded gh fetch (at most once)
+
+    def _branch_prs() -> dict:
+        nonlocal pr_map
+        if pr_map is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                pr_map = {}  # over budget — skip the gh probe entirely
+            else:
+                pr_map = _list_my_open_prs(
+                    cwd, timeout=15 if remaining is None else min(15.0, remaining)
+                ) or {}
+        return pr_map
+
     for worktree_path, branch in candidates:
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
             continue
         if _marker_session_id(worktree_path) == session_id:
+            # Already ours — but if the marker's PR is stale (the branch's open
+            # PR changed since we armed), rewrite it so the Stop-gate re-checks
+            # the CURRENT PR even inside the clean-stop window.
+            cur = _branch_prs().get(branch)
+            if cur is not None and not cur[1] and _marker_pr(worktree_path) != str(cur[0]):
+                _write_arm_marker(worktree_path, session_id, int(eff_pid), int(cur[0]))
             _emit(worktree_path)
             continue
-        if pr_map is None:
-            # An unmarked candidate exists. Only now do the gh probe — and only
-            # if we still have budget; cap its timeout to the remaining budget.
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                pr_map = {}  # over budget — skip adoption, keep markered owners
-            else:
-                pr_map = _list_my_open_prs(
-                    cwd, timeout=15 if remaining is None else min(15.0, remaining)
-                )
-        if not pr_map:
+        prs = _branch_prs()
+        if not prs:
             continue
-        pr = pr_map.get(branch)
+        pr = prs.get(branch)
         if pr is None:
             continue
         number, is_draft = pr
@@ -279,11 +300,14 @@ def _reconcile_owned_across_roots(
     roots, for Stop-context use.
 
     Returns ``(owned, newly_adopted)`` where ``newly_adopted`` is the subset of
-    ``owned`` whose ownership marker was written on THIS call (a missed-arm PR
-    just picked up). It is detected by diffing the markered set BEFORE adoption
-    (``_collect_stop_gate_worktrees``) against the markered-or-adopted set after
-    (``_collect_owned_worktrees``) — so ``_collect_owned_worktrees`` keeps its
-    existing 3-arg signature for every other caller.
+    ``owned`` whose ownership marker was (re)written on THIS call — either a
+    missed-arm PR freshly adopted, OR a marker we already owned whose ``pr`` was
+    rewritten because the branch's open PR changed (preflight parity). Both must
+    bypass the clean-stop rate-limit so the Stop-gate inspects the current PR.
+
+    Detection avoids changing ``_collect_owned_worktrees``' signature: a worktree
+    is newly-adopted if it was NOT markered to us before but is owned after, OR
+    if it was markered before but its marker ``pr`` changed across the call.
 
     ``deadline`` is an optional ``time.monotonic()`` budget — once exceeded,
     remaining roots are skipped so a slow ``gh``/worktree probe can't blow the
@@ -296,11 +320,13 @@ def _reconcile_owned_across_roots(
         if deadline is not None and time.monotonic() > deadline:
             break
         before = set(_collect_stop_gate_worktrees(session_id, root))
+        before_prs = {wt: _marker_pr(wt) for wt in before}
         for wt in _collect_owned_worktrees(session_id, root, pid, deadline):
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)
-            if wt not in before and wt not in newly_adopted:
+            adopted = wt not in before or before_prs.get(wt) != _marker_pr(wt)
+            if adopted and wt not in newly_adopted:
                 newly_adopted.append(wt)
     return owned, newly_adopted
 
