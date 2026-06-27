@@ -324,3 +324,45 @@ def test_collect_owned_caps_gh_timeout_to_remaining_budget(
     assert gh_timeouts, "gh probe should run while budget remains"
     assert gh_timeouts[0] <= 2.0 + 0.5, gh_timeouts
     assert gh_timeouts[0] < 15.0
+
+
+def test_gh_pr_list_honors_sub_second_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #54 review round 2: a sub-second budget must be passed to the gh
+    subprocess verbatim — no max(1.0, ...) floor that would overrun the deadline."""
+    from agentic_pr_dash._maintenance import pr_state as _pr_state
+
+    captured: dict[str, float] = {}
+
+    class _Result:
+        returncode = 0
+        stdout = "[]"
+
+    def _run(cmd, **kwargs):
+        captured["timeout"] = kwargs.get("timeout")
+        return _Result()
+
+    monkeypatch.setattr(_pr_state.subprocess, "run", _run)
+
+    _pr_state._list_my_open_prs("/tmp/x", timeout=0.3)
+
+    assert captured["timeout"] == 0.3, "sub-second budget must not be floored to 1s"
+
+
+def test_gh_pr_list_skips_subprocess_when_no_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-positive budget means no time left — skip the gh call entirely
+    rather than spending any wall-clock past the deadline."""
+    from agentic_pr_dash._maintenance import pr_state as _pr_state
+
+    calls: list[int] = []
+    monkeypatch.setattr(
+        _pr_state.subprocess, "run", lambda *a, **k: calls.append(1)
+    )
+
+    out = _pr_state._list_my_open_prs("/tmp/x", timeout=0)
+
+    assert calls == [], "no gh subprocess should spawn when the budget is gone"
+    assert out == {}
