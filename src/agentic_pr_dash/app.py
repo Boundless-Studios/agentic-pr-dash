@@ -495,6 +495,81 @@ def _terminal_session_matches_active_agents(
     return any(agent.pid == runtime_session.pid for agent in active_agents)
 
 
+def _ownership_for_card(
+    worktree_path: str | None,
+    pr_number: int | None,
+    repo_cwd: str,
+) -> dict:
+    """Best-effort ownership/observability info for a WorktreeCard. Never raises.
+
+    Returns a (possibly empty) dict with a subset of:
+        owner_session_id, owner_pid, owner_pid_alive, armed_at,
+        last_heartbeat_at, loop_state, thread_decisions.
+    """
+    result: dict = {}
+
+    if worktree_path:
+        try:
+            from ._maintenance.markers import _read_marker  # noqa: PLC0415
+            from ._maintenance._common import _pid_alive, _parse_iso  # noqa: PLC0415
+
+            marker = _read_marker(worktree_path)
+            if marker:
+                session_id = marker.get("session_id") or None
+                if session_id:
+                    result["owner_session_id"] = session_id
+                pid_str = marker.get("pid", "")
+                if pid_str.isdigit():
+                    result["owner_pid"] = int(pid_str)
+                    result["owner_pid_alive"] = _pid_alive(pid_str)
+                raw_armed = marker.get("armed_at")
+                if raw_armed:
+                    dt = _parse_iso(raw_armed)
+                    if dt is not None:
+                        result["armed_at"] = dt
+                for hb_key in ("last_heartbeat", "heartbeat"):
+                    raw_hb = marker.get(hb_key)
+                    if raw_hb:
+                        dt = _parse_iso(raw_hb)
+                        if dt is not None:
+                            result["last_heartbeat_at"] = dt
+                            break
+        except Exception:  # noqa: BLE001
+            pass
+
+        if pr_number is not None:
+            try:
+                from . import maintenance as _maintenance  # noqa: PLC0415
+                state_obj = _maintenance.load_state(worktree_path, pr_number)
+                if state_obj is not None:
+                    result["loop_state"] = state_obj.state.value
+            except Exception:  # noqa: BLE001
+                pass
+
+    if pr_number is not None:
+        try:
+            from .observability import get_event_store  # noqa: PLC0415
+            from .models import ThreadDecision  # noqa: PLC0415
+
+            events = get_event_store(repo_cwd).query(
+                pr_number=pr_number, kind="comment_scan", limit=1
+            )
+            if events:
+                decisions_raw = events[0].details.get("decisions", [])
+                decisions: list[ThreadDecision] = []
+                for raw_d in decisions_raw:
+                    try:
+                        decisions.append(ThreadDecision.model_validate(raw_d))
+                    except Exception:  # noqa: BLE001
+                        pass
+                if decisions:
+                    result["thread_decisions"] = decisions
+        except Exception:  # noqa: BLE001
+            pass
+
+    return result
+
+
 def _build_card_for_worktree(
     worktree: dict,
     pr: PRData | None,
@@ -521,6 +596,12 @@ def _build_card_for_worktree(
         _wt_dt = worktree_started_at(worktree.get("path") or "")
         if _wt_dt is not None:
             _pr_created_at = _wt_dt.isoformat().replace("+00:00", "Z")
+
+    _ownership = _ownership_for_card(
+        worktree_path=worktree.get("path"),
+        pr_number=pr.number if pr else None,
+        repo_cwd=get_main_repo_root(),
+    )
 
     return WorktreeCard(
         id=f"worktree:{worktree['path']}",
@@ -566,6 +647,7 @@ def _build_card_for_worktree(
         container_names=runtime_session.container_names if runtime_session else [],
         runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
         pr_created_at=_pr_created_at,
+        **_ownership,
     )
 
 
@@ -611,6 +693,12 @@ def _build_unassigned_pr_card(
     # is still used above (activity_worktree_path) for the working/idle signal.
     card_worktree_path = None if worktree_hidden else session_worktree_path
 
+    _ownership = _ownership_for_card(
+        worktree_path=session_worktree_path or pr.worktree_path,
+        pr_number=pr.number,
+        repo_cwd=get_main_repo_root(),
+    )
+
     return WorktreeCard(
         id=f"pr:{pr.number}",
         worktree_name=worktree_name,
@@ -651,6 +739,7 @@ def _build_unassigned_pr_card(
         docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
         container_names=runtime_session.container_names if runtime_session else [],
         runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
+        **_ownership,
     )
 
 

@@ -12,7 +12,7 @@ import os
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class PRStatus(str, Enum):
@@ -264,6 +264,14 @@ class WorktreeCard(BaseModel):
     container_names: list[str] = []
     runtime_warnings: list[str] = []
     pr_created_at: str = ""
+    # Ownership / observability fields (populated best-effort by _ownership_for_card)
+    owner_session_id: str | None = None
+    owner_pid: int | None = None
+    owner_pid_alive: bool | None = None
+    armed_at: datetime | None = None
+    last_heartbeat_at: datetime | None = None
+    loop_state: str | None = None
+    thread_decisions: list[ThreadDecision] = Field(default_factory=list)
 
     @property
     def started_at(self) -> datetime | None:
