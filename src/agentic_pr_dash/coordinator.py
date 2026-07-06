@@ -96,18 +96,45 @@ def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
         text=True,
         timeout=10,
     )
-    if status.returncode == 0 and status.stdout.strip():
+    dirty_lines = [
+        line
+        for line in status.stdout.splitlines()
+        if line and line[3:] != maintenance.HANDOFF_FILENAME
+    ]
+    if status.returncode == 0 and dirty_lines:
         return True
-    upstream = subprocess.run(
-        ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    branch = subprocess.run(
+        ["git", "-C", str(worktree), "branch", "--show-current"],
         capture_output=True,
         text=True,
         timeout=10,
     )
-    if upstream.returncode != 0:
+    if branch.returncode != 0:
         return False
+    branch_name = branch.stdout.strip()
+    upstream_ref = ""
+    if branch_name:
+        candidate_ref = f"refs/remotes/origin/{branch_name}"
+        remote_branch = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet", candidate_ref],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if remote_branch.returncode == 0:
+            upstream_ref = candidate_ref
+    if not upstream_ref:
+        upstream = subprocess.run(
+            ["git", "-C", str(worktree), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if upstream.returncode != 0:
+            return False
+        upstream_ref = upstream.stdout.strip()
     ahead = subprocess.run(
-        ["git", "-C", str(worktree), "rev-list", "--count", "@{u}..HEAD"],
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{upstream_ref}..HEAD"],
         capture_output=True,
         text=True,
         timeout=10,
