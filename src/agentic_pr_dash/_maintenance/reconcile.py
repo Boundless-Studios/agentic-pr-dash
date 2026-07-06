@@ -126,8 +126,16 @@ def _detached_pr_records(session_id: str, cwd: str,
 
 
 def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans: bool,
-                      include_legacy: bool = True, prune_legacy: bool = True):
-    """Union of live-worktree PRs and detached ledger PRs, each with live state."""
+                      include_legacy: bool = True, prune_legacy: bool = True,
+                      adopt_unmarked: bool = True):
+    """Union of live-worktree PRs and detached ledger PRs, each with live state.
+
+    ``adopt_unmarked=False`` scans this root's worktrees read-only — already
+    markered worktrees stay visible but unmarked open ``@me`` PRs are NOT armed.
+    Sibling (non-anchor) roots in :func:`_owned_pr_records_all_roots` pass this so
+    a cross-root scan never claims an unrelated idle PR merely because it belongs
+    to ``@me`` (BOU-1814).
+    """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     records: dict[int, dict] = {}
@@ -136,7 +144,10 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
                                     prune_legacy=prune_legacy):
         records[rec["pr"]] = rec
 
-    for wt in _collect_owned_worktrees(session_id, cwd, pid):
+    # Only thread the flag when DISABLING adoption (sibling roots). The anchor
+    # path keeps the default call so its callers/stubs need no signature change.
+    collect_kwargs = {} if adopt_unmarked else {"adopt_unmarked": False}
+    for wt in _collect_owned_worktrees(session_id, cwd, pid, **collect_kwargs):
         marker = _read_marker(wt) or {}
         pr_raw = marker.get("pr")
         if not pr_raw or not str(pr_raw).isdigit():
@@ -183,11 +194,17 @@ def _owned_pr_records_all_roots(session_id: str, anchor_cwd: str, pid: int | Non
     """Owned-PR records across ``[anchor] + maintenance_repo_roots``, keyed by repo."""
     roots = _maint_roots_for(anchor_cwd)
     prune_legacy = len(roots) <= 1
+    anchor = os.path.abspath(os.path.expanduser(anchor_cwd))
     merged: dict[tuple[str, int], dict] = {}
     for root in roots:
         repo = _repo_slug(root)
+        # Only the anchor/current root adopts unmarked open @me PRs; sibling
+        # roots are scanned read-only so a cross-root scan can't arm pr-watch
+        # for an idle PR that belongs to another session (BOU-1814).
+        adopt_unmarked = os.path.abspath(root) == anchor
         for rec in _owned_pr_records(session_id, root, pid, adopt_orphans,
-                                     include_legacy=True, prune_legacy=prune_legacy):
+                                     include_legacy=True, prune_legacy=prune_legacy,
+                                     adopt_unmarked=adopt_unmarked):
             key = (repo, rec["pr"])
             existing = merged.get(key)
             if existing is None:

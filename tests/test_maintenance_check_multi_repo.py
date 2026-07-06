@@ -112,6 +112,35 @@ def test_list_owned_excludes_live_foreign_owner(tmp_path, monkeypatch, capsys):
     assert _rp(sib) not in out
 
 
+def test_list_owned_does_not_adopt_unmarked_sibling_root_pr(
+    tmp_path, monkeypatch, capsys
+):
+    """BOU-1814: cross-root aggregation may include explicit sibling ownership,
+    but it must not claim arbitrary unmarked @me PRs in maintenance_repo_roots.
+    """
+    sib = _make_repo(tmp_path / "sibling")
+    anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
+    _arm(anchor, "sess-1", 100, os.getpid())
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_list_my_open_prs",
+        lambda cwd, timeout=15: {"main": (200, False)},
+    )
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_live_independent_owner_paths",
+        lambda paths, session_id: set(),
+    )
+
+    args = argparse.Namespace(session_id="sess-1", cwd=str(anchor),
+                              pid=os.getpid())
+    rc = mc._cmd_list_owned(args)
+    out = [_rp(p) for p in capsys.readouterr().out.splitlines() if p.strip()]
+    assert rc == 0
+    assert _rp(anchor) in out
+    assert _rp(sib) not in out
+
+
 # --- stop-gate aggregation --------------------------------------------------
 
 def test_stop_gate_blocks_when_sibling_has_pending(tmp_path, monkeypatch):
@@ -153,6 +182,46 @@ def test_stop_gate_clean_across_roots_exits_zero(tmp_path, monkeypatch):
                               pid=os.getpid(), no_waiter=True)
     rc = mc._stop_gate_impl(args)
     assert rc == 0
+
+
+def test_stop_gate_does_not_adopt_or_inspect_unmarked_sibling_root_pr(
+    tmp_path, monkeypatch
+):
+    """BOU-1814: stop-gate reconciliation must not pull an unrelated sibling
+    root's unmarked open PR into this session's ownership scope.
+    """
+    sib = _make_repo(tmp_path / "sibling")
+    anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)])
+    _arm(anchor, "sess-1", 100, os.getpid())
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_list_my_open_prs",
+        lambda cwd, timeout=15: {"main": (200, False)},
+    )
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_live_independent_owner_paths",
+        lambda paths, session_id: set(),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    checked: list[str] = []
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda worktree, sid, *, claim=False: checked.append(_rp(worktree)) or (0, ""),
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: set())
+    monkeypatch.setattr(_stop_gate_mod, "_read_escalation_marker", lambda cwd: {})
+
+    args = argparse.Namespace(cwd=str(anchor), session_id="sess-1",
+                              pid=os.getpid(), no_waiter=True)
+    rc = mc._stop_gate_impl(args)
+    assert rc == 0
+    assert checked == [_rp(anchor)]
 
 
 # --- codex PR #30 review fixes ----------------------------------------------
