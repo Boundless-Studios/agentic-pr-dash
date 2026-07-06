@@ -73,6 +73,40 @@ def test_dashboard_dispatch_claims_and_suppresses_duplicate_requeue(monkeypatch,
     assert decision.state == "active"
 
 
+def test_dashboard_skips_dispatch_when_live_in_session_owner_holds_marker(monkeypatch, tmp_path: Path):
+    """Session precedence: the dashboard must NOT dispatch headless maintenance
+    (nor claim) for a PR whose worktree a LIVE in-session owner holds — a
+    pid-alive .gaia/pr-watch.armed marker naming another session. The live
+    session owns its PR; the detached loop only services unowned worktrees."""
+    from agentic_pr_dash import maintenance_check as mc  # noqa: PLC0415
+
+    worktree = tmp_path / "feature-owned"
+    worktree.mkdir()
+    # Live in-session owner marker (a different session, pid alive).
+    mc._write_arm_marker(str(worktree), "live-session-x", os.getpid(), 321)
+
+    pr = PRData(
+        number=321,
+        title="Fix comments",
+        branch="feature/owned",
+        url="https://github.com/Boundless-Studios/gaia-free/pull/321",
+        worktree_path=str(worktree),
+        status=PRStatus.HAS_COMMENTS,
+        review_comments=[_comment()],
+    )
+    monkeypatch.setattr(github_api, "get_failed_logs", lambda *a, **k: {})
+
+    orch = orchestrator.Orchestrator(repo_cwd=None)
+    asyncio.run(orch.dispatch_pr_maintenance(pr))
+
+    # The dashboard deferred: no maintenance queued and no coordinator claim.
+    assert pr.maintenance is None
+    assert pr.coordinator_claim_id is None
+    # Nothing claimed it, so it stays dispatchable (for the live session / an
+    # unowned-worktree takeover later) — the dashboard simply stood down.
+    assert pr_coordinator.dispatch_decision_for_pr(pr).should_dispatch is True
+
+
 def test_refresh_requeues_matching_active_state_when_owner_session_ended(monkeypatch, tmp_path: Path):
     """A queued state from a dead/closed session must not suppress open comments."""
 

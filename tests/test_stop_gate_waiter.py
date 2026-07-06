@@ -41,11 +41,19 @@ def _no_rate_limit(monkeypatch, tmp_path):
     config.load.cache_clear()
 
 
-def _make_armed_worktree(tmp_path: Path, session_id: str, pr_number: int) -> Path:
-    """Create a worktree dir with an armed marker for the given PR."""
+_DEAD_PID = 2147480000  # unused high pid — the owning session is gone
+
+
+def _make_armed_worktree(tmp_path: Path, session_id: str, pr_number: int, pid: int | None = None) -> Path:
+    """Create a worktree dir with an armed marker for the given PR.
+
+    ``pid`` defaults to this live test process (an ACTIVELY-owned worktree). Pass
+    ``_DEAD_PID`` to model a worktree whose owning session has gone away — the
+    case where the detached loop legitimately provides coverage.
+    """
     wt = tmp_path / "worktree"
     wt.mkdir(exist_ok=True)
-    mc._write_arm_marker(str(wt), session_id, os.getpid(), pr_number)
+    mc._write_arm_marker(str(wt), session_id, os.getpid() if pid is None else pid, pr_number)
     return wt
 
 
@@ -98,12 +106,15 @@ def test_stop_gate_no_waiter_flag_suppresses(tmp_path, monkeypatch, capsys):
 
 
 def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, capsys):
-    """A live detached pr-maintenance-loop is sufficient idle coverage (BOU-1653).
+    """A live detached loop is sufficient idle coverage ONLY once the owning
+    session is gone (BOU-1653, refined by session-precedence).
 
-    With no pending work and an owned open PR, the stop-gate must NOT prompt for
-    a per-session waiter when the detached loop daemon is alive → exit 0.
+    With no pending work and an owned open PR whose marker pid is DEAD (session
+    gone), the stop-gate must NOT prompt for a per-session waiter when the
+    detached loop daemon is alive → exit 0. (A live in-session owner keeps its
+    own waiter — see test_live_in_session_owner_keeps_waiter_despite_live_loop.)
     """
-    wt = _make_armed_worktree(tmp_path, SID, 42)
+    wt = _make_armed_worktree(tmp_path, SID, 42, pid=_DEAD_PID)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
@@ -119,11 +130,37 @@ def test_stop_gate_live_detached_loop_suppresses_waiter(tmp_path, monkeypatch, c
     assert "await" not in err.lower()
 
 
+def test_live_in_session_owner_keeps_waiter_despite_live_loop(tmp_path, monkeypatch, capsys):
+    """Session precedence: a LIVE in-session owner (pid-alive marker) keeps its
+    OWN waiter even when the machine-wide detached loop is alive — the loop
+    defers to the session, so it is NOT coverage for that PR → exit 2 (spawn a
+    per-session waiter)."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)  # live pid (os.getpid())
+
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    # Loop is alive — but the live in-session owner takes precedence.
+    monkeypatch.setattr(_waiter_mod, "_detached_loop_alive", lambda cwd: True)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "await" in err.lower()
+    assert "#42" in err
+
+
 def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypatch, capsys):
     """The detached loop only services worktree-backed PRs. A detached-ledger PR
     (worktree torn down, no blockers yet) must still get a waiter even when a
-    machine-wide loop is live (codex PR #21 review)."""
-    wt = _make_armed_worktree(tmp_path, SID, 42)
+    machine-wide loop is live (codex PR #21 review).
+
+    The worktree-backed PR #42 here uses a DEAD marker pid (owning session gone)
+    so the live loop legitimately covers it — isolating the detached-ledger
+    behavior. A live in-session owner is covered separately."""
+    wt = _make_armed_worktree(tmp_path, SID, 42, pid=_DEAD_PID)
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))

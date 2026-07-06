@@ -75,6 +75,19 @@ def test_loop_covers_pr_false_when_loop_dead(tmp_path, monkeypatch):
     assert loop._loop_covers_pr(cwd, 42) is False
 
 
+def test_loop_does_not_cover_pr_owned_by_live_session(tmp_path, monkeypatch):
+    """Session precedence: a worktree held by a LIVE in-session owner marker is
+    NOT loop-covered — the loop defers to the session, so the stop-gate must keep
+    the session's own waiter alive instead of idling on phantom loop coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    # Loop alive, zero streak — would normally count as coverage...
+    monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 0)
+    # ...but a live in-session owner holds this worktree's marker (pid alive).
+    mc._write_arm_marker(cwd, "live-session-x", os.getpid(), 42)
+    assert loop._loop_covers_pr(cwd, 42) is False
+
+
 def test_stop_gate_loop_alive_streak_at_threshold_forces_waiter(tmp_path, monkeypatch, capsys):
     """Loop alive but streak >= threshold → loop does not cover PR → stop-gate returns 2."""
     wt = _make_armed_worktree(tmp_path, SID, 42)
