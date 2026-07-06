@@ -113,7 +113,8 @@ def test_same_pr_number_in_two_repos_does_not_collide(tmp_path, monkeypatch, cap
     sl.append("sess-X", pr=42, branch="b-sib", worktree=str(tmp_path / "gone-b"),
               repo=repo_sib)
 
-    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
+                        lambda sid, cwd, pid, *, adopt_unmarked=True: [])
     monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
@@ -148,7 +149,8 @@ def test_legacy_entry_resolves_against_anchor_not_pruned_cross_repo(
     sl.append("sess-X", pr=99, branch="b-legacy", worktree=str(tmp_path / "gone"),
               repo="")
 
-    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
+                        lambda sid, cwd, pid, *, adopt_unmarked=True: [])
     monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
@@ -265,3 +267,49 @@ def test_stop_gate_aggregates_detached_across_roots_p1_first(tmp_path, monkeypat
     pending = captured["pending"]
     assert "PR #2" in pending[0][0]  # sibling P1 first
     assert "[P1]" in pending[0][1]
+
+
+# --------------------------------------------------------------------------
+# 5) reconcile-prs must NOT adopt/arm an unmarked open @me PR in a sibling root.
+# --------------------------------------------------------------------------
+
+def test_reconcile_prs_does_not_arm_unmarked_sibling_root_pr(
+    tmp_path, monkeypatch, capsys
+):
+    """BOU-1814 (PR #58 review): ``_owned_pr_records_all_roots`` scans sibling
+    roots read-only. An unmarked open ``@me`` PR in a maintenance_repo_root must
+    NOT get a ``pr-watch.armed`` marker written (cross-root wrong-session
+    ownership), while the anchor root keeps adopting its own unmarked PR.
+    """
+    sib = _make_repo(tmp_path / "sibling", slug="o/sib")
+    anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)], slug="o/anchor")
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    # Both roots' "main" branch has an open @me PR, but neither is markered.
+    monkeypatch.setattr(
+        _worktrees_mod, "_list_my_open_prs",
+        lambda cwd, timeout=15: {"main": (200, False)},
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths",
+        lambda paths, session_id: set(),
+    )
+    # Live GitHub state for whichever PR the anchor adopts.
+    monkeypatch.setattr(
+        _reconcile_mod, "_pr_open_state",
+        lambda pr, cwd: ("open", f"https://x/pull/{pr}", False, []),
+    )
+    monkeypatch.setattr(github_api, "get_review_threads",
+                        lambda pr, cwd=None: [_thread()])
+
+    sib_marker = sib / ".gaia" / "pr-watch.armed"
+    anchor_marker = anchor / ".gaia" / "pr-watch.armed"
+
+    records = _run_reconcile(anchor, capsys)
+
+    # Anchor adopted its own unmarked PR; sibling was scanned read-only.
+    assert anchor_marker.exists()
+    assert not sib_marker.exists()
+    # The sibling's PR is not pulled into the session's owned records via the
+    # cross-root scan (only the anchor's adoption surfaces).
+    assert all(r.get("repo") != mc._repo_slug(str(sib)) for r in records)
