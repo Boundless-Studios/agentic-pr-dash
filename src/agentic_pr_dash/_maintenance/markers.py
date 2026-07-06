@@ -76,7 +76,20 @@ def _fix_lease_active(lease_until: str) -> bool:
 
 
 def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
-    """Session id of a live, ACTIVELY-LOOPING in-session owner, else None."""
+    """Session id of a live in-session owner (a DIFFERENT session), else None.
+
+    A live owner is recognised by, in order: a fresh heartbeat, an active
+    fix-lease, or — as the robust fallback — a still-alive owner ``pid``.
+
+    The pid fallback matters because the heartbeat/fix-lease are only refreshed
+    by a RUNNING in-session waiter/loop. When a session owns a PR but has no
+    waiter running (e.g. the waiter stood down under machine-wide loop
+    coverage), its heartbeat goes stale — yet the session is still very much
+    alive. Without the pid check the machine-wide dashboard/loop would treat the
+    live session as dead and claim the PR out from under it, overriding the
+    "live in-session session wins; the loop only services unowned worktrees"
+    rule. Pid-liveness makes that ownership durable regardless of heartbeat age.
+    """
     fields = _read_marker(cwd)
     if fields is None:
         return None
@@ -96,14 +109,18 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
         if ts is None:
             print(
                 f"[pr-watch] warning: unparseable fix_lease_until={lease_until!r}; "
-                "treating as STALE because no fresh heartbeat remains",
+                "falling back to owner pid-liveness",
                 file=sys.stderr,
             )
-            return None
-        from datetime import datetime, timezone  # noqa: PLC0415
+        else:
+            from datetime import datetime, timezone  # noqa: PLC0415
 
-        if datetime.now(timezone.utc) < ts:
-            return owner
+            if datetime.now(timezone.utc) < ts:
+                return owner
+    # Robust fallback: a still-alive owner pid keeps ownership even with a stale
+    # heartbeat and no active fix-lease.
+    if _pid_alive(fields.get("pid", "")):
+        return owner
     return None
 
 

@@ -679,6 +679,23 @@ class Orchestrator:
                     level="warn",
                 )
                 return
+            # Session precedence: never dispatch headless maintenance (nor claim)
+            # for a PR whose worktree a LIVE in-session owner holds — its
+            # .gaia/pr-watch.armed marker names a different session whose pid is
+            # still alive. That in-session agent has full context and owns its PR;
+            # the detached dashboard/loop only services UNOWNED worktrees. The
+            # check is pid-robust (via markers) so a stale heartbeat — e.g. no
+            # in-session waiter running — can't make a live session look dead and
+            # let the dashboard grab the claim out from under it.
+            from ._maintenance import markers  # noqa: PLC0415
+
+            if markers._marker_live_foreign_pid(pr.worktree_path, DASHBOARD_OWNER_SESSION_ID):
+                self.log(
+                    f"Skipping headless maintenance for #{pr.number} — a live "
+                    f"in-session owner holds the worktree marker",
+                    pr_number=pr.number,
+                )
+                return
             blockers = maintenance.blockers_for_pr(pr)
             if not blockers:
                 self.log(f"No PR maintenance blockers for #{pr.number}", pr_number=pr.number)

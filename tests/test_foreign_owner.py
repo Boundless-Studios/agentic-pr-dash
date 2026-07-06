@@ -1,5 +1,11 @@
-"""BOU-1478: the detached loop must DEFER to a live, actively-looping in-session
-owner (fresh heartbeat OR active fix-lease) and TAKE OVER once it goes stale."""
+"""BOU-1478: the detached loop must DEFER to a live in-session owner and TAKE
+OVER only once the owner is truly gone.
+
+Ownership is recognised by a fresh heartbeat, an active fix-lease, or — as the
+robust fallback — a still-alive owner ``pid``. The pid fallback (session
+precedence over the machine-wide loop) means a live session keeps ownership even
+when its heartbeat has gone stale (e.g. no in-session waiter is running to
+refresh it); the loop only takes over when the owner ``pid`` is dead."""
 
 import os
 from datetime import datetime, timedelta, timezone
@@ -24,8 +30,19 @@ def test_fresh_heartbeat_defers(tmp_path):
     assert mc._live_foreign_owner(str(tmp_path), "me") == "owner-A"
 
 
-def test_stale_heartbeat_no_lease_takes_over(tmp_path):
+def test_stale_heartbeat_live_pid_still_defers(tmp_path):
+    # Session precedence: a stale heartbeat with NO active lease used to hand the
+    # PR to the loop, but a still-alive owner pid now keeps ownership — the loop
+    # must not claim a live session's PR just because its heartbeat lapsed.
     _write_marker(tmp_path, session_id="owner-A", pid=str(os.getpid()),
+                  heartbeat=_iso(datetime.now(timezone.utc) - timedelta(hours=1)))
+    assert mc._live_foreign_owner(str(tmp_path), "me") == "owner-A"
+
+
+def test_stale_heartbeat_dead_pid_takes_over(tmp_path):
+    # Only when the owner is TRULY gone (dead pid, stale heartbeat, no lease) does
+    # the loop take over — the anti-wedge backstop for an abandoned worktree.
+    _write_marker(tmp_path, session_id="owner-A", pid="2147480000",
                   heartbeat=_iso(datetime.now(timezone.utc) - timedelta(hours=1)))
     assert mc._live_foreign_owner(str(tmp_path), "me") is None
 
@@ -109,10 +126,12 @@ def test_worktree_toml_ttl_beats_legacy_env(tmp_path, monkeypatch):
 
 
 def test_heartbeat_ttl_is_configurable(tmp_path, monkeypatch):
+    # Dead pid so heartbeat freshness (not the pid fallback) is the deciding
+    # factor — this test isolates the configurable TTL behavior.
     # A heartbeat 5 min old is stale at the 60s TTL...
     monkeypatch.setenv("AGENTIC_PR_DASH_HEARTBEAT_TTL_SECONDS", "60")
     config.load.cache_clear()
-    _write_marker(tmp_path, session_id="owner-A", pid=str(os.getpid()),
+    _write_marker(tmp_path, session_id="owner-A", pid="2147480000",
                   heartbeat=_iso(datetime.now(timezone.utc) - timedelta(minutes=5)))
     assert mc._live_foreign_owner(str(tmp_path), "me") is None
     # ...but fresh at a 3600s TTL.

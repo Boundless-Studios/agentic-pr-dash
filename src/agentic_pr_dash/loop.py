@@ -241,6 +241,15 @@ def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     from ._maintenance.waiter import _detached_loop_alive  # noqa: PLC0415
     if not _detached_loop_alive(cwd):
         return False
+    # Session precedence: if a live in-session owner holds this worktree's marker
+    # (pid alive), the loop DEFERS to it — the dashboard skips dispatch and the
+    # check/stop-gate gate on _live_foreign_owner. So the loop is NOT coverage for
+    # this PR; the owning session must keep its own waiter to surface feedback.
+    # Return False so the stop-gate forces a per-session waiter instead of idling
+    # on phantom loop coverage.
+    from ._maintenance import markers  # noqa: PLC0415
+    if markers._marker_live_foreign_pid(cwd, ""):
+        return False
     cfg = load_config(cwd)
     threshold = cfg.escalation_failure_threshold
     return executor_failure_streak(cwd, pr) < threshold
