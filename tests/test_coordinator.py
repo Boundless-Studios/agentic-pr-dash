@@ -1,10 +1,11 @@
 from datetime import datetime, timezone
 import os
+import subprocess
 
 from agent_coordinator.models import OwnerIdentity
 from agent_coordinator.service import TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
-from agentic_pr_dash import coordinator
+from agentic_pr_dash import coordinator, maintenance
 from agentic_pr_dash.models import PRData, ReviewComment
 
 
@@ -33,6 +34,26 @@ def _pr(**kwargs) -> PRData:
     }
     base.update(kwargs)
     return PRData(**base)
+
+
+def _git(cwd, *args: str) -> str:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def _init_repo(cwd) -> None:
+    cwd.mkdir(parents=True, exist_ok=True)
+    _git(cwd, "init")
+    _git(cwd, "config", "user.email", "test@example.com")
+    _git(cwd, "config", "user.name", "Test User")
+    (cwd / "README.md").write_text("initial\n", encoding="utf-8")
+    _git(cwd, "add", "README.md")
+    _git(cwd, "commit", "-m", "initial")
+    _git(cwd, "checkout", "-B", "main")
 
 
 def test_fingerprint_is_stable_and_changes_with_blocker_details():
@@ -128,3 +149,43 @@ def test_dirty_released_owner_blocks_unsafe_takeover(tmp_path, monkeypatch):
     assert decision.state == "manual_intervention"
     assert "PR #123 has 2 unaddressed review comments" in decision.reason
     assert owner_worktree in decision.reason
+
+
+def test_handoff_file_does_not_make_worktree_dirty(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    handoff = repo / maintenance.HANDOFF_FILENAME
+    handoff.write_text("old handoff\n", encoding="utf-8")
+    _git(repo, "add", maintenance.HANDOFF_FILENAME)
+    _git(repo, "commit", "-m", "track handoff")
+
+    handoff.write_text("new handoff\n", encoding="utf-8")
+
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is False
+
+    (repo / "README.md").write_text("changed\n", encoding="utf-8")
+
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is True
+
+
+def test_unpushed_check_prefers_remote_branch_over_main_upstream(tmp_path):
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True, text=True)
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    _git(repo, "remote", "add", "origin", str(remote))
+    _git(repo, "push", "-u", "origin", "main")
+    _git(repo, "checkout", "-b", "feature/fix", "origin/main")
+    (repo / "fix.txt").write_text("fix\n", encoding="utf-8")
+    _git(repo, "add", "fix.txt")
+    _git(repo, "commit", "-m", "fix")
+    _git(repo, "push", "origin", "HEAD")
+
+    assert _git(repo, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}") == "origin/main"
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is False
+
+    (repo / "more.txt").write_text("more\n", encoding="utf-8")
+    _git(repo, "add", "more.txt")
+    _git(repo, "commit", "-m", "more")
+
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is True
