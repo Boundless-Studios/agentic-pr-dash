@@ -260,7 +260,16 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
             if root == anchor:
                 anchor_failed = True
             continue
-        for path in _collect_owned_worktrees(args.session_id, root, args.pid):
+        if os.path.abspath(root) == anchor:
+            root_owned = _collect_owned_worktrees(args.session_id, root, args.pid)
+        else:
+            root_owned = _collect_owned_worktrees(
+                args.session_id,
+                root,
+                args.pid,
+                adopt_unmarked=False,
+            )
+        for path in root_owned:
             if path not in seen:
                 seen.add(path)
                 print(path)

@@ -212,16 +212,26 @@ def _marker_pr(worktree_path: str) -> str:
 
 
 def _collect_owned_worktrees(
-    session_id: str, cwd: str, pid: int | None, deadline: float | None = None
+    session_id: str,
+    cwd: str,
+    pid: int | None,
+    deadline: float | None = None,
+    *,
+    adopt_unmarked: bool = True,
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted.
 
-    Two ownership-marker writes happen here, both forms of reconciliation:
+    Two ownership-marker writes can happen here, both forms of reconciliation:
       * ADOPT an unmarked worktree whose branch has an open non-draft ``@me`` PR
         with no live foreign/independent owner (a missed-arm pickup), and
       * REWRITE a marker we already own whose ``pr`` no longer matches the
         branch's current open non-draft PR (a superseded PR — preflight parity,
         BOU-1787 PR #2337 review).
+
+    ``adopt_unmarked=False`` disables the missed-arm pickup while keeping already
+    markered worktrees visible. This lets multi-repo callers inspect explicit
+    ownership in configured sibling roots without claiming unrelated idle PRs
+    merely because they belong to ``@me``.
 
     ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily and at most once, and
     only when a candidate actually needs the branch→PR map (an unmarked
@@ -277,6 +287,8 @@ def _collect_owned_worktrees(
                 _write_arm_marker(worktree_path, session_id, int(eff_pid), int(cur[0]))
             _emit(worktree_path)
             continue
+        if not adopt_unmarked:
+            continue
         prs = _branch_prs()
         if not prs:
             continue
@@ -316,12 +328,23 @@ def _reconcile_owned_across_roots(
     owned: list[str] = []
     newly_adopted: list[str] = []
     seen: set[str] = set()
+    anchor = os.path.abspath(os.path.expanduser(anchor_cwd))
     for root in _maint_roots_for(anchor_cwd):
         if deadline is not None and time.monotonic() > deadline:
             break
         before = set(_collect_stop_gate_worktrees(session_id, root))
         before_prs = {wt: _marker_pr(wt) for wt in before}
-        for wt in _collect_owned_worktrees(session_id, root, pid, deadline):
+        if os.path.abspath(root) == anchor:
+            root_owned = _collect_owned_worktrees(session_id, root, pid, deadline)
+        else:
+            root_owned = _collect_owned_worktrees(
+                session_id,
+                root,
+                pid,
+                deadline,
+                adopt_unmarked=False,
+            )
+        for wt in root_owned:
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)
