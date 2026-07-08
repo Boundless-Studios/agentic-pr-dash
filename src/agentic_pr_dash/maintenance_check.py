@@ -15,6 +15,7 @@ functions so that ``--help`` works without the project venv's heavy deps.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
 import sys
@@ -465,7 +466,54 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
     return anchors
 
 
+# Exit code -> (machine-readable outcome, human reason) (BOU-1877). An exit code
+# alone can't distinguish "another waiter/loop is actively covering this session"
+# (3) from "idle: nothing pending, nothing to watch" (0) — so supervising
+# sessions parse the outcome. These are DISTINCT outcomes: `deferred_to_loop`
+# means real coverage handed off; `idle` means no coverage was needed (#62).
+_AWAIT_OUTCOMES: dict[int, tuple[str, str]] = {
+    10: ("woke", "feedback arrived on an owned PR"),
+    3: ("deferred_to_loop", "another waiter already covers this session"),
+    0: ("idle", "no pending feedback and nothing to watch (idle / max-wait elapsed)"),
+}
+
+
+def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = "") -> None:
+    """Emit exactly one machine-readable JSON outcome line to stderr (BOU-1877).
+
+    ``outcome`` is one of ``woke`` | ``deferred_to_loop`` | ``idle`` | ``error``.
+    Written to stderr (not stdout) so the exit-10 stop-block on stdout stays clean
+    for the harness. Best-effort — never raises out of a process already exiting.
+    """
+    try:
+        line = json.dumps(
+            {"outcome": outcome, "pr": pr, "reason": reason},
+            separators=(",", ":"),
+        )
+        print(line, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — outcome reporting must never mask the real exit
+        pass
+
+
 def _cmd_await(args: argparse.Namespace) -> int:
+    """Background feedback waiter — structured-outcome wrapper (BOU-1877).
+
+    Runs the poll loop and emits exactly one outcome line on every exit path,
+    including an unexpected crash (e.g. a deep helper hitting a deleted cwd,
+    BOU-1905): the waiter must never die with a bare traceback that a supervisor
+    cannot tell apart from a clean deferral.
+    """
+    try:
+        code = _run_await_loop(args)
+    except Exception as exc:  # noqa: BLE001 — KeyboardInterrupt/SystemExit still propagate
+        _emit_await_outcome("error", reason=f"{type(exc).__name__}: {exc}")
+        return 1
+    outcome, reason = _AWAIT_OUTCOMES.get(code, ("idle", f"exit {code}"))
+    _emit_await_outcome(outcome, reason=reason)
+    return code
+
+
+def _run_await_loop(args: argparse.Namespace) -> int:
     """Background feedback waiter — poll owned PRs, exit 10 when work arrives."""
     cwd = os.path.abspath(args.cwd)
     session_id = args.session_id or _read_session_marker(cwd)
@@ -487,10 +535,18 @@ def _cmd_await(args: argparse.Namespace) -> int:
         deadline = now + args.max_wait
     else:
         deadline = None
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         while True:
             if not _pid_alive(str(owner_pid)):
                 return 0
+
+            # Reset the per-tick rate-limit observation BEFORE any gh call this
+            # tick. rate_limit_seen() below then reflects a quota wall hit by ANY
+            # call this tick (list / ci / review-threads / watch-pending), and is
+            # cleared each tick so a stale earlier rate-limit can't wedge the
+            # waiter alive on a later observable tick (BOU-1921 #62).
+            github_api.reset_rate_limit_seen()
 
             # Span every repo anchor the session owns PRs in (not just cwd's
             # maintenance roots), so the single session-scoped waiter honestly
@@ -544,7 +600,12 @@ def _cmd_await(args: argparse.Namespace) -> int:
                 r.get("state") not in ("merged", "closed", "draft", "unknown")
                 for r in _detached_this_tick
             )
-            if not owned and not has_open_detached and not getattr(args, "keep_alive_without_prs", False):
+            if (
+                not owned
+                and not has_open_detached
+                and not github_api.rate_limit_seen()
+                and not getattr(args, "keep_alive_without_prs", False)
+            ):
                 return 0
 
             if deadline is not None and time.time() >= deadline:
@@ -561,17 +622,32 @@ def _cmd_await(args: argparse.Namespace) -> int:
                     detached_watch_pending
                     or _collect_await_watch_pending(owned, cwd, session_id)
                 )
-                if not watch_pending:
+                # Read the flag AFTER the watch-pending probe so a quota wall hit
+                # by THAT call is captured too (a PR with running CI must not lose
+                # its waiter on a rate-limited tick) (BOU-1921 #62).
+                if github_api.rate_limit_seen():
+                    # Rate-limited: we could not observe PR state — do not
+                    # conclude "no feedback". Stay alive and keep polling; gh
+                    # backs off on rate-limit (github_api._run) and typically
+                    # recovers within a tick or two (BOU-1921).
+                    print(
+                        "[pr-watch] waiter max-wait reached but GitHub was "
+                        "rate-limited this tick — staying alive until PR state "
+                        "can be observed.",
+                        file=sys.stderr,
+                    )
+                elif not watch_pending:
                     print(
                         "[pr-watch] waiter max-wait reached with no feedback; "
                         "will re-arm on next stop."
                     )
                     return 0
-                print(
-                    "[pr-watch] waiter max-wait reached but required CI is still "
-                    "running — staying alive until CI completes or fails.",
-                    file=sys.stderr,
-                )
+                else:
+                    print(
+                        "[pr-watch] waiter max-wait reached but required CI is still "
+                        "running — staying alive until CI completes or fails.",
+                        file=sys.stderr,
+                    )
 
             time.sleep(max(args.interval, 1))
     finally:
