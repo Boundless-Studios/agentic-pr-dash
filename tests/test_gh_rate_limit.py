@@ -113,3 +113,47 @@ def test_list_open_prs_tags_rate_limit_reason(monkeypatch):
     failure = github_api.last_list_open_prs_failure()
     assert failure is not None
     assert failure.reason == "rate-limit"
+
+
+# --------------------------------------------------------------------------- #
+# per-tick rate-limit-seen flag (BOU-1921 #62) — set by _run for ANY gh call,
+# reset/read by the tick-based waiter
+# --------------------------------------------------------------------------- #
+
+def test_run_sets_rate_limit_seen_on_persistent_rate_limit(monkeypatch):
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: _cp(returncode=1, stderr="API rate limit exceeded"))
+    github_api.reset_rate_limit_seen()
+    assert github_api.rate_limit_seen() is False
+    github_api._run(["gh", "pr", "list"])
+    assert github_api.rate_limit_seen() is True
+
+
+def test_run_does_not_set_rate_limit_seen_on_success(monkeypatch):
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _cp(stdout="[]", returncode=0))
+    github_api.reset_rate_limit_seen()
+    github_api._run(["gh", "pr", "list"])
+    assert github_api.rate_limit_seen() is False
+
+
+def test_run_does_not_set_rate_limit_seen_on_hard_failure(monkeypatch):
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: _cp(returncode=1, stderr="not logged into any GitHub hosts"))
+    github_api.reset_rate_limit_seen()
+    github_api._run(["gh", "pr", "list"])
+    assert github_api.rate_limit_seen() is False  # hard failure is not a quota wall
+
+
+def test_run_rate_limit_recovers_on_retry_leaves_flag_clear(monkeypatch):
+    """A rate-limit that clears on retry means GitHub WAS observable — flag stays clear."""
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    stub, _ = _sequence_run([
+        _cp(returncode=1, stderr="You have exceeded a secondary rate limit"),
+        _cp(stdout="[]", returncode=0),
+    ])
+    monkeypatch.setattr(subprocess, "run", stub)
+    github_api.reset_rate_limit_seen()
+    github_api._run(["gh", "pr", "list"])
+    assert github_api.rate_limit_seen() is False

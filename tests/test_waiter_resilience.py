@@ -22,9 +22,18 @@ from pathlib import Path
 
 import pytest
 
-from agentic_pr_dash import config, maintenance_check as mc
+from agentic_pr_dash import config, github_api, maintenance_check as mc
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+
+
+def _force_rate_limit_seen(monkeypatch, value):
+    """Pin github_api.rate_limit_seen() (a callable or bool) and neutralize the
+    per-tick reset so the waiter loop observes the intended rate-limit state
+    (real gh isn't exercised in these hermetic tests)."""
+    monkeypatch.setattr(github_api, "reset_rate_limit_seen", lambda: None)
+    fn = value if callable(value) else (lambda: value)
+    monkeypatch.setattr(github_api, "rate_limit_seen", fn)
 
 
 SID = "sess-waiter-resilience"
@@ -128,6 +137,7 @@ def test_await_emits_idle_outcome_on_exit_0(tmp_path, monkeypatch, capsys):
     supervisor must be able to tell it apart from `deferred_to_loop` (exit 3,
     another waiter actually covering the session) (#62)."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    _force_rate_limit_seen(monkeypatch, False)
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
     monkeypatch.setattr(
         _reconcile_mod, "_detached_pr_records",
@@ -189,7 +199,7 @@ def test_await_emits_error_outcome_on_exception(tmp_path, monkeypatch, capsys):
 def test_await_stays_alive_when_rate_limited_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)  # don't actually wait between ticks
-    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: True)  # the code-2 was a rate-limit
+    _force_rate_limit_seen(monkeypatch, True)  # a gh call this tick hit the quota wall
     wt = tmp_path / "worktree"
     wt.mkdir()
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
@@ -219,7 +229,7 @@ def test_await_honors_max_wait_on_hard_gh_failure(tmp_path, monkeypatch):
     waiter alive forever (#62 review)."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
-    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: False)  # HARD failure, not quota
+    _force_rate_limit_seen(monkeypatch, False)  # HARD failure did NOT set the rate-limit flag
     wt = tmp_path / "worktree"
     wt.mkdir()
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
@@ -236,11 +246,11 @@ def test_await_honors_max_wait_on_hard_gh_failure(tmp_path, monkeypatch):
     assert rc == 0  # hard failure honors --max-wait; does not stay alive forever
 
 
-def test_await_detached_only_unobservable_tick_stays_alive(tmp_path, monkeypatch):
-    """A detached/ledger-only session (no owned worktrees) whose detached fetch
-    could not observe state (records left state='unknown', excluded from
-    has_open_detached) must NOT exit 0 — the quota-outage case #62 flagged. The
-    signal is the per-tick 'unknown' state itself, NOT the global diagnostic."""
+def test_await_detached_only_rate_limited_tick_stays_alive(tmp_path, monkeypatch):
+    """A detached/ledger-only session (no owned worktrees) whose detached-path gh
+    calls hit the quota wall must NOT exit 0 — the quota-outage case #62 flagged.
+    The signal is the per-tick rate_limit_seen() flag set by github_api._run for
+    ANY gh call, not the (never-set-for-detached) list-failure global."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])  # no owned
@@ -252,38 +262,34 @@ def test_await_detached_only_unobservable_tick_stays_alive(tmp_path, monkeypatch
         calls["n"] += 1
         base = {"pr": 7, "url": "http://x/7", "branch": "b", "ci_failing": False, "p1": False}
         if calls["n"] == 1:
-            # unobservable: 'unknown' state, no blockers -> would exit 0 w/o fix
-            return [{**base, "state": "unknown", "unresolved_threads": 0}]
+            # rate-limited detached tick: an open PR, no actionable blocker yet
+            return [{**base, "state": "open", "unresolved_threads": 0}]
         # recovered: a real blocker -> pending -> exit 10
         return [{**base, "state": "open", "unresolved_threads": 1}]
 
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", _detached)
+    # rate-limited on the first tick, observable on the second.
+    _force_rate_limit_seen(monkeypatch, lambda: calls["n"] == 1)
 
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
-    assert rc == 10  # stayed alive past the unobservable-detached tick
+    assert rc == 10  # stayed alive past the rate-limited detached tick
 
 
-def test_await_detached_observable_tick_exits_despite_stale_global(tmp_path, monkeypatch):
-    """Staleness regression (#62): a detached-only tick with fully OBSERVABLE
-    records must exit idle even if the GLOBAL last-failure diagnostic still
-    reports a rate-limit from an earlier owned poll — the stay-alive decision is
-    per-tick ('unknown' records), not the sticky global."""
+def test_await_observable_tick_exits_idle_no_stale_ratelimit(tmp_path, monkeypatch):
+    """Staleness regression (#62): the rate-limit flag is reset per tick, so an
+    observable tick (rate_limit_seen() False) exits idle and a rate-limit from an
+    earlier tick cannot wedge the waiter alive."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
-    # Simulate a stale global rate-limit from an earlier tick that was never cleared.
-    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: True)
+    _force_rate_limit_seen(monkeypatch, False)  # this tick observed GitHub fine
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
-    # Fully observable detached record (state 'closed', no 'unknown') -> nothing to watch.
     monkeypatch.setattr(
         _reconcile_mod, "_detached_pr_records",
-        lambda sid, cwd, include_legacy=True, prune_legacy=True: [
-            {"pr": 7, "url": "http://x/7", "branch": "b", "ci_failing": False,
-             "p1": False, "state": "closed", "unresolved_threads": 0}
-        ],
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
     )
 
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
-    assert rc == 0  # observable tick exits idle; the stale global does not wedge it alive
+    assert rc == 0  # observable tick exits idle

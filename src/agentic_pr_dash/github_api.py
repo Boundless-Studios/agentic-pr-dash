@@ -194,6 +194,28 @@ def _rate_limit_backoff_seconds(stderr: str, attempt: int) -> float:
     return min(delay, _GH_RATELIMIT_MAX_SLEEP_S)
 
 
+# Per-tick rate-limit observation (BOU-1921 #62). A tick-based consumer (the
+# await waiter) calls reset_rate_limit_seen() at the start of each tick and reads
+# rate_limit_seen() after ALL its gh calls, so it reflects a rate-limit hit by
+# ANY call in the tick — list_open_prs, get_ci_checks, review-thread reads,
+# watch-pending probes — not just the initial PR list. This is the single source
+# of truth for "GitHub was quota-limited this tick", replacing the brittle
+# state=="unknown" / last-list-failure heuristics that conflated a HARD failure
+# (missing gh / auth / bad JSON) with a real quota wall.
+_RATE_LIMIT_SEEN = False
+
+
+def reset_rate_limit_seen() -> None:
+    """Clear the rate-limit-seen flag (call at the start of a poll tick)."""
+    global _RATE_LIMIT_SEEN
+    _RATE_LIMIT_SEEN = False
+
+
+def rate_limit_seen() -> bool:
+    """True if any gh call since the last reset ultimately failed on a rate-limit."""
+    return _RATE_LIMIT_SEEN
+
+
 def _run_once(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -240,6 +262,11 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
         else:
             return result
         result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+    # Exhausted retries. Record a persistent rate-limit so a tick-based caller
+    # can tell "GitHub was quota-limited" from a hard failure (BOU-1921 #62).
+    if _is_rate_limit_failure(result):
+        global _RATE_LIMIT_SEEN
+        _RATE_LIMIT_SEEN = True
     return result
 
 
