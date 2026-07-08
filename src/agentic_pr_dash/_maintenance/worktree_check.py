@@ -8,19 +8,74 @@ import it without depending on the CLI facade.
 """
 from __future__ import annotations
 
+import json
 import os
+
+from agentic_pr_dash.config import load as load_config
 
 # Cross-module dependencies are called module-qualified (e.g.
 # ``pr_state._resolve_pr_for_branch``) so the OWNING module is the single seam
 # tests patch — patching ``markers._live_foreign_owner`` intercepts the call
 # below, same as before the maintenance_check.py split.
-from . import _common, completion, markers, pr_state, worktrees
+from . import _common, completion, markers, pr_state, waiter, worktrees
 
 
 # Stable suffix on every warn-only defer text. The detached loop (loop._tick)
 # matches on it to LOG these exit-0 notices instead of dropping them, so a
 # blocked owned PR is visible in loop output too (BOU-1788, codex PR #48 review).
 WARN_ONLY_MARKER = "NOT clean (no fix dispatched)"
+
+
+# ── BOU-1879: never defer to a WAKE-LESS owner beyond one grace tick ────────────
+# A "live foreign owner" holds ownership while its marker pid is alive or its
+# heartbeat is fresh. But a wake-less owner — a session with NO live feedback
+# waiter (e.g. codex, which has no wake channel) — can't be woken to service the
+# PR, so deferring to it every tick leaves the PR unserviced forever (the observed
+# "deferring … NOT clean (no fix dispatched)" loop). Grant exactly ONE grace tick
+# (in case it's mid-task / about to arm a waiter), then take over.
+def _wakeless_defer_path(cwd: str):
+    return load_config(cwd).state_dir_for(cwd) / "pr-watch.wakeless-defer.json"
+
+
+def _read_wakeless_defer(cwd: str) -> dict:
+    try:
+        with open(_wakeless_defer_path(cwd), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_wakeless_defer(cwd: str, data: dict) -> None:
+    try:
+        path = _wakeless_defer_path(cwd)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+
+
+def _wakeless_grace_exhausted(cwd: str, owner: str) -> bool:
+    """True if we've ALREADY deferred to this wake-less owner once (grace used up →
+    take over). Records the first grace tick; keyed by cwd so sibling worktrees don't
+    interfere, and reset implicitly when the owner changes."""
+    data = _read_wakeless_defer(cwd)
+    entry = data.get(cwd) if isinstance(data.get(cwd), dict) else {}
+    if entry.get("owner") == owner and int(entry.get("count", 0)) >= 1:
+        return True
+    data[cwd] = {"owner": owner, "count": 1}
+    _write_wakeless_defer(cwd, data)
+    return False
+
+
+def _clear_wakeless_defer(cwd: str) -> None:
+    """Drop this cwd's grace record — called once the owner is wake-capable again or
+    we've taken over, so a future wake-less spell starts with a fresh grace tick."""
+    data = _read_wakeless_defer(cwd)
+    if cwd in data:
+        data.pop(cwd, None)
+        _write_wakeless_defer(cwd, data)
 
 
 def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str) -> str:
@@ -103,14 +158,25 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # the fix, but every checker must still SURFACE that the PR is blocked.
     owner = markers._live_foreign_owner(cwd, self_session_id)
     if owner is not None:
-        owner_pr, owner_blockers = _resolve_and_blockers(cwd)
-        if owner_blockers:
-            return 0, _blocked_defer_text(
-                pr_number=owner_pr.number,
-                blockers=owner_blockers,
-                owner_desc=f"live PR-watch owner session {owner}",
-            )
-        return 0, f"deferring to live PR-watch owner session {owner}"
+        # BOU-1879: a wake-capable owner (live feedback waiter) keeps ownership; a
+        # WAKE-LESS owner gets exactly one grace tick, then we take over (fall through
+        # to the normal claim/dispatch path below) so its PR isn't stuck forever.
+        if waiter._await_alive(cwd, owner):
+            _clear_wakeless_defer(cwd)  # wake-capable → reset any prior grace record
+            take_over = False
+        else:
+            take_over = _wakeless_grace_exhausted(cwd, owner)
+        if not take_over:
+            owner_pr, owner_blockers = _resolve_and_blockers(cwd)
+            if owner_blockers:
+                return 0, _blocked_defer_text(
+                    pr_number=owner_pr.number,
+                    blockers=owner_blockers,
+                    owner_desc=f"live PR-watch owner session {owner}",
+                )
+            return 0, f"deferring to live PR-watch owner session {owner}"
+        # Grace exhausted for a wake-less owner — clear the record and take over.
+        _clear_wakeless_defer(cwd)
 
     # Resolve PR + blockers (thread-aware). Purely read, no state written.
     pr, blockers = _resolve_and_blockers(cwd)
