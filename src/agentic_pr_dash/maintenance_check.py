@@ -493,6 +493,18 @@ def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = ""
         pass
 
 
+def _last_failure_was_rate_limit() -> bool:
+    """True when the most recent ``list_open_prs`` failure was a rate-limit (vs a
+    HARD failure like missing ``gh`` / auth / invalid JSON).
+
+    The waiter stays alive through rate-limit ticks (a quota outage is transient)
+    but must still honor ``--max-wait`` on hard failures — keeping it alive
+    forever on a broken ``gh`` install would wedge the session (BOU-1921 #62)."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    failure = github_api.last_list_open_prs_failure()
+    return bool(failure and failure.reason == "rate-limit")
+
+
 def _cmd_await(args: argparse.Namespace) -> int:
     """Background feedback waiter — structured-outcome wrapper (BOU-1877).
 
@@ -557,19 +569,21 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
-            # A check code of 2 means gh was UNAVAILABLE this tick (e.g. a
-            # rate-limited `gh pr list` → None → _GH_UNAVAILABLE sentinel), so we
-            # did not actually observe PR state. That must NOT be collapsed into
-            # "no feedback → exit 0" — the shared GitHub budget is drained
-            # constantly on heavy review days, and a poller that exits on the
-            # first quota wall defeats its purpose (BOU-1921).
-            gh_unavailable_this_tick = False
+            # A check code of 2 means gh was unavailable this tick (a failed
+            # `gh pr list` → None → _GH_UNAVAILABLE sentinel), so we did not
+            # observe PR state. If that was a RATE-LIMIT (not a hard failure like
+            # missing gh / auth / bad JSON) we must NOT collapse it into "no
+            # feedback → exit 0" — the shared GitHub budget is drained constantly
+            # on heavy review days and a poller that exits on the first quota wall
+            # defeats its purpose. Hard failures still honor --max-wait so a
+            # broken gh install can't wedge the waiter forever (BOU-1921, #62).
+            gh_rate_limited_this_tick = False
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     pending.append((worktree, text))
-                elif code == 2:
-                    gh_unavailable_this_tick = True
+                elif code == 2 and _last_failure_was_rate_limit():
+                    gh_rate_limited_this_tick = True
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             _detached_this_tick: list[dict] = []
@@ -586,6 +600,15 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))
 
+            # A detached/ledger-only session makes no _check_worktree calls, so
+            # the owned-loop signal above never fires for it. Under a rate-limit,
+            # `_detached_records_across_roots` returns records with an
+            # unobservable state ("unknown", excluded from `has_open_detached`) —
+            # detect the rate-limit diagnostic here so those PRs are not silently
+            # dropped during the exact quota outage this guard must survive (#62).
+            if not gh_rate_limited_this_tick and _last_failure_was_rate_limit():
+                gh_rate_limited_this_tick = True
+
             if pending:
                 print(_build_stop_block(pending))
                 print(
@@ -599,7 +622,12 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 r.get("state") not in ("merged", "closed", "draft", "unknown")
                 for r in _detached_this_tick
             )
-            if not owned and not has_open_detached and not getattr(args, "keep_alive_without_prs", False):
+            if (
+                not owned
+                and not has_open_detached
+                and not gh_rate_limited_this_tick
+                and not getattr(args, "keep_alive_without_prs", False)
+            ):
                 return 0
 
             if deadline is not None and time.time() >= deadline:
@@ -616,15 +644,15 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     detached_watch_pending
                     or _collect_await_watch_pending(owned, cwd, session_id)
                 )
-                if gh_unavailable_this_tick:
-                    # We could not observe PR state — do not conclude "no
-                    # feedback". Stay alive and keep polling; gh backs off on
-                    # rate-limit (github_api._run) and typically recovers within
-                    # a tick or two (BOU-1921).
+                if gh_rate_limited_this_tick:
+                    # Rate-limited: we could not observe PR state — do not
+                    # conclude "no feedback". Stay alive and keep polling; gh
+                    # backs off on rate-limit (github_api._run) and typically
+                    # recovers within a tick or two (BOU-1921).
                     print(
                         "[pr-watch] waiter max-wait reached but GitHub was "
-                        "unavailable (rate-limited?) this tick — staying alive "
-                        "until PR state can be observed.",
+                        "rate-limited this tick — staying alive until PR state "
+                        "can be observed.",
                         file=sys.stderr,
                     )
                 elif not watch_pending:

@@ -183,9 +183,10 @@ def test_await_emits_error_outcome_on_exception(tmp_path, monkeypatch, capsys):
 # --------------------------------------------------------------------------
 
 
-def test_await_stays_alive_when_gh_unavailable_tick(tmp_path, monkeypatch):
+def test_await_stays_alive_when_rate_limited_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)  # don't actually wait between ticks
+    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: True)  # the code-2 was a rate-limit
     wt = tmp_path / "worktree"
     wt.mkdir()
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
@@ -196,7 +197,7 @@ def test_await_stays_alive_when_gh_unavailable_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
 
-    # First tick: gh unavailable (rate-limited) -> _check_worktree returns code 2.
+    # First tick: gh rate-limited -> _check_worktree returns code 2.
     # Second tick: real feedback -> code 10.
     seq = iter([(2, "gh unavailable (rate limit)"), (10, "pending\nPR_NUMBER=9")])
     monkeypatch.setattr(mc, "_check_worktree", lambda p, sid, *, claim=True: next(seq))
@@ -204,6 +205,57 @@ def test_await_stays_alive_when_gh_unavailable_tick(tmp_path, monkeypatch):
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
     # Without the fix: first (code-2) tick + max-wait 0 -> "no feedback" -> return 0.
-    # With the fix: the gh-unavailable tick keeps the waiter alive; it re-polls
+    # With the fix: the rate-limited tick keeps the waiter alive; it re-polls
     # and the second tick's feedback -> exit 10.
     assert rc == 10
+
+
+def test_await_honors_max_wait_on_hard_gh_failure(tmp_path, monkeypatch):
+    """A persistent NON-rate-limit gh failure (missing gh / auth / bad JSON) also
+    returns code 2, but must still honor --max-wait rather than keeping the
+    waiter alive forever (#62 review)."""
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: False)  # HARD failure, not quota
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(mc, "_check_worktree", lambda p, sid, *, claim=True: (2, "gh unavailable"))
+
+    rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
+                  "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
+    assert rc == 0  # hard failure honors --max-wait; does not stay alive forever
+
+
+def test_await_detached_only_rate_limited_tick_stays_alive(tmp_path, monkeypatch):
+    """A detached/ledger-only session (no owned worktrees) whose detached fetch
+    is rate-limited (records left state='unknown', excluded from
+    has_open_detached) must NOT exit 0 — the quota-outage case #62 flagged."""
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(mc, "_last_failure_was_rate_limit", lambda: True)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])  # no owned
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+
+    calls = {"n": 0}
+
+    def _detached(sid, cwd, include_legacy=True, prune_legacy=True):
+        calls["n"] += 1
+        base = {"pr": 7, "url": "http://x/7", "branch": "b", "ci_failing": False, "p1": False}
+        if calls["n"] == 1:
+            # rate-limited: unobservable state, no blockers -> would exit 0 w/o fix
+            return [{**base, "state": "unknown", "unresolved_threads": 0}]
+        # recovered: a real blocker -> pending -> exit 10
+        return [{**base, "state": "open", "unresolved_threads": 1}]
+
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", _detached)
+
+    rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
+                  "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
+    assert rc == 10  # stayed alive past the rate-limited unknown-detached tick
