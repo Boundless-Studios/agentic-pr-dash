@@ -145,6 +145,13 @@ def _live_pr_owner(
     except (TypeError, ValueError):
         return None
     self_sid = self_session_id or ""
+    # Collect every LIVE owner, then prefer the most-recent one: a PR re-armed /
+    # handed off to session B while A is still alive leaves BOTH sessions' ledger
+    # rows (arm only appends for the new owner), so returning the first live
+    # session in filesystem order could resolve the STALE previous owner A instead
+    # of the current B (PR #61 review, P2). Rank by the matching row's ``opened_at``
+    # (ISO ⇒ lexicographic == chronological); latest handoff wins.
+    live: list[tuple[str, str]] = []  # (opened_at, session_id)
     for other in session_ledger.list_session_ids():
         if not other or other == self_sid:
             continue
@@ -159,11 +166,22 @@ def _live_pr_owner(
             entries = session_ledger.read(other, repo=repo, include_legacy=False)
         except Exception:  # noqa: BLE001 - a corrupt sibling ledger must not break resolution
             continue
-        if not any(e.pr == target for e in entries):
+        matching = [e for e in entries if e.pr == target]
+        if not matching:
             continue
-        if _session_is_live(other, cwd):
-            return other
-    return None
+        entry = max(matching, key=lambda e: e.opened_at or "")
+        # Resolve liveness in the ENTRY's OWN worktree context, not the checker's
+        # cwd: a repo may configure its own ``session_registry_path``, so the owner
+        # session is absent from the checker cwd's registry summary and would look
+        # dead — wrongly taking over a PR a live session still owns (PR #61 review,
+        # P2). Fall back to cwd when the entry has no recorded worktree.
+        live_ctx = entry.worktree or cwd
+        if _session_is_live(other, live_ctx):
+            live.append((entry.opened_at or "", other))
+    if not live:
+        return None
+    live.sort(key=lambda t: t[0], reverse=True)
+    return live[0][1]
 
 
 def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:

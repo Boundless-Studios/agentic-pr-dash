@@ -50,6 +50,35 @@ def test_none_when_pr_not_owned(monkeypatch):
     assert markers._live_pr_owner(999, REPO, "me") is None
 
 
+def test_prefers_most_recent_owner_after_handoff(monkeypatch):
+    """PR #61 review (P2): after a re-arm/handoff both sessions keep ledger rows;
+    resolve the MOST RECENT owner (latest opened_at), not filesystem order."""
+    from agentic_pr_dash.session_ledger import LedgerEntry, _write_all
+    _write_all("sess-OLD", [LedgerEntry(pr=2401, branch="b", worktree="",
+                                        opened_at="2026-07-01T00:00:00Z", repo=REPO)])
+    _write_all("sess-NEW", [LedgerEntry(pr=2401, branch="b", worktree="",
+                                        opened_at="2026-07-08T00:00:00Z", repo=REPO)])
+    monkeypatch.setattr(markers, "_session_is_live", lambda sid, cwd=None: True)
+    assert markers._live_pr_owner(2401, REPO, "me") == "sess-NEW"
+
+
+def test_liveness_checked_in_entry_worktree_context(monkeypatch, tmp_path):
+    """PR #61 review (P2): liveness is resolved in the ledger entry's OWN worktree
+    (its repo may configure a per-worktree session_registry_path), not the
+    checker's cwd."""
+    wt = str(tmp_path / "owner-wt")
+    sl.append("sess-LIVE", pr=2401, branch="b", worktree=wt, repo=REPO)
+    seen = {}
+
+    def _live(sid, cwd=None):
+        seen[sid] = cwd
+        return True
+
+    monkeypatch.setattr(markers, "_session_is_live", _live)
+    assert markers._live_pr_owner(2401, REPO, "me", cwd="/some/checker/cwd") == "sess-LIVE"
+    assert seen["sess-LIVE"] == wt  # entry worktree, NOT the checker cwd
+
+
 def test_empty_ledger_returns_none(monkeypatch):
     # No sessions in the ledger → no owner (also the common back-compat path:
     # the resolver must be a no-op when nothing is recorded).
