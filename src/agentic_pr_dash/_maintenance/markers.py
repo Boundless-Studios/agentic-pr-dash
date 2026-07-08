@@ -124,6 +124,41 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     return None
 
 
+def _live_pr_owner(
+    pr_number: int, repo: str, self_session_id: str, cwd: str | None = None
+) -> str | None:
+    """Session id of a LIVE OTHER session that owns ``(repo, pr)`` in the durable
+    session ledger + registry, else None (BOU-1924).
+
+    The per-worktree marker gate (``_live_foreign_owner``) only sees the marker at
+    the queried ``cwd``. A session working several PRs out of ONE repointed
+    worktree keeps a marker for only its *current* branch's PR; its other owned
+    PRs have no marker anywhere, so marker-only resolution can't attribute them to
+    the live session — and a machine-wide loop would then service (or take over) a
+    PR a live session is actually working. This resolver closes that gap by
+    reading ownership from the worktree-independent ledger and gating on the
+    registry's session liveness (mirrors ``_adopt_orphan_prs``' session scan).
+    """
+    from agentic_pr_dash import session_ledger  # noqa: PLC0415
+    try:
+        target = int(pr_number)
+    except (TypeError, ValueError):
+        return None
+    self_sid = self_session_id or ""
+    for other in session_ledger.list_session_ids():
+        if not other or other == self_sid:
+            continue
+        try:
+            entries = session_ledger.read(other, repo=repo)
+        except Exception:  # noqa: BLE001 - a corrupt sibling ledger must not break resolution
+            continue
+        if not any(e.pr == target for e in entries):
+            continue
+        if _session_is_live(other, cwd):
+            return other
+    return None
+
+
 def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
     """True if the worktree's marker names a DIFFERENT session whose pid is still alive."""
     fields = _read_marker(cwd)

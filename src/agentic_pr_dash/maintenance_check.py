@@ -237,8 +237,31 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     return 1
 
 
+def _list_owned_prs(args: argparse.Namespace) -> int:
+    """Enumerate every PR this session owns — across worktrees AND detached
+    (no-worktree) ledger PRs — one per line (BOU-1924).
+
+    Read-only: ``adopt_orphans=False`` so listing never claims a dead session's
+    orphaned PRs. Each line is ``PR=<n> REPO=<owner/name> WORKTREE=<present|none>
+    BRANCH=<b> URL=<u>`` so ``/pr-maintenance-check`` can iterate them (running a
+    per-worktree ``check`` for present ones, and surfacing the recreate/handoff
+    guidance for detached ones)."""
+    from ._maintenance.reconcile import _owned_pr_records_all_roots  # noqa: PLC0415
+    cwd = os.path.abspath(os.path.expanduser(args.cwd))
+    records = _owned_pr_records_all_roots(args.session_id, cwd, args.pid, False)
+    for r in records:
+        present = "present" if r.get("worktree_present") else "none"
+        print(
+            f"PR={r['pr']} REPO={r.get('repo', '')} WORKTREE={present} "
+            f"BRANCH={r.get('branch', '')} URL={r.get('url', '')}"
+        )
+    return 0
+
+
 def _cmd_list_owned(args: argparse.Namespace) -> int:
-    """Print worktree paths this session owns — markered OR reconciled-and-adopted."""
+    """Print the session's owned worktree paths, or (``--prs``) its owned PRs."""
+    if getattr(args, "prs", False):
+        return _list_owned_prs(args)
     anchor = os.path.abspath(os.path.expanduser(args.cwd))
     seen: set[str] = set()
     anchor_failed = False
@@ -602,6 +625,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Owner pid stamped into markers ADOPTED by reconciliation (default: "
         "os.getppid() — the Claude session that ran this CLI via a shell). The "
         "pid lets the detached loop / other sessions defer while this owner is alive.",
+    )
+    list_owned_p.add_argument(
+        "--prs",
+        action="store_true",
+        help="Enumerate every PR this session owns (across worktrees AND detached "
+        "no-worktree ledger PRs), one per line, instead of worktree paths. Use for "
+        "surfacing ALL owned PRs' pending feedback in one /pr-maintenance-check "
+        "(BOU-1924). The default (path) mode is the loop's discovery contract.",
     )
 
     # --- arm ---

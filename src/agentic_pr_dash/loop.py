@@ -266,6 +266,14 @@ def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     from ._maintenance import markers  # noqa: PLC0415
     if markers._marker_live_foreign_pid(cwd, ""):
         return False
+    # BOU-1924: also defer to a live owner resolved from the durable
+    # ledger/registry — the marker at THIS cwd is stale/absent when the owning
+    # session repointed its worktree away, so marker-only resolution would miss
+    # a live stacked owner and wrongly count the loop as coverage.
+    if pr is not None:
+        from ._maintenance._common import _repo_slug  # noqa: PLC0415
+        if markers._live_pr_owner(pr, _repo_slug(cwd), ""):
+            return False
     cfg = load_config(cwd)
     threshold = cfg.escalation_failure_threshold
     return executor_failure_streak(cwd, pr) < threshold
