@@ -124,6 +124,76 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     return None
 
 
+def _live_pr_owner_record(
+    pr_number: int, repo: str, self_session_id: str, cwd: str | None = None
+) -> tuple[str, str] | None:
+    """``(session_id, owner_context_cwd)`` for a live ledger owner, else None."""
+    from agentic_pr_dash import session_ledger  # noqa: PLC0415
+    try:
+        target = int(pr_number)
+    except (TypeError, ValueError):
+        return None
+    self_sid = self_session_id or ""
+    # Collect every LIVE owner, then prefer the most-recent one: a PR re-armed /
+    # handed off to session B while A is still alive leaves BOTH sessions' ledger
+    # rows (arm only appends for the new owner), so returning the first live
+    # session in filesystem order could resolve the STALE previous owner A instead
+    # of the current B (PR #61 review, P2). Rank by the matching row's ``opened_at``
+    # (ISO ⇒ lexicographic == chronological); latest handoff wins.
+    live: list[tuple[str, str, str]] = []  # (opened_at, session_id, owner_context)
+    for other in session_ledger.list_session_ids():
+        if not other or other == self_sid:
+            continue
+        try:
+            # STRICT repo match (include_legacy=False): a repo-less LEGACY ledger
+            # row for PR #N must NOT resolve an unrelated session as the owner of a
+            # different repo's PR #N — this cross-session ownership gate defers
+            # (or suppresses) work, so a loose legacy match could leave a
+            # same-number PR in another repo unserviced (PR #61 review, P1). When
+            # `repo` is undetectable ("") strict match yields nothing → no false
+            # defer (fail-safe).
+            entries = session_ledger.read(other, repo=repo, include_legacy=False)
+        except Exception:  # noqa: BLE001 - a corrupt sibling ledger must not break resolution
+            continue
+        matching = [e for e in entries if e.pr == target]
+        if not matching:
+            continue
+        entry = max(matching, key=lambda e: e.opened_at or "")
+        # Resolve liveness in the ENTRY's OWN worktree context when it still
+        # exists: a repo may configure its own ``session_registry_path``, so the
+        # owner session can be absent from the checker cwd's registry summary.
+        # Detached ledger rows can outlive their recorded worktree, though; in
+        # that case fall back to the checker cwd so a removed path doesn't hide a
+        # live owner session (PR #61 review, P2).
+        live_ctx = entry.worktree if entry.worktree and os.path.exists(entry.worktree) else cwd
+        if _session_is_live(other, live_ctx):
+            live.append((entry.opened_at or "", other, live_ctx or ""))
+    if not live:
+        return None
+    live.sort(key=lambda t: t[0], reverse=True)
+    _opened_at, session_id, owner_context = live[0]
+    return session_id, owner_context
+
+
+def _live_pr_owner(
+    pr_number: int, repo: str, self_session_id: str, cwd: str | None = None
+) -> str | None:
+    """Session id of a LIVE OTHER session that owns ``(repo, pr)`` in the durable
+    session ledger + registry, else None (BOU-1924).
+
+    The per-worktree marker gate (``_live_foreign_owner``) only sees the marker at
+    the queried ``cwd``. A session working several PRs out of ONE repointed
+    worktree keeps a marker for only its *current* branch's PR; its other owned
+    PRs have no marker anywhere, so marker-only resolution can't attribute them to
+    the live session — and a machine-wide loop would then service (or take over) a
+    PR a live session is actually working. This resolver closes that gap by
+    reading ownership from the worktree-independent ledger and gating on the
+    registry's session liveness (mirrors ``_adopt_orphan_prs``' session scan).
+    """
+    record = _live_pr_owner_record(pr_number, repo, self_session_id, cwd)
+    return record[0] if record is not None else None
+
+
 def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
     """True if the worktree's marker names a DIFFERENT session whose pid is still alive."""
     fields = _read_marker(cwd)

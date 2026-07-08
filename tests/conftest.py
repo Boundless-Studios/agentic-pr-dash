@@ -20,6 +20,12 @@ def _isolate_config(tmp_path_factory, monkeypatch):
     for var in list(os.environ):
         if var.startswith(("AGENTIC_PR_DASH_", "GAIA_")):
             monkeypatch.delenv(var, raising=False)
+    # The session_ledger default dir (_DEFAULT_DIR) is import-frozen to the REAL
+    # ~/.gaia, so the HOME override above does NOT redirect it — a test would read
+    # the developer's real ledger (e.g. the BOU-1924 ownership gate resolving THIS
+    # live session as a PR's owner). Pin it under the temp home so every test's
+    # ledger/claim access is hermetic. Individual tests may still override.
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(home / ".gaia" / "pr-watch" / "ledger"))
     config.load.cache_clear()
     yield
     config.load.cache_clear()

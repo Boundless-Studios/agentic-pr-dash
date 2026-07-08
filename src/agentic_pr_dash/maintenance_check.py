@@ -136,6 +136,8 @@ from ._maintenance.waiter import (  # noqa: F401, E402
     _read_await_pidfile,
     _write_await_pidfile,
     _remove_await_pidfile,
+    _read_requested_roots,
+    _update_await_coverage,
     _await_alive,
     _detached_loop_alive,
     _detached_pending_entry,
@@ -433,22 +435,51 @@ def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _await_anchors(session_id: str, cwd: str) -> list[str]:
+    """Repo anchors this session's SINGLE waiter must poll (BOU-1924, PR #61 P1).
+
+    The waiter pidfile is session-scoped, so ``_await_alive`` claims coverage for
+    the session in EVERY repo — but the poll loop only spans ``_maint_roots_for``
+    of one cwd. If the session owns a PR in a repo that is neither the launch
+    cwd's repo nor in its ``maintenance_repo_roots``, that PR's feedback would be
+    silently unwatched while its own stop-gate is suppressed. Make the single
+    waiter honest by ALSO anchoring at every still-present worktree the session's
+    ledger references, so its coverage matches its session-wide claim."""
+    anchors = [cwd]
+    seen = {os.path.abspath(cwd)}
+    if not session_id:
+        return anchors
+    try:
+        from agentic_pr_dash import session_ledger  # noqa: PLC0415
+        for e in session_ledger.read(session_id):
+            wt = os.path.abspath(e.worktree) if e.worktree else ""
+            if wt and wt not in seen and os.path.isdir(wt):
+                seen.add(wt)
+                anchors.append(wt)
+    except Exception:  # noqa: BLE001 - a bad ledger must not stop the waiter
+        pass
+    for requested in _read_requested_roots(session_id):
+        if requested not in seen and os.path.isdir(requested):
+            seen.add(requested)
+            anchors.append(requested)
+    return anchors
+
+
 def _cmd_await(args: argparse.Namespace) -> int:
     """Background feedback waiter — poll owned PRs, exit 10 when work arrives."""
     cwd = os.path.abspath(args.cwd)
     session_id = args.session_id or _read_session_marker(cwd)
     owner_pid = args.owner_pid if args.owner_pid else _resolve_owner_pid()
 
-    existing = _read_await_pidfile(cwd, session_id)
-    if (
-        existing
-        and _pid_alive(str(existing.get("pid", "")))
-        and existing.get("session_id") == session_id
-    ):
+    # Single-instance guard — dual-read (new session-scoped + legacy per-worktree)
+    # so an in-flight pre-BOU-1924 waiter for this session isn't missed, which
+    # would launch a SECOND poller for the same session (PR #61 review, P2).
+    from ._maintenance.waiter import _await_alive  # noqa: PLC0415
+    if _await_alive(cwd, session_id):
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
 
-    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id}, session_id)
+    _update_await_coverage(cwd, session_id, _await_anchors(session_id, cwd))
     now = time.time()
     if args.max_wait == 0:
         deadline: float | None = now
@@ -461,7 +492,23 @@ def _cmd_await(args: argparse.Namespace) -> int:
             if not _pid_alive(str(owner_pid)):
                 return 0
 
-            owned = _owned_worktrees_across_roots(session_id, cwd) if session_id else [cwd]
+            # Span every repo anchor the session owns PRs in (not just cwd's
+            # maintenance roots), so the single session-scoped waiter honestly
+            # covers all owned PRs (PR #61 review, P1). Dedup owned worktrees and
+            # detached records across anchors.
+            anchors = _await_anchors(session_id, cwd)
+            _update_await_coverage(cwd, session_id, anchors)
+            owned: list[str] = []
+            if session_id:
+                _seen_wt: set[str] = set()
+                for anchor in anchors:
+                    for wt in _owned_worktrees_across_roots(session_id, anchor):
+                        if wt not in _seen_wt:
+                            _seen_wt.add(wt)
+                            owned.append(wt)
+            else:
+                owned = [cwd]
+            _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
             for worktree in owned:
@@ -472,7 +519,14 @@ def _cmd_await(args: argparse.Namespace) -> int:
 
             _detached_this_tick: list[dict] = []
             if session_id:
-                _detached_this_tick = _detached_records_across_roots(session_id, cwd)
+                _seen_d: set[tuple] = set()
+                for anchor in anchors:
+                    for r in _detached_records_across_roots(session_id, anchor):
+                        key = (r.get("repo", ""), r["pr"], r.get("branch", ""))
+                        if key in _seen_d:
+                            continue
+                        _seen_d.add(key)
+                        _detached_this_tick.append(r)
                 for r in _detached_this_tick:
                     if _record_has_blockers(r):
                         pending.append(_detached_pending_entry(r))

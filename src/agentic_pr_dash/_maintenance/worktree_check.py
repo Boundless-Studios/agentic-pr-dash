@@ -190,6 +190,58 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     if pr.is_draft:
         return 0, "PR is a draft; nothing pending"
 
+    # ── BOU-1924: ledger/registry ownership gate ───────────────────────────────
+    # The marker gate above only sees THIS worktree's marker. A PR owned by a
+    # live OTHER session whose worktree was repointed away has no marker here, so
+    # resolve ownership from the durable session ledger + registry and defer to
+    # that live session rather than servicing (or taking over) its PR. Same
+    # wake-capability semantics as the marker gate: a wake-capable owner (live
+    # SESSION-scoped waiter) keeps ownership; a wake-less owner gets one grace
+    # tick then we take over. Self is excluded by the resolver, so a session
+    # checking its OWN owned PR falls through to service it.
+    #
+    # LIMIT to cases where the marker gate did NOT resolve ownership (PR #61
+    # review, P2): a self-owned marker means this session should service its own
+    # PR, and a live foreign marker owner has already been handled above. But a
+    # stale foreign marker whose owner is no longer live must NOT suppress the
+    # durable ledger gate; another live session may still own this PR there.
+    marker_session = markers._marker_session_id(cwd)
+    marker_pr_matches = worktrees._marker_pr(cwd) == str(pr.number)
+    marker_resolved_ownership = bool(marker_session) and (
+        (marker_session == (self_session_id or "") and marker_pr_matches)
+        or owner is not None
+    )
+    ledger_owner_record = None
+    ledger_owner = None
+    ledger_owner_cwd = cwd
+    if not marker_resolved_ownership:
+        ledger_owner_record = markers._live_pr_owner_record(
+            pr.number, _common._repo_slug(cwd), self_session_id, cwd
+        )
+        if ledger_owner_record is not None:
+            ledger_owner, ledger_owner_cwd = ledger_owner_record
+        else:
+            # Keep tests and older patch points that monkeypatch _live_pr_owner
+            # working while real code uses the richer record above.
+            ledger_owner = markers._live_pr_owner(
+                pr.number, _common._repo_slug(cwd), self_session_id, cwd
+            )
+    if ledger_owner is not None:
+        if waiter._await_alive(ledger_owner_cwd, ledger_owner):
+            _clear_wakeless_defer(cwd)
+            take_over = False
+        else:
+            take_over = _wakeless_grace_exhausted(cwd, ledger_owner)
+        if not take_over:
+            if blockers:
+                return 0, _blocked_defer_text(
+                    pr_number=pr.number,
+                    blockers=blockers,
+                    owner_desc=f"live PR-watch owner session {ledger_owner} (ledger)",
+                )
+            return 0, f"deferring to live PR-watch owner session {ledger_owner} (ledger)"
+        _clear_wakeless_defer(cwd)
+
     # Populate ci_watch_pending for non-draft PRs (best-effort; False on gh
     # error). BOU-1789: required-checks-in-progress as a watch condition.
     pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)

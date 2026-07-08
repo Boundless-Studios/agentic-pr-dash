@@ -231,3 +231,24 @@ def test_clear_recovered_streak_skips_pr_resolution_without_state(tmp_path, monk
     loop._clear_recovered_streak(str(tmp_path))
     assert not any("pr" in c and "view" in c for c in cmds), \
         "must not resolve the PR via `gh pr view` when there is no recorded state"
+
+
+def test_loop_covers_pr_passes_cwd_to_ledger_owner_check(tmp_path, monkeypatch):
+    """PR #61 review (P2): ledger owner checks need the current cwd fallback when
+    a matching ledger row has no usable worktree path."""
+    from agentic_pr_dash._maintenance import markers
+
+    cwd = str(tmp_path)
+    monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 0)
+    monkeypatch.setattr(loop, "load_config", lambda cwd: types.SimpleNamespace(escalation_failure_threshold=3))
+    monkeypatch.setattr(markers, "_marker_live_foreign_pid", lambda cwd, sid: False)
+
+    def _live_pr_owner(pr, repo, self_session_id, owner_cwd=None):
+        assert owner_cwd == cwd
+        return None
+
+    monkeypatch.setattr(markers, "_live_pr_owner", _live_pr_owner)
+    monkeypatch.setattr("agentic_pr_dash._maintenance.waiter._detached_loop_alive", lambda cwd: True)
+    monkeypatch.setattr("agentic_pr_dash._maintenance._common._repo_slug", lambda cwd: "owner/name")
+
+    assert loop._loop_covers_pr(cwd, 42) is True

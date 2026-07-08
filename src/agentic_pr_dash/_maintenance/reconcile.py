@@ -104,6 +104,12 @@ def _detached_pr_records(session_id: str, cwd: str,
         )
         records.append({
             "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
+            # Repo identity so a cross-anchor dedupe (await's _await_anchors span)
+            # keeps the SAME pr number + branch in two different repos distinct,
+            # instead of collapsing them to one ("", pr, branch) key and dropping
+            # the second repo's blockers (PR #61 review, P2). Legacy repo-less rows
+            # fall back to the anchor's repo.
+            "repo": e.repo or target_repo,
             "worktree_present": False, "unresolved_threads": len(unresolved),
             "ci_failing": has_fail, "failing_checks": failing,
             # BOU-1789: required CI still running on a detached (no-worktree) PR
