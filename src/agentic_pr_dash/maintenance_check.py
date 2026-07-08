@@ -466,22 +466,24 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
     return anchors
 
 
-# Exit code -> machine-readable outcome + human reason (BOU-1877). An exit code
-# alone cannot distinguish "deferred to the loop, covered" (0) from "idle" (0),
-# so supervising sessions parse the outcome line instead.
-_AWAIT_OUTCOME_REASONS: dict[int, str] = {
-    10: "feedback arrived on an owned PR",
-    3: "another waiter already covers this session",
-    0: "no pending feedback; deferred to the maintenance loop",
+# Exit code -> (machine-readable outcome, human reason) (BOU-1877). An exit code
+# alone can't distinguish "another waiter/loop is actively covering this session"
+# (3) from "idle: nothing pending, nothing to watch" (0) — so supervising
+# sessions parse the outcome. These are DISTINCT outcomes: `deferred_to_loop`
+# means real coverage handed off; `idle` means no coverage was needed (#62).
+_AWAIT_OUTCOMES: dict[int, tuple[str, str]] = {
+    10: ("woke", "feedback arrived on an owned PR"),
+    3: ("deferred_to_loop", "another waiter already covers this session"),
+    0: ("idle", "no pending feedback and nothing to watch (idle / max-wait elapsed)"),
 }
 
 
 def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = "") -> None:
     """Emit exactly one machine-readable JSON outcome line to stderr (BOU-1877).
 
-    ``outcome`` is one of ``deferred_to_loop`` | ``woke`` | ``error``. Written to
-    stderr (not stdout) so the exit-10 stop-block on stdout stays clean for the
-    harness. Best-effort — never raises out of a process that is already exiting.
+    ``outcome`` is one of ``woke`` | ``deferred_to_loop`` | ``idle`` | ``error``.
+    Written to stderr (not stdout) so the exit-10 stop-block on stdout stays clean
+    for the harness. Best-effort — never raises out of a process already exiting.
     """
     try:
         line = json.dumps(
@@ -518,8 +520,8 @@ def _cmd_await(args: argparse.Namespace) -> int:
     except Exception as exc:  # noqa: BLE001 — KeyboardInterrupt/SystemExit still propagate
         _emit_await_outcome("error", reason=f"{type(exc).__name__}: {exc}")
         return 1
-    outcome = "woke" if code == 10 else "deferred_to_loop"
-    _emit_await_outcome(outcome, reason=_AWAIT_OUTCOME_REASONS.get(code, f"exit {code}"))
+    outcome, reason = _AWAIT_OUTCOMES.get(code, ("idle", f"exit {code}"))
+    _emit_await_outcome(outcome, reason=reason)
     return code
 
 
@@ -602,11 +604,17 @@ def _run_await_loop(args: argparse.Namespace) -> int:
 
             # A detached/ledger-only session makes no _check_worktree calls, so
             # the owned-loop signal above never fires for it. Under a rate-limit,
-            # `_detached_records_across_roots` returns records with an
-            # unobservable state ("unknown", excluded from `has_open_detached`) —
-            # detect the rate-limit diagnostic here so those PRs are not silently
-            # dropped during the exact quota outage this guard must survive (#62).
-            if not gh_rate_limited_this_tick and _last_failure_was_rate_limit():
+            # `_detached_records_across_roots` returns records with an unobservable
+            # state ("unknown", excluded from `has_open_detached`) — use THAT
+            # per-tick signal, not the global last-failure diagnostic: detached
+            # reconciliation never calls list_open_prs, so it neither sets nor
+            # clears that global, and a stale earlier owned rate-limit would keep
+            # this true on later observable ticks and wedge the waiter alive
+            # forever (#62). "unknown" is the detached fetch reporting, per tick,
+            # that it could not observe state.
+            if not gh_rate_limited_this_tick and any(
+                r.get("state") in (None, "", "unknown") for r in _detached_this_tick
+            ):
                 gh_rate_limited_this_tick = True
 
             if pending:
