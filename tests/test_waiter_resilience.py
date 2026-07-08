@@ -76,6 +76,26 @@ def test_config_load_survives_vanished_cwd(monkeypatch):
     assert hasattr(cfg, "state_dir_for")
 
 
+def test_resolved_repo_survives_vanished_cwd(monkeypatch):
+    """Config.resolved_repo(cwd=None) must not re-raise the deleted-cwd error
+    after load() succeeds — the PR #62 review gap: ambient callers
+    (coordinator._repo_slug_for_pr, maintenance.pr_url(cwd=None)) hit this."""
+    import dataclasses
+
+    config.load.cache_clear()
+    # A real Config with repo unset -> resolved_repo() falls through to
+    # _detect_repo(_safe_cwd()) instead of returning the pinned repo.
+    cfg = dataclasses.replace(config.load(), repo="")
+
+    def _boom(*_a, **_k):
+        raise FileNotFoundError("[Errno 2] No such file or directory (cwd deleted)")
+
+    monkeypatch.setattr(config.Path, "cwd", staticmethod(_boom))
+    # The contract: must NOT raise on the vanished cwd (returns None or a str).
+    result = cfg.resolved_repo()
+    assert result is None or isinstance(result, str)
+
+
 # --------------------------------------------------------------------------
 # BOU-1877 — machine-readable exit outcome on every await exit path
 # --------------------------------------------------------------------------

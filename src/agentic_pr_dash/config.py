@@ -200,7 +200,23 @@ class Config:
         """Return ``owner/name``, auto-detecting from ``gh``/git remote if unset."""
         if self.repo:
             return self.repo
-        return _detect_repo(cwd or Path.cwd())
+        # ``_safe_cwd()`` (not ``Path.cwd()``) so an ambient caller
+        # (coordinator._repo_slug_for_pr, maintenance.pr_url(cwd=None)) does not
+        # re-raise the deleted-cwd FileNotFoundError that ``load()`` already
+        # guards against (BOU-1905 / PR #62 review).
+        return _detect_repo(cwd or _safe_cwd())
+
+
+def _safe_cwd() -> Path:
+    """``Path.cwd()`` that tolerates a deleted working directory.
+
+    A long-lived detached process (the waiter) can outlive its cwd when
+    stale-worktree reaping removes the directory, so ``os.getcwd()`` raises
+    FileNotFoundError. Fall back to $HOME rather than crashing (BOU-1905)."""
+    try:
+        return Path.cwd()
+    except (FileNotFoundError, OSError):
+        return Path(os.path.expanduser("~"))
 
 
 def _detect_repo(cwd: Path) -> str | None:
@@ -249,19 +265,11 @@ def _resolve_state_dir(file_cfg: dict, base: Path) -> Path:
 @lru_cache(maxsize=8)
 def load(cwd: str | None = None) -> Config:
     """Load and cache the resolved config for ``cwd`` (defaults to the process cwd)."""
-    if cwd:
-        base = Path(cwd)
-    else:
-        # A long-lived detached waiter can outlive its cwd: stale-worktree
-        # reaping is routine background activity and deletes directories out
-        # from under running processes, so ``os.getcwd()`` (via ``Path.cwd()``)
-        # raises FileNotFoundError. Fall back to $HOME rather than dying with a
-        # raw traceback — every ambient-cwd ``load()`` call site (agents.py's
-        # discovery/cpu helpers among them) inherits this safety net (BOU-1905).
-        try:
-            base = Path.cwd()
-        except (FileNotFoundError, OSError):
-            base = Path(os.path.expanduser("~"))
+    # ``_safe_cwd()`` tolerates a deleted ambient cwd (a long-lived detached
+    # waiter can outlive its worktree via stale-worktree reaping), so every
+    # ambient-cwd ``load()`` site — agents.py's discovery/cpu helpers among
+    # them — inherits the safety net rather than a raw traceback (BOU-1905).
+    base = Path(cwd) if cwd else _safe_cwd()
     cfg_path = _find_config_file(base)
     root = cfg_path.parent if cfg_path else base
     data = _load_toml(cfg_path)
