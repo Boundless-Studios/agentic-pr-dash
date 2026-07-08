@@ -155,3 +155,35 @@ def test_await_emits_error_outcome_on_exception(tmp_path, monkeypatch, capsys):
     assert len(outcomes) == 1, f"expected exactly one outcome line, got {outcomes}"
     assert outcomes[0]["outcome"] == "error"
     assert "FileNotFoundError" in outcomes[0].get("reason", "")
+
+
+# --------------------------------------------------------------------------
+# BOU-1921 — a gh-unavailable / rate-limited tick must not be misread as
+# "no feedback -> exit 0"; the waiter stays alive and re-polls.
+# --------------------------------------------------------------------------
+
+
+def test_await_stays_alive_when_gh_unavailable_tick(tmp_path, monkeypatch):
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(mc.time, "sleep", lambda *_: None)  # don't actually wait between ticks
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+
+    # First tick: gh unavailable (rate-limited) -> _check_worktree returns code 2.
+    # Second tick: real feedback -> code 10.
+    seq = iter([(2, "gh unavailable (rate limit)"), (10, "pending\nPR_NUMBER=9")])
+    monkeypatch.setattr(mc, "_check_worktree", lambda p, sid, *, claim=True: next(seq))
+
+    rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
+                  "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])
+    # Without the fix: first (code-2) tick + max-wait 0 -> "no feedback" -> return 0.
+    # With the fix: the gh-unavailable tick keeps the waiter alive; it re-polls
+    # and the second tick's feedback -> exit 10.
+    assert rc == 10

@@ -145,6 +145,55 @@ def _is_transient_connectivity_failure(result: subprocess.CompletedProcess) -> b
     return any(pat in stderr for pat in _CONNECTIVITY_STDERR_PATTERNS)
 
 
+# GitHub rate-limit signatures (BOU-1921). Two distinct modes: PRIMARY quota
+# exhaustion ("API rate limit exceeded") and the velocity-triggered SECONDARY /
+# abuse limit ("secondary rate limit" / "submitted too quickly"). A shared dev
+# identity drains these constantly on heavy review days; the waiter is a
+# long-lived poller, so a rate-limited call should back off and retry rather
+# than surface as a hard failure that misfires the poll loop.
+_RATE_LIMIT_STDERR_PATTERNS = (
+    "rate limit exceeded",
+    "secondary rate limit",
+    "exceeded a secondary rate",
+    "submitted too quickly",
+    "retry-after",
+)
+
+# Bounded rate-limit backoff. Reuses the connectivity attempt budget, but each
+# sleep is CAPPED so a latency-sensitive caller (the stop gate) never wedges on
+# a primary-exhaustion reset that can be up to an hour away — the common case is
+# a secondary limit that clears in seconds. The long-lived waiter tolerates
+# residual starvation by staying alive across ticks (see maintenance_check).
+_GH_RATELIMIT_MAX_SLEEP_S = float(os.environ.get("APD_GH_RATELIMIT_MAX_SLEEP_S", "10"))
+
+
+def _is_rate_limit_failure(result: subprocess.CompletedProcess) -> bool:
+    """True when a failed gh result is a primary or secondary rate-limit."""
+    if result.returncode == 0:
+        return False
+    stderr = (result.stderr or "").lower()
+    return any(pat in stderr for pat in _RATE_LIMIT_STDERR_PATTERNS)
+
+
+def _retry_after_seconds(stderr: str) -> float | None:
+    """Parse a ``Retry-After: N`` hint (seconds) from stderr, if present."""
+    match = re.search(r"retry-after:\s*(\d+)", stderr or "", re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def _rate_limit_backoff_seconds(stderr: str, attempt: int) -> float:
+    """Backoff for a rate-limited attempt: honor Retry-After when parseable,
+    else exponential — always clamped to the cap so latency stays bounded."""
+    hint = _retry_after_seconds(stderr)
+    delay = hint if hint is not None else _GH_RETRY_BASE_DELAY_S * (2 ** attempt)
+    return min(delay, _GH_RATELIMIT_MAX_SLEEP_S)
+
+
 def _run_once(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
@@ -180,9 +229,16 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
     """
     result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
     for attempt in range(1, _GH_RETRY_ATTEMPTS):
-        if not _is_transient_connectivity_failure(result):
+        if _is_transient_connectivity_failure(result):
+            time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+        elif _is_rate_limit_failure(result):
+            # Rate-limited: back off (capped) and retry. Brief secondary limits
+            # clear within a couple of short sleeps; a persistent primary
+            # exhaustion still returns after the bounded attempts so the caller
+            # (waiter) can decide to stay alive across ticks (BOU-1921).
+            time.sleep(_rate_limit_backoff_seconds(result.stderr or "", attempt))
+        else:
             return result
-        time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
         result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
     return result
 
@@ -272,8 +328,11 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
+        # Distinguish a rate-limit failure so the poll path can back off / stay
+        # alive rather than treating it as a hard "gh unavailable" (BOU-1921).
+        reason = "rate-limit" if _is_rate_limit_failure(r) else "exit"
         _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
-            command=cmd, returncode=r.returncode, stderr=r.stderr or "", reason="exit",
+            command=cmd, returncode=r.returncode, stderr=r.stderr or "", reason=reason,
         )
         return None
     try:

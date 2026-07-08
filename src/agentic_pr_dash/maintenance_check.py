@@ -557,10 +557,19 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
+            # A check code of 2 means gh was UNAVAILABLE this tick (e.g. a
+            # rate-limited `gh pr list` → None → _GH_UNAVAILABLE sentinel), so we
+            # did not actually observe PR state. That must NOT be collapsed into
+            # "no feedback → exit 0" — the shared GitHub budget is drained
+            # constantly on heavy review days, and a poller that exits on the
+            # first quota wall defeats its purpose (BOU-1921).
+            gh_unavailable_this_tick = False
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     pending.append((worktree, text))
+                elif code == 2:
+                    gh_unavailable_this_tick = True
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             _detached_this_tick: list[dict] = []
@@ -607,17 +616,29 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     detached_watch_pending
                     or _collect_await_watch_pending(owned, cwd, session_id)
                 )
-                if not watch_pending:
+                if gh_unavailable_this_tick:
+                    # We could not observe PR state — do not conclude "no
+                    # feedback". Stay alive and keep polling; gh backs off on
+                    # rate-limit (github_api._run) and typically recovers within
+                    # a tick or two (BOU-1921).
+                    print(
+                        "[pr-watch] waiter max-wait reached but GitHub was "
+                        "unavailable (rate-limited?) this tick — staying alive "
+                        "until PR state can be observed.",
+                        file=sys.stderr,
+                    )
+                elif not watch_pending:
                     print(
                         "[pr-watch] waiter max-wait reached with no feedback; "
                         "will re-arm on next stop."
                     )
                     return 0
-                print(
-                    "[pr-watch] waiter max-wait reached but required CI is still "
-                    "running — staying alive until CI completes or fails.",
-                    file=sys.stderr,
-                )
+                else:
+                    print(
+                        "[pr-watch] waiter max-wait reached but required CI is still "
+                        "running — staying alive until CI completes or fails.",
+                        file=sys.stderr,
+                    )
 
             time.sleep(max(args.interval, 1))
     finally:
