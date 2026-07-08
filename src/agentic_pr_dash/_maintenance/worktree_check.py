@@ -206,18 +206,28 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # stale foreign marker whose owner is no longer live must NOT suppress the
     # durable ledger gate; another live session may still own this PR there.
     marker_session = markers._marker_session_id(cwd)
+    marker_pr_matches = worktrees._marker_pr(cwd) == str(pr.number)
     marker_resolved_ownership = bool(marker_session) and (
-        marker_session == (self_session_id or "") or owner is not None
+        (marker_session == (self_session_id or "") and marker_pr_matches)
+        or owner is not None
     )
-    ledger_owner = (
-        None
-        if marker_resolved_ownership
-        else markers._live_pr_owner(
+    ledger_owner_record = None
+    ledger_owner = None
+    ledger_owner_cwd = cwd
+    if not marker_resolved_ownership:
+        ledger_owner_record = markers._live_pr_owner_record(
             pr.number, _common._repo_slug(cwd), self_session_id, cwd
         )
-    )
+        if ledger_owner_record is not None:
+            ledger_owner, ledger_owner_cwd = ledger_owner_record
+        else:
+            # Keep tests and older patch points that monkeypatch _live_pr_owner
+            # working while real code uses the richer record above.
+            ledger_owner = markers._live_pr_owner(
+                pr.number, _common._repo_slug(cwd), self_session_id, cwd
+            )
     if ledger_owner is not None:
-        if waiter._await_alive(cwd, ledger_owner):
+        if waiter._await_alive(ledger_owner_cwd, ledger_owner):
             _clear_wakeless_defer(cwd)
             take_over = False
         else:

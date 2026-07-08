@@ -136,6 +136,8 @@ from ._maintenance.waiter import (  # noqa: F401, E402
     _read_await_pidfile,
     _write_await_pidfile,
     _remove_await_pidfile,
+    _read_requested_roots,
+    _update_await_coverage,
     _await_alive,
     _detached_loop_alive,
     _detached_pending_entry,
@@ -456,6 +458,10 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
                 anchors.append(wt)
     except Exception:  # noqa: BLE001 - a bad ledger must not stop the waiter
         pass
+    for requested in _read_requested_roots(session_id):
+        if requested not in seen and os.path.isdir(requested):
+            seen.add(requested)
+            anchors.append(requested)
     return anchors
 
 
@@ -473,7 +479,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
 
-    _write_await_pidfile(cwd, {"pid": os.getpid(), "session_id": session_id}, session_id)
+    _update_await_coverage(cwd, session_id, _await_anchors(session_id, cwd))
     now = time.time()
     if args.max_wait == 0:
         deadline: float | None = now
@@ -491,6 +497,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
             # covers all owned PRs (PR #61 review, P1). Dedup owned worktrees and
             # detached records across anchors.
             anchors = _await_anchors(session_id, cwd)
+            _update_await_coverage(cwd, session_id, anchors)
             owned: list[str] = []
             if session_id:
                 _seen_wt: set[str] = set()
@@ -501,6 +508,7 @@ def _cmd_await(args: argparse.Namespace) -> int:
                             owned.append(wt)
             else:
                 owned = [cwd]
+            _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
             for worktree in owned:

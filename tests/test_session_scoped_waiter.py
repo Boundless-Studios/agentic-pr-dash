@@ -27,10 +27,13 @@ def _isolate_ledger(tmp_path, monkeypatch):
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
 
-def _write_session_pidfile(session_id: str, pid: int) -> None:
+def _write_session_pidfile(session_id: str, pid: int, **extra) -> None:
     p = Path(waiter._await_pidfile("", session_id))
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"pid": pid, "session_id": session_id}), encoding="utf-8")
+    p.write_text(
+        json.dumps({"pid": pid, "session_id": session_id, **extra}),
+        encoding="utf-8",
+    )
 
 
 def test_pidfile_is_session_scoped_across_worktrees(tmp_path):
@@ -88,6 +91,41 @@ def test_await_anchors_span_ledger_repos(tmp_path, monkeypatch):
     assert str(launch) in anchors
     assert str(other) in anchors
     assert str(gone) not in anchors
+
+
+def test_await_alive_does_not_claim_uncovered_markerless_repo(tmp_path, monkeypatch):
+    from agentic_pr_dash._maintenance import markers
+
+    covered = tmp_path / "covered"
+    other = tmp_path / "markerless-other"
+    covered.mkdir()
+    other.mkdir()
+    _write_session_pidfile(SID, os.getpid(), covered_roots=[str(covered)])
+    monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: None)
+
+    assert waiter._await_alive(str(covered), SID) is True
+    assert waiter._await_alive(str(other), SID) is False
+
+
+def test_await_alive_requests_coverage_for_marker_owned_repo(tmp_path, monkeypatch):
+    from agentic_pr_dash import maintenance_check as mc
+    from agentic_pr_dash._maintenance import markers
+
+    covered = tmp_path / "covered"
+    marker_only = tmp_path / "marker-only"
+    covered.mkdir()
+    marker_only.mkdir()
+    _write_session_pidfile(SID, os.getpid(), covered_roots=[str(covered)])
+    monkeypatch.setattr(
+        markers,
+        "_marker_session_id",
+        lambda cwd: SID if Path(cwd) == marker_only else None,
+    )
+
+    assert waiter._await_alive(str(marker_only), SID) is True
+    data = waiter._read_await_pidfile("", SID)
+    assert str(marker_only) in data["requested_roots"]
+    assert str(marker_only) in mc._await_anchors(SID, str(covered))
 
 
 def test_await_alive_legacy_per_worktree_pidfile_honored(tmp_path):

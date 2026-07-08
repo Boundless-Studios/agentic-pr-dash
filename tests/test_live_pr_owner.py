@@ -140,6 +140,47 @@ def test_check_worktree_defers_to_live_ledger_owner(monkeypatch, tmp_path):
     assert wc.WARN_ONLY_MARKER in text
 
 
+def test_check_worktree_uses_ledger_owner_worktree_for_waiter(monkeypatch, tmp_path):
+    """PR #61 review (P2): ledger owners may still have a legacy per-worktree
+    waiter. Check waiter liveness in the owner entry's worktree, not the checker
+    cwd, so a live owner is not mistaken for wake-less."""
+    from agentic_pr_dash._maintenance import worktree_check as wc
+    from agentic_pr_dash._maintenance import waiter
+
+    checker = tmp_path / "checker"
+    owner_wt = tmp_path / "owner"
+    checker.mkdir()
+    owner_wt.mkdir()
+
+    class _PR:
+        number = 2401
+        is_draft = False
+
+    seen: list[str] = []
+
+    monkeypatch.setattr(markers, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(wc, "_resolve_and_blockers", lambda cwd: (_PR(), ["review_comments"]))
+    monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: None)
+    monkeypatch.setattr(wc.worktrees, "_marker_pr", lambda cwd: "")
+    monkeypatch.setattr(
+        markers,
+        "_live_pr_owner_record",
+        lambda pr, repo, sid, cwd=None: ("sess-LIVE", str(owner_wt)),
+    )
+
+    def _await_alive(cwd, owner):
+        seen.append(cwd)
+        return True
+
+    monkeypatch.setattr(waiter, "_await_alive", _await_alive)
+
+    code, text = wc._check_worktree(str(checker), "me", claim=False)
+
+    assert code == 0
+    assert "sess-LIVE" in text
+    assert seen == [str(owner_wt)]
+
+
 def test_check_worktree_self_owned_marker_skips_ledger_gate(monkeypatch, tmp_path):
     """PR #61 review (P2): when THIS worktree's marker is self-owned, a stale
     previous-session ledger row must NOT make the current owner defer — the
@@ -158,6 +199,7 @@ def test_check_worktree_self_owned_marker_skips_ledger_gate(monkeypatch, tmp_pat
     monkeypatch.setattr(wc, "_resolve_and_blockers", lambda cwd: (_PR(), []))
     # Current worktree marker is OURS...
     monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: "me")
+    monkeypatch.setattr(wc.worktrees, "_marker_pr", lambda cwd: str(_PR.number))
 
     # ...so a stale ledger row's owner must NOT even be consulted.
     def _boom(*a, **k):
@@ -172,6 +214,39 @@ def test_check_worktree_self_owned_marker_skips_ledger_gate(monkeypatch, tmp_pat
     assert code == 0
     assert "nothing pending" in text
     assert "(ledger)" not in text
+
+
+def test_check_worktree_stale_self_marker_still_checks_ledger(monkeypatch, tmp_path):
+    """PR #61 review (P2): a self-owned marker only resolves ownership for the
+    current PR when the marker's recorded PR matches the branch PR."""
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import worktree_check as wc
+    from agentic_pr_dash._maintenance import waiter
+
+    class _PR:
+        number = 2401
+        is_draft = False
+        ci_watch_pending = False
+
+    monkeypatch.setattr(markers, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(wc, "_resolve_and_blockers", lambda cwd: (_PR(), []))
+    monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: "me")
+    monkeypatch.setattr(wc.worktrees, "_marker_pr", lambda cwd: "999")
+    monkeypatch.setattr(
+        markers,
+        "_live_pr_owner_record",
+        lambda pr, repo, sid, cwd=None: ("sess-LIVE", str(tmp_path)),
+    )
+    monkeypatch.setattr(waiter, "_await_alive", lambda cwd, owner: True)
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda *a, **k: False)
+    monkeypatch.setattr(wc.worktrees, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(wc.markers, "_touch_owner_heartbeat", lambda *a, **k: None)
+
+    code, text = wc._check_worktree(str(tmp_path), "me", claim=False)
+
+    assert code == 0
+    assert "sess-LIVE" in text
+    assert "(ledger)" in text
 
 
 def test_check_worktree_stale_foreign_marker_still_checks_ledger(monkeypatch, tmp_path):
