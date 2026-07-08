@@ -90,3 +90,37 @@ def test_check_worktree_defers_to_live_ledger_owner(monkeypatch, tmp_path):
     assert "sess-LIVE" in text
     # The blocked-owned-PR invariant: a defer must still name the PR is blocked.
     assert wc.WARN_ONLY_MARKER in text
+
+
+def test_check_worktree_self_owned_marker_skips_ledger_gate(monkeypatch, tmp_path):
+    """PR #61 review (P2): when THIS worktree's marker is self-owned, a stale
+    previous-session ledger row must NOT make the current owner defer — the
+    ledger gate is limited to the markerless/repointed-away case."""
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import worktree_check as wc
+
+    class _PR:
+        number = 2401
+        is_draft = False
+        ci_watch_pending = False
+
+    monkeypatch.setattr(markers, "_live_foreign_owner", lambda cwd, sid: None)
+    # Clean PR (no blockers) so the service path is short — the point is only that
+    # the ledger gate is bypassed, not the full prompt build.
+    monkeypatch.setattr(wc, "_resolve_and_blockers", lambda cwd: (_PR(), []))
+    # Current worktree marker is OURS...
+    monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: "me")
+
+    # ...so a stale ledger row's owner must NOT even be consulted.
+    def _boom(*a, **k):
+        raise AssertionError("ledger gate must be skipped when marker is self-owned")
+
+    monkeypatch.setattr(markers, "_live_pr_owner", _boom)
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda *a, **k: False)
+    monkeypatch.setattr(wc.worktrees, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(wc.markers, "_touch_owner_heartbeat", lambda *a, **k: None)
+
+    code, text = wc._check_worktree(str(tmp_path), "me", claim=False)
+    assert code == 0
+    assert "nothing pending" in text
+    assert "(ledger)" not in text
