@@ -125,6 +125,21 @@ def executor_failure_streak(cwd: str, pr: int | None) -> int:
     return _entry_streak(_load_health(cwd).get(str(pr), {}))
 
 
+def _emit_loop_event(cwd: str, kind: str, pr: int | None, details: dict) -> None:
+    """Best-effort observability emit (BOU-1880): persist streak/escalation to the
+    decoupled events.jsonl so they survive restart. Never raises, never alters the
+    loop's dispatch flow (mirrors orchestrator._emit)."""
+    try:
+        from datetime import datetime, timezone  # noqa: PLC0415
+        from .observability.event_store import ObservabilityEvent, get_event_store  # noqa: PLC0415
+        get_event_store(cwd).append(ObservabilityEvent(
+            ts=datetime.now(timezone.utc), repo=cwd, pr_number=pr, kind=kind,
+            session_id=None, details=details,
+        ))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     """Record a new executor failure for ``pr``; return the new streak count."""
     key = str(pr)
@@ -132,6 +147,7 @@ def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     new_streak = _entry_streak(data.get(key, {})) + 1
     data[key] = {"streak": new_streak, "last_error": err, "updated": time.time()}
     _save_health(cwd, data)
+    _emit_loop_event(cwd, "streak", pr, {"streak": new_streak, "last_error": err[:200]})
     return new_streak
 
 
@@ -299,6 +315,10 @@ def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
         os.replace(tmp, marker_path)
     except OSError:
         pass
+
+    _emit_loop_event(cwd, "escalation", pr, {
+        "streak": streak, "threshold": threshold, "last_error": err[:200],
+    })
 
     iterm.notify(
         f"PR #{pr} escalated",
