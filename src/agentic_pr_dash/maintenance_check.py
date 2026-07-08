@@ -15,6 +15,7 @@ functions so that ``--help`` works without the project venv's heavy deps.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
 import sys
@@ -465,7 +466,52 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
     return anchors
 
 
+# Exit code -> machine-readable outcome + human reason (BOU-1877). An exit code
+# alone cannot distinguish "deferred to the loop, covered" (0) from "idle" (0),
+# so supervising sessions parse the outcome line instead.
+_AWAIT_OUTCOME_REASONS: dict[int, str] = {
+    10: "feedback arrived on an owned PR",
+    3: "another waiter already covers this session",
+    0: "no pending feedback; deferred to the maintenance loop",
+}
+
+
+def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = "") -> None:
+    """Emit exactly one machine-readable JSON outcome line to stderr (BOU-1877).
+
+    ``outcome`` is one of ``deferred_to_loop`` | ``woke`` | ``error``. Written to
+    stderr (not stdout) so the exit-10 stop-block on stdout stays clean for the
+    harness. Best-effort — never raises out of a process that is already exiting.
+    """
+    try:
+        line = json.dumps(
+            {"outcome": outcome, "pr": pr, "reason": reason},
+            separators=(",", ":"),
+        )
+        print(line, file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 — outcome reporting must never mask the real exit
+        pass
+
+
 def _cmd_await(args: argparse.Namespace) -> int:
+    """Background feedback waiter — structured-outcome wrapper (BOU-1877).
+
+    Runs the poll loop and emits exactly one outcome line on every exit path,
+    including an unexpected crash (e.g. a deep helper hitting a deleted cwd,
+    BOU-1905): the waiter must never die with a bare traceback that a supervisor
+    cannot tell apart from a clean deferral.
+    """
+    try:
+        code = _run_await_loop(args)
+    except Exception as exc:  # noqa: BLE001 — KeyboardInterrupt/SystemExit still propagate
+        _emit_await_outcome("error", reason=f"{type(exc).__name__}: {exc}")
+        return 1
+    outcome = "woke" if code == 10 else "deferred_to_loop"
+    _emit_await_outcome(outcome, reason=_AWAIT_OUTCOME_REASONS.get(code, f"exit {code}"))
+    return code
+
+
+def _run_await_loop(args: argparse.Namespace) -> int:
     """Background feedback waiter — poll owned PRs, exit 10 when work arrives."""
     cwd = os.path.abspath(args.cwd)
     session_id = args.session_id or _read_session_marker(cwd)

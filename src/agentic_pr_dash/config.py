@@ -249,7 +249,19 @@ def _resolve_state_dir(file_cfg: dict, base: Path) -> Path:
 @lru_cache(maxsize=8)
 def load(cwd: str | None = None) -> Config:
     """Load and cache the resolved config for ``cwd`` (defaults to the process cwd)."""
-    base = Path(cwd) if cwd else Path.cwd()
+    if cwd:
+        base = Path(cwd)
+    else:
+        # A long-lived detached waiter can outlive its cwd: stale-worktree
+        # reaping is routine background activity and deletes directories out
+        # from under running processes, so ``os.getcwd()`` (via ``Path.cwd()``)
+        # raises FileNotFoundError. Fall back to $HOME rather than dying with a
+        # raw traceback — every ambient-cwd ``load()`` call site (agents.py's
+        # discovery/cpu helpers among them) inherits this safety net (BOU-1905).
+        try:
+            base = Path.cwd()
+        except (FileNotFoundError, OSError):
+            base = Path(os.path.expanduser("~"))
     cfg_path = _find_config_file(base)
     root = cfg_path.parent if cfg_path else base
     data = _load_toml(cfg_path)
