@@ -14,9 +14,17 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 from agentic_pr_dash._maintenance import waiter
 
 SID = "sess-1924"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ledger(tmp_path, monkeypatch):
+    # session_ledger._DEFAULT_DIR is frozen at import, so isolate per test.
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
 
 def _write_session_pidfile(session_id: str, pid: int) -> None:
@@ -57,6 +65,29 @@ def test_await_alive_false_for_dead_pid(tmp_path):
 def test_await_alive_ignores_mismatched_session(tmp_path):
     _write_session_pidfile("other-session", os.getpid())
     assert waiter._await_alive(str(tmp_path), SID) is False
+
+
+def test_await_anchors_span_ledger_repos(tmp_path, monkeypatch):
+    """PR #61 review (P1): the single session waiter must poll every repo the
+    session owns PRs in — anchor at each still-present ledger worktree, not just
+    the launch cwd. A ledger worktree that no longer exists is skipped."""
+    from agentic_pr_dash import maintenance_check as mc
+    from agentic_pr_dash import session_ledger as sl
+
+    launch = tmp_path / "gaia-wt"
+    other = tmp_path / "other-repo-wt"
+    gone = tmp_path / "torn-down-wt"
+    launch.mkdir()
+    other.mkdir()  # exists, in a different repo → must be anchored
+    # `gone` is never created → must be skipped
+
+    sl.append("sess-A", pr=1, branch="b1", worktree=str(other), repo="o/other")
+    sl.append("sess-A", pr=2, branch="b2", worktree=str(gone), repo="o/gone")
+
+    anchors = mc._await_anchors("sess-A", str(launch))
+    assert str(launch) in anchors
+    assert str(other) in anchors
+    assert str(gone) not in anchors
 
 
 def test_await_alive_legacy_per_worktree_pidfile_honored(tmp_path):

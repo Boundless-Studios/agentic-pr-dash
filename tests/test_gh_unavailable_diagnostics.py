@@ -20,6 +20,7 @@ import argparse
 import subprocess
 
 from agentic_pr_dash import github_api, maintenance_check
+from agentic_pr_dash._maintenance import markers as _markers_mod
 from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 
 
@@ -135,7 +136,12 @@ def test_check_worktree_surfaces_underlying_stderr(monkeypatch):
     # Force a non-empty branch so resolution proceeds to list_open_prs.
     # _resolve_pr_for_branch lives in pr_state and uses _current_branch from pr_state's namespace.
     monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
-    monkeypatch.setattr(maintenance_check, "_live_foreign_owner", lambda *a, **k: None)
+    # ``_check_worktree`` calls ``markers._live_foreign_owner`` module-qualified
+    # (not the maintenance_check re-export), so patch the marker module — else a
+    # REAL armed marker at cwd="." (e.g. this dev worktree's own PR-watch marker)
+    # makes the marker-owner gate fire and the gh-unavailable path is never
+    # reached. This is the seam the subject actually reads (hermetic in CI).
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda *a, **k: None)
 
     code, text = maintenance_check._check_worktree(".", "self-session")
     assert code == 2

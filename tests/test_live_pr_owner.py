@@ -10,10 +10,20 @@ worktree-independent session ledger + the session registry's liveness.
 """
 from __future__ import annotations
 
+import pytest
+
 from agentic_pr_dash import session_ledger as sl
 from agentic_pr_dash._maintenance import markers
 
 REPO = "owner/name"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_ledger(tmp_path, monkeypatch):
+    # session_ledger._DEFAULT_DIR is frozen at import (expanduser("~") once), so
+    # without an explicit dir every test shares one ledger. Point it at tmp so
+    # each test's appends are isolated.
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
 
 def test_resolves_live_session_via_ledger(monkeypatch):
@@ -43,6 +53,16 @@ def test_none_when_pr_not_owned(monkeypatch):
 def test_empty_ledger_returns_none(monkeypatch):
     # No sessions in the ledger → no owner (also the common back-compat path:
     # the resolver must be a no-op when nothing is recorded).
+    assert markers._live_pr_owner(2401, REPO, "me") is None
+
+
+def test_legacy_repoless_row_does_not_match_other_repo(monkeypatch):
+    """PR #61 review (P1): a live session's REPO-LESS legacy ledger row for PR #N
+    must NOT resolve it as the owner of a DIFFERENT repo's PR #N — strict repo
+    matching, else a same-number PR in another repo gets wrongly deferred."""
+    sl.append("sess-LIVE", pr=2401, branch="b", worktree="")  # legacy: no repo
+    monkeypatch.setattr(markers, "_session_is_live", lambda sid, cwd=None: True)
+    # Querying a concrete repo must NOT match the repo-less legacy row.
     assert markers._live_pr_owner(2401, REPO, "me") is None
 
 

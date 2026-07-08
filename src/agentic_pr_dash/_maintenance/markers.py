@@ -149,7 +149,14 @@ def _live_pr_owner(
         if not other or other == self_sid:
             continue
         try:
-            entries = session_ledger.read(other, repo=repo)
+            # STRICT repo match (include_legacy=False): a repo-less LEGACY ledger
+            # row for PR #N must NOT resolve an unrelated session as the owner of a
+            # different repo's PR #N — this cross-session ownership gate defers
+            # (or suppresses) work, so a loose legacy match could leave a
+            # same-number PR in another repo unserviced (PR #61 review, P1). When
+            # `repo` is undetectable ("") strict match yields nothing → no false
+            # defer (fail-safe).
+            entries = session_ledger.read(other, repo=repo, include_legacy=False)
         except Exception:  # noqa: BLE001 - a corrupt sibling ledger must not break resolution
             continue
         if not any(e.pr == target for e in entries):
