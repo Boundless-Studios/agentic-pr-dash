@@ -272,7 +272,7 @@ def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     # a live stacked owner and wrongly count the loop as coverage.
     if pr is not None:
         from ._maintenance._common import _repo_slug  # noqa: PLC0415
-        if markers._live_pr_owner(pr, _repo_slug(cwd), ""):
+        if markers._live_pr_owner(pr, _repo_slug(cwd), "", cwd):
             return False
     cfg = load_config(cwd)
     threshold = cfg.escalation_failure_threshold

@@ -200,16 +200,18 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # tick then we take over. Self is excluded by the resolver, so a session
     # checking its OWN owned PR falls through to service it.
     #
-    # LIMIT to the truly MARKERLESS/repointed-away case (PR #61 review, P2): run
-    # the ledger gate ONLY when THIS worktree has no armed marker at all. If a
-    # marker is present, the marker gate above already decided ownership for this
-    # worktree — consulting the ledger would (a) let a stale PREVIOUS-owner row
-    # make the current self-owner defer its own blockers, and (b) re-grant a
-    # wake-less grace tick to a foreign owner the marker gate JUST took over
-    # (double grace), deferring once more instead of taking over as promised.
+    # LIMIT to cases where the marker gate did NOT resolve ownership (PR #61
+    # review, P2): a self-owned marker means this session should service its own
+    # PR, and a live foreign marker owner has already been handled above. But a
+    # stale foreign marker whose owner is no longer live must NOT suppress the
+    # durable ledger gate; another live session may still own this PR there.
+    marker_session = markers._marker_session_id(cwd)
+    marker_resolved_ownership = bool(marker_session) and (
+        marker_session == (self_session_id or "") or owner is not None
+    )
     ledger_owner = (
         None
-        if markers._marker_session_id(cwd)
+        if marker_resolved_ownership
         else markers._live_pr_owner(
             pr.number, _common._repo_slug(cwd), self_session_id, cwd
         )

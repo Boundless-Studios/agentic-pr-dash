@@ -66,7 +66,9 @@ def test_liveness_checked_in_entry_worktree_context(monkeypatch, tmp_path):
     """PR #61 review (P2): liveness is resolved in the ledger entry's OWN worktree
     (its repo may configure a per-worktree session_registry_path), not the
     checker's cwd."""
-    wt = str(tmp_path / "owner-wt")
+    wt_path = tmp_path / "owner-wt"
+    wt_path.mkdir()
+    wt = str(wt_path)
     sl.append("sess-LIVE", pr=2401, branch="b", worktree=wt, repo=REPO)
     seen = {}
 
@@ -77,6 +79,23 @@ def test_liveness_checked_in_entry_worktree_context(monkeypatch, tmp_path):
     monkeypatch.setattr(markers, "_session_is_live", _live)
     assert markers._live_pr_owner(2401, REPO, "me", cwd="/some/checker/cwd") == "sess-LIVE"
     assert seen["sess-LIVE"] == wt  # entry worktree, NOT the checker cwd
+
+
+def test_liveness_falls_back_to_checker_cwd_when_entry_worktree_gone(monkeypatch, tmp_path):
+    """PR #61 review (P2): detached ledger rows may point at removed worktrees;
+    liveness must then use the checker cwd so repo-scoped registries still work."""
+    gone = str(tmp_path / "gone-owner-wt")
+    checker = str(tmp_path / "checker")
+    sl.append("sess-LIVE", pr=2401, branch="b", worktree=gone, repo=REPO)
+    seen = {}
+
+    def _live(sid, cwd=None):
+        seen[sid] = cwd
+        return True
+
+    monkeypatch.setattr(markers, "_session_is_live", _live)
+    assert markers._live_pr_owner(2401, REPO, "me", cwd=checker) == "sess-LIVE"
+    assert seen["sess-LIVE"] == checker
 
 
 def test_empty_ledger_returns_none(monkeypatch):
@@ -153,3 +172,30 @@ def test_check_worktree_self_owned_marker_skips_ledger_gate(monkeypatch, tmp_pat
     assert code == 0
     assert "nothing pending" in text
     assert "(ledger)" not in text
+
+
+def test_check_worktree_stale_foreign_marker_still_checks_ledger(monkeypatch, tmp_path):
+    """PR #61 review (P2): a stale marker whose owner is no longer live must not
+    suppress the durable ledger owner gate."""
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import worktree_check as wc
+    from agentic_pr_dash._maintenance import waiter
+
+    class _PR:
+        number = 2401
+        is_draft = False
+        ci_watch_pending = False
+
+    monkeypatch.setattr(markers, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(wc, "_resolve_and_blockers", lambda cwd: (_PR(), []))
+    monkeypatch.setattr(markers, "_marker_session_id", lambda cwd: "stale-other")
+    monkeypatch.setattr(markers, "_live_pr_owner", lambda pr, repo, sid, cwd=None: "sess-LIVE")
+    monkeypatch.setattr(waiter, "_await_alive", lambda cwd, owner: True)
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda *a, **k: False)
+    monkeypatch.setattr(wc.worktrees, "_live_independent_owner_paths", lambda paths, sid: set())
+    monkeypatch.setattr(wc.markers, "_touch_owner_heartbeat", lambda *a, **k: None)
+
+    code, text = wc._check_worktree(str(tmp_path), "me", claim=False)
+    assert code == 0
+    assert "sess-LIVE" in text
+    assert "(ledger)" in text

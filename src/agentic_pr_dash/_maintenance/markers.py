@@ -170,12 +170,13 @@ def _live_pr_owner(
         if not matching:
             continue
         entry = max(matching, key=lambda e: e.opened_at or "")
-        # Resolve liveness in the ENTRY's OWN worktree context, not the checker's
-        # cwd: a repo may configure its own ``session_registry_path``, so the owner
-        # session is absent from the checker cwd's registry summary and would look
-        # dead — wrongly taking over a PR a live session still owns (PR #61 review,
-        # P2). Fall back to cwd when the entry has no recorded worktree.
-        live_ctx = entry.worktree or cwd
+        # Resolve liveness in the ENTRY's OWN worktree context when it still
+        # exists: a repo may configure its own ``session_registry_path``, so the
+        # owner session can be absent from the checker cwd's registry summary.
+        # Detached ledger rows can outlive their recorded worktree, though; in
+        # that case fall back to the checker cwd so a removed path doesn't hide a
+        # live owner session (PR #61 review, P2).
+        live_ctx = entry.worktree if entry.worktree and os.path.exists(entry.worktree) else cwd
         if _session_is_live(other, live_ctx):
             live.append((entry.opened_at or "", other))
     if not live:
