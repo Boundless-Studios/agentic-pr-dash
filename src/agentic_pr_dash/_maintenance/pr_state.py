@@ -257,15 +257,19 @@ def _pr_open_state(pr_number: int, cwd: str):
     import json as _json  # noqa: PLC0415
 
     unavailable = ("unknown", "", False, [], "", "", "")
-    try:
-        res = subprocess.run(
-            [
-                "gh", "pr", "view", str(pr_number),
-                "--json", "state,url,isDraft,reviewDecision,mergeStateStatus,mergeable",
-            ],
-            cwd=cwd, capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        return unavailable
+    # Route through github_api._run (not raw subprocess) so a rate-limit on this
+    # detached PR-state probe is detected and recorded in the per-tick
+    # rate_limit_seen() flag — otherwise a detached-only waiter whose only gh call
+    # is this probe can't tell a quota outage from "no PRs" and exits 0 during the
+    # outage (BOU-1949, #62 follow-up). _run also gives it the connectivity /
+    # rate-limit backoff, and _run_once already catches OSError/TimeoutExpired.
+    res = github_api._run(
+        [
+            "gh", "pr", "view", str(pr_number),
+            "--json", "state,url,isDraft,reviewDecision,mergeStateStatus,mergeable",
+        ],
+        timeout_s=15, cwd=cwd,
+    )
     if res.returncode != 0:
         return unavailable
     try:
