@@ -171,3 +171,107 @@ def test_run_rate_limit_recovers_on_retry_leaves_flag_clear(monkeypatch):
     github_api.reset_rate_limit_seen()
     github_api._run(["gh", "pr", "list"])
     assert github_api.rate_limit_seen() is False
+
+
+# --------------------------------------------------------------------------- #
+# process-level rate-limit-backoff suppression (BOU-1953) — the stop-gate is a
+# Stop-hook subprocess with a hard ~108s deadline and must fail fast on a
+# rate-limit instead of accumulating backoff; the waiter keeps backing off.
+# --------------------------------------------------------------------------- #
+
+def test_run_with_backoff_disabled_returns_immediately_on_persistent_rate_limit(monkeypatch):
+    slept: list[float] = []
+    monkeypatch.setattr(github_api.time, "sleep", lambda s: slept.append(s))
+    calls = {"n": 0}
+
+    def _always(*a, **k):
+        calls["n"] += 1
+        return _cp(returncode=1, stderr="API rate limit exceeded")
+
+    monkeypatch.setattr(subprocess, "run", _always)
+    github_api.set_rate_limit_backoff(False)
+    github_api.reset_rate_limit_seen()
+
+    r = github_api._run(["gh", "pr", "list"])
+
+    assert r.returncode == 1
+    assert calls["n"] == 1  # no rate-limit retries — fails fast on the first call
+    assert not slept  # no backoff sleep occurred
+    assert github_api.rate_limit_seen() is True  # flag semantics preserved
+
+
+def test_run_with_backoff_disabled_still_retries_connectivity_failures(monkeypatch):
+    """Disabling rate-limit backoff must not touch the short, unrelated
+    connectivity retry (transient DNS/connect/5xx failures)."""
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    stub, calls = _sequence_run([
+        _cp(returncode=1, stderr="error connecting to api.github.com"),
+        _cp(stdout="[]", returncode=0),
+    ])
+    monkeypatch.setattr(subprocess, "run", stub)
+    github_api.set_rate_limit_backoff(False)
+
+    r = github_api._run(["gh", "pr", "list"])
+
+    assert r.returncode == 0
+    assert calls["n"] == 2  # connectivity retry still happened
+
+
+def test_run_with_backoff_enabled_default_still_backs_off(monkeypatch):
+    """Sanity check: the default (enabled) mode is unchanged by the toggle's
+    existence — a persistent rate-limit still retries up to the bound."""
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    calls = {"n": 0}
+
+    def _always(*a, **k):
+        calls["n"] += 1
+        return _cp(returncode=1, stderr="API rate limit exceeded")
+
+    monkeypatch.setattr(subprocess, "run", _always)
+    assert github_api.rate_limit_backoff_enabled() is True  # default
+
+    r = github_api._run(["gh", "pr", "list"])
+
+    assert r.returncode == 1
+    assert calls["n"] == github_api._GH_RETRY_ATTEMPTS  # unchanged, bounded retry
+
+
+def test_stop_gate_disables_rate_limit_backoff(tmp_path, monkeypatch):
+    """The stop-gate entrypoint must disable backoff at the START of its run so
+    a rate-limited gh call inside it fails fast instead of wedging toward the
+    Stop-hook's hard deadline (BOU-1953)."""
+    from types import SimpleNamespace
+
+    import agentic_pr_dash._maintenance.worktree_check as worktree_check_mod
+    import agentic_pr_dash._maintenance.worktrees as worktrees_mod
+    from agentic_pr_dash._maintenance import stop_gate
+
+    assert github_api.rate_limit_backoff_enabled() is True  # precondition
+
+    # Stub out everything _stop_gate_impl touches past the toggle so this stays
+    # a focused unit test of the toggle, not a full stop-gate integration test.
+    # These are imported *locally* inside `_stop_gate_impl`, so patch the
+    # defining modules (read at call time) rather than the `stop_gate` module.
+    monkeypatch.setattr(
+        worktrees_mod, "_owned_worktrees_across_roots", lambda *a, **k: [str(tmp_path)]
+    )
+    monkeypatch.setattr(
+        worktrees_mod, "_reconcile_owned_across_roots", lambda *a, **k: ([], [])
+    )
+    monkeypatch.setattr(
+        worktrees_mod, "_detached_records_across_roots", lambda *a, **k: []
+    )
+
+    seen_enabled_during_call: list[bool] = []
+
+    def _fake_check_worktree(worktree, session_id, claim=False):
+        seen_enabled_during_call.append(github_api.rate_limit_backoff_enabled())
+        return 0, ""
+
+    monkeypatch.setattr(worktree_check_mod, "_check_worktree", _fake_check_worktree)
+
+    args = SimpleNamespace(cwd=str(tmp_path), session_id="", pid=None, no_waiter=True)
+    stop_gate._stop_gate_impl(args)
+
+    assert github_api.rate_limit_backoff_enabled() is False
+    assert seen_enabled_during_call == [False]

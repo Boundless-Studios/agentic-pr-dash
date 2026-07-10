@@ -165,11 +165,22 @@ RECONCILES_BEFORE_RATE_LIMIT = True
 
 
 def _stop_gate_impl(args) -> int:
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
     from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
+
+    # BOU-1953: the stop-gate is a Stop-hook subprocess with a hard ~108s
+    # deadline that fails CLOSED when exceeded. Every gh call it makes below
+    # (across possibly several owned PRs) would otherwise each back off up to
+    # `_GH_RATELIMIT_MAX_SLEEP_S` on a shared-quota rate-limit, easily blowing
+    # the deadline. Disable backoff for this process so a rate-limited call
+    # fails fast instead — the long-lived `await` waiter (a different process)
+    # is unaffected and keeps backing off.
+    github_api.set_rate_limit_backoff(False)
+
     cwd = os.path.abspath(args.cwd)
 
     session_id = args.session_id or _read_session_marker(cwd)
