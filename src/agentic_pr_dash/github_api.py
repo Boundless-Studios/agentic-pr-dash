@@ -380,7 +380,14 @@ def last_list_open_prs_failure() -> GhFailure | None:
 
 
 def list_open_prs(cwd: str | None = None) -> list[dict] | None:
-    """List all open PRs authored by the current user.
+    """List all open PRs authored by the tracked PR author.
+
+    The author defaults to ``@me`` but is configurable (``pr_author`` in
+    ``agentic-pr-dash.toml`` / ``AGENTIC_PR_DASH_PR_AUTHOR``): under an
+    isolated automation identity (a GitHub App installation token in
+    ``GH_TOKEN``, BOU-1923) ``@me`` resolves to the App bot — which authored
+    no PRs — so every discovery path silently returns ``[]`` and the board
+    empties. See :attr:`agentic_pr_dash.config.Config.pr_author`.
 
     Returns ``None`` when the underlying ``gh`` call fails (e.g. the GitHub
     API is rate-limited or unreachable) so callers can distinguish a genuine
@@ -391,9 +398,11 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     :func:`last_list_open_prs_failure` so the caller can surface the underlying
     cause instead of a bare "gh unavailable".
     """
+    from .config import load as _load_config  # noqa: PLC0415 — deferred to avoid import cycles
+
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
-        "gh", "pr", "list", "--author", "@me", "--state", "open",
+        "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
