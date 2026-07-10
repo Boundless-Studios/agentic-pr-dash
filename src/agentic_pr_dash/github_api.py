@@ -22,6 +22,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+
+try:  # POSIX file locking for the snapshot refresh (unix-only; degrade gracefully)
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None  # type: ignore[assignment]
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -442,9 +447,63 @@ _PR_SNAPSHOT_FILENAME = "pr-snapshot.json"
 # collapses to a single `gh` call. Env-overridable for tests/tuning.
 _PR_SNAPSHOT_TTL_S = float(os.environ.get("APD_PR_SNAPSHOT_TTL_S", "45"))
 
+# Bounded wait for the snapshot refresh lock (see ``_acquire_snapshot_lock``).
+# On a cold/expired cache a burst of processes would otherwise ALL fetch at
+# once (the "thundering herd" the cache is meant to collapse). The first to
+# grab this lock fetches+writes; the rest wait briefly, then re-read the fresh
+# snapshot. Capped so a wedged holder can't hang a latency-sensitive caller
+# (the stop-gate) — on timeout we fall through to a direct fetch.
+_PR_SNAPSHOT_LOCK_WAIT_S = float(os.environ.get("APD_PR_SNAPSHOT_LOCK_WAIT_S", "5"))
+
 
 def _pr_snapshot_path(cwd: str | None) -> Path:
     return load_config(cwd).state_dir_for(cwd or ".") / _PR_SNAPSHOT_FILENAME
+
+
+def _acquire_snapshot_lock(path: Path) -> "int | None":
+    """Best-effort exclusive lock on ``<snapshot>.lock``, bounded by
+    ``_PR_SNAPSHOT_LOCK_WAIT_S``.
+
+    Returns an open fd (held lock) on success, or ``None`` when locking is
+    unavailable (non-POSIX / open failure) or the wait times out. A ``None``
+    return is not fatal: the caller still re-reads the snapshot (a sibling that
+    held the lock has likely just refreshed it) and only fetches if it is still
+    stale — so lock contention degrades to at most an unserialized fetch rather
+    than a hang."""
+    if fcntl is None:
+        return None
+    lock_path = path.with_name(path.name + ".lock")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return None
+    deadline = time.monotonic() + _PR_SNAPSHOT_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except OSError:
+            if time.monotonic() >= deadline:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                return None
+            time.sleep(0.05)
+
+
+def _release_snapshot_lock(fd: "int | None") -> None:
+    if fd is None:
+        return
+    try:
+        if fcntl is not None:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _read_pr_snapshot(path: Path, ttl_s: float) -> list[dict] | None:
@@ -509,18 +568,46 @@ def list_open_prs_cached(
     ``force=True`` bypasses the cache entirely (read AND write a fresh value)
     for callers that must see the current state. ``ttl_s`` overrides the
     module default (`` APD_PR_SNAPSHOT_TTL_S``, default 45s) for one call.
+
+    On a cold/expired cache the refresh is serialized behind a per-snapshot
+    lock so a burst of processes collapses to ONE ``gh`` fetch (the herd this
+    cache exists to prevent): the lock winner fetches+writes; the rest wait
+    briefly, then re-read the now-fresh snapshot (see
+    :func:`_acquire_snapshot_lock`).
     """
     path = _pr_snapshot_path(cwd)
     effective_ttl = _PR_SNAPSHOT_TTL_S if ttl_s is None else ttl_s
-    if not force:
+    if force:
+        # The caller demands current state — skip the cache/lock entirely.
+        prs = list_open_prs(cwd)
+        if prs is None:
+            return None
+        _write_pr_snapshot(path, prs)
+        return prs
+
+    cached = _read_pr_snapshot(path, effective_ttl)
+    if cached is not None:
+        return cached
+
+    # MISS/expiry: serialize the refresh so concurrent misses don't each fire
+    # their own `gh pr list`.
+    lock = _acquire_snapshot_lock(path)
+    try:
+        # Re-check under the lock: whoever we waited on (or a sibling that
+        # raced us to the file before we took the lock) may have just written a
+        # fresh snapshot, in which case we skip the redundant fetch. This
+        # re-check ALSO covers the ``lock is None`` degraded path — a timed-out
+        # waiter usually finds the holder's fresh write here.
         cached = _read_pr_snapshot(path, effective_ttl)
         if cached is not None:
             return cached
-    prs = list_open_prs(cwd)
-    if prs is None:
-        return None
-    _write_pr_snapshot(path, prs)
-    return prs
+        prs = list_open_prs(cwd)
+        if prs is None:
+            return None
+        _write_pr_snapshot(path, prs)
+        return prs
+    finally:
+        _release_snapshot_lock(lock)
 
 
 _PR_HEAD_FIELDS = (
@@ -1144,6 +1231,7 @@ def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -
     more — mutations are not idempotent-safe to retry indefinitely, but a
     single bounded extra attempt clears the common secondary-limit case.
     """
+    global _LAST_MUTATION_MONOTONIC
     _pace_mutation()
     result = _run(cmd, timeout_s=timeout_s, cwd=cwd)
     if _is_rate_limit_failure(result):
@@ -1151,6 +1239,13 @@ def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -
         if hint is not None:
             time.sleep(min(hint, _GH_RATELIMIT_MAX_SLEEP_S))
             result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+            # The Retry-After sleep + retry advanced wall-clock well past the
+            # pacing stamp set in _pace_mutation(). Re-stamp to the retry time
+            # so the NEXT mutation still waits a full interval — otherwise it
+            # would see the (now-stale) pre-sleep stamp as already-elapsed and
+            # fire immediately, reintroducing the very back-to-back burst this
+            # pacing exists to prevent (BOU-1923 review).
+            _LAST_MUTATION_MONOTONIC = time.monotonic()
     return result
 
 

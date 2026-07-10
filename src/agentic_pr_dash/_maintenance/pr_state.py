@@ -58,6 +58,16 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         return None
 
     pr_number = int(raw["number"])
+    # Preserve a live gh-availability signal on the CACHED path (BOU-1923
+    # review). A warm snapshot skips the `list_open_prs` call that used to turn
+    # a current gh/rate-limit outage into _GH_UNAVAILABLE; the detail getters
+    # below then fail OPEN to empty values, so a warm cache + a concurrent
+    # GitHub outage would make a genuinely-blocked PR read as CLEAN. Watch the
+    # per-call rate-limit flag across the detail fetch: if a detail call trips
+    # it here, the empty results are unreliable — surface _GH_UNAVAILABLE (→
+    # stop-gate/check code 2) instead of a false "clean". We read (never reset)
+    # the flag, so the tick-based waiter's per-tick accumulation is untouched.
+    _rl_before = github_api.rate_limit_seen()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -66,6 +76,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    if not _rl_before and github_api.rate_limit_seen():
+        return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
 
@@ -106,6 +118,10 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
                 raw = entry
                 break
 
+    # See _resolve_pr_for_branch: keep a live gh-availability signal on the
+    # cached path so a warm snapshot + a concurrent outage during the detail
+    # fetch surfaces _GH_UNAVAILABLE rather than a false "clean" (BOU-1923).
+    _rl_before = github_api.rate_limit_seen()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -114,6 +130,8 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    if not _rl_before and github_api.rate_limit_seen():
+        return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 

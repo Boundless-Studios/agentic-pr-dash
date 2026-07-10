@@ -125,6 +125,52 @@ def test_run_mutation_honors_retry_after_and_retries_once(monkeypatch):
     assert slept == [3]
 
 
+def test_run_mutation_restamps_pacing_after_retry_after_retry(monkeypatch):
+    """After a Retry-After sleep+retry succeeds, the pacing timestamp must
+    reflect the RETRY time — not the pre-sleep attempt — so the next mutation
+    still waits a full interval instead of firing immediately and reintroducing
+    the secondary-limit burst (BOU-1923 review #3)."""
+    github_api.reset_mutation_pacing()
+    monkeypatch.setattr(github_api, "_MUTATION_MIN_INTERVAL_S", 1.0)
+
+    clock = {"t": 100.0}
+    monkeypatch.setattr(github_api.time, "monotonic", lambda: clock["t"])
+
+    def _fake_sleep(seconds: float) -> None:
+        clock["t"] += seconds
+
+    monkeypatch.setattr(github_api.time, "sleep", _fake_sleep)
+
+    # First mutation: rate-limited with Retry-After: 3, retry succeeds.
+    monkeypatch.setattr(
+        github_api, "_run",
+        lambda *a, **k: _cp(returncode=1, stderr="secondary rate limit\nRetry-After: 3"),
+    )
+    monkeypatch.setattr(github_api, "_run_once", lambda *a, **k: _cp(stdout="{}", returncode=0))
+
+    github_api._run_mutation(["gh", "api", "graphql"])
+
+    # The Retry-After sleep advanced monotonic from 100 -> 103; the stamp must
+    # be 103 (the retry time), NOT the 100 set before the sleep.
+    assert github_api._LAST_MUTATION_MONOTONIC == 103.0
+
+    # A subsequent, non-rate-limited mutation ~0.4s later must still pace: only
+    # 0.4s of the 1.0s interval has elapsed since the retry, so it sleeps ~0.6s.
+    monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp(returncode=0))
+    clock["t"] += 0.4  # -> 103.4
+    slept2: list[float] = []
+
+    def _sleep2(seconds: float) -> None:
+        slept2.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(github_api.time, "sleep", _sleep2)
+
+    github_api._run_mutation(["gh", "api", "graphql"])
+
+    assert slept2 == pytest.approx([1.0 - 0.4])
+
+
 def test_run_mutation_caps_large_retry_after(monkeypatch):
     github_api.reset_mutation_pacing()
     monkeypatch.setattr(github_api, "_MUTATION_MIN_INTERVAL_S", 0.0)
