@@ -370,6 +370,7 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     # No foreign owner → work is surfaced AND the fix lease is stamped.
     monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
+    monkeypatch.setattr(_maint, "build_maintenance_summary", lambda pr: "SUMMARY")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 10
     assert "PR_NUMBER=7" in text2

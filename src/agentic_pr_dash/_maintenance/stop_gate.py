@@ -53,6 +53,28 @@ def _extract_pr_number(text: str) -> str:
     return ""
 
 
+def _extract_summary(text: str) -> str:
+    """Pull the trailing SUMMARY=<...> the check/detached-entry appends, or '' if absent."""
+    for line in reversed(text.splitlines()):
+        if line.startswith("SUMMARY="):
+            return line[len("SUMMARY="):].strip()
+    return ""
+
+
+def _write_stop_payload(cwd: str, content: str) -> str | None:
+    """Write the full verbose stop-block to the payload file (BOU-1947).
+
+    Returns the absolute path as a string, or None if the write failed.
+    """
+    try:
+        path = load_config(cwd).state_dir_for(cwd) / "pr-watch.stop-payload.md"
+        os.makedirs(path.parent, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+    except OSError:
+        return None
+
+
 def _build_stop_block(pending: list[tuple[str, str]]) -> str:
     lines = [
         "[pr-watch] Open PR(s) you own have pending review/CI work. Address it "
@@ -75,6 +97,23 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
             f"(Passing the post-fix head as --baseline leaves threads unresolved.)"
         )
         lines.append("")
+    return "\n".join(lines)
+
+
+def _build_concise_stop_block(pending: list[tuple[str, str]], payload_path: str) -> str:
+    """Render the concise stderr block: one summary line per pending entry plus
+    a pointer to the full verbose payload file (BOU-1947)."""
+    lines = [
+        f"[pr-watch] Open PR(s) you own have pending review/CI work. Full detail "
+        f"written to {payload_path}.\n"
+    ]
+    for _path, text in pending:
+        lines.append(f"  - {_extract_summary(text) or text.splitlines()[0]}")
+    lines.append("")
+    lines.append(
+        f"Full instructions (comment bodies, baseline capture, per-PR complete "
+        f"commands): read {payload_path}"
+    )
     return "\n".join(lines)
 
 
@@ -266,7 +305,21 @@ def _stop_gate_impl(args) -> int:
     # executor error) ABOVE the generic pending prompt (codex PR #50 review).
     if escalated_owned:
         print(_build_escalation_block(escalated_owned), file=sys.stderr)
-    print(_build_stop_block(pending), file=sys.stderr)
+
+    verbose_text = _build_stop_block(pending)
+    # Write the full prompt (comment bodies, baseline-capture boilerplate, and
+    # per-PR complete commands) to a payload file instead of stderr, and print
+    # only a concise per-PR summary there — a stop-blocked agent otherwise reads
+    # a wall of PR detail on every re-stop (BOU-1947). Fail-open to the verbose
+    # block on stderr if the payload can't be written.
+    try:
+        payload_path = _write_stop_payload(cwd, verbose_text)
+    except OSError:
+        payload_path = None
+    if payload_path is not None:
+        print(_build_concise_stop_block(pending, payload_path), file=sys.stderr)
+    else:
+        print(verbose_text, file=sys.stderr)
 
     threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
     if count >= threshold:
@@ -279,13 +332,22 @@ def _stop_gate_impl(args) -> int:
         _save_stop_state(cwd, {"ts": now})
         return 0
 
-    print(
-        "[pr-watch] Address the items above (commit + push to each EXISTING "
-        "branch), run the per-worktree `complete` command shown in that section, "
-        "then try stopping again. If you cannot resolve an item yourself, tell "
-        "the user.",
-        file=sys.stderr,
-    )
+    if payload_path is not None:
+        print(
+            "[pr-watch] Read the payload file for full instructions, address the "
+            "items (commit + push to each EXISTING branch), run the per-worktree "
+            "`complete` command it shows, then try stopping again. If you cannot "
+            "resolve an item yourself, tell the user.",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[pr-watch] Address the items above (commit + push to each EXISTING "
+            "branch), run the per-worktree `complete` command shown in that section, "
+            "then try stopping again. If you cannot resolve an item yourself, tell "
+            "the user.",
+            file=sys.stderr,
+        )
     return 2
 
 

@@ -204,12 +204,26 @@ def _detached_pending_entry(r: dict) -> tuple[str, str]:
     if r.get("merge_conflict"):
         why.append("merge conflict")
     tag = " [P1]" if r["p1"] else ""
+    # Concise-summary parts use "unresolved review comment(s)" wording to match
+    # build_maintenance_summary; the verbose `why` list above keeps its
+    # existing "thread(s)" wording untouched (BOU-1947).
+    summary_why = []
+    if r["unresolved_threads"]:
+        summary_why.append(f"{r['unresolved_threads']} unresolved review comment(s)")
+    if r["ci_failing"]:
+        summary_why.append("failing CI")
+    if r.get("changes_requested"):
+        summary_why.append("review-level CHANGES_REQUESTED")
+    if r.get("merge_conflict"):
+        summary_why.append("merge conflict")
+    summary = f"PR #{r['pr']}{tag} (no worktree): {', '.join(summary_why)}"
     text = (
         f"PR #{r['pr']}{tag} (No worktree / Awaiting Fixes): {r['url']}\n"
         f"  needs: {', '.join(why)}\n"
         f"  This PR's worktree was torn down. Recreate it from the branch "
         f"({r['branch'] or '<branch>'}) to fix, or explicitly hand it off — "
         f"do NOT leave it unmonitored.\n"
+        f"SUMMARY={summary}\n"
         f"PR_NUMBER={r['pr']}"
     )
     return (f"(no worktree) PR #{r['pr']}", text)

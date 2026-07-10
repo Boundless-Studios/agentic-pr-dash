@@ -251,7 +251,10 @@ def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(
         _worktree_check_mod, "_check_worktree",
-        lambda path, sid, *, claim=True: (10, "needs review\nPR_NUMBER=99")
+        lambda path, sid, *, claim=True: (
+            10,
+            "needs review\nSUMMARY=PR #99 (br): 1 unresolved review comment(s), CI green\nPR_NUMBER=99",
+        )
     )
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
 

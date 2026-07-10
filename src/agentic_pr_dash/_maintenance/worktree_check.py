@@ -352,7 +352,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
 
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    text = f"{prompt}\nPR_NUMBER={pr.number}"
+    summary = maintenance.build_maintenance_summary(pr)
+    text = f"{prompt}\nSUMMARY={summary}\nPR_NUMBER={pr.number}"
     if coordinator_claim_id is not None:
         text += (
             f"\nCOORDINATOR_CLAIM_ID={coordinator_claim_id}"
