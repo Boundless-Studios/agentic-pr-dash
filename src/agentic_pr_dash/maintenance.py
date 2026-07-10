@@ -223,6 +223,23 @@ def discover_active_primary_claude(worktree_path: str) -> list[AgentProcess]:
     return discover_active_primary_feature_pipeline_agents(worktree_path)
 
 
+def build_maintenance_summary(pr: PRData) -> str:
+    """One-line summary of a PR's pending maintenance work (BOU-1947 concise stop gate)."""
+    parts: list[str] = []
+    unresolved = len(pr.review_comments)
+    if unresolved:
+        parts.append(f"{unresolved} unresolved review comment(s)")
+    if pr.failing_checks:
+        parts.append(f"{len(pr.failing_checks)} failing CI check(s)")
+    else:
+        parts.append("CI green")
+    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
+        parts.append("merge conflict")
+    if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
+        parts.append("changes requested")
+    return f"PR #{pr.number} ({pr.branch}): {', '.join(parts)}"
+
+
 def build_maintenance_prompt(
     pr: PRData,
     *,

@@ -6,6 +6,7 @@ It drives the real mc.main(['stop-gate', ...]) and asserts the real exit code +
 stderr. Only the GitHub boundary (review threads / PR state) and the worktree-
 enumeration boundary (worktree gone) are faked.
 """
+from agentic_pr_dash import config
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_ledger as sl
 from agentic_pr_dash import github_api
@@ -36,7 +37,11 @@ def test_detached_pr_with_review_comment_blocks_stop(tmp_path, monkeypatch, caps
     rc = mc.main(["stop-gate", "--session-id", "sess-X", "--cwd", str(tmp_path)])
     err = capsys.readouterr().err
     assert rc == 2                      # blocks the stop
-    assert "777" in err and "pull/777" in err
+    assert "777" in err                 # concise stderr names the PR
+    # Full detail (including the PR URL) now lives in the payload file, not
+    # stderr, per the BOU-1947 concise stop gate (RED: test_stop_gate_concise.py).
+    payload = config.load(str(tmp_path)).state_dir_for(tmp_path) / "pr-watch.stop-payload.md"
+    assert "pull/777" in payload.read_text(encoding="utf-8")
 
 
 def test_detached_pr_with_review_level_changes_requested_blocks_stop(
