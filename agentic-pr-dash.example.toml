@@ -22,6 +22,13 @@ discovery_names = ["claude", "codex"]
 # runner-fleet panel entirely (the default for projects on GitHub-hosted runners).
 # runner_label = "my-ci-fleet"
 
+# GitHub login whose open PRs the dashboard/maintenance tooling tracks.
+# Default "@me" is right when gh runs as the human operator. REQUIRED when
+# automation uses an isolated identity (a GitHub App installation token in
+# GH_TOKEN): there "@me" is the App bot, which authored nothing, so the board
+# goes silently empty and waiters see no PRs. Env: AGENTIC_PR_DASH_PR_AUTHOR.
+# pr_author = "your-github-login"
+
 # Ownership lease tuning (seconds).
 lease_seconds = 1800
 heartbeat_ttl_seconds = 600

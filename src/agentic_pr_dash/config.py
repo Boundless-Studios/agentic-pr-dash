@@ -113,6 +113,18 @@ class Config:
     """Shell command template the stop-gate surfaces when spawning the in-session
     feedback waiter; ``{cwd}`` and ``{session_id}`` are substituted at render time."""
 
+    pr_author: str = "@me"
+    """GitHub login whose open PRs the dashboard/maintenance tooling tracks.
+
+    Every PR-discovery path runs ``gh pr list --author <pr_author>``. The
+    ``@me`` default is correct when ``gh`` authenticates as the human operator,
+    but under an ISOLATED AUTOMATION IDENTITY — a GitHub App installation
+    token in ``GH_TOKEN`` (BOU-1923) — ``@me`` resolves to the App bot, which
+    authored nothing: the board goes silently empty and waiters see no PR to
+    watch. Set this to the operator's login (``pr_author = "ilganeli"``) in
+    ``agentic-pr-dash.toml`` (or ``AGENTIC_PR_DASH_PR_AUTHOR``) whenever the
+    automation identity differs from the PR author."""
+
     fallback_executor: str = ""
     """Shell command template the loop runs when the primary :attr:`executor`
     fails for a PR (non-zero exit or a failed spawn); ``{prompt}`` is substituted.
@@ -360,6 +372,7 @@ def load(cwd: str | None = None) -> Config:
         executor=_env("EXECUTOR") or proj.get("executor") or "",
         fallback_executor=_env("FALLBACK_EXECUTOR") or proj.get("fallback_executor") or "",
         await_command=await_command,
+        pr_author=_env("PR_AUTHOR") or proj.get("pr_author") or "@me",
         maintenance_loop_pidfile=loop_pidfile,
         maintenance_loop_machine_wide=machine_wide,
         maintenance_repo_roots=tuple(maintenance_repo_roots),

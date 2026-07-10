@@ -390,7 +390,14 @@ def last_list_open_prs_failure() -> GhFailure | None:
 
 
 def list_open_prs(cwd: str | None = None) -> list[dict] | None:
-    """List all open PRs authored by the current user.
+    """List all open PRs authored by the tracked PR author.
+
+    The author defaults to ``@me`` but is configurable (``pr_author`` in
+    ``agentic-pr-dash.toml`` / ``AGENTIC_PR_DASH_PR_AUTHOR``): under an
+    isolated automation identity (a GitHub App installation token in
+    ``GH_TOKEN``, BOU-1923) ``@me`` resolves to the App bot — which authored
+    no PRs — so every discovery path silently returns ``[]`` and the board
+    empties. See :attr:`agentic_pr_dash.config.Config.pr_author`.
 
     Returns ``None`` when the underlying ``gh`` call fails (e.g. the GitHub
     API is rate-limited or unreachable) so callers can distinguish a genuine
@@ -401,9 +408,11 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     :func:`last_list_open_prs_failure` so the caller can surface the underlying
     cause instead of a bare "gh unavailable".
     """
+    from .config import load as _load_config  # noqa: PLC0415 — deferred to avoid import cycles
+
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
-        "gh", "pr", "list", "--author", "@me", "--state", "open",
+        "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
         "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
@@ -516,8 +525,16 @@ def _release_snapshot_lock(fd: "int | None") -> None:
             pass
 
 
-def _read_pr_snapshot(path: Path, ttl_s: float) -> list[dict] | None:
+def _read_pr_snapshot(path: Path, ttl_s: float, author: str) -> list[dict] | None:
     """Return the cached PR list if a fresh-enough snapshot exists, else ``None``.
+
+    The snapshot is PARTITIONED BY AUTHOR: a snapshot fetched for a different
+    ``pr_author`` (including legacy snapshots written before the ``author``
+    field existed) is a MISS, never a hit. Without this, changing ``pr_author``
+    (e.g. pinning the operator login after an App-token process cached a fresh
+    ``@me``-as-bot ``[]``) would serve the wrong author's list until the TTL
+    expired — making stop/await resolution miss the operator's PR (PR #69
+    review).
 
     Any read/parse failure (missing file, torn write from a concurrent
     sibling process, unexpected shape) is treated as a cache miss rather than
@@ -536,12 +553,14 @@ def _read_pr_snapshot(path: Path, ttl_s: float) -> list[dict] | None:
     prs = data.get("prs")
     if not isinstance(fetched_at, (int, float)) or not isinstance(prs, list):
         return None
+    if data.get("author") != author:
+        return None
     if (time.time() - fetched_at) > ttl_s:
         return None
     return prs
 
 
-def _write_pr_snapshot(path: Path, prs: list[dict]) -> None:
+def _write_pr_snapshot(path: Path, prs: list[dict], author: str) -> None:
     """Atomically write the snapshot (temp file + rename). Best-effort: a
     failure to persist the cache must never fail the caller's real fetch."""
     try:
@@ -554,7 +573,7 @@ def _write_pr_snapshot(path: Path, prs: list[dict]) -> None:
         return
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"fetched_at": time.time(), "prs": prs}, fh)
+            json.dump({"fetched_at": time.time(), "prs": prs, "author": author}, fh)
         os.replace(tmp, path)
     except OSError:
         try:
@@ -585,17 +604,22 @@ def list_open_prs_cached(
     briefly, then re-read the now-fresh snapshot (see
     :func:`_acquire_snapshot_lock`).
     """
+    from .config import load as _load_config  # noqa: PLC0415 — deferred to avoid import cycles
+
     path = _pr_snapshot_path(cwd)
+    # The snapshot is keyed by the configured PR author (PR #69 review): a hit
+    # is only a hit for the SAME author the caller would fetch for.
+    author = _load_config(cwd).pr_author
     effective_ttl = _PR_SNAPSHOT_TTL_S if ttl_s is None else ttl_s
     if force:
         # The caller demands current state — skip the cache/lock entirely.
         prs = list_open_prs(cwd)
         if prs is None:
             return None
-        _write_pr_snapshot(path, prs)
+        _write_pr_snapshot(path, prs, author)
         return prs
 
-    cached = _read_pr_snapshot(path, effective_ttl)
+    cached = _read_pr_snapshot(path, effective_ttl, author)
     if cached is not None:
         return cached
 
@@ -608,13 +632,13 @@ def list_open_prs_cached(
         # fresh snapshot, in which case we skip the redundant fetch. This
         # re-check ALSO covers the ``lock is None`` degraded path — a timed-out
         # waiter usually finds the holder's fresh write here.
-        cached = _read_pr_snapshot(path, effective_ttl)
+        cached = _read_pr_snapshot(path, effective_ttl, author)
         if cached is not None:
             return cached
         prs = list_open_prs(cwd)
         if prs is None:
             return None
-        _write_pr_snapshot(path, prs)
+        _write_pr_snapshot(path, prs, author)
         return prs
     finally:
         _release_snapshot_lock(lock)

@@ -208,7 +208,12 @@ def _pr_head_branch(cwd: str, pr_number: int):
 def _gh_pr_list_json(
     cwd: str, extra_args: list[str], fields: str, timeout: float = 15
 ) -> list | None:
-    """Run `gh pr list --author @me --state open --json <fields> <extra>`.
+    """Run `gh pr list --author <pr_author> --state open --json <fields> <extra>`.
+
+    The author comes from config (``pr_author``, default ``@me``) — under an
+    App-token automation identity ``@me`` is the App bot and every PR-state
+    probe would silently see no PRs (BOU-1923); see
+    :attr:`agentic_pr_dash.config.Config.pr_author`.
 
     ``timeout`` bounds the gh subprocess; Stop-context callers pass the remaining
     reconciliation budget so a single slow root cannot blow the Stop-hook
@@ -219,11 +224,13 @@ def _gh_pr_list_json(
     """
     import json  # noqa: PLC0415
 
+    from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
+
     if timeout <= 0:
         return None
     try:
         result = subprocess.run(
-            ["gh", "pr", "list", "--author", "@me", "--state", "open", *extra_args, "--json", fields],
+            ["gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open", *extra_args, "--json", fields],
             cwd=cwd,
             capture_output=True,
             text=True,

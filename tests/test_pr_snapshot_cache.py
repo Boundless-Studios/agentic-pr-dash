@@ -35,7 +35,7 @@ def test_cache_hit_avoids_gh_call(tmp_path, monkeypatch):
 
     cached = _fake_prs(2)
     path = github_api._pr_snapshot_path(str(tmp_path))
-    github_api._write_pr_snapshot(path, cached)
+    github_api._write_pr_snapshot(path, cached, "@me")
 
     result = github_api.list_open_prs_cached(str(tmp_path))
 
@@ -50,7 +50,7 @@ def test_cache_hit_within_custom_ttl(tmp_path, monkeypatch):
     ))
     cached = _fake_prs(1)
     path = github_api._pr_snapshot_path(str(tmp_path))
-    github_api._write_pr_snapshot(path, cached)
+    github_api._write_pr_snapshot(path, cached, "@me")
 
     result = github_api.list_open_prs_cached(str(tmp_path), ttl_s=3600)
 
@@ -139,7 +139,7 @@ def test_failed_forced_refetch_leaves_prior_snapshot_untouched(tmp_path, monkeyp
     clobber (or otherwise corrupt) whatever snapshot was already on disk."""
     prior = _fake_prs(1)
     path = github_api._pr_snapshot_path(str(tmp_path))
-    github_api._write_pr_snapshot(path, prior)
+    github_api._write_pr_snapshot(path, prior, "@me")
 
     monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: None)
 
@@ -157,7 +157,7 @@ def test_failed_forced_refetch_leaves_prior_snapshot_untouched(tmp_path, monkeyp
 def test_force_bypasses_warm_cache(tmp_path, monkeypatch):
     old = _fake_prs(1)
     path = github_api._pr_snapshot_path(str(tmp_path))
-    github_api._write_pr_snapshot(path, old)
+    github_api._write_pr_snapshot(path, old, "@me")
 
     new = _fake_prs(9)
     calls = {"n": 0}
@@ -199,7 +199,7 @@ def test_concurrent_miss_rechecks_under_lock_and_skips_fetch(tmp_path, monkeypat
     # under-lock re-check HITS.
     reads = {"n": 0}
 
-    def _read(p, ttl):
+    def _read(p, ttl, author):
         reads["n"] += 1
         return None if reads["n"] == 1 else fresh
 
@@ -266,7 +266,7 @@ def _warm_snapshot(tmp_path, branch: str, number: int) -> None:
         "baseRefName": "main", "isDraft": False,
         "mergeStateStatus": "CLEAN", "mergeable": "MERGEABLE",
     }]
-    github_api._write_pr_snapshot(github_api._pr_snapshot_path(str(tmp_path)), snap)
+    github_api._write_pr_snapshot(github_api._pr_snapshot_path(str(tmp_path)), snap, "@me")
 
 
 def test_warm_cache_plus_gh_unavailable_detail_is_unavailable(tmp_path, monkeypatch):
@@ -345,3 +345,77 @@ def test_resolve_by_number_warm_cache_plus_outage_is_unavailable(tmp_path, monke
     result = pr_state._resolve_pr_by_number(42, str(tmp_path))
 
     assert result is pr_state._GH_UNAVAILABLE
+
+
+# --------------------------------------------------------------------------- #
+# snapshot is partitioned by pr_author (PR #69 review)
+# --------------------------------------------------------------------------- #
+
+def test_author_mismatch_is_a_cache_miss(tmp_path, monkeypatch):
+    """A fresh snapshot fetched for a DIFFERENT author must not be served.
+
+    Regression for the PR #69 review: after pr_author is pinned (e.g.
+    "ilganeli" under the App automation identity), a fresh "@me"-fetched []
+    snapshot from an older process must not make stop/await resolution miss
+    the operator's PR until the TTL expires.
+    """
+    from agentic_pr_dash import config
+
+    stale_author_prs = []  # what @me-as-App-bot saw: nothing
+    path = github_api._pr_snapshot_path(str(tmp_path))
+    github_api._write_pr_snapshot(path, stale_author_prs, "@me")
+
+    (tmp_path / "agentic-pr-dash.toml").write_text(
+        'pr_author = "ilganeli"\n', encoding="utf-8"
+    )
+    config.load.cache_clear()
+    try:
+        fresh = _fake_prs(3)
+        calls = {"n": 0}
+
+        def _fake_list(cwd=None):
+            calls["n"] += 1
+            return fresh
+
+        monkeypatch.setattr(github_api, "list_open_prs", _fake_list)
+
+        result = github_api.list_open_prs_cached(str(tmp_path))
+
+        assert result == fresh  # the @me snapshot was NOT served
+        assert calls["n"] == 1  # a real fetch happened despite the fresh file
+        on_disk = json.loads(path.read_text(encoding="utf-8"))
+        assert on_disk["author"] == "ilganeli"  # rewritten under the new key
+    finally:
+        config.load.cache_clear()
+
+
+def test_legacy_snapshot_without_author_field_is_a_miss(tmp_path, monkeypatch):
+    """Snapshots written before the author field existed are treated as a miss
+    (one extra fetch), never as a hit for any author."""
+    import time as _time
+
+    path = github_api._pr_snapshot_path(str(tmp_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"fetched_at": _time.time(), "prs": _fake_prs(2)}),
+        encoding="utf-8",
+    )
+
+    fresh = _fake_prs(5)
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: fresh)
+
+    assert github_api.list_open_prs_cached(str(tmp_path)) == fresh
+
+
+def test_same_author_hit_still_skips_gh(tmp_path, monkeypatch):
+    """Partitioning must not break the herd-suppression hit path."""
+    cached = _fake_prs(2)
+    path = github_api._pr_snapshot_path(str(tmp_path))
+    github_api._write_pr_snapshot(path, cached, "@me")
+
+    monkeypatch.setattr(
+        github_api, "list_open_prs",
+        lambda cwd=None: (_ for _ in ()).throw(AssertionError("warm same-author cache: no list call")),
+    )
+
+    assert github_api.list_open_prs_cached(str(tmp_path)) == cached
