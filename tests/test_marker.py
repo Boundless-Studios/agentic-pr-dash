@@ -343,6 +343,84 @@ def test_collect_owned_skips_foreign_owner_with_fresh_heartbeat_even_dead_pid(tm
     assert mc._marker_session_id(str(foreign)) == "foreign-session"
 
 
+def test_collect_owned_never_adopts_dead_foreign_marker(tmp_path, monkeypatch):
+    """BOU-1953 root cause #3 regression: a worktree that already carries a
+    DIFFERENT session's marker must NOT be re-stamped with our session_id, even
+    when that foreign owner is genuinely dead (stale heartbeat, no active fix
+    lease, dead pid) and the branch's PR happens to be one of "my" open GitHub
+    PRs (the same GH login as us). ``git worktree list`` from a shared-repo
+    anchor enumerates sibling worktrees from unrelated epics/branches that a
+    past, now-finished session armed for itself — that marker must be left
+    alone here; genuine dead-session PR recovery is `_adopt_orphan_prs`'s job,
+    gated on the durable session registry, not this filesystem-marker path.
+    """
+    foreign = tmp_path / "interactive-scenes-p4-interact"
+    foreign.mkdir()
+    marker = config.load(str(foreign)).watch_marker_for(str(foreign))
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        "\n".join(
+            [
+                "pr=202",
+                "session_id=old-finished-session",
+                "pid=2147480000",
+                "armed_at=2026-01-01T00:00:00Z",
+                "last_heartbeat=2026-01-01T00:05:00Z",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_iter_worktrees_with_branch",
+        lambda cwd: [(str(foreign), "interactive-scenes-p4-interact")],
+    )
+    # This branch's PR is genuinely one of "my" (same GH login) open PRs — that
+    # alone must not be sufficient evidence THIS session ever armed it.
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_list_my_open_prs",
+        lambda cwd, timeout=15: {"interactive-scenes-p4-interact": (202, False)},
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set()
+    )
+
+    result = mc._collect_owned_worktrees("current-session-961d5c60", str(tmp_path), 555)
+
+    assert result == []
+    assert mc._marker_session_id(str(foreign)) == "old-finished-session"
+
+
+def test_collect_owned_still_refreshes_worktree_this_session_armed(tmp_path, monkeypatch):
+    """A worktree THIS session actually armed stays owned and its heartbeat/pr
+    stays refreshable — the new foreign-marker guard must not touch the
+    already-ours path (regression companion to the adoption-blocking fix)."""
+    own = tmp_path / "own-epic"
+    own.mkdir()
+    mc._write_arm_marker(str(own), "current-session-961d5c60", 555, 101)
+
+    monkeypatch.setattr(
+        _worktrees_mod, "_iter_worktrees_with_branch", lambda cwd: [(str(own), "own-branch")]
+    )
+    # Branch's open PR now differs (102) — the already-ours path must still
+    # rewrite it in place (preflight parity), unaffected by the new guard.
+    monkeypatch.setattr(
+        _worktrees_mod, "_list_my_open_prs", lambda cwd, timeout=15: {"own-branch": (102, False)}
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set()
+    )
+
+    result = mc._collect_owned_worktrees("current-session-961d5c60", str(tmp_path), 555)
+
+    assert str(own) in result
+    assert mc._marker_session_id(str(own)) == "current-session-961d5c60"
+    assert _worktrees_mod._marker_pr(str(own)) == "102"
+
+
 def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     """When work exists but a live independent session owns the worktree, check
     DEFERS (exit 0) instead of declaring work (exit 10) — the heal/safety net for
