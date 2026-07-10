@@ -240,6 +240,48 @@ def test_resolve_fallback_env_uses_configured_token(monkeypatch):
     assert env["GH_TOKEN"] == "machine-user-pat"
 
 
+def test_resolve_fallback_env_drops_github_token_too_ambient(monkeypatch):
+    """gh falls back GH_TOKEN -> GITHUB_TOKEN; GITHUB_TOKEN is commonly the SAME
+    App token (GitHub Actions / wrapper shells). Dropping only GH_TOKEN would let
+    gh silently reuse GITHUB_TOKEN and stay FORBIDDEN. Ambient case: NEITHER."""
+    monkeypatch.setenv("GH_TOKEN", "app-installation-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "app-installation-token")
+    monkeypatch.delenv("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN", raising=False)
+
+    env = github_api._resolve_fallback_env()
+
+    assert env is not None
+    assert "GH_TOKEN" not in env
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_resolve_fallback_env_drops_github_token_when_resolve_token_set(monkeypatch):
+    """Resolve-token case: GH_TOKEN=the PAT and GITHUB_TOKEN removed so it can't
+    shadow the PAT we just set."""
+    monkeypatch.setenv("GH_TOKEN", "app-installation-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "app-installation-token")
+    monkeypatch.setenv("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN", "machine-user-pat")
+
+    env = github_api._resolve_fallback_env()
+
+    assert env is not None
+    assert env["GH_TOKEN"] == "machine-user-pat"
+    assert "GITHUB_TOKEN" not in env
+
+
+def test_resolve_fallback_env_local_no_global_github_token_leak(monkeypatch):
+    """The per-call env override never touches the real process environment."""
+    monkeypatch.setenv("GH_TOKEN", "app-installation-token")
+    monkeypatch.setenv("GITHUB_TOKEN", "app-installation-token")
+    monkeypatch.delenv("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN", raising=False)
+
+    github_api._resolve_fallback_env()
+
+    import os as _os
+    assert _os.environ["GH_TOKEN"] == "app-installation-token"
+    assert _os.environ["GITHUB_TOKEN"] == "app-installation-token"
+
+
 # --------------------------------------------------------------------------- #
 # Fallback log message: printed once, not spammed
 # --------------------------------------------------------------------------- #

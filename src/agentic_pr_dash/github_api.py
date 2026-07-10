@@ -1308,6 +1308,15 @@ def _resolve_fallback_env() -> dict[str, str] | None:
          `gh`'s ambient/keyring-authenticated identity (the human operator's),
          which CAN resolve threads.
 
+    ``gh`` reads ``GH_TOKEN`` first and ``GITHUB_TOKEN`` second. ``GITHUB_TOKEN``
+    is commonly set to the SAME App/integration token (GitHub Actions injects it;
+    wrapper shells re-export it), so dropping only ``GH_TOKEN`` would let ``gh``
+    silently fall through to ``GITHUB_TOKEN`` — the very App token that just got
+    FORBIDDEN — defeating the fallback. So we ALWAYS remove ``GITHUB_TOKEN`` from
+    the per-call env: in the ambient case it must not shadow the keyring
+    identity, and in the resolve-token case it must not shadow the PAT we set in
+    ``GH_TOKEN``.
+
     Returns ``None`` when ``GH_TOKEN`` isn't set in this process's environment
     to begin with — there's no App token to fall back FROM, so the FORBIDDEN
     has some other cause and retrying with a different env can't help.
@@ -1320,6 +1329,8 @@ def _resolve_fallback_env() -> dict[str, str] | None:
     if "GH_TOKEN" not in os.environ:
         return None
     env = dict(os.environ)
+    # Never let GITHUB_TOKEN shadow the identity we're switching to (see above).
+    env.pop("GITHUB_TOKEN", None)
     resolve_token = os.environ.get("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN")
     if resolve_token:
         env["GH_TOKEN"] = resolve_token
