@@ -68,3 +68,16 @@ def _isolate_mutation_pacing():
     github_api.reset_mutation_pacing()
     yield
     github_api.reset_mutation_pacing()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_resolve_fallback_logged():
+    """Reset github_api's once-per-process resolve-fallback log flag (BOU-1974).
+
+    Without resetting this, a test earlier in the run that triggers the
+    App-token FORBIDDEN fallback would leave the flag set, so a later test
+    asserting on the fallback log message would see nothing printed.
+    """
+    github_api.reset_resolve_fallback_logged()
+    yield
+    github_api.reset_resolve_fallback_logged()

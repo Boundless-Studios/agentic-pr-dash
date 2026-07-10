@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.error
@@ -253,10 +254,12 @@ def rate_limit_seen() -> bool:
     return _RATE_LIMIT_SEEN
 
 
-def _run_once(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
+def _run_once(
+    cmd: list[str], timeout_s: int = 20, cwd: str | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd,
+            cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd, env=env,
         )
     except subprocess.TimeoutExpired as exc:
         # Preserve WHY the call failed instead of returning a blank stderr that
@@ -277,7 +280,9 @@ def _run_once(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> su
         return subprocess.CompletedProcess(cmd, 1, "", f"{type(exc).__name__}: {exc}")
 
 
-def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subprocess.CompletedProcess:
+def _run(
+    cmd: list[str], timeout_s: int = 20, cwd: str | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run a gh command, retrying transient connectivity failures with backoff.
 
     Non-connectivity failures (auth, bad args) and successes return immediately;
@@ -285,8 +290,13 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
     ``_GH_RETRY_ATTEMPTS`` total with exponential backoff. This makes the reach
     robust rather than merely diagnosable — BOU-1694's AC that the completion
     path "can be retried successfully when direct gh works from the same cwd."
+
+    ``env``, when given, REPLACES the subprocess environment entirely (as
+    ``subprocess.run`` does) — callers pass a full ``os.environ`` copy with
+    targeted overrides, never a partial dict. ``None`` (the default) inherits
+    this process's environment unchanged.
     """
-    result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+    result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
     for attempt in range(1, _GH_RETRY_ATTEMPTS):
         if _is_transient_connectivity_failure(result):
             time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
@@ -304,7 +314,7 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
             time.sleep(_rate_limit_backoff_seconds(result.stderr or "", attempt))
         else:
             return result
-        result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+        result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
     # Exhausted retries. Record a persistent rate-limit so a tick-based caller
     # can tell "GitHub was quota-limited" from a hard failure (BOU-1921 #62).
     if _is_rate_limit_failure(result):
@@ -1244,7 +1254,9 @@ def _pace_mutation() -> None:
     _LAST_MUTATION_MONOTONIC = now
 
 
-def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -> subprocess.CompletedProcess:
+def _run_mutation(
+    cmd: list[str], cwd: str | None = None, timeout_s: int = 20, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess:
     """Run a content-mutating ``gh`` call with pacing + a Retry-After-aware retry.
 
     Paces against the previous mutation (see :func:`_pace_mutation`), then
@@ -1254,15 +1266,19 @@ def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -
     that long (capped at ``_GH_RATELIMIT_MAX_SLEEP_S``) and retry exactly once
     more — mutations are not idempotent-safe to retry indefinitely, but a
     single bounded extra attempt clears the common secondary-limit case.
+
+    ``env`` is forwarded to :func:`_run` / :func:`_run_once` unchanged (a full
+    replacement environment, or ``None`` to inherit) — see :func:`resolve_review_thread`
+    for the one caller that overrides it.
     """
     global _LAST_MUTATION_MONOTONIC
     _pace_mutation()
-    result = _run(cmd, timeout_s=timeout_s, cwd=cwd)
+    result = _run(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
     if _is_rate_limit_failure(result):
         hint = _retry_after_seconds(result.stderr or "")
         if hint is not None:
             time.sleep(min(hint, _GH_RATELIMIT_MAX_SLEEP_S))
-            result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+            result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
             # The Retry-After sleep + retry advanced wall-clock well past the
             # pacing stamp set in _pace_mutation(). Re-stamp to the retry time
             # so the NEXT mutation still waits a full interval — otherwise it
@@ -1273,18 +1289,114 @@ def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -
     return result
 
 
+# GitHub App installation tokens (the BOU-1923 automation identity) cannot call
+# `resolveReviewThread` over GraphQL — GitHub answers with a FORBIDDEN GraphQL
+# error even when the App has full pull-request permissions. This is a
+# documented platform limitation of GitHub Apps, not a missing scope, so no
+# amount of permission-granting fixes it. Left unhandled, the detached
+# maintenance loop can read threads and post comments under the App token but
+# never actually resolve them — it re-services already-fixed PRs forever and
+# never converges. The substrings below are how `gh api graphql` reports it.
+_FORBIDDEN_INTEGRATION_STDERR_PATTERNS = (
+    "not accessible by integration",
+    "resource not accessible by integration",
+)
+
+# Logged once per process, not once per PR/thread, so a loop resolving many
+# threads under the App token doesn't spam stderr on every single one.
+_RESOLVE_FALLBACK_LOGGED = False
+
+
+def reset_resolve_fallback_logged() -> None:
+    """Reset the resolve-fallback once-per-process log flag (test isolation)."""
+    global _RESOLVE_FALLBACK_LOGGED
+    _RESOLVE_FALLBACK_LOGGED = False
+
+
+def _is_forbidden_integration_failure(result: subprocess.CompletedProcess) -> bool:
+    """True when a failed gh call is GitHub's App-token GraphQL resolve block."""
+    if result.returncode == 0:
+        return False
+    stderr = (result.stderr or "").lower()
+    return any(pat in stderr for pat in _FORBIDDEN_INTEGRATION_STDERR_PATTERNS)
+
+
+def _resolve_fallback_env() -> dict[str, str] | None:
+    """Build a per-call environment for retrying a FORBIDDEN resolve mutation.
+
+    Precedence:
+      1. ``AGENTIC_PR_DASH_GH_RESOLVE_TOKEN``, if set — a dedicated
+         resolve-capable identity (e.g. a machine-user PAT) swapped in for
+         ``GH_TOKEN`` so operators don't have to spend a human's quota/session.
+      2. Otherwise, drop ``GH_TOKEN`` entirely so the subprocess falls back to
+         `gh`'s ambient/keyring-authenticated identity (the human operator's),
+         which CAN resolve threads.
+
+    ``gh`` reads ``GH_TOKEN`` first and ``GITHUB_TOKEN`` second. ``GITHUB_TOKEN``
+    is commonly set to the SAME App/integration token (GitHub Actions injects it;
+    wrapper shells re-export it), so dropping only ``GH_TOKEN`` would let ``gh``
+    silently fall through to ``GITHUB_TOKEN`` — the very App token that just got
+    FORBIDDEN — defeating the fallback. So we ALWAYS remove ``GITHUB_TOKEN`` from
+    the per-call env: in the ambient case it must not shadow the keyring
+    identity, and in the resolve-token case it must not shadow the PAT we set in
+    ``GH_TOKEN``.
+
+    Returns ``None`` when ``GH_TOKEN`` isn't set in this process's environment
+    to begin with — there's no App token to fall back FROM, so the FORBIDDEN
+    has some other cause and retrying with a different env can't help.
+
+    Builds a full copy of ``os.environ`` (subprocess.run's ``env=`` replaces
+    the whole environment, it doesn't merge) so this is safe to pass straight
+    to ``_run_mutation`` without touching the real process environment —
+    every other call in this process still sees the original ``GH_TOKEN``.
+    """
+    if "GH_TOKEN" not in os.environ:
+        return None
+    env = dict(os.environ)
+    # Never let GITHUB_TOKEN shadow the identity we're switching to (see above).
+    env.pop("GITHUB_TOKEN", None)
+    resolve_token = os.environ.get("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN")
+    if resolve_token:
+        env["GH_TOKEN"] = resolve_token
+    else:
+        del env["GH_TOKEN"]
+    return env
+
+
 def resolve_review_thread(thread_id: str, cwd: str | None = None) -> bool:
-    """Resolve a review thread via GraphQL mutation."""
-    r = _run_mutation(
-        [
-            "gh", "api", "graphql",
-            "-f", f"query={_RESOLVE_THREAD_MUTATION}",
-            "-F", f"id={thread_id}",
-        ],
-        cwd=cwd,
-        timeout_s=20,
-    )
-    return r.returncode == 0
+    """Resolve a review thread via GraphQL mutation.
+
+    See the App-token FORBIDDEN note above `_FORBIDDEN_INTEGRATION_STDERR_PATTERNS`:
+    when the first attempt fails that way, retry the SAME mutation once with a
+    resolve-capable identity (`_resolve_fallback_env`) instead of giving up —
+    reads/comments stay on the App's own budget either way; only this
+    low-volume resolve call ever uses the fallback identity.
+    """
+    cmd = [
+        "gh", "api", "graphql",
+        "-f", f"query={_RESOLVE_THREAD_MUTATION}",
+        "-F", f"id={thread_id}",
+    ]
+    r = _run_mutation(cmd, cwd=cwd, timeout_s=20)
+    if r.returncode == 0:
+        return True
+    if not _is_forbidden_integration_failure(r):
+        return False
+    fallback_env = _resolve_fallback_env()
+    if fallback_env is None:
+        return False
+    global _RESOLVE_FALLBACK_LOGGED
+    if not _RESOLVE_FALLBACK_LOGGED:
+        print(
+            "agentic-pr-dash: resolveReviewThread FORBIDDEN under GH_TOKEN "
+            "(GitHub App tokens can't resolve review threads — platform "
+            "limitation, not a permission gap) — retrying with a "
+            "resolve-capable identity.",
+            file=sys.stderr,
+        )
+        _RESOLVE_FALLBACK_LOGGED = True
+    r2 = _run_mutation(cmd, cwd=cwd, timeout_s=20, env=fallback_env)
+    return r2.returncode == 0
 
 
 def edit_review_comment(comment_id: int, body: str, cwd: str | None = None) -> bool:
