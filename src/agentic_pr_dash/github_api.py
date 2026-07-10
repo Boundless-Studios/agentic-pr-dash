@@ -17,6 +17,7 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -418,6 +419,107 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
         )
         return None
     _LAST_LIST_OPEN_PRS_FAILURE = None
+    return prs
+
+
+# ---------------------------------------------------------------------------
+# Shared short-TTL PR-list snapshot cache (BOU-1923 Bucket 2 / BOU-1953).
+#
+# The stop-gate, the detached ``pr-maintenance-loop``, and every in-session
+# ``await`` waiter each resolve "my open PRs" on their own cadence (a Stop
+# hook, a poll tick, a per-owned-worktree check) — all via the SAME underlying
+# ``gh pr list --author @me --state open`` call. With several of those active
+# at once (a busy multi-PR session) that multiplies the call volume against one
+# shared GitHub quota, and is part of why the stop-gate can time out under
+# exhaustion (BOU-1953). A short-TTL, state_dir-backed JSON snapshot lets every
+# process within the TTL window reuse ONE fetch instead of firing its own.
+# ---------------------------------------------------------------------------
+
+_PR_SNAPSHOT_FILENAME = "pr-snapshot.json"
+# Default snapshot TTL. Short enough that a caller needing genuinely fresh
+# state (a completion/mutation path) can just pass force=True; long enough
+# that a burst of stop-gate/loop/waiter calls within the same few seconds
+# collapses to a single `gh` call. Env-overridable for tests/tuning.
+_PR_SNAPSHOT_TTL_S = float(os.environ.get("APD_PR_SNAPSHOT_TTL_S", "45"))
+
+
+def _pr_snapshot_path(cwd: str | None) -> Path:
+    return load_config(cwd).state_dir_for(cwd or ".") / _PR_SNAPSHOT_FILENAME
+
+
+def _read_pr_snapshot(path: Path, ttl_s: float) -> list[dict] | None:
+    """Return the cached PR list if a fresh-enough snapshot exists, else ``None``.
+
+    Any read/parse failure (missing file, torn write from a concurrent
+    sibling process, unexpected shape) is treated as a cache miss rather than
+    raised — the caller falls back to a real fetch."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    fetched_at = data.get("fetched_at")
+    prs = data.get("prs")
+    if not isinstance(fetched_at, (int, float)) or not isinstance(prs, list):
+        return None
+    if (time.time() - fetched_at) > ttl_s:
+        return None
+    return prs
+
+
+def _write_pr_snapshot(path: Path, prs: list[dict]) -> None:
+    """Atomically write the snapshot (temp file + rename). Best-effort: a
+    failure to persist the cache must never fail the caller's real fetch."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".pr-snapshot.")
+    except OSError:
+        return
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"fetched_at": time.time(), "prs": prs}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def list_open_prs_cached(
+    cwd: str | None = None, *, force: bool = False, ttl_s: float | None = None,
+) -> list[dict] | None:
+    """``list_open_prs``, sharing one snapshot across processes within a short TTL.
+
+    On a cache HIT (an unexpired snapshot under this worktree's ``state_dir``)
+    returns it WITHOUT calling ``gh``. On MISS/expiry/torn-read, calls
+    :func:`list_open_prs` for real. Preserves the ``None``-vs-``[]`` invariant:
+    a failed real fetch returns ``None`` and never writes (or poisons) the
+    snapshot, so a transient outage can't get cached as "no PRs" and prune
+    tracked state elsewhere.
+
+    ``force=True`` bypasses the cache entirely (read AND write a fresh value)
+    for callers that must see the current state. ``ttl_s`` overrides the
+    module default (`` APD_PR_SNAPSHOT_TTL_S``, default 45s) for one call.
+    """
+    path = _pr_snapshot_path(cwd)
+    effective_ttl = _PR_SNAPSHOT_TTL_S if ttl_s is None else ttl_s
+    if not force:
+        cached = _read_pr_snapshot(path, effective_ttl)
+        if cached is not None:
+            return cached
+    prs = list_open_prs(cwd)
+    if prs is None:
+        return None
+    _write_pr_snapshot(path, prs)
     return prs
 
 
@@ -991,9 +1093,70 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
     return threads
 
 
+# ---------------------------------------------------------------------------
+# Mutation pacing (BOU-1923 Bucket 4).
+#
+# Content mutations — resolving a review thread, replying to one, editing a
+# comment — fired back-to-back (e.g. reply-then-resolve from the completion
+# path) trip GitHub's velocity-triggered *secondary*/abuse rate limit even
+# when the primary quota has headroom. `_run` already retries a rate-limited
+# call with backoff (BOU-1921), but that is reactive; this adds a small
+# PROACTIVE pacing gate so consecutive mutations don't fire back-to-back in
+# the first place, plus one more Retry-After-honoring sleep+retry if a
+# mutation is still rate-limited after `_run`'s own retries are exhausted.
+# ---------------------------------------------------------------------------
+
+_MUTATION_MIN_INTERVAL_S = float(os.environ.get("APD_MUTATION_MIN_INTERVAL_S", "1.0"))
+_LAST_MUTATION_MONOTONIC: float | None = None
+
+
+def reset_mutation_pacing() -> None:
+    """Clear the last-mutation timestamp (test isolation)."""
+    global _LAST_MUTATION_MONOTONIC
+    _LAST_MUTATION_MONOTONIC = None
+
+
+def _pace_mutation() -> None:
+    """Block until at least ``_MUTATION_MIN_INTERVAL_S`` has elapsed since the
+    previous mutation call in this process.
+
+    Single-process pacing: it does not coordinate across processes, but the
+    back-to-back bursts this guards against (reply immediately followed by
+    resolve) originate from one completion-path call in one process."""
+    global _LAST_MUTATION_MONOTONIC
+    now = time.monotonic()
+    if _LAST_MUTATION_MONOTONIC is not None:
+        remaining = _MUTATION_MIN_INTERVAL_S - (now - _LAST_MUTATION_MONOTONIC)
+        if remaining > 0:
+            time.sleep(remaining)
+            now = time.monotonic()
+    _LAST_MUTATION_MONOTONIC = now
+
+
+def _run_mutation(cmd: list[str], cwd: str | None = None, timeout_s: int = 20) -> subprocess.CompletedProcess:
+    """Run a content-mutating ``gh`` call with pacing + a Retry-After-aware retry.
+
+    Paces against the previous mutation (see :func:`_pace_mutation`), then
+    delegates to :func:`_run` (which already retries connectivity/rate-limit
+    failures internally, bounded by ``_GH_RETRY_ATTEMPTS``). If the result is
+    STILL a rate limit afterward and carries a parseable ``Retry-After``, sleep
+    that long (capped at ``_GH_RATELIMIT_MAX_SLEEP_S``) and retry exactly once
+    more — mutations are not idempotent-safe to retry indefinitely, but a
+    single bounded extra attempt clears the common secondary-limit case.
+    """
+    _pace_mutation()
+    result = _run(cmd, timeout_s=timeout_s, cwd=cwd)
+    if _is_rate_limit_failure(result):
+        hint = _retry_after_seconds(result.stderr or "")
+        if hint is not None:
+            time.sleep(min(hint, _GH_RATELIMIT_MAX_SLEEP_S))
+            result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd)
+    return result
+
+
 def resolve_review_thread(thread_id: str, cwd: str | None = None) -> bool:
     """Resolve a review thread via GraphQL mutation."""
-    r = _run(
+    r = _run_mutation(
         [
             "gh", "api", "graphql",
             "-f", f"query={_RESOLVE_THREAD_MUTATION}",
@@ -1007,7 +1170,7 @@ def resolve_review_thread(thread_id: str, cwd: str | None = None) -> bool:
 
 def edit_review_comment(comment_id: int, body: str, cwd: str | None = None) -> bool:
     """Edit an existing review comment in place via REST PATCH."""
-    r = _run(
+    r = _run_mutation(
         [
             "gh", "api", "-X", "PATCH",
             f"repos/{{owner}}/{{repo}}/pulls/comments/{comment_id}",
@@ -2138,7 +2301,7 @@ def reply_to_review_comment(
     non-inline / fallback replies or on failure.
     """
     if comment.is_inline:
-        r = _run(
+        r = _run_mutation(
             [
                 "gh", "api",
                 f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/comments/{comment.id}/replies",
@@ -2154,7 +2317,7 @@ def reply_to_review_comment(
         except (json.JSONDecodeError, TypeError, ValueError):
             return None
 
-    r = _run(
+    r = _run_mutation(
         [
             "gh", "pr", "comment", str(pr_number),
             "--body", f"Review @{comment.author} ({comment.id}):\n\n{body}",

@@ -23,8 +23,15 @@ def _gh_unavailable_message(cwd: str | None = None) -> str:
     return "could not list PRs (gh unavailable)\n" + failure.describe()
 
 
-def _resolve_pr_for_branch(cwd: str):
-    """Find the open PR whose headRefName matches the current branch."""
+def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
+    """Find the open PR whose headRefName matches the current branch.
+
+    ``force`` bypasses the shared PR-list snapshot cache (see
+    :func:`github_api.list_open_prs_cached`) for callers about to act on the
+    result (e.g. the completion path, right before firing mutations) where a
+    stale merge/draft state would be a correctness risk rather than merely a
+    quota optimization.
+    """
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
@@ -32,7 +39,11 @@ def _resolve_pr_for_branch(cwd: str):
     if not branch:
         return None
 
-    prs = github_api.list_open_prs(cwd)
+    # Shared short-TTL snapshot (BOU-1923 Bucket 2): the stop-gate, the
+    # detached loop, and the await waiter each resolve this per worktree/tick,
+    # so a cached "list my open PRs" here collapses that fan-out onto one
+    # underlying `gh` call within the TTL window instead of one per caller.
+    prs = github_api.list_open_prs_cached(cwd, force=force)
     if prs is None:
         return _GH_UNAVAILABLE
     if not prs:
@@ -77,12 +88,15 @@ def _resolve_pr_for_branch(cwd: str):
     )
 
 
-def _resolve_pr_by_number(pr_number: int, cwd: str):
-    """Resolve a PR by explicit number (for --pr override)."""
+def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
+    """Resolve a PR by explicit number (for --pr override).
+
+    See :func:`_resolve_pr_for_branch` for the ``force`` semantics."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
-    prs = github_api.list_open_prs(cwd)
+    # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
+    prs = github_api.list_open_prs_cached(cwd, force=force)
     if prs is None:
         return _GH_UNAVAILABLE
     raw: dict | None = None

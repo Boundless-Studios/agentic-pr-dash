@@ -287,10 +287,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     cwd = os.path.abspath(args.cwd)
     pr_number_arg = args.pr
 
+    # force=True: this path is about to act on `pr` (resolve threads, reply,
+    # post the completion marker) — bypass the shared snapshot cache
+    # (BOU-1923 Bucket 2) so a stale merge/draft state can't misdirect a
+    # mutation. The freshness cost here is one extra `gh` call per completion
+    # run, not per Stop-hook/poll-tick, so it does not reintroduce the
+    # fan-out the cache exists to collapse.
     if pr_number_arg is not None:
-        pr = _resolve_pr_by_number(int(pr_number_arg), cwd)
+        pr = _resolve_pr_by_number(int(pr_number_arg), cwd, force=True)
     else:
-        pr = _resolve_pr_for_branch(cwd)
+        pr = _resolve_pr_for_branch(cwd, force=True)
 
     if pr is _GH_UNAVAILABLE:
         print(_gh_unavailable_message(cwd))
@@ -392,7 +398,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         except Exception as exc:  # noqa: BLE001
             print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
 
-    fresh = _resolve_pr_by_number(resolved_pr_number, cwd)
+    # force=True: re-resolve post-mutation state (threads were just
+    # resolved/replied-to above) — a cached pre-mutation snapshot would report
+    # stale "remaining blockers" (BOU-1923).
+    fresh = _resolve_pr_by_number(resolved_pr_number, cwd, force=True)
     if fresh is _GH_UNAVAILABLE or fresh is None:
         remaining = ["unknown"]
     else:
