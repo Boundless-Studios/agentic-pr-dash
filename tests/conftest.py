@@ -42,3 +42,29 @@ def _isolate_rate_limit_backoff():
     github_api.set_rate_limit_backoff(True)
     yield
     github_api.set_rate_limit_backoff(True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limit_seen():
+    """Reset github_api's per-tick rate-limit-seen flag (BOU-1923 review).
+
+    The flag is process-global and sticky until reset; the cached PR-resolution
+    path now reads it to detect a gh outage during the detail fetch. Reset it
+    around each test so a rate-limit set by one test can't bleed into another.
+    """
+    github_api.reset_rate_limit_seen()
+    yield
+    github_api.reset_rate_limit_seen()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_mutation_pacing():
+    """Reset github_api's last-mutation timestamp (BOU-1923 Bucket 4).
+
+    Without resetting this between tests, a mutation call in one test would
+    leave a monotonic timestamp behind that a later test's mutation call would
+    pace against — an unrelated, order-dependent sleep bleeding across tests.
+    """
+    github_api.reset_mutation_pacing()
+    yield
+    github_api.reset_mutation_pacing()

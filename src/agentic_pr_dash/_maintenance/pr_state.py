@@ -23,8 +23,15 @@ def _gh_unavailable_message(cwd: str | None = None) -> str:
     return "could not list PRs (gh unavailable)\n" + failure.describe()
 
 
-def _resolve_pr_for_branch(cwd: str):
-    """Find the open PR whose headRefName matches the current branch."""
+def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
+    """Find the open PR whose headRefName matches the current branch.
+
+    ``force`` bypasses the shared PR-list snapshot cache (see
+    :func:`github_api.list_open_prs_cached`) for callers about to act on the
+    result (e.g. the completion path, right before firing mutations) where a
+    stale merge/draft state would be a correctness risk rather than merely a
+    quota optimization.
+    """
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
@@ -32,7 +39,11 @@ def _resolve_pr_for_branch(cwd: str):
     if not branch:
         return None
 
-    prs = github_api.list_open_prs(cwd)
+    # Shared short-TTL snapshot (BOU-1923 Bucket 2): the stop-gate, the
+    # detached loop, and the await waiter each resolve this per worktree/tick,
+    # so a cached "list my open PRs" here collapses that fan-out onto one
+    # underlying `gh` call within the TTL window instead of one per caller.
+    prs = github_api.list_open_prs_cached(cwd, force=force)
     if prs is None:
         return _GH_UNAVAILABLE
     if not prs:
@@ -47,6 +58,16 @@ def _resolve_pr_for_branch(cwd: str):
         return None
 
     pr_number = int(raw["number"])
+    # Preserve a live gh-availability signal on the CACHED path (BOU-1923
+    # review). A warm snapshot skips the `list_open_prs` call that used to turn
+    # a current gh/rate-limit outage into _GH_UNAVAILABLE; the detail getters
+    # below then fail OPEN to empty values, so a warm cache + a concurrent
+    # GitHub outage would make a genuinely-blocked PR read as CLEAN. Watch the
+    # per-call rate-limit flag across the detail fetch: if a detail call trips
+    # it here, the empty results are unreliable — surface _GH_UNAVAILABLE (→
+    # stop-gate/check code 2) instead of a false "clean". We read (never reset)
+    # the flag, so the tick-based waiter's per-tick accumulation is untouched.
+    _rl_before = github_api.rate_limit_seen()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -55,6 +76,8 @@ def _resolve_pr_for_branch(cwd: str):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    if not _rl_before and github_api.rate_limit_seen():
+        return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
 
@@ -77,12 +100,15 @@ def _resolve_pr_for_branch(cwd: str):
     )
 
 
-def _resolve_pr_by_number(pr_number: int, cwd: str):
-    """Resolve a PR by explicit number (for --pr override)."""
+def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
+    """Resolve a PR by explicit number (for --pr override).
+
+    See :func:`_resolve_pr_for_branch` for the ``force`` semantics."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
-    prs = github_api.list_open_prs(cwd)
+    # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
+    prs = github_api.list_open_prs_cached(cwd, force=force)
     if prs is None:
         return _GH_UNAVAILABLE
     raw: dict | None = None
@@ -92,6 +118,10 @@ def _resolve_pr_by_number(pr_number: int, cwd: str):
                 raw = entry
                 break
 
+    # See _resolve_pr_for_branch: keep a live gh-availability signal on the
+    # cached path so a warm snapshot + a concurrent outage during the detail
+    # fetch surfaces _GH_UNAVAILABLE rather than a false "clean" (BOU-1923).
+    _rl_before = github_api.rate_limit_seen()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -100,6 +130,8 @@ def _resolve_pr_by_number(pr_number: int, cwd: str):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    if not _rl_before and github_api.rate_limit_seen():
+        return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 

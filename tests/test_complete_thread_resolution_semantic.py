@@ -45,7 +45,7 @@ def _wire(monkeypatch, *, thread, touched_files):
     """
     resolved_calls: list[str] = []
 
-    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd: _pr())
+    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: _pr())
     # No local-head override: keep the API head/date.
     monkeypatch.setattr(github_api, "get_local_pr_head", lambda branch, cwd: ("", ""))
     monkeypatch.setattr(github_api, "_is_ancestor", lambda a, d, cwd: False)
