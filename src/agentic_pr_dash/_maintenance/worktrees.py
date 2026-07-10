@@ -222,11 +222,26 @@ def _collect_owned_worktrees(
     """Return the worktree paths this session owns — markered OR adopted.
 
     Two ownership-marker writes can happen here, both forms of reconciliation:
-      * ADOPT an unmarked worktree whose branch has an open non-draft ``@me`` PR
-        with no live foreign/independent owner (a missed-arm pickup), and
+      * ADOPT a truly UNMARKERED worktree (no ``pr-watch.armed`` file at all)
+        whose branch has an open non-draft ``@me`` PR with no live
+        foreign/independent owner (a missed-arm pickup), and
       * REWRITE a marker we already own whose ``pr`` no longer matches the
         branch's current open non-draft PR (a superseded PR — preflight parity,
         BOU-1787 PR #2337 review).
+
+    Adoption is gated on the worktree having NO existing marker at all — a
+    worktree that already carries ANY other session's marker (live OR dead) is
+    left untouched here (BOU-1953 root cause #3). ``git worktree list`` from an
+    anchor cwd enumerates EVERY worktree sharing that repo, including sibling
+    worktrees from unrelated epics/branches a past (now-dead) session armed for
+    its own PR. Because ``@me`` PR lookups are keyed on GitHub identity, not
+    session, those foreign-but-idle worktrees would otherwise match "branch has
+    an open @me PR + no LIVE foreign owner" and get silently re-stamped with
+    THIS session's id — over-adopting cross-epic PRs the session never armed or
+    touched. Genuine orphan-PR recovery for dead sessions is the ledger-based
+    ``_adopt_orphan_prs`` path (registry-gated via ``_session_is_live``), not
+    this marker-adoption path; this path is reserved for the missed-arm case
+    where no marker was ever written.
 
     ``adopt_unmarked=False`` disables the missed-arm pickup while keeping already
     markered worktrees visible. This lets multi-repo callers inspect explicit
@@ -240,7 +255,7 @@ def _collect_owned_worktrees(
     and its subprocess timeout is capped to the remaining budget, so a single
     slow root cannot blow the Stop-hook deadline mid-scan (BOU-1787 review).
     """
-    from .markers import _live_foreign_owner, _marker_session_id, _write_arm_marker  # noqa: PLC0415
+    from .markers import _live_foreign_owner, _marker_session_id, _read_marker, _write_arm_marker  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
@@ -288,6 +303,14 @@ def _collect_owned_worktrees(
             _emit(worktree_path)
             continue
         if not adopt_unmarked:
+            continue
+        if _read_marker(worktree_path):
+            # Already carries SOME session's marker (foreign, live or dead —
+            # ``_marker_session_id`` above already excluded the "already ours"
+            # case). Only an explicit `arm` may claim an already-markered
+            # worktree; a shared-repo `git worktree list` scan surfacing one of
+            # "my" open GitHub PRs here is not evidence THIS session ever armed
+            # it (BOU-1953 root cause #3 — no cross-epic adoption).
             continue
         prs = _branch_prs()
         if not prs:
