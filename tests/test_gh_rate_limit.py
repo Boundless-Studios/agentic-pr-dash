@@ -16,6 +16,7 @@ from __future__ import annotations
 import subprocess
 
 from agentic_pr_dash import github_api
+from agentic_pr_dash._maintenance import pr_state
 
 
 def _cp(stdout: str = "", returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
@@ -144,6 +145,19 @@ def test_run_does_not_set_rate_limit_seen_on_hard_failure(monkeypatch):
     github_api.reset_rate_limit_seen()
     github_api._run(["gh", "pr", "list"])
     assert github_api.rate_limit_seen() is False  # hard failure is not a quota wall
+
+
+def test_pr_open_state_rate_limit_sets_flag(monkeypatch):
+    """_pr_open_state's `gh pr view` must flow through github_api._run so a
+    rate-limit there sets the per-tick flag — a detached-only waiter relies on it
+    (BOU-1949, #62 follow-up)."""
+    monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: _cp(returncode=1, stderr="API rate limit exceeded"))
+    github_api.reset_rate_limit_seen()
+    state, *_ = pr_state._pr_open_state(7, ".")
+    assert state == "unknown"  # unobservable
+    assert github_api.rate_limit_seen() is True  # ...but the flag IS set now
 
 
 def test_run_rate_limit_recovers_on_retry_leaves_flag_clear(monkeypatch):
