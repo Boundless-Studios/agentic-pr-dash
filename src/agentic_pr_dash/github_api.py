@@ -166,6 +166,37 @@ _RATE_LIMIT_STDERR_PATTERNS = (
 # residual starvation by staying alive across ticks (see maintenance_check).
 _GH_RATELIMIT_MAX_SLEEP_S = float(os.environ.get("APD_GH_RATELIMIT_MAX_SLEEP_S", "10"))
 
+# Process-level rate-limit-backoff toggle (BOU-1953). The waiter (long-lived
+# poller) benefits from backing off and retrying a rate-limited call — it can
+# afford to wait. The stop-gate is a Stop-hook subprocess with a hard ~108s
+# deadline that fails CLOSED when exceeded; when a session owns several PRs and
+# the shared gh quota is exhausted, EVERY gh call in that run would each
+# accumulate up to `_GH_RATELIMIT_MAX_SLEEP_S` of backoff, easily blowing the
+# deadline. The stop-gate disables this at process start (see
+# `_stop_gate_impl`) so a rate-limited call fails fast instead. Defaults to
+# enabled (today's behavior); also honors `APD_GH_NO_RATE_LIMIT_BACKOFF=1` as a
+# process-start default for callers that prefer an env var over the setter.
+_RATE_LIMIT_BACKOFF_ENABLED = os.environ.get(
+    "APD_GH_NO_RATE_LIMIT_BACKOFF", ""
+).strip().lower() not in ("1", "true", "yes")
+
+
+def set_rate_limit_backoff(enabled: bool) -> None:
+    """Enable/disable the rate-limit backoff-and-retry behavior in `_run`.
+
+    When disabled, a rate-limited `gh` call returns immediately (no sleep, no
+    retry) instead of backing off up to `_GH_RATELIMIT_MAX_SLEEP_S` per call —
+    `_RATE_LIMIT_SEEN` is still recorded so tick-based callers keep working, and
+    the (short, unrelated) connectivity retry is unaffected.
+    """
+    global _RATE_LIMIT_BACKOFF_ENABLED
+    _RATE_LIMIT_BACKOFF_ENABLED = enabled
+
+
+def rate_limit_backoff_enabled() -> bool:
+    """True iff `_run` currently backs off and retries rate-limited calls."""
+    return _RATE_LIMIT_BACKOFF_ENABLED
+
 
 def _is_rate_limit_failure(result: subprocess.CompletedProcess) -> bool:
     """True when a failed gh result is a primary or secondary rate-limit."""
@@ -254,6 +285,12 @@ def _run(cmd: list[str], timeout_s: int = 20, cwd: str | None = None) -> subproc
         if _is_transient_connectivity_failure(result):
             time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
         elif _is_rate_limit_failure(result):
+            if not _RATE_LIMIT_BACKOFF_ENABLED:
+                # Backoff suppressed (e.g. the stop-gate, BOU-1953): a
+                # latency-sensitive caller must fail fast on quota exhaustion
+                # rather than accumulate sleeps toward its hard deadline.
+                # `_RATE_LIMIT_SEEN` is still set below.
+                break
             # Rate-limited: back off (capped) and retry. Brief secondary limits
             # clear within a couple of short sleeps; a persistent primary
             # exhaustion still returns after the bounded attempts so the caller

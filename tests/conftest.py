@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-from agentic_pr_dash import config
+from agentic_pr_dash import config, github_api
 
 
 @pytest.fixture(autouse=True)
@@ -29,3 +29,16 @@ def _isolate_config(tmp_path_factory, monkeypatch):
     config.load.cache_clear()
     yield
     config.load.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_rate_limit_backoff():
+    """Reset github_api's process-level rate-limit-backoff toggle (BOU-1953).
+
+    ``_stop_gate_impl`` disables backoff as a side effect of running; without
+    resetting it, one test invoking the stop-gate would silently disable
+    backoff for every test that runs after it in the same pytest process.
+    """
+    github_api.set_rate_limit_backoff(True)
+    yield
+    github_api.set_rate_limit_backoff(True)
