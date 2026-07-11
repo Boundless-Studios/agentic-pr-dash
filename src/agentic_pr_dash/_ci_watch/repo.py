@@ -86,6 +86,7 @@ def get_pr_number(branch: str, project_dir: Path) -> int | None:
             ["gh", "pr", "list", "--head", branch, "--state", "open",
              "--limit", "1", "--json", "number"],
             cwd=str(project_dir), capture_output=True, text=True, timeout=20,
+            env=github_api.automation_subprocess_env(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return None
