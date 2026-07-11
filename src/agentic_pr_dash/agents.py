@@ -315,18 +315,27 @@ def _redact_command_for_display(command: str, *, limit: int = 240) -> str:
         if _looks_like_secret_assignment(token):
             name, _, _value = token.partition("=")
             redacted.append(f"{name}={_REDACTED}")
+            # An option's inline value (--private-key=...) can be multi-word
+            # once `ps` strips shell quoting; swallow the tail like the
+            # space-separated form. Bare env assignments (GH_TOKEN=... cmd)
+            # must not swallow: the next token is the command itself.
+            swallowing_value = token.startswith("-")
             continue
 
         if token.startswith("--") and "=" in token:
             name, _, value = token.partition("=")
             if _looks_like_secret_name(name.lstrip("-")):
                 redacted.append(f"{name}={_REDACTED}")
+                # An inline value can also be multi-word once `ps` strips the
+                # shell quoting; swallow the tail like the space-separated form.
+                swallowing_value = True
                 continue
             # Wrapper forms hide the secret assignment in the option VALUE
             # (--env=GH_TOKEN=..., --build-arg=API_KEY=...).
             inner_name, inner_sep, inner_value = value.partition("=")
             if inner_sep and inner_value and _looks_like_secret_name(inner_name):
                 redacted.append(f"{name}={inner_name}={_REDACTED}")
+                swallowing_value = True
                 continue
 
         if token.startswith("--") and _looks_like_secret_name(token.lstrip("-")):

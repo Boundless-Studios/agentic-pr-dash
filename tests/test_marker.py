@@ -210,6 +210,28 @@ def test_redact_command_multiword_secret_value_swallowed_to_next_option():
     assert "--model gpt-5" in redacted
 
 
+def test_redact_command_inline_multiword_secret_value_swallowed():
+    """Multi-word secrets also leak through the inline --name=value form:
+    shlex yields `--private-key=-----BEGIN` plus tail fragments, which must be
+    swallowed just like the space-separated form (PR #72 P2)."""
+    command = (
+        "codex exec --private-key=-----BEGIN PRIVATE KEY----- abc123 "
+        "-----END PRIVATE KEY----- --model gpt-5 "
+        "--env=API_KEY=multi word-value --output out.txt"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "BEGIN" not in redacted
+    assert "abc123" not in redacted
+    assert "multi" not in redacted
+    assert "word-value" not in redacted
+    assert "--private-key=<redacted>" in redacted
+    assert "--env=API_KEY=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+    assert "--output" in redacted
+
+
 def test_redact_command_env_assignment_embedded_in_option_value():
     """Wrapper forms like --env=GH_TOKEN=... hide the secret assignment in the
     option VALUE; the outer name check alone must not let it through (PR #72 P2)."""
