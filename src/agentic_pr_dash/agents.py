@@ -67,6 +67,9 @@ _SECRET_LONG_OPTION_VALUE_RE = re.compile(
     r"(--[A-Za-z0-9][A-Za-z0-9_-]*(?:token|password|passwd|secret|api-key|private-key|auth|credential)[A-Za-z0-9_-]*)(\s+)([^\s]+)",
     re.IGNORECASE,
 )
+# A token that plausibly starts a NEW option (`-v`, `--model`), as opposed to a
+# fragment of a quote-stripped multi-word secret value such as `-----BEGIN`.
+_OPTION_BOUNDARY_RE = re.compile(r"^--?[A-Za-z0-9]")
 
 
 def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
@@ -293,11 +296,21 @@ def _redact_command_for_display(command: str, *, limit: int = 240) -> str:
 
     redacted: list[str] = []
     redact_next = False
+    swallowing_value = False
     for token in tokens:
         if redact_next:
             redacted.append(_REDACTED)
             redact_next = False
+            # `ps` output loses shell quoting, so a quoted multi-word secret
+            # value arrives as several tokens; keep swallowing them until the
+            # next option-like boundary rather than leaking the value's tail.
+            swallowing_value = True
             continue
+
+        if swallowing_value:
+            if not _OPTION_BOUNDARY_RE.match(token):
+                continue
+            swallowing_value = False
 
         if _looks_like_secret_assignment(token):
             name, _, _value = token.partition("=")
@@ -305,9 +318,15 @@ def _redact_command_for_display(command: str, *, limit: int = 240) -> str:
             continue
 
         if token.startswith("--") and "=" in token:
-            name, _, _value = token.partition("=")
+            name, _, value = token.partition("=")
             if _looks_like_secret_name(name.lstrip("-")):
                 redacted.append(f"{name}={_REDACTED}")
+                continue
+            # Wrapper forms hide the secret assignment in the option VALUE
+            # (--env=GH_TOKEN=..., --build-arg=API_KEY=...).
+            inner_name, inner_sep, inner_value = value.partition("=")
+            if inner_sep and inner_value and _looks_like_secret_name(inner_name):
+                redacted.append(f"{name}={inner_name}={_REDACTED}")
                 continue
 
         if token.startswith("--") and _looks_like_secret_name(token.lstrip("-")):
@@ -325,6 +344,11 @@ def _redact_unparsed_command(command: str) -> str:
         name = match.group(1)
         if _looks_like_secret_name(name):
             return f"{name}={_REDACTED}"
+        # The greedy value may itself be a secret assignment hidden in an
+        # option value (--env=GH_TOKEN=...).
+        inner_name, inner_sep, inner_value = match.group(2).partition("=")
+        if inner_sep and inner_value and _looks_like_secret_name(inner_name):
+            return f"{name}={inner_name}={_REDACTED}"
         return match.group(0)
 
     command = _SECRET_ASSIGNMENT_RE.sub(redact_assignment, command)
@@ -339,7 +363,12 @@ def _looks_like_secret_assignment(token: str) -> bool:
 
 def _looks_like_secret_name(name: str) -> bool:
     normalized = name.strip("-").upper().replace("-", "_")
-    return any(marker in normalized for marker in _SECRET_MARKERS) or normalized in {"PASS", "AUTH"}
+    if any(marker in normalized for marker in _SECRET_MARKERS):
+        return True
+    # Align with _SECRET_LONG_OPTION_RE: any auth-ish name (--authorization,
+    # --auth-header, OAUTH_*) carries a credential value. Over-redacting a
+    # non-secret value here is a cosmetic loss; leaking one is not.
+    return normalized == "PASS" or "AUTH" in normalized
 
 
 def _collect_cwds() -> dict[int, str]:

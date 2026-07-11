@@ -193,6 +193,68 @@ def test_redact_command_for_display_removes_secret_values():
     assert "--model gpt-5" in redacted
 
 
+def test_redact_command_multiword_secret_value_swallowed_to_next_option():
+    """`ps` output loses shell quoting: a quoted multi-word secret value
+    arrives as separate tokens and every one of them must be redacted, not
+    just the first (PR #72 P2)."""
+    command = (
+        "codex exec --private-key -----BEGIN PRIVATE KEY----- abc123 "
+        "-----END PRIVATE KEY----- --model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "BEGIN" not in redacted
+    assert "abc123" not in redacted
+    assert "--private-key <redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_redact_command_env_assignment_embedded_in_option_value():
+    """Wrapper forms like --env=GH_TOKEN=... hide the secret assignment in the
+    option VALUE; the outer name check alone must not let it through (PR #72 P2)."""
+    command = (
+        "codex exec --env=GH_TOKEN=ghp_secret --build-arg=API_KEY=sk-secret "
+        "--model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "ghp_secret" not in redacted
+    assert "sk-secret" not in redacted
+    assert "--env=GH_TOKEN=<redacted>" in redacted
+    assert "--build-arg=API_KEY=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_redact_unparsed_command_embedded_env_assignment():
+    """The unparsed fallback (unbalanced quote) must also catch secret
+    assignments embedded in option values (PR #72 P2)."""
+    command = "codex exec --env=GH_TOKEN=ghp_secret 'unterminated"
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "ghp_secret" not in redacted
+    assert "--env=GH_TOKEN=<redacted>" in redacted
+
+
+def test_redact_command_auth_header_style_option_names():
+    """--authorization / --auth-header carry credentials; the parsed-path name
+    check must cover the same auth forms as the fallback regex (PR #72 P2)."""
+    command = (
+        "codex exec --authorization Bearer-abc123 --auth-header=Basic-xyz789 "
+        "--model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "Bearer-abc123" not in redacted
+    assert "Basic-xyz789" not in redacted
+    assert "--authorization <redacted>" in redacted
+    assert "--auth-header=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
 def test_discover_active_agents_returns_redacted_command(tmp_path, monkeypatch):
     command = "codex exec --token ghp_secret --prompt ok"
     process_table = f"123 1 5.0 {command}\n"
