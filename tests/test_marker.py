@@ -174,6 +174,49 @@ def test_command_cli_name_honors_supplied_discovery_names():
     assert agents._command_cli_name("/usr/bin/aider --message x", {"aider"}) == "aider"
 
 
+def test_redact_command_for_display_removes_secret_values():
+    command = (
+        "env E2E_TEST_PASSWORD=supersecret GH_TOKEN=ghp_secret "
+        "codex exec --api-key sk-secret --auth-token=auth-secret --model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "supersecret" not in redacted
+    assert "ghp_secret" not in redacted
+    assert "sk-secret" not in redacted
+    assert "auth-secret" not in redacted
+    assert "E2E_TEST_PASSWORD=<redacted>" in redacted
+    assert "GH_TOKEN=<redacted>" in redacted
+    assert "--api-key <redacted>" in redacted
+    assert "--auth-token=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_discover_active_agents_returns_redacted_command(tmp_path, monkeypatch):
+    command = "codex exec --token ghp_secret --prompt ok"
+    process_table = f"123 1 5.0 {command}\n"
+
+    monkeypatch.setattr(agents, "_run_process_table", lambda: process_table)
+    monkeypatch.setattr(agents, "_collect_cwds", lambda: {123: str(tmp_path)})
+
+    discovered = agents.discover_active_agents([str(tmp_path)])
+
+    assert discovered[str(tmp_path)][0].command == "codex exec --token <redacted> --prompt ok"
+
+
+def test_discover_feature_pipeline_agents_returns_redacted_command(tmp_path, monkeypatch):
+    command = "codex exec /feature-pipeline --linear-api-key lin_secret"
+    process_table = f"123 1 5.0 {command}\n"
+
+    monkeypatch.setattr(agents, "_run_process_table", lambda: process_table)
+    monkeypatch.setattr(agents, "_collect_cwds", lambda: {123: str(tmp_path)})
+
+    discovered = agents.discover_primary_feature_pipeline_agents([str(tmp_path)])
+
+    assert discovered[str(tmp_path)][0].command == "codex exec /feature-pipeline --linear-api-key <redacted>"
+
+
 def test_live_independent_owner_paths_registry_honors_discovery_names(tmp_path, monkeypatch):
     """A live registry session whose cli is NOT in the target repo's discovery_names
     (default: claude, codex) is not treated as an owner (PR #7 P2)."""

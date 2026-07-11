@@ -22,6 +22,7 @@ Filters:
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -45,6 +46,27 @@ class ProcessRow:
 # sample at 0.0% while an agent that's processing a turn typically sits
 # between 1-60% depending on load. 1% is comfortably above the noise floor.
 _ACTIVE_CPU_THRESHOLD = 1.0
+_REDACTED = "<redacted>"
+_SECRET_MARKERS = (
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "SECRET",
+    "API_KEY",
+    "PRIVATE_KEY",
+    "AUTH_TOKEN",
+    "ACCESS_KEY",
+    "CREDENTIAL",
+)
+_SECRET_ASSIGNMENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_-]*?)=([^\s]+)")
+_SECRET_LONG_OPTION_RE = re.compile(
+    r"(--[A-Za-z0-9][A-Za-z0-9_-]*(?:token|password|passwd|secret|api-key|private-key|auth|credential)[A-Za-z0-9_-]*=)([^\s]+)",
+    re.IGNORECASE,
+)
+_SECRET_LONG_OPTION_VALUE_RE = re.compile(
+    r"(--[A-Za-z0-9][A-Za-z0-9_-]*(?:token|password|passwd|secret|api-key|private-key|auth|credential)[A-Za-z0-9_-]*)(\s+)([^\s]+)",
+    re.IGNORECASE,
+)
 
 
 def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
@@ -106,7 +128,7 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
                 pid=row.pid,
                 cli_name=cli_name,
                 label=cli_name.capitalize(),
-                command=row.command[:240],
+                command=_redact_command_for_display(row.command),
             )
         )
 
@@ -174,7 +196,7 @@ def discover_primary_feature_pipeline_agents(
                 pid=row.pid,
                 cli_name=cli_name,
                 label=cli_name.capitalize(),
-                command=row.command[:240],
+                command=_redact_command_for_display(row.command),
             )
         )
 
@@ -260,6 +282,64 @@ def _parse_process_rows(output: str) -> list[ProcessRow]:
             command=command,
         ))
     return rows
+
+
+def _redact_command_for_display(command: str, *, limit: int = 240) -> str:
+    """Return a dashboard-safe command string without likely secret values."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return _redact_unparsed_command(command)[:limit]
+
+    redacted: list[str] = []
+    redact_next = False
+    for token in tokens:
+        if redact_next:
+            redacted.append(_REDACTED)
+            redact_next = False
+            continue
+
+        if _looks_like_secret_assignment(token):
+            name, _, _value = token.partition("=")
+            redacted.append(f"{name}={_REDACTED}")
+            continue
+
+        if token.startswith("--") and "=" in token:
+            name, _, _value = token.partition("=")
+            if _looks_like_secret_name(name.lstrip("-")):
+                redacted.append(f"{name}={_REDACTED}")
+                continue
+
+        if token.startswith("--") and _looks_like_secret_name(token.lstrip("-")):
+            redacted.append(token)
+            redact_next = True
+            continue
+
+        redacted.append(token)
+
+    return " ".join(redacted)[:limit]
+
+
+def _redact_unparsed_command(command: str) -> str:
+    def redact_assignment(match: re.Match[str]) -> str:
+        name = match.group(1)
+        if _looks_like_secret_name(name):
+            return f"{name}={_REDACTED}"
+        return match.group(0)
+
+    command = _SECRET_ASSIGNMENT_RE.sub(redact_assignment, command)
+    command = _SECRET_LONG_OPTION_RE.sub(rf"\1{_REDACTED}", command)
+    return _SECRET_LONG_OPTION_VALUE_RE.sub(rf"\1\2{_REDACTED}", command)
+
+
+def _looks_like_secret_assignment(token: str) -> bool:
+    name, separator, value = token.partition("=")
+    return bool(separator and value and _looks_like_secret_name(name))
+
+
+def _looks_like_secret_name(name: str) -> bool:
+    normalized = name.strip("-").upper().replace("-", "_")
+    return any(marker in normalized for marker in _SECRET_MARKERS) or normalized in {"PASS", "AUTH"}
 
 
 def _collect_cwds() -> dict[int, str]:
