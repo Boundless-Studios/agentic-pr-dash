@@ -358,6 +358,32 @@ class GhFailure:
     def command_str(self) -> str:
         return " ".join(self.command)
 
+    def summary(self) -> str:
+        """One-line classified cause for event logs and dashboards.
+
+        The bare "GitHub API unavailable" collapsed very different failure
+        modes (expired App token vs DNS outage vs quota wall) into one string
+        during the 2026-07-11 outage (BOU-1987); this names the class so the
+        operator's first look at the event log points at the right fix.
+        """
+        stderr = (self.stderr or "").strip()
+        lowered = stderr.lower()
+        first_line = stderr.splitlines()[0] if stderr else f"gh exited {self.returncode}"
+        if len(first_line) > 140:
+            first_line = first_line[:137] + "..."
+        probe = subprocess.CompletedProcess(self.command, self.returncode, "", stderr)
+        if "401" in lowered or "bad credentials" in lowered:
+            return f"auth failure — {first_line}"
+        if _is_rate_limit_failure(probe):
+            return f"rate-limited — {first_line}"
+        if _is_transient_connectivity_failure(probe):
+            return f"network unreachable — {first_line}"
+        if "timed out" in lowered:
+            return f"timeout — {first_line}"
+        if self.reason != "exit":
+            return f"{self.reason} — {first_line}"
+        return first_line
+
     def describe(self) -> str:
         """Multi-line operator-facing diagnostic + self-check + remediation."""
         stderr = (self.stderr or "").strip() or "(no stderr captured)"
