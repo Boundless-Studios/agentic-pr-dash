@@ -1459,8 +1459,15 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     on any non-zero rc therefore DROPPED exactly the failing/pending checks the
     maintenance gate needs (a pending→fail flip would read as "no checks", so
     ``failing_checks`` stayed empty and the await waiter never woke on failure —
-    codex PR #50 review). Parse stdout regardless of the exit code; fall back to
-    ``[]`` only when stdout is genuinely unparseable (a real gh error).
+    codex PR #50 review). Parse stdout regardless of the exit code.
+
+    Unparseable stdout is NOT always "a real gh error meaning no checks":
+    under a GitHub App installation token without **Actions: Read-only**, gh's
+    underlying GraphQL requests ``checkSuite.workflowRun`` and dies with
+    "Resource not accessible by integration" and EMPTY stdout — for every PR,
+    forever. Treating that as ``[]`` made the dashboard silently blind to CI
+    (every PR with running/failing CI read as Clean — BOU-1980). Fall back to
+    the REST check-runs API, which needs only Checks: Read.
     """
     r = _run(
         ["gh", "pr", "checks", str(pr_number),
@@ -1472,7 +1479,7 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     except (json.JSONDecodeError, TypeError):
         raw = None
     if not isinstance(raw, list):
-        return []
+        return _get_ci_checks_rest(pr_number, cwd)
 
     # Dedup by name (keep latest)
     by_name: dict[str, dict] = {}
@@ -1501,6 +1508,55 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
             conclusion = None
             status = state or "unknown"
         checks.append(CICheck(name=c.get("name", "?"), status=status, conclusion=conclusion))
+    return checks
+
+
+# REST check-run conclusions that ``gh pr checks`` buckets as ``fail`` — must
+# normalize to "failure" so orchestrator ``failing_checks`` (which matches
+# ``conclusion == "failure"`` exactly) behaves identically on both paths.
+# ``stale`` is terminal-but-not-success: the post-push watcher already treats
+# it as blocking, so the fallback must too (codex PR #71 review).
+_REST_FAIL_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "stale"}
+
+# The only non-terminal statuses downstream pending predicates match
+# (orchestrator/_compute_status and the board test ``queued``/``in_progress``
+# exactly; the primary path collapses gh's whole pending bucket to
+# ``in_progress``). REST also emits ``waiting``/``requested``/``pending`` —
+# anything else non-completed must normalize into this set or a pending PR
+# reads as clean (codex PR #71 review).
+_REST_PENDING_STATUSES = ("queued", "in_progress")
+
+
+def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]:
+    """REST fallback for :func:`get_ci_checks` (BOU-1980).
+
+    Requires only the **Checks: Read** permission — available to the automation
+    App token even when the Actions grant that gh's GraphQL rollup needs is
+    missing. Resolves the PR's ACTUAL head SHA via the REST ``pulls/{n}``
+    endpoint (``get_latest_commit``'s ``pulls/{n}/commits`` read is unpaginated,
+    so ``.[-1]`` is the 30th commit on big PRs — a stale SHA whose checks can
+    read as clean), then reuses :func:`get_check_runs_for_commit`, which
+    paginates ``/check-runs`` AND folds in legacy commit StatusContexts so
+    external-CI repos aren't seen as check-less (codex PR #71 review).
+    """
+    r = _run(
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}",
+         "--jq", ".head.sha"],
+        cwd=cwd, timeout_s=30,
+    )
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or not sha:
+        return []
+
+    checks = []
+    for run in get_check_runs_for_commit(sha, cwd):
+        status = run.get("status") or ""
+        conclusion = run.get("conclusion")
+        if status != "completed" and status not in _REST_PENDING_STATUSES:
+            status = "in_progress"
+        if conclusion in _REST_FAIL_CONCLUSIONS:
+            conclusion = "failure"
+        checks.append(CICheck(name=run.get("name", "?"), status=status, conclusion=conclusion))
     return checks
 
 
