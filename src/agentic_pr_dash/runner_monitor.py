@@ -56,6 +56,7 @@ RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProce
 
 
 def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -64,6 +65,7 @@ def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.Complete
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         check=False,
+        env=github_api.automation_subprocess_env(cmd),
     )
 
 

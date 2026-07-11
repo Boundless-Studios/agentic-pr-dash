@@ -300,20 +300,60 @@ def _read_automation_token() -> str | None:
     return token or None
 
 
-def _automation_env_refresh(cmd: list[str]) -> dict[str, str] | None:
-    """Fresh ``GH_TOKEN`` env for a gh subprocess, or ``None`` to inherit.
+# Sticky verdict for the initial-match opt-in heuristic (see
+# `_automation_identity_opted_in`). Memoized on first use so a later rotation
+# cannot flip a caller-provided PAT into "automation" mid-process.
+_SPAWN_TOKEN_WAS_AUTOMATION: bool | None = None
 
-    Applies only when (a) the command is ``gh``, (b) this process was launched
-    WITH the automation identity (``GH_TOKEN`` set — identity selection stays
-    the supervisor's decision; interactively-launched instances keep their
-    keyring auth), and (c) the token file holds a token DIFFERENT from the
-    spawn-time env value. Explicit-env callers (`_resolve_fallback_env`) never
-    reach this — `_run_once` only consults it when ``env`` is ``None``.
+
+def _automation_identity_opted_in() -> bool:
+    """True when this process's ``GH_TOKEN`` is the supervisor-provided
+    automation identity, so following the rotating token file is safe.
+
+    Merely having ``GH_TOKEN`` set is NOT enough (PR #73 review): a shell or
+    CI job may export its own PAT while the automation token file happens to
+    exist on the machine — silently replacing that PAT would change the
+    authenticated identity of every gh call. Opt-in signals, strongest first:
+
+    1. ``AGENTIC_PR_DASH_TOKEN_FROM_FILE=1`` — the explicit marker exported by
+       supervisors that sourced ``GH_TOKEN`` from the token file
+       (gh-automation-token.sh since BOU-1991).
+    2. Sticky initial match: the spawn-time ``GH_TOKEN`` equals the file's
+       token the FIRST time this is consulted. A caller-provided PAT never
+       matches the file; covers supervisors predating the marker. Memoized so
+       the verdict is stable for the process lifetime (the file rotating
+       AFTER a match is exactly the case we refresh for; a rotation BETWEEN
+       spawn and first gh call under a marker-less supervisor is a benign
+       miss — behavior degrades to the legacy inherit-spawn-env).
     """
-    if not cmd or os.path.basename(cmd[0]) != "gh":
+    global _SPAWN_TOKEN_WAS_AUTOMATION
+    if os.environ.get("AGENTIC_PR_DASH_TOKEN_FROM_FILE") == "1":
+        return True
+    if _SPAWN_TOKEN_WAS_AUTOMATION is None:
+        spawn_token = os.environ.get("GH_TOKEN")
+        _SPAWN_TOKEN_WAS_AUTOMATION = bool(spawn_token) and spawn_token == _read_automation_token()
+    return _SPAWN_TOKEN_WAS_AUTOMATION
+
+
+def automation_subprocess_env(cmd: list[str] | None = None) -> dict[str, str] | None:
+    """Env for a gh subprocess with a fresh automation token, or ``None`` to inherit.
+
+    Public entry point for DIRECT ``subprocess.run(["gh", ...])`` call sites
+    that bypass `_run` (loop baseline lookups, maintenance pr_state, config
+    repo detection, ...) — long-lived processes must route gh spawns through
+    this or they keep the stale spawn-time token after a rotation (PR #73
+    review). Pass the command to no-op safely for non-gh spawns.
+
+    Returns ``None`` (inherit the process env unchanged) unless this process
+    opted into the automation identity AND the token file currently holds a
+    token different from the spawn-time env value.
+    """
+    if cmd is not None and (not cmd or os.path.basename(cmd[0]) != "gh"):
         return None
     spawn_token = os.environ.get("GH_TOKEN")
     if not spawn_token:
+        return None
+    if not _automation_identity_opted_in():
         return None
     token = _read_automation_token()
     if token is None or token == spawn_token:
@@ -321,6 +361,15 @@ def _automation_env_refresh(cmd: list[str]) -> dict[str, str] | None:
     env = dict(os.environ)
     env["GH_TOKEN"] = token
     return env
+
+
+def _automation_env_refresh(cmd: list[str]) -> dict[str, str] | None:
+    """`_run_once`'s hook: fresh-token env for gh commands, ``None`` to inherit.
+
+    Explicit-env callers (`_resolve_fallback_env`) never reach this —
+    `_run_once` only consults it when ``env`` is ``None``.
+    """
+    return automation_subprocess_env(cmd)
 
 
 def _run_once(

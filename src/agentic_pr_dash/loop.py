@@ -230,10 +230,12 @@ def _clear_recovered_streak(cwd: str) -> None:
     if not _load_health(cwd) and not _load_escalation(cwd):
         return
     import json as _json  # noqa: PLC0415
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         r = subprocess.run(
             ["gh", "pr", "view", "--json", "number"],
             cwd=cwd, capture_output=True, text=True, timeout=30,
+            env=github_api.automation_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return
@@ -454,11 +456,15 @@ def _baseline_sha(cwd: str, pr: int | None) -> str:
     if pr is not None:
         cmd.append(str(pr))
     cmd += ["--json", "headRefOid", "-q", ".headRefOid"]
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         # Bounded + guarded: a broken/missing gh on PATH raises OSError and an
         # interactive auth prompt would otherwise hang the whole loop before it
         # ever dispatches the executor. Either way, fall back to the local HEAD.
-        out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=15)
+        out = subprocess.run(
+            cmd, cwd=cwd, capture_output=True, text=True, timeout=15,
+            env=github_api.automation_subprocess_env(),
+        )
     except (OSError, subprocess.SubprocessError):
         return _head_sha(cwd)
     sha = out.stdout.strip()
