@@ -1514,47 +1514,46 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
 # REST check-run conclusions that ``gh pr checks`` buckets as ``fail`` — must
 # normalize to "failure" so orchestrator ``failing_checks`` (which matches
 # ``conclusion == "failure"`` exactly) behaves identically on both paths.
-_REST_FAIL_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required"}
+# ``stale`` is terminal-but-not-success: the post-push watcher already treats
+# it as blocking, so the fallback must too (codex PR #71 review).
+_REST_FAIL_CONCLUSIONS = {"failure", "timed_out", "startup_failure", "action_required", "stale"}
+
+# The only non-terminal statuses downstream pending predicates match
+# (orchestrator/_compute_status and the board test ``queued``/``in_progress``
+# exactly; the primary path collapses gh's whole pending bucket to
+# ``in_progress``). REST also emits ``waiting``/``requested``/``pending`` —
+# anything else non-completed must normalize into this set or a pending PR
+# reads as clean (codex PR #71 review).
+_REST_PENDING_STATUSES = ("queued", "in_progress")
 
 
 def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     """REST fallback for :func:`get_ci_checks` (BOU-1980).
 
-    Uses ``repos/{owner}/{repo}/commits/{sha}/check-runs``, which requires only
-    the **Checks: Read** permission — available to the automation App token even
-    when the Actions grant that gh's GraphQL rollup needs is missing. Covers
-    check runs only (not legacy commit StatusContexts), which is every check
-    this dashboard's repos produce.
+    Requires only the **Checks: Read** permission — available to the automation
+    App token even when the Actions grant that gh's GraphQL rollup needs is
+    missing. Resolves the PR's ACTUAL head SHA via the REST ``pulls/{n}``
+    endpoint (``get_latest_commit``'s ``pulls/{n}/commits`` read is unpaginated,
+    so ``.[-1]`` is the 30th commit on big PRs — a stale SHA whose checks can
+    read as clean), then reuses :func:`get_check_runs_for_commit`, which
+    paginates ``/check-runs`` AND folds in legacy commit StatusContexts so
+    external-CI repos aren't seen as check-less (codex PR #71 review).
     """
-    sha, _ = get_latest_commit(pr_number, cwd)
-    if not sha:
-        return []
     r = _run(
-        ["gh", "api", f"repos/{{owner}}/{{repo}}/commits/{sha}/check-runs",
-         "--paginate", "--jq", ".check_runs[] | {name, status, conclusion}"],
+        ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}",
+         "--jq", ".head.sha"],
         cwd=cwd, timeout_s=30,
     )
-    if not (r.stdout or "").strip():
+    sha = (r.stdout or "").strip()
+    if r.returncode != 0 or not sha:
         return []
 
-    # --jq emits one JSON object per line; dedup by name (keep latest), matching
-    # the primary path.
-    by_name: dict[str, dict] = {}
-    for line in r.stdout.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            run = json.loads(line)
-        except json.JSONDecodeError:
-            return []
-        if isinstance(run, dict) and run.get("name"):
-            by_name[run["name"]] = run
-
     checks = []
-    for run in by_name.values():
-        status = run.get("status") or "unknown"
+    for run in get_check_runs_for_commit(sha, cwd):
+        status = run.get("status") or ""
         conclusion = run.get("conclusion")
+        if status != "completed" and status not in _REST_PENDING_STATUSES:
+            status = "in_progress"
         if conclusion in _REST_FAIL_CONCLUSIONS:
             conclusion = "failure"
         checks.append(CICheck(name=run.get("name", "?"), status=status, conclusion=conclusion))
