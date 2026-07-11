@@ -254,9 +254,80 @@ def rate_limit_seen() -> bool:
     return _RATE_LIMIT_SEEN
 
 
+# ── Automation-token file source (BOU-1991) ────────────────────────────────
+# The PR-automation GitHub App installation token lives in
+# $XDG_CONFIG_HOME/agentic-pr-dash/gh-automation-token and rotates roughly
+# every 45 minutes (1-hour TTL). Long-lived processes (the dashboard server,
+# the maintenance loop) previously inherited GH_TOKEN once at spawn, which
+# forced their supervisor to RESTART them on every rotation — dropping all
+# in-memory poll state, user-visible as CI state vanishing from the board for
+# the first poll cycle after each restart. Instead, source the token from the
+# file per gh invocation: one stat() per call, re-reading only on mtime
+# change, so a rotation is picked up mid-flight with no restart.
+_TOKEN_FILE_CACHE: tuple[float, str] | None = None  # (mtime, token)
+
+
+def _automation_token_file() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(config_home, "agentic-pr-dash", "gh-automation-token")
+
+
+def _read_automation_token() -> str | None:
+    """Current token from the rotating token file, mtime-cached.
+
+    Returns ``None`` when the file is absent/unreadable/empty. Rotation always
+    replaces the file atomically (fresh mtime), so an unchanged mtime means an
+    unchanged token by contract and the cached value is served without a read.
+    """
+    global _TOKEN_FILE_CACHE
+    path = _automation_token_file()
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        _TOKEN_FILE_CACHE = None
+        return None
+    if _TOKEN_FILE_CACHE is not None and _TOKEN_FILE_CACHE[0] == mtime:
+        return _TOKEN_FILE_CACHE[1] or None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            token = fh.readline().strip()
+    except OSError:
+        _TOKEN_FILE_CACHE = None
+        return None
+    _TOKEN_FILE_CACHE = (mtime, token)
+    return token or None
+
+
+def _automation_env_refresh(cmd: list[str]) -> dict[str, str] | None:
+    """Fresh ``GH_TOKEN`` env for a gh subprocess, or ``None`` to inherit.
+
+    Applies only when (a) the command is ``gh``, (b) this process was launched
+    WITH the automation identity (``GH_TOKEN`` set — identity selection stays
+    the supervisor's decision; interactively-launched instances keep their
+    keyring auth), and (c) the token file holds a token DIFFERENT from the
+    spawn-time env value. Explicit-env callers (`_resolve_fallback_env`) never
+    reach this — `_run_once` only consults it when ``env`` is ``None``.
+    """
+    if not cmd or os.path.basename(cmd[0]) != "gh":
+        return None
+    spawn_token = os.environ.get("GH_TOKEN")
+    if not spawn_token:
+        return None
+    token = _read_automation_token()
+    if token is None or token == spawn_token:
+        return None
+    env = dict(os.environ)
+    env["GH_TOKEN"] = token
+    return env
+
+
 def _run_once(
     cmd: list[str], timeout_s: int = 20, cwd: str | None = None, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
+    if env is None:
+        env = _automation_env_refresh(cmd)
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd, env=env,
