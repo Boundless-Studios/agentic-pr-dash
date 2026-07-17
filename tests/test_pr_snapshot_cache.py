@@ -288,8 +288,11 @@ def test_warm_cache_plus_gh_unavailable_detail_is_unavailable(tmp_path, monkeypa
 
     def _ci(n, cwd=None):
         # Simulate a rate-limit hit DURING the detail fetch: the getter fails
-        # open to [] but the per-tick flag is set.
+        # open to [] but `_run` records the event — it sets the per-tick flag
+        # AND bumps the monotonic event counter (the guard reads the counter
+        # since BOU-1966, so it also fires when the flag was already set).
         github_api._RATE_LIMIT_SEEN = True
+        github_api._RATE_LIMIT_EVENTS = github_api._RATE_LIMIT_EVENTS + 1
         return []
 
     monkeypatch.setattr(github_api, "get_ci_checks", _ci)
@@ -336,7 +339,10 @@ def test_resolve_by_number_warm_cache_plus_outage_is_unavailable(tmp_path, monke
     monkeypatch.setattr(github_api, "get_latest_commit", lambda n, cwd=None: ("", ""))
 
     def _ci(n, cwd=None):
+        # See test_warm_cache_plus_gh_unavailable_detail_is_unavailable: mirror
+        # `_run`'s real recording (flag + monotonic event counter, BOU-1966).
         github_api._RATE_LIMIT_SEEN = True
+        github_api._RATE_LIMIT_EVENTS = github_api._RATE_LIMIT_EVENTS + 1
         return []
 
     monkeypatch.setattr(github_api, "get_ci_checks", _ci)

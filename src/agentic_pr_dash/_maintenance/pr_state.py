@@ -20,7 +20,68 @@ def _gh_unavailable_message(cwd: str | None = None) -> str:
             f"Re-run `gh pr list --author @me --state open`{where} from the same "
             "cwd and check `gh auth status`."
         )
-    return "could not list PRs (gh unavailable)\n" + failure.describe()
+    text = "could not list PRs (gh unavailable)\n" + failure.describe()
+    if failure.is_rate_limited:
+        text += (
+            "\n  note: the PR list was rate-limited and the per-PR REST "
+            "fallback could not fully verify the target PR either (BOU-1966); "
+            "this usually clears once the quota window resets."
+        )
+    return text
+
+
+def _list_failure_is_rate_limited() -> bool:
+    """True when the just-failed ``list_open_prs`` was quota/rate-limit classified.
+
+    Gate for the BOU-1966 quota-safe REST fallback: only a rate-limited author
+    list may fall back to per-PR REST resolution. Auth lapses, a missing ``gh``,
+    and malformed output keep failing closed — those failure modes affect the
+    REST path identically, so "verified via REST" would be meaningless there.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    failure = github_api.last_list_open_prs_failure()
+    return failure is not None and failure.is_rate_limited
+
+
+def _rest_fallback_entry_by_number(pr_number: int, cwd: str):
+    """Quota fallback (BOU-1966): raw PR entry for ``--pr N`` via pure REST.
+
+    Returns the normalized payload dict, or ``None`` when the list failure was
+    not quota-classified OR REST cannot verify the PR either — the caller stays
+    fail-closed (``_GH_UNAVAILABLE``) in both cases.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not _list_failure_is_rate_limited():
+        return None
+    return github_api._rest_pr_payload(pr_number, cwd=cwd)
+
+
+def _rest_fallback_entry_for_branch(branch: str, cwd: str):
+    """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
+
+    Resolves owner (REST) → exact owner-qualified head numbers (REST) → full
+    payload (REST). Deliberately avoids ``gh pr list --head`` — that path is
+    GraphQL, exactly what is quota-blocked here. An empty exact-head result
+    ALSO returns ``None`` (→ fail closed): the owner-qualified query cannot see
+    a fork-backed head, so "no match" under quota exhaustion is weaker evidence
+    than the author-scoped list and must not read as a verified "no PR".
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not _list_failure_is_rate_limited():
+        return None
+    owner = github_api._rest_repo_owner(cwd)
+    if not owner:
+        return None
+    numbers = github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    if not numbers:
+        return None
+    raw = github_api._rest_pr_payload(numbers[0], cwd=cwd)
+    if raw is None or str(raw.get("headRefName") or "") != branch:
+        return None
+    return raw
 
 
 def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
@@ -44,30 +105,39 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # so a cached "list my open PRs" here collapses that fan-out onto one
     # underlying `gh` call within the TTL window instead of one per caller.
     prs = github_api.list_open_prs_cached(cwd, force=force)
-    if prs is None:
-        return _GH_UNAVAILABLE
-    if not prs:
-        return None
-
     raw: dict | None = None
-    for entry in prs:
-        if entry.get("headRefName") == branch:
-            raw = entry
-            break
-    if raw is None:
-        return None
+    if prs is None:
+        # Quota-safe REST fallback (BOU-1966): a rate-limited author list can
+        # still verify THIS branch's PR via per-PR REST calls. Any other
+        # failure mode (auth, missing gh) — and REST failing too — stays
+        # fail-closed.
+        raw = _rest_fallback_entry_for_branch(branch, cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+    else:
+        if not prs:
+            return None
+        for entry in prs:
+            if entry.get("headRefName") == branch:
+                raw = entry
+                break
+        if raw is None:
+            return None
 
     pr_number = int(raw["number"])
-    # Preserve a live gh-availability signal on the CACHED path (BOU-1923
-    # review). A warm snapshot skips the `list_open_prs` call that used to turn
-    # a current gh/rate-limit outage into _GH_UNAVAILABLE; the detail getters
-    # below then fail OPEN to empty values, so a warm cache + a concurrent
-    # GitHub outage would make a genuinely-blocked PR read as CLEAN. Watch the
-    # per-call rate-limit flag across the detail fetch: if a detail call trips
-    # it here, the empty results are unreliable — surface _GH_UNAVAILABLE (→
-    # stop-gate/check code 2) instead of a false "clean". We read (never reset)
-    # the flag, so the tick-based waiter's per-tick accumulation is untouched.
-    _rl_before = github_api.rate_limit_seen()
+    # Preserve a live gh-availability signal across the detail fetch (BOU-1923
+    # review, BOU-1966). A warm snapshot (or the REST fallback above) skips the
+    # `list_open_prs` failure that used to turn a current gh/rate-limit outage
+    # into _GH_UNAVAILABLE; the detail getters below then fail OPEN to empty
+    # values, so an outage during the fetch would make a genuinely-blocked PR
+    # read as CLEAN. Compare the monotonic rate-limit event COUNT across the
+    # span — the tick-scoped rate_limit_seen() flag is already set on the
+    # fallback path (by the failed list itself), so a boolean read cannot see
+    # NEW failures. If any detail call ultimately rate-limits here, the empty
+    # results are unreliable — surface _GH_UNAVAILABLE (→ stop-gate/check code
+    # 2) instead of a false "clean". We never reset the flag or the counter,
+    # so the tick-based waiter's per-tick accumulation is untouched.
+    _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -76,7 +146,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    if not _rl_before and github_api.rate_limit_seen():
+    if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
@@ -109,19 +179,27 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
 
     # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
     prs = github_api.list_open_prs_cached(cwd, force=force)
-    if prs is None:
-        return _GH_UNAVAILABLE
     raw: dict | None = None
-    if prs:
+    if prs is None:
+        # Quota-safe REST fallback (BOU-1966): see _resolve_pr_for_branch. A
+        # rate-limited author list still verifies an explicit --pr N via the
+        # REST pulls endpoint; anything unverifiable stays fail-closed.
+        raw = _rest_fallback_entry_by_number(pr_number, cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+    elif prs:
         for entry in prs:
             if entry.get("number") == pr_number:
                 raw = entry
                 break
 
-    # See _resolve_pr_for_branch: keep a live gh-availability signal on the
-    # cached path so a warm snapshot + a concurrent outage during the detail
-    # fetch surfaces _GH_UNAVAILABLE rather than a false "clean" (BOU-1923).
-    _rl_before = github_api.rate_limit_seen()
+    # See _resolve_pr_for_branch: keep a live gh-availability signal across the
+    # detail fetch so a warm snapshot (or REST-fallback resolution) + a
+    # concurrent outage during the fetch surfaces _GH_UNAVAILABLE rather than a
+    # false "clean" (BOU-1923, BOU-1966 — event-count compare, not the
+    # tick-scoped boolean, which the failed list already set on the fallback
+    # path).
+    _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -130,7 +208,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    if not _rl_before and github_api.rate_limit_seen():
+    if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")

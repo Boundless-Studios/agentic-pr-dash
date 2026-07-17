@@ -241,3 +241,212 @@ def test_list_open_prs_recovers_via_retry(monkeypatch):
     assert prs == [{"number": 7}]
     assert github_api.last_list_open_prs_failure() is None  # cleared on success
     assert calls["n"] == 2
+
+
+# --------------------------------------------------------------------------- #
+# BOU-1966: quota-safe REST fallback for PR resolution.
+#
+# A rate-limited `gh pr list --author @me` (GraphQL) used to fail the
+# maintenance check closed even when the target PR was concretely verifiable
+# via per-PR REST endpoints. The resolvers now fall back to REST when — and
+# only when — the list failure is quota/rate-limit classified. Auth/missing-gh
+# failures, REST-also-failing, and a rate-limit DURING the detail fetch all
+# still fail closed.
+# --------------------------------------------------------------------------- #
+
+_QUOTA_STDERR = "GraphQL: API rate limit already exceeded for installation ID 1"
+
+_REST_PR_123 = {
+    "number": 123,
+    "title": "Quota-safe fallback",
+    "body": "body",
+    "html_url": "https://github.com/o/r/pull/123",
+    "draft": False,
+    "mergeable": True,
+    "mergeable_state": "clean",
+    "merged_at": None,
+    "head": {"ref": "feature/x", "sha": "abc123", "repo": {"owner": {"login": "o"}}},
+    "base": {"ref": "main"},
+}
+
+
+def _quota_dispatch_run(calls, *, rest_ok=True, head_numbers='[{"number": 123}]'):
+    """``github_api._run`` stub: the author list is GraphQL-quota-blocked while
+    the REST endpoints answer (or 403 when ``rest_ok=False``). Records every
+    command so tests can assert which paths were (not) taken."""
+    import json as _json
+
+    def run(cmd, timeout_s=20, cwd=None, env=None):
+        calls.append(list(cmd))
+        joined = " ".join(cmd)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _cp(returncode=1, stderr=_QUOTA_STDERR)
+        if not rest_ok:
+            return _cp(returncode=1, stderr="HTTP 403: API rate limit exceeded")
+        if ".owner.login" in joined:
+            return _cp(stdout="o\n")
+        if "pulls?head=" in joined:
+            return _cp(stdout=head_numbers)
+        if joined.endswith("pulls/123"):
+            return _cp(stdout=_json.dumps(_REST_PR_123))
+        raise AssertionError(f"unexpected gh call: {joined}")
+
+    return run
+
+
+def _patch_detail_getters(monkeypatch):
+    monkeypatch.setattr(
+        github_api, "get_latest_commit",
+        lambda n, cwd=None: ("abc123", "2026-07-17T00:00:00Z"))
+    monkeypatch.setattr(github_api, "get_ci_checks", lambda n, cwd=None: [])
+    monkeypatch.setattr(
+        github_api, "get_unaddressed_comments", lambda n, d, cwd=None: [])
+
+
+def test_ghfailure_rate_limit_classifier():
+    def failure(stderr, reason="exit"):
+        return github_api.GhFailure(
+            command=["gh"], returncode=1, stderr=stderr, reason=reason)
+
+    assert failure("", reason="rate-limit").is_rate_limited
+    # The GraphQL primary-quota phrasing ("already exceeded") — the exact
+    # BOU-1966 symptom — must classify as a rate-limit.
+    assert failure(_QUOTA_STDERR).is_rate_limited
+    assert failure("You have exceeded a secondary rate limit").is_rate_limited
+    assert not failure("To get started with GitHub CLI: gh auth login").is_rate_limited
+    assert not failure("FileNotFoundError: No such file or directory: 'gh'").is_rate_limited
+
+
+def test_quota_blocked_list_falls_back_to_rest_by_number(monkeypatch):
+    calls = []
+    monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls))
+    _patch_detail_getters(monkeypatch)
+
+    pr = _pr_state_mod._resolve_pr_by_number(123, ".", force=True)
+    assert pr is not _pr_state_mod._GH_UNAVAILABLE and pr is not None
+    assert pr.number == 123
+    assert pr.branch == "feature/x"
+    assert pr.base_branch == "main"
+    assert pr.is_draft is False
+    assert pr.merge_state == "CLEAN"  # REST mergeable_state, GraphQL-normalized
+    assert pr.mergeable == "MERGEABLE"
+    failure = github_api.last_list_open_prs_failure()
+    assert failure is not None and failure.is_rate_limited
+
+
+def test_quota_blocked_list_falls_back_to_rest_for_branch(monkeypatch):
+    calls = []
+    monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+    _patch_detail_getters(monkeypatch)
+
+    pr = _pr_state_mod._resolve_pr_for_branch(".", force=True)
+    assert pr is not _pr_state_mod._GH_UNAVAILABLE and pr is not None
+    assert pr.number == 123
+    assert pr.branch == "feature/x"
+    # The head lookup must use the owner-qualified REST endpoint, never the
+    # GraphQL `gh pr list --head` path (which is exactly what's quota-blocked).
+    assert not any("--head" in c for c in calls)
+    assert any("pulls?head=" in " ".join(c) for c in calls)
+
+
+def test_auth_failure_does_not_fall_back_to_rest(monkeypatch):
+    calls = []
+
+    def run(cmd, timeout_s=20, cwd=None, env=None):
+        calls.append(list(cmd))
+        if cmd[:3] == ["gh", "pr", "list"]:
+            return _cp(
+                returncode=1,
+                stderr="To get started with GitHub CLI, please run: gh auth login")
+        raise AssertionError(
+            f"REST fallback must not run on an auth failure: {' '.join(cmd)}")
+
+    monkeypatch.setattr(github_api, "_run", run)
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+
+    assert _pr_state_mod._resolve_pr_by_number(
+        123, ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+    assert _pr_state_mod._resolve_pr_for_branch(
+        ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+    # Only the (failing) list calls ran; no REST endpoint was touched.
+    assert all(c[:3] == ["gh", "pr", "list"] for c in calls)
+
+
+def test_quota_blocked_and_rest_also_failing_stays_fail_closed(monkeypatch):
+    calls = []
+    monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls, rest_ok=False))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+
+    assert _pr_state_mod._resolve_pr_by_number(
+        123, ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+    assert _pr_state_mod._resolve_pr_for_branch(
+        ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+
+
+def test_quota_fallback_branch_without_rest_match_stays_fail_closed(monkeypatch):
+    # REST healthy but no owner-qualified PR for this head → still fail closed:
+    # the owner-qualified query cannot see a fork-backed head, so an empty
+    # result under quota exhaustion must not read as a verified "no PR".
+    calls = []
+    monkeypatch.setattr(
+        github_api, "_run", _quota_dispatch_run(calls, head_numbers="[]"))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+
+    assert _pr_state_mod._resolve_pr_for_branch(
+        ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+
+
+def test_quota_fallback_detail_rate_limit_stays_fail_closed(monkeypatch):
+    # REST resolves the PR, but a detail fetch ULTIMATELY rate-limits — the
+    # empty detail results are unreliable, so the resolver must fail closed.
+    # Uses the monotonic event counter: the tick-scoped rate_limit_seen() flag
+    # is already set by the failed list, so a boolean guard could not see this.
+    calls = []
+    monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls))
+    monkeypatch.setattr(
+        github_api, "get_latest_commit",
+        lambda n, cwd=None: ("abc123", "2026-07-17T00:00:00Z"))
+    monkeypatch.setattr(github_api, "get_ci_checks", lambda n, cwd=None: [])
+
+    def _comments_rate_limited(n, d, cwd=None):
+        github_api._RATE_LIMIT_EVENTS = github_api._RATE_LIMIT_EVENTS + 1
+        return []
+
+    monkeypatch.setattr(
+        github_api, "get_unaddressed_comments", _comments_rate_limited)
+
+    assert _pr_state_mod._resolve_pr_by_number(
+        123, ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+
+
+def test_rest_pr_payload_normalizes_to_graphql_shape(monkeypatch):
+    import json as _json
+
+    monkeypatch.setattr(
+        github_api, "_run", lambda *a, **k: _cp(stdout=_json.dumps(_REST_PR_123)))
+    payload = github_api._rest_pr_payload(123, cwd=".")
+    assert payload == {
+        "number": 123,
+        "title": "Quota-safe fallback",
+        "body": "body",
+        "url": "https://github.com/o/r/pull/123",
+        "isDraft": False,
+        "mergeStateStatus": "CLEAN",
+        "reviewDecision": "",
+        "headRefOid": "abc123",
+        "headRefName": "feature/x",
+        "headRepositoryOwner": {"login": "o"},
+        "baseRefName": "main",
+        "mergedAt": None,
+        "mergeable": "MERGEABLE",
+    }
+
+
+def test_gh_unavailable_message_mentions_rest_fallback_on_quota(monkeypatch):
+    monkeypatch.setattr(
+        github_api, "_run", lambda *a, **k: _cp(returncode=1, stderr=_QUOTA_STDERR))
+    assert github_api.list_open_prs(".") is None
+    msg = _pr_state_mod._gh_unavailable_message(".")
+    assert "gh unavailable" in msg
+    assert "REST" in msg and "BOU-1966" in msg
