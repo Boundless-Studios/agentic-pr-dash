@@ -136,10 +136,18 @@ def test_stop_gate_demands_waiter_for_detached_open_pr(tmp_path, monkeypatch, ca
 def test_await_keeps_ticking_when_owned_empty_but_detached_prs_exist(
     tmp_path, monkeypatch, capsys
 ):
-    """await must NOT exit 0 when owned=[] but the session has open detached PRs.
-    It should continue ticking until max-wait or work is found.
+    """await must NOT exit 0 when owned=[] but the session has open detached PRs
+    that still have something to watch. It should continue ticking until
+    max-wait or work is found.
+
+    Since BOU-1962 a detached PR that is fully CLEAN (no blockers AND required
+    CI terminal) is a legitimate exit-0, so tick 1 marks the record
+    watch-pending (``ci_watch_pending``) — the codex-P2 concern this test
+    guards is that the empty-`owned` early exit must not drop coverage of a
+    detached PR that is still being watched.
     """
-    # First tick: no owned worktrees, but has detached records → should NOT exit 0
+    # First tick: no owned worktrees, but a watch-pending detached record
+    # → should NOT exit 0
     # Second tick: detached record has a blocker → exits 10
 
     tick_count = [0]
@@ -153,14 +161,14 @@ def test_await_keeps_ticking_when_owned_empty_but_detached_prs_exist(
     def fake_detached(sid, cwd, include_legacy=True, prune_legacy=True):
         tick_count[0] += 1
         if tick_count[0] == 1:
-            # First tick: open but no blockers
+            # First tick: open, no blockers, required CI still running
             return [{
                 "pr": 202, "url": "https://x/pull/202", "branch": "bou-202",
                 "worktree_present": False, "unresolved_threads": 0,
                 "ci_failing": False, "failing_checks": [],
                 "changes_requested": False, "merge_conflict": False,
                 "review_decision": "", "merge_state": "", "mergeable": "",
-                "p1": False, "state": "open",
+                "p1": False, "state": "open", "ci_watch_pending": True,
             }]
         # Second tick: has a blocker
         return [{

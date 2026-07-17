@@ -180,6 +180,29 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
     return False
 
 
+def _await_watch_pending_this_tick(
+    owned: list[str],
+    detached_records: list[dict],
+    cwd: str,
+    session_id: str,
+) -> bool:
+    """Watch-pending across BOTH live worktrees and detached (ledger-only) PRs.
+
+    A session can own a PR solely through the ledger, so ``owned`` may be empty
+    while its required CI is still running (codex PR #50 review). Shared by the
+    BOU-1962 clean-state early exit and the ``--max-wait`` deadline path so both
+    apply the same definition of "required CI still running".
+    """
+    detached_watch_pending = any(
+        r.get("ci_watch_pending")
+        and r.get("state") not in ("merged", "closed", "draft", "unknown")
+        for r in detached_records
+    )
+    return detached_watch_pending or _collect_await_watch_pending(
+        owned, cwd, session_id
+    )
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     code, text = _check_worktree(args.cwd, args.session_id or "")
     print(text)
@@ -576,10 +599,16 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
+            gh_unobservable = False
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     pending.append((worktree, text))
+                elif code == 2:
+                    # gh could not resolve this worktree's PR this tick — its
+                    # state is UNOBSERVABLE, so this tick must not conclude
+                    # "clean" (suppresses the BOU-1962 early exit below).
+                    gh_unobservable = True
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             _detached_this_tick: list[dict] = []
@@ -617,20 +646,39 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             ):
                 return 0
 
+            # BOU-1962: clean-state early exit. `pending` is empty here (the
+            # return-10 above fired otherwise), so no owned or detached PR has
+            # an actionable blocker. If required CI is also TERMINAL (not
+            # watch-pending — the same probe the deadline path uses, so the
+            # BOU-1789 stay-alive-while-CI-runs behavior is preserved) and PR
+            # state was actually observable this tick (no gh outage, no rate
+            # limit), the watched PRs are CLEAN: exit 0 now instead of sleeping
+            # until the deadline — or forever with `--max-wait < 0`. The
+            # detached pr-maintenance-loop remains the durable backstop.
+            watch_pending: bool | None = None
+            if not getattr(args, "keep_alive_without_prs", False):
+                watch_pending = _await_watch_pending_this_tick(
+                    owned, _detached_this_tick, cwd, session_id
+                )
+                if (
+                    not watch_pending
+                    and not gh_unobservable
+                    and not github_api.rate_limit_seen()
+                ):
+                    print(
+                        "[pr-watch] all watched PRs are clean (no pending "
+                        "feedback, required CI terminal); waiter exiting."
+                    )
+                    return 0
+
             if deadline is not None and time.time() >= deadline:
-                # Watch-pending across BOTH live worktrees and detached
-                # (ledger-only) PRs — a session can own a PR solely through the
-                # ledger, so `owned` may be empty while its required CI is still
-                # running (codex PR #50 review).
-                detached_watch_pending = any(
-                    r.get("ci_watch_pending")
-                    and r.get("state") not in ("merged", "closed", "draft", "unknown")
-                    for r in _detached_this_tick
-                )
-                watch_pending = (
-                    detached_watch_pending
-                    or _collect_await_watch_pending(owned, cwd, session_id)
-                )
+                # Reuse this tick's watch-pending probe when the clean-exit
+                # path already ran it (identical inputs within the tick);
+                # compute it here otherwise (keep_alive_without_prs sessions).
+                if watch_pending is None:
+                    watch_pending = _await_watch_pending_this_tick(
+                        owned, _detached_this_tick, cwd, session_id
+                    )
                 # Read the flag AFTER the watch-pending probe so a quota wall hit
                 # by THAT call is captured too (a PR with running CI must not lose
                 # its waiter on a rate-limited tick) (BOU-1921 #62).
