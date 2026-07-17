@@ -95,6 +95,10 @@ class ReviewThreadComment:
     body: str
     author: str
     created_at: str
+    # GitHub's `originalLine` — the anchor line at the commit the comment was
+    # made on. For OUTDATED threads GitHub nulls `line` (it can no longer track
+    # the anchor), so this is the only line evidence left (BOU-2095).
+    original_line: int | None = None
 
 
 @dataclass(frozen=True)
@@ -1181,6 +1185,7 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
                         body=str(c.get("body") or ""),
                         author=str((c.get("author") or {}).get("login") or "unknown"),
                         created_at=str(c.get("createdAt") or ""),
+                        original_line=c.get("originalLine"),
                     )
 
                 top = _parse_comment(comment_nodes[0])
@@ -1448,6 +1453,57 @@ def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
     if r.returncode != 0:
         return []
     return [line for line in r.stdout.splitlines() if line.strip()]
+
+
+# `@@ -old_start[,old_count] +new_start[,new_count] @@` (git unified hunk header)
+_HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def get_changed_line_spans(
+    base_sha: str,
+    head_sha: str,
+    path: str,
+    cwd: str | None = None,
+) -> list[tuple[int, int, int, int]] | None:
+    """Hunk line spans changed for ``path`` in ``base_sha..head_sha`` (local git).
+
+    Returns a list of ``(old_start, old_end, new_start, new_end)`` tuples, one
+    per hunk, parsed from a zero-context diff. A side with a zero line count
+    (pure insertion/deletion) yields an EMPTY span encoded as ``end < start``
+    (``(start, start - 1)``) so callers can tell "no lines on this side" apart
+    from a one-line change.
+
+    Returns ``None`` when the diff is unavailable (missing SHAs, git failure,
+    SHAs not in local history). Callers MUST treat ``None`` as "no evidence" —
+    never as "nothing changed" (BOU-2095: absence of proof must not resolve
+    review threads).
+    """
+    if not base_sha or not head_sha or not path:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "-c", "core.quotePath=false",
+             "diff", "--unified=0", f"{base_sha}..{head_sha}", "--", path],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    spans: list[tuple[int, int, int, int]] = []
+    for line in r.stdout.splitlines():
+        m = _HUNK_HEADER_RE.match(line)
+        if not m:
+            continue
+        old_start = int(m.group(1))
+        old_count = int(m.group(2)) if m.group(2) is not None else 1
+        new_start = int(m.group(3))
+        new_count = int(m.group(4)) if m.group(4) is not None else 1
+        spans.append((
+            old_start, old_start + old_count - 1,
+            new_start, new_start + new_count - 1,
+        ))
+    return spans
 
 
 def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:

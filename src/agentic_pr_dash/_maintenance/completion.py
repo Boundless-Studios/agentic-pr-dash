@@ -21,6 +21,68 @@ _FILE_REF_RE = re.compile(
 # Module-ish tokens that are almost always prose, not real module references.
 _MODULE_REF_STOPWORDS = frozenset({"e.g", "i.e", "etc"})
 
+# BOU-2095: how far (in lines) a changed hunk may sit from a thread's anchored
+# line and still count as evidence that the comment's subject was edited. Three
+# lines matches the diff context GitHub shows around an inline comment.
+_ANCHOR_CONTEXT_LINES = 3
+
+
+def _spans_intersect_line(
+    spans: list[tuple[int, int, int, int]],
+    anchor_line: int,
+) -> bool:
+    """True if any changed hunk touches ``anchor_line`` (± context fuzz).
+
+    ``spans`` come from :func:`agentic_pr_dash.github_api.get_changed_line_spans`
+    — ``(old_start, old_end, new_start, new_end)`` per hunk, where an empty side
+    is encoded as ``end < start``. The anchor is checked against BOTH sides: a
+    non-outdated thread's ``line`` is head-side, an outdated thread's
+    ``original_line`` is base-side, and we deliberately do not guess which —
+    intersecting either side within the context window is accepted as evidence.
+    """
+    for old_start, old_end, new_start, new_end in spans:
+        for start, end in ((old_start, old_end), (new_start, new_end)):
+            if end < start:  # empty side: pure insertion/deletion counterpart
+                continue
+            if start - _ANCHOR_CONTEXT_LINES <= anchor_line <= end + _ANCHOR_CONTEXT_LINES:
+                return True
+    return False
+
+
+def _thread_completion_evidence(
+    thread,  # type: ignore[no-untyped-def]
+    spans: list[tuple[int, int, int, int]] | None,
+    complete_marker: str,
+) -> str | None:
+    """Positive per-thread evidence that the completing commits addressed THIS thread.
+
+    BOU-2095: "the anchor file was touched" / "GitHub marks the thread
+    outdated" is NOT evidence — line drift and unrelated same-file edits were
+    silently resolving live feedback. Returns the evidence kind, or ``None``
+    when there is none (caller must leave the thread OPEN):
+
+    - ``"reply"``  — a completion-marker reply already targets this thread
+      (an earlier `complete` run replied but the resolve mutation failed);
+    - ``"hunk"``   — the completing commits changed content at the thread's
+      anchored line (± :data:`_ANCHOR_CONTEXT_LINES`);
+    - ``"file"``   — the thread is file-level (no line anchor at all) and the
+      file's content changed; the whole file IS the anchor span.
+
+    ``spans is None`` means the base..head diff was unavailable — that is
+    absence of proof, never proof of absence, so it yields ``None``.
+    """
+    for reply in thread.replies:
+        if complete_marker in (reply.body or ""):
+            return "reply"
+    anchor_line = thread.top.line
+    if anchor_line is None:
+        anchor_line = thread.top.original_line
+    if anchor_line is None:
+        return "file" if spans else None
+    if spans and _spans_intersect_line(spans, anchor_line):
+        return "hunk"
+    return None
+
 
 def _commit_subject(message: str) -> str:
     """First non-empty line of a commit message, trimmed."""
