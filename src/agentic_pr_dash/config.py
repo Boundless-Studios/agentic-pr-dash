@@ -33,6 +33,33 @@ DEFAULT_DISCOVERY_NAMES = ("claude", "codex")
 DEFAULT_LEASE_SECONDS = 1800
 DEFAULT_HEARTBEAT_TTL_SECONDS = 600
 
+# --- Capability markers (BOU-2086) -----------------------------------------
+# Importable, machine-checkable feature flags. Config keys are silently inert on
+# an OLD installed snapshot (e.g. ``escalation_failure_threshold`` before
+# BOU-1789 shipped) — a consumer setting the key has no way to tell whether the
+# engine honors it. External wrappers (gaia's daemon.sh / Stop hook) probe THIS
+# set instead of guessing from the package version:
+#
+#     python -c "from agentic_pr_dash.config import has_capability; \
+#                print(has_capability('loop_health_executor_viability'))"
+#
+# An ImportError/AttributeError from that probe means the snapshot predates the
+# marker entirely — treat every listed capability as absent (fail closed).
+CAPABILITIES: frozenset[str] = frozenset({
+    # BOU-1789: per-PR executor-failure streaks + escalation; the
+    # ``escalation_failure_threshold`` config key is honored.
+    "escalation_failure_threshold",
+    # BOU-2086: the loop persists a heartbeat + executor-viability record and
+    # coverage checks (``_detached_loop_alive`` / ``_loop_covers_pr``) require
+    # it fresh — pid-alive alone never counts as coverage.
+    "loop_health_executor_viability",
+})
+
+
+def has_capability(name: str) -> bool:
+    """True when this installed snapshot implements the named capability."""
+    return name in CAPABILITIES
+
 
 def _env(name: str) -> str | None:
     """Read ``AGENTIC_PR_DASH_<name>``, falling back to the legacy ``GAIA_<name>``."""

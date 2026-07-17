@@ -104,6 +104,91 @@ def _save_health(cwd: str, data: dict) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Loop health record (BOU-2086)
+# ---------------------------------------------------------------------------
+# Reserved (non-numeric) key in the per-repo health file holding the LOOP's own
+# health record — heartbeat + executor viability — alongside the per-PR streak
+# entries (whose keys are bare PR numbers). Coverage checks require this record
+# to be FRESH and viable; a live wrapper/daemon PID alone is not proof the loop
+# can actually dispatch an executor (both executors can be unreachable while the
+# process idles), so pid-alive-only coverage left red PRs unwatched.
+LOOP_HEALTH_KEY = "__loop__"
+
+# Freshness floor (seconds) for the loop heartbeat. The effective max age is
+# max(LOOP_HEALTH_INTERVAL_MULTIPLIER * recorded tick interval, this floor) so a
+# short-interval loop isn't declared stale during one long executor dispatch.
+LOOP_HEALTH_MIN_FRESH_S = 900.0
+LOOP_HEALTH_INTERVAL_MULTIPLIER = 3.0
+_DEFAULT_TICK_INTERVAL_S = 600.0
+
+
+def _pr_health_entries(data: dict) -> dict:
+    """The per-PR streak entries of a health dict (drops the loop record)."""
+    return {k: v for k, v in data.items() if k != LOOP_HEALTH_KEY}
+
+
+def loop_health_entry(cwd: str) -> dict:
+    """The loop's own health record from the per-repo health file, or {}."""
+    entry = _load_health(cwd).get(LOOP_HEALTH_KEY)
+    return entry if isinstance(entry, dict) else {}
+
+
+def record_loop_health(
+    cwd: str,
+    *,
+    executors_viable: bool,
+    errors: dict | None = None,
+    interval: float | None = None,
+) -> None:
+    """Persist the loop's heartbeat + executor-viability record (BOU-2086).
+
+    Written on every tick (viable or not) and on startup executor-validation
+    failure — so coverage readers can distinguish "daemon process exists" from
+    "daemon can actually service PRs". ``errors`` retains the CONCRETE
+    per-executor error strings (both primary and fallback) for diagnosis.
+    """
+    data = _load_health(cwd)
+    entry: dict = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": bool(executors_viable),
+    }
+    clean_errors = {k: str(v)[:500] for k, v in (errors or {}).items() if v}
+    if clean_errors:
+        entry["errors"] = clean_errors
+    if interval is not None:
+        try:
+            entry["interval"] = float(interval)
+        except (TypeError, ValueError):
+            pass
+    data[LOOP_HEALTH_KEY] = entry
+    _save_health(cwd, data)
+
+
+def loop_health_ok(cwd: str, now: float | None = None) -> bool:
+    """True when the loop's health record is FRESH and executors are viable.
+
+    Fail-closed: a missing/corrupt record, a stale heartbeat, or an explicit
+    ``executors_viable: false`` all return False — pid-alive alone must never
+    count as maintenance coverage (BOU-2086).
+    """
+    entry = loop_health_entry(cwd)
+    if not entry.get("executors_viable"):
+        return False
+    try:
+        heartbeat = float(entry["heartbeat"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    try:
+        interval = float(entry.get("interval") or _DEFAULT_TICK_INTERVAL_S)
+    except (TypeError, ValueError):
+        interval = _DEFAULT_TICK_INTERVAL_S
+    max_age = max(LOOP_HEALTH_INTERVAL_MULTIPLIER * interval, LOOP_HEALTH_MIN_FRESH_S)
+    now = time.time() if now is None else now
+    return (now - heartbeat) <= max_age
+
+
 def _entry_streak(entry: object) -> int:
     """Streak from a per-PR health entry, coercing malformed content to 0.
 
@@ -227,7 +312,10 @@ def _clear_recovered_streak(cwd: str) -> None:
     closes that gap. Cheap-guarded: only resolves the PR via ``gh`` when this
     repo actually has recorded streak/escalation state.
     """
-    if not _load_health(cwd) and not _load_escalation(cwd):
+    # Only the per-PR streak entries gate this guard — the loop's own health
+    # record (LOOP_HEALTH_KEY) is persistent, so counting it would turn the
+    # cheap-guard into a `gh pr view` per worktree per tick (BOU-2086).
+    if not _pr_health_entries(_load_health(cwd)) and not _load_escalation(cwd):
         return
     import json as _json  # noqa: PLC0415
     try:
@@ -248,11 +336,15 @@ def _clear_recovered_streak(cwd: str) -> None:
 
 
 def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
-    """True when the detached loop is alive AND the failure streak < threshold.
+    """True when the detached loop is alive+healthy AND the streak < threshold.
 
     When the streak reaches the threshold the loop has repeatedly failed to fix
     the PR, so it no longer counts as coverage — the stop-gate must force a
     per-session waiter to bring the issue to the user.
+
+    ``_detached_loop_alive`` itself requires a fresh, executors-viable loop
+    health record (BOU-2086), so a wrapper pid that is alive while the python
+    loop exited (or can dispatch neither executor) is NOT coverage.
     """
     from ._maintenance.waiter import _detached_loop_alive  # noqa: PLC0415
     if not _detached_loop_alive(cwd):
@@ -526,46 +618,58 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
     return subprocess.run(parts, cwd=cwd).returncode
 
 
-def _try_run(executor: str, prompt: str, cwd: str) -> int | None:
-    """Run an executor; return its exit code, or ``None`` if it couldn't spawn.
+_SPAWN_FAILED_PREFIX = "spawn failed: "
+
+
+def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
+    """Run an executor; return ``(exit code | None, concrete error text)``.
 
     The executor binary may be missing from PATH (OSError/FileNotFoundError) or
     otherwise fail to launch. Returning ``None`` lets the caller treat "couldn't
     launch" the same as "ran and failed" for fallback purposes, without killing
-    the whole loop on one bad spawn.
+    the whole loop on one bad spawn. The error text retains the CONCRETE cause
+    (the spawn exception, or the exit code) instead of collapsing it (BOU-2086);
+    it is ``""`` on success.
     """
     try:
-        return _run_executor(executor, prompt, cwd)
+        rc = _run_executor(executor, prompt, cwd)
     except Exception as exc:
         print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
-        return None
+        return None, f"{_SPAWN_FAILED_PREFIX}{exc}"
+    return rc, ("" if rc == 0 else f"exit {rc}")
 
 
-def _dispatch_with_fallback(primary: str, fallback: str, prompt: str, cwd: str, pr: int | None) -> bool:
+def _dispatch_with_fallback(
+    primary: str, fallback: str, prompt: str, cwd: str, pr: int | None
+) -> tuple[bool, dict[str, str]]:
     """Dispatch the fix to the primary executor, falling back on any failure.
 
     Chain (BOU-1734): run ``primary``; if it fails (non-zero exit or a failed
     spawn) and a ``fallback`` is configured, run the same prompt through the
     fallback; if BOTH fail, report a clear error rather than silently leaving the
-    PR. Returns ``True`` when some executor serviced the PR (exit 0).
+    PR. Returns ``(serviced, errors)``: ``serviced`` is True when some executor
+    serviced the PR (exit 0); ``errors`` maps ``"primary"``/``"fallback"`` to the
+    concrete per-executor failure text (BOU-2086) — empty when serviced.
     """
-    rc = _try_run(primary, prompt, cwd)
+    rc, err = _try_run(primary, prompt, cwd)
     if rc == 0:
-        return True
+        return True, {}
+    errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
     if not fallback:
         # Legacy single-executor behavior: leave the PR for the next tick.
         print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
-        return False
+        return False, errors
     print(f"[agentic-pr-dash] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
-    rc2 = _try_run(fallback, prompt, cwd)
+    rc2, err2 = _try_run(fallback, prompt, cwd)
     if rc2 == 0:
-        return True
+        return True, {}
+    errors["fallback"] = f"{_executor_program(fallback) or fallback}: {err2}"
     print(
         f"[agentic-pr-dash] ERROR: both executors failed for PR #{pr} "
         f"(primary={rc}, fallback={rc2}); leaving for next tick",
         file=sys.stderr,
     )
-    return False
+    return False, errors
 
 
 def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
@@ -588,11 +692,47 @@ def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
     return False
 
 
+def _tick_executor_viability(executor: str, fallback: str) -> tuple[bool, dict[str, str]]:
+    """Re-check executor resolvability for this tick (BOU-2086).
+
+    Viable means the loop can dispatch AT LEAST one executor: the primary
+    resolves, or a configured fallback resolves (a broken primary still gets
+    serviced via the fallback chain). Returns ``(viable, errors)`` with the
+    concrete per-executor validation errors retained.
+    """
+    errors: dict[str, str] = {}
+    primary_err = _validate_executor(executor)
+    if primary_err:
+        errors["primary"] = primary_err
+    fallback_err = None
+    if fallback:
+        fallback_err = _validate_executor(fallback)
+        if fallback_err:
+            errors["fallback"] = fallback_err
+    viable = primary_err is None or (bool(fallback) and fallback_err is None)
+    return viable, errors
+
+
 def _tick(args, executor: str) -> None:
     fallback = getattr(args, "fallback_executor", "") or ""
+    # Heartbeat + viability (BOU-2086): stamp each serviced repo's health file
+    # once per tick so coverage readers can require a FRESH, executors-viable
+    # loop rather than trusting a live pid alone.
+    tick_viable, tick_errors = _tick_executor_viability(executor, fallback)
+    interval = getattr(args, "interval", None)
+    stamped_health_files: set[Path] = set()
     for cwd in _discover_cwds(args):
         if not Path(cwd).is_dir():
             continue
+        try:
+            hf = _health_file(cwd)
+        except Exception:  # noqa: BLE001 — heartbeat is best-effort
+            hf = None
+        if hf is not None and hf not in stamped_health_files:
+            stamped_health_files.add(hf)
+            record_loop_health(
+                cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
+            )
         if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
             continue
         check = subprocess.run(
@@ -626,11 +766,24 @@ def _tick(args, executor: str) -> None:
         session = args.session_id or f"pid:{_loop_pid()}"
         if claim_id:
             coordinator.heartbeat_claim_id(claim_id, session)
-        if not _dispatch_with_fallback(executor, fallback, prompt, cwd, pr):
+        serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
+        if not serviced:
             # Primary (and fallback, if any) failed. Record the failure streak,
             # then release the claim so the PR is not left wrongly owned until
-            # the lease expires, then move on.
-            err_summary = f"executor exit non-zero or spawn-failed for PR #{pr}"
+            # the lease expires, then move on. Retain the CONCRETE per-executor
+            # errors in the streak record (BOU-2086) instead of a generic line.
+            detail = "; ".join(f"{k}: {v}" for k, v in exec_errors.items())
+            err_summary = (
+                f"executor dispatch failed for PR #{pr}: {detail}"
+                if detail else f"executor exit non-zero or spawn-failed for PR #{pr}"
+            )
+            # Every attempted executor failed to even SPAWN → the loop cannot
+            # currently dispatch anything: downgrade this repo's viability record
+            # immediately rather than waiting for the next tick's validation.
+            if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
+                record_loop_health(
+                    cwd, executors_viable=False, errors=exec_errors, interval=interval,
+                )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
             if claim_id:
@@ -702,10 +855,15 @@ def main(argv: list[str] | None = None) -> int:
     # Validate the executor up-front (BOU-1637): catch a missing/misconfigured
     # command at startup, not on the first dispatch tick (where a PR would already
     # be claimed). Fail loudly with exit 2 so a supervisor sees the misconfig.
+    # Validate BOTH the primary and the fallback before exiting (BOU-2086) so a
+    # DEGRADED health record retaining every concrete error is persisted — the
+    # wrapper daemon's pid can stay "running" after this exit, and pid-alive
+    # alone must never read as coverage.
+    startup_errors: dict[str, str] = {}
     executor_error = _validate_executor(executor)
     if executor_error:
+        startup_errors["primary"] = executor_error
         print(f"agentic-pr-dash loop: {executor_error}", file=sys.stderr)
-        return 2
 
     # Validate the fallback the same way when one is configured, so a broken
     # fallback (typo, uninstalled agent) is caught at startup rather than only
@@ -713,8 +871,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.fallback_executor:
         fallback_error = _validate_executor(args.fallback_executor)
         if fallback_error:
+            startup_errors["fallback"] = fallback_error
             print(f"agentic-pr-dash loop (fallback): {fallback_error}", file=sys.stderr)
-            return 2
+
+    if startup_errors:
+        for cwd in args.cwd:
+            try:
+                record_loop_health(
+                    cwd, executors_viable=False, errors=startup_errors,
+                    interval=args.interval,
+                )
+            except Exception:  # noqa: BLE001 — never mask the loud exit
+                pass
+        return 2
 
     if args.once:
         _tick(args, executor)

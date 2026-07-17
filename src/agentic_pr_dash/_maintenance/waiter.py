@@ -178,7 +178,19 @@ def _await_alive(cwd: str, session_id: str) -> bool:
 
 
 def _detached_loop_alive(cwd: str) -> bool:
-    """True when the detached ``pr-maintenance-loop`` daemon is running."""
+    """True when the detached ``pr-maintenance-loop`` daemon is running AND
+    capable of maintenance.
+
+    Pid-alive alone is NOT coverage (BOU-2086): a supervisor/wrapper pidfile can
+    stay "running" while the python loop exited at startup validation (e.g. the
+    fallback executor missing from PATH) or while NEITHER executor is
+    dispatchable — a red PR would then idle uncovered. So beyond the machine-wide
+    opt-in and a live pid, require the loop's own health record (written every
+    tick to the per-repo health file) to be FRESH with viable executors.
+    Fail-closed: an absent/stale/degraded record — including one written by an
+    older package snapshot that never records health — means "not covered", which
+    at worst forces a cheap per-session waiter.
+    """
     cfg = load_config(cwd)
     if not cfg.maintenance_loop_machine_wide:
         return False
@@ -189,7 +201,10 @@ def _detached_loop_alive(cwd: str) -> bool:
         pid_raw = pidfile.read_text(encoding="utf-8").strip()
     except OSError:
         return False
-    return _pid_alive(pid_raw)
+    if not _pid_alive(pid_raw):
+        return False
+    from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
+    return _loop_mod.loop_health_ok(cwd)
 
 
 def _detached_pending_entry(r: dict) -> tuple[str, str]:

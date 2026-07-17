@@ -185,10 +185,13 @@ def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypat
 
 
 def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
-    """_detached_loop_alive: live pid → True, dead pid → False, missing → False.
+    """_detached_loop_alive: live pid + fresh healthy record → True; a live pid
+    ALONE → False (BOU-2086); dead pid → False; missing → False.
 
     Requires the machine-wide opt-in (a scoped loop is not proof of coverage).
     """
+    from agentic_pr_dash import loop
+
     daemon_dir = tmp_path / "daemons"
     daemon_dir.mkdir()
     monkeypatch.setenv("GAIA_DAEMON_DIR", str(daemon_dir))
@@ -200,11 +203,17 @@ def test_detached_loop_alive_reads_pidfile(tmp_path, monkeypatch):
     # Missing pidfile → not alive.
     assert mc._detached_loop_alive(str(tmp_path)) is False
 
-    # Live pid (this process) → alive.
+    # Live pid (this process) but NO health record → pid-alive alone is NOT
+    # proof of maintenance capability (BOU-2086).
     pidfile.write_text(str(os.getpid()), encoding="utf-8")
+    assert mc._detached_loop_alive(str(tmp_path)) is False
+
+    # Live pid + fresh, executors-viable health record → alive.
+    loop.record_loop_health(str(tmp_path), executors_viable=True, interval=600)
     assert mc._detached_loop_alive(str(tmp_path)) is True
 
-    # Dead pid → not alive. PID 1 is always live, so use a pid that cannot exist.
+    # Dead pid → not alive even with a healthy record. PID 1 is always live, so
+    # use a pid that cannot exist.
     pidfile.write_text("2147483647", encoding="utf-8")
     assert mc._detached_loop_alive(str(tmp_path)) is False
 
