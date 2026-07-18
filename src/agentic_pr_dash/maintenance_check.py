@@ -102,6 +102,7 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _extract_pr_number,
     _build_stop_block,
     _owned_open_pr_numbers,
+    _owned_open_pr_pairs,
     _build_waiter_block,
     _stop_gate_impl,
     _record_has_blockers,
@@ -147,7 +148,8 @@ from ._maintenance.waiter import (  # noqa: F401, E402
     _detached_pending_entry,
     _write_clean_exit_marker,
     _clear_clean_exit_marker,
-    _read_clean_exit_prs,
+    _read_clean_exit_keys,
+    _clean_exit_key,
 )
 
 
@@ -741,9 +743,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 ):
                     # Record WHICH open PRs were verified clean so the stop
                     # gate doesn't re-demand a waiter that would immediately
-                    # clean-exit again (codex PR #75 review).
-                    verified = set(_owned_open_pr_numbers(owned)) | {
-                        r["pr"]
+                    # clean-exit again (codex PR #75 review). Keys are
+                    # repo-qualified so the same PR number in two maintenance
+                    # repos stays distinct (round 3).
+                    verified = {
+                        _clean_exit_key(_repo_slug(wt), n)
+                        for wt, n in _owned_open_pr_pairs(owned)
+                    } | {
+                        _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick
                         if r.get("state") not in ("merged", "closed", "draft", "unknown")
                     }

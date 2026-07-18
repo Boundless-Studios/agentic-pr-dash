@@ -23,6 +23,7 @@ from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance._common import _repo_slug
 
 SID = "sess-codex-pr75"
 
@@ -181,6 +182,11 @@ def _arm(tmp_path, pr_number: int):
     return wt
 
 
+def _marker_key(wt, pr: int) -> str:
+    """The repo-qualified identity the waiter/stop-gate derive for ``wt``'s PR."""
+    return _waiter_mod._clean_exit_key(_repo_slug(str(wt)), pr)
+
+
 def test_await_clean_exit_writes_marker(tmp_path, monkeypatch):
     wt = _arm(tmp_path, 42)
     _wire_await(tmp_path, monkeypatch, wt)
@@ -190,13 +196,13 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch):
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
-    assert _waiter_mod._read_clean_exit_prs(SID) == {42}
+    assert _waiter_mod._read_clean_exit_keys(SID) == {_marker_key(wt, 42)}
 
 
 def test_await_exit_10_clears_marker(tmp_path, monkeypatch):
     wt = _arm(tmp_path, 42)
     _wire_await(tmp_path, monkeypatch, wt)
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(
         mc, "_check_worktree",
         lambda path, sid, *, claim=True: (10, "needs review\nPR_NUMBER=42"),
@@ -204,7 +210,7 @@ def test_await_exit_10_clears_marker(tmp_path, monkeypatch):
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 10
-    assert _waiter_mod._read_clean_exit_prs(SID) == set()
+    assert _waiter_mod._read_clean_exit_keys(SID) == set()
 
 
 def _wire_stop_gate(tmp_path, monkeypatch, wt):
@@ -221,7 +227,7 @@ def test_stop_gate_skips_redemand_for_marker_covered_clean_pr(tmp_path, monkeypa
     waiter that would immediately clean-exit again (CI terminal, observable)."""
     wt = _arm(tmp_path, 42)
     _wire_stop_gate(tmp_path, monkeypatch, wt)
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -235,7 +241,7 @@ def test_stop_gate_still_demands_waiter_when_ci_running_again(tmp_path, monkeypa
     alive (BOU-1789 watch-pending), so the demand stands."""
     wt = _arm(tmp_path, 42)
     _wire_stop_gate(tmp_path, monkeypatch, wt)
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: True)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -249,7 +255,7 @@ def test_stop_gate_still_demands_waiter_when_probe_unobservable(tmp_path, monkey
     coverage (demand the waiter; it suppresses ITS clean exit the same way)."""
     wt = _arm(tmp_path, 42)
     _wire_stop_gate(tmp_path, monkeypatch, wt)
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
 
     def failing_probe(n, cwd=None):
         github_api._note_checks_probe_failure()
@@ -274,7 +280,7 @@ def test_stop_gate_marker_skip_fails_closed_on_unobservable_check(tmp_path, monk
                         lambda path, sid, *, claim=True: (2, "could not list PRs (gh unavailable)"))
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
                         lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -299,7 +305,7 @@ def test_stop_gate_marker_skip_fails_closed_on_warn_only_deferral(tmp_path, monk
     )
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
                         lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -344,10 +350,95 @@ def test_stop_gate_demands_waiter_for_pr_not_covered_by_marker(tmp_path, monkeyp
     fires so the new PR gets its first waiter round."""
     wt = _arm(tmp_path, 43)  # new PR; marker only covers 42
     _wire_stop_gate(tmp_path, monkeypatch, wt)
-    _waiter_mod._write_clean_exit_marker(SID, {42})
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     err = capsys.readouterr().err
     assert rc == 2
     assert "#43" in err
+
+
+# ---------------------------------------------------------------------------
+# Round 3: repo-qualified identity for the marker and detached CI-watch state
+# ---------------------------------------------------------------------------
+
+
+def _detached_record(pr: int, repo: str, *, ci_watch_pending: bool) -> dict:
+    return {
+        "pr": pr, "url": f"https://example/{repo}/pull/{pr}", "branch": "b",
+        "repo": repo, "worktree_present": False, "unresolved_threads": 0,
+        "ci_failing": False, "failing_checks": [],
+        "ci_watch_pending": ci_watch_pending, "changes_requested": False,
+        "review_decision": None, "merge_conflict": False,
+        "merge_state": "CLEAN", "mergeable": "MERGEABLE",
+        "p1": False, "state": "open",
+    }
+
+
+def test_stop_gate_marker_skip_requires_every_repo_identity(tmp_path, monkeypatch, capsys):
+    """Round 3: the same PR number in a SECOND repo (detached record) is a
+    distinct identity — a marker covering only the worktree repo's #42 must not
+    suppress the demand."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(
+        _worktrees_mod, "_detached_records_across_roots",
+        lambda sid, cwd: [_detached_record(42, "other-org/other-repo",
+                                           ci_watch_pending=False)],
+    )
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#42" in err
+
+
+def test_stop_gate_detached_ci_watch_not_collapsed_across_repos(tmp_path, monkeypatch, capsys):
+    """Round 3: two same-numbered detached records in different repos — the one
+    with required CI running must keep the demand alive even when another
+    record with the same number is CI-terminal (no last-wins collapse)."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    rec_running = _detached_record(7, "org-a/repo-a", ci_watch_pending=True)
+    rec_terminal = _detached_record(7, "org-b/repo-b", ci_watch_pending=False)
+    # Iteration order puts the CI-running record FIRST so a last-wins dict
+    # would drop it in favor of the terminal one.
+    monkeypatch.setattr(
+        _worktrees_mod, "_detached_records_across_roots",
+        lambda sid, cwd: [rec_running, rec_terminal],
+    )
+    _waiter_mod._write_clean_exit_marker(SID, {
+        _marker_key(wt, 42),
+        _waiter_mod._clean_exit_key("org-a/repo-a", 7),
+        _waiter_mod._clean_exit_key("org-b/repo-b", 7),
+    })
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert rc == 2, "a CI-running detached record must keep the waiter demand"
+
+
+def test_stop_gate_marker_skip_covers_multi_repo_identities_when_all_clean(tmp_path, monkeypatch, capsys):
+    """Round 3 complement: when the marker covers BOTH repo identities and no
+    record has CI running, the skip fires."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(
+        _worktrees_mod, "_detached_records_across_roots",
+        lambda sid, cwd: [_detached_record(7, "org-a/repo-a", ci_watch_pending=False),
+                          _detached_record(7, "org-b/repo-b", ci_watch_pending=False)],
+    )
+    _waiter_mod._write_clean_exit_marker(SID, {
+        _marker_key(wt, 42),
+        _waiter_mod._clean_exit_key("org-a/repo-a", 7),
+        _waiter_mod._clean_exit_key("org-b/repo-b", 7),
+    })
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "await" not in err.lower()

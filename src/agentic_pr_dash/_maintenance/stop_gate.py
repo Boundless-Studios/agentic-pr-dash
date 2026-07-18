@@ -168,7 +168,7 @@ def _stop_gate_impl(args) -> int:
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
-    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_prs  # noqa: PLC0415
+    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_keys, _clean_exit_key  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
@@ -315,10 +315,30 @@ def _stop_gate_impl(args) -> int:
                 # pending, so only re-demand a waiter that would actually STAY
                 # alive: required CI running again (BOU-1789 watch-pending) or
                 # CI state unobservable this tick (fail toward coverage).
-                verified_clean = _read_clean_exit_prs(session_id)
+                verified_clean = _read_clean_exit_keys(session_id)
+                # Repo-qualified identities for every open PR the demand would
+                # cover — the SAME number in two maintenance repos must stay
+                # distinct in both the marker-coverage and CI-watch reads
+                # (codex PR #75 review, round 3).
+                open_detached_records = [
+                    r for r in _detached_records_across_roots(session_id, cwd)
+                    if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                ]
+                from ._common import _repo_slug as _slug  # noqa: PLC0415
+                open_keys = {
+                    _clean_exit_key(_slug(wt), n)
+                    for n, wts in pr_to_wts.items()
+                    if n in open_prs
+                    for wt in wts
+                } | {
+                    _clean_exit_key(r.get("repo", ""), r["pr"])
+                    for r in open_detached_records
+                    if r["pr"] in open_prs
+                }
                 if (
                     verified_clean
-                    and open_prs <= verified_clean
+                    and open_keys
+                    and open_keys <= verified_clean
                     # Fail closed: an unobservable or warn-only-deferred check
                     # this pass means "nothing pending" was NOT established for
                     # every owned PR — a CI-only probe below cannot stand in
@@ -328,21 +348,18 @@ def _stop_gate_impl(args) -> int:
                     and not check_warn_only
                 ):
                     github_api.reset_checks_probe_failure_seen()
-                    detached_watch = {
-                        r["pr"]: bool(r.get("ci_watch_pending"))
-                        for r in _detached_records_across_roots(session_id, cwd)
-                        if r.get("state") not in ("merged", "closed", "draft", "unknown")
-                    }
-                    ci_running = False
-                    for n in sorted(open_prs):
-                        if n in pr_to_wts:
+                    # ANY open detached record with required CI running keeps
+                    # the demand alive — never collapse same-numbered records
+                    # across repos to a last-wins value (round 3).
+                    ci_running = any(
+                        r.get("ci_watch_pending") for r in open_detached_records
+                    )
+                    if not ci_running:
+                        for n in sorted(open_prs):
                             if any(github_api.required_checks_pending(n, wt)
-                                   for wt in _wts_for(n)):
+                                   for wt in pr_to_wts.get(n, ())):
                                 ci_running = True
                                 break
-                        elif detached_watch.get(n):
-                            ci_running = True
-                            break
                     if (
                         not ci_running
                         and not github_api.checks_probe_failure_seen()
