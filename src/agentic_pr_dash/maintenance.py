@@ -263,6 +263,11 @@ def build_maintenance_prompt(
             f"This PR has merge conflicts against `{base_branch}`.",
             f"Fetch `origin/{base_branch}`, merge it into the current branch, resolve conflicts, test, commit, and push.",
             "Do not use `git reset --hard` and do not discard unrelated local changes.",
+            "Never use bare `git stash push`/`git stash pop` — the stash stack is shared "
+            "across all worktrees of this repo and indexes shift under concurrent agents. "
+            "Prefer stash-free flows; if you must stash, use "
+            "`agentic-pr-dash stash push -m \"<branch>: <purpose>\"` and "
+            "`agentic-pr-dash stash apply|drop \"<label>\"`.",
         ])
 
     if pr.failing_checks:

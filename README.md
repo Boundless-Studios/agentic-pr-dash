@@ -193,6 +193,44 @@ claim held by a dead pid is taken over. The claimed PR is appended to the live
 session's ledger and surfaced as blocked work — so abandoned PRs get reclaimed
 instead of lingering unmonitored.
 
+## Labeled-stash discipline (`agentic-pr-dash stash`)
+
+`git stash` refs are shared across **every worktree** of a repo, and
+`stash@{n}` is a stack *index* that shifts whenever any worktree pushes or
+drops. With multiple agents working sibling worktrees (exactly what this
+package orchestrates), a bare `git stash pop` can grab a *foreign* session's
+WIP — resolve-then-act on `stash@{n}` is a TOCTOU race.
+
+The `stash` subcommand ships the race-safe discipline as a package capability:
+
+```bash
+agentic-pr-dash stash push -m "<branch>: <purpose>"   # label is REQUIRED
+agentic-pr-dash stash apply "<label-substring>"       # applies by pinned COMMIT HASH
+agentic-pr-dash stash drop "<label-substring>"        # re-verifies ref==hash right before drop
+agentic-pr-dash stash list                            # read-only
+```
+
+Semantics: the label is resolved to a `(commit hash, stash@{n})` pair in **one**
+`git stash list` invocation (hash pinned at the instant the index is read);
+`apply` acts on the commit hash directly (immune to index shifts); `drop`
+re-verifies `git rev-parse stash@{n}` still equals the pinned hash immediately
+before dropping and **aborts loudly** if the shared stack shifted. Zero or
+ambiguous label matches **fail closed**. There is deliberately no `pop` — it
+applies *and* drops in one step and cannot name a survivable undo.
+
+**Recommended consumer guard policy** (mirrors gaia's allowlist-of-canonical-forms
+posture, BOU-2031/PR #2577): rather than enumerating bad `git stash` shapes
+(regex evasions win that game), allow **only** the canonical race-safe forms and
+route everything else to a prompt/deny:
+
+* `git stash list|show ...` — read-only, always safe.
+* `git stash push` whose only tokens are exactly one non-empty `-m|--message`
+  label, optional `-u|--include-untracked`, and optional pathspecs after a
+  trailing `--`.
+* `git stash apply|drop` of an explicit `stash@{n}` ref or stash commit hash.
+* `agentic-pr-dash stash <push|apply|drop|list> ...` — this wrapper.
+* Every other `git stash ...` shape (notably bare `push`, any `pop`) → ask/deny.
+
 ## License
 
 MIT
