@@ -8,8 +8,21 @@ and ``run_post_push_watch`` can share them and they can be tested in isolation.
 """
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
+
+
+def is_git_token(token: str) -> bool:
+    """Return True iff *token* invokes the ``git`` executable.
+
+    Matches by BASENAME so path-qualified invocations (``/usr/bin/git``,
+    ``/opt/homebrew/bin/git``, ``../bin/git``) are recognized alongside the
+    bare ``git`` command name — an absolute-path git must not evade git-aware
+    policy hooks (BOU-2147). Non-git lookalikes (``mygit``, ``gitx``) and a
+    trailing-slash ``git/`` (a directory, not an executable) stay rejected.
+    """
+    return token == "git" or os.path.basename(token) == "git"
 
 
 def _skip_command_prefixes(tokens: list[str]) -> int:
@@ -232,7 +245,7 @@ def is_git_push(command: str) -> bool:
     if index >= len(tokens):
         return False
     token = tokens[index]
-    if token != "git" and not token.endswith("/git"):
+    if not is_git_token(token):
         return False
 
     index += 1
@@ -279,7 +292,7 @@ def effective_git_cwd(command: str, base_cwd: str) -> str:
     if index >= len(tokens):
         return base_cwd
     token = tokens[index]
-    if token != "git" and not token.endswith("/git"):
+    if not is_git_token(token):
         return base_cwd
     index += 1
 
