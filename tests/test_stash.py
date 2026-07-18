@@ -136,6 +136,21 @@ def test_ambiguous_label_fails_closed_and_leaves_stash_untouched(
     assert not (repo / "g.txt").exists()
 
 
+@pytest.mark.parametrize("action", ["apply", "drop"])
+@pytest.mark.parametrize("bad_label", ["", "   ", "\t"])
+def test_empty_or_blank_label_fails_closed(
+    repo: Path, capsys: pytest.CaptureFixture, action: str, bad_label: str
+) -> None:
+    """An empty/blank label (e.g. an unset $LABEL shell variable) must never
+    resolve — an empty substring matches EVERY entry, and with exactly one
+    entry on the stack it would 'unambiguously' act on someone's WIP."""
+    _make_stash(repo, "f.txt", "test-branch: sole entry")  # the dangerous case
+    assert stash.main([action, bad_label, "--cwd", str(repo)]) == 1
+    assert "empty/blank label" in capsys.readouterr().err
+    assert "sole entry" in _stash_list(repo)  # stash untouched
+    assert not (repo / "f.txt").exists()  # nothing was applied
+
+
 def test_label_never_matches_hash_hex(repo: Path) -> None:
     """The label is matched against the entry text only, never the hash."""
     _make_stash(repo, "f.txt", "test-branch: wip a")
@@ -197,6 +212,48 @@ def test_drop_aborts_on_index_shift(
     listing = _stash_list(repo)
     assert "toctou target" in listing, "TOCTOU abort must leave the target entry in place"
     assert "concurrent: interloper" in listing, "interloper push did not run (harness broken)"
+
+
+def test_drop_restores_foreign_entry_dropped_inside_drop_window(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """A stack shift AFTER the pre-drop re-verify (git has no compare-and-swap
+    drop) makes `git stash drop stash@{n}` remove the interloper's entry. The
+    post-drop verification must detect the wrong hash in the `Dropped` output,
+    RESTORE the foreign entry via `git stash store`, and abort loudly."""
+    _make_stash(repo, "f.txt", "test-branch: toctou target")
+    # Fires between `rev-parse` (re-verify passes) and the actual drop.
+    _install_shift_interloper(monkeypatch, repo, before="stash drop")
+
+    assert stash.main(["drop", "toctou target", "--cwd", str(repo)]) == 1
+    err = capsys.readouterr().err
+    assert "ABORT" in err, "post-drop mismatch abort message missing"
+    assert "RESTORED" in err, "rollback confirmation missing"
+
+    listing = _stash_list(repo)
+    assert "toctou target" in listing, "target entry must survive a foreign drop"
+    assert "concurrent: interloper" in listing, (
+        "foreign entry was dropped and NOT restored — rollback failed"
+    )
+
+
+def test_drop_fails_closed_when_drop_output_unconfirmable(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture
+) -> None:
+    """If git's drop output carries no `(<hash>)` confirmation, the wrapper
+    cannot prove which entry was removed and must report failure."""
+    _make_stash(repo, "f.txt", "test-branch: wip a")
+    real_git = stash._git
+
+    def muted_git(args: list[str], cwd: str) -> subprocess.CompletedProcess:
+        result = real_git(args, cwd)
+        if args[:2] == ["stash", "drop"]:
+            result.stdout = ""  # simulate unparseable/localized-away output
+        return result
+
+    monkeypatch.setattr(stash, "_git", muted_git)
+    assert stash.main(["drop", "wip a", "--cwd", str(repo)]) == 1
+    assert "did not confirm" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

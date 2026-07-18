@@ -13,7 +13,9 @@ This module closes that window with labeled-stash discipline:
 
 * ``push`` REQUIRES a non-empty ``-m/--message`` label — anonymous stash
   entries cannot be safely re-identified on a shared stack.
-* ``apply <label>`` / ``drop <label>`` resolve the label to a
+* ``apply <label>`` / ``drop <label>`` REQUIRE a non-empty, non-blank label
+  (an empty string — e.g. an unset ``$LABEL`` shell variable — would
+  substring-match EVERY entry) and resolve the label to a
   (commit hash, stash ref) pair in ONE ``git stash list`` invocation, so the
   hash is pinned at the same instant the index is read (TOCTOU guard). The
   label is matched as a FIXED substring against the ``stash@{n}: On
@@ -21,13 +23,19 @@ This module closes that window with labeled-stash discipline:
   entry must match — zero or ambiguous matches fail closed.
 * ``apply`` acts on the pinned COMMIT HASH (``git stash apply`` accepts a
   stash commit id directly), so it is immune to index shifts entirely.
-* ``drop`` only accepts a ``stash@{n}`` reflog ref, so it re-verifies
+* ``drop`` only accepts a ``stash@{n}`` reflog ref, so it (a) re-verifies
   ``git rev-parse stash@{n}`` still equals the pinned hash IMMEDIATELY
-  before dropping and aborts loudly if the shared stack shifted underneath.
+  before dropping, and (b) POST-VERIFIES the ``Dropped <ref> (<hash>)``
+  output: if the hash actually dropped is not the pinned one (the stack
+  shifted inside the drop window — git has no compare-and-swap drop), the
+  foreign entry is RESTORED via ``git stash store`` and the command aborts
+  loudly.
 
-Residual (accepted): git offers no compare-and-swap for stash refs, so a
+Residual (accepted): git offers no compare-and-swap for stash refs, so the
 sub-millisecond window between the pre-drop re-verify and the drop itself
-remains. Apply is fully race-free.
+cannot be eliminated — but a wrong drop is now detected and rolled back,
+so the worst case is a transiently-missing-then-restored foreign entry,
+never a silently lost one. Apply is fully race-free.
 
 Usage::
 
@@ -40,6 +48,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 
@@ -60,6 +69,16 @@ def _resolve_label(label: str, cwd: str) -> tuple[str, str, str]:
     the same instant the index is read — the TOCTOU guard at the core of the
     ported semantics. Raises :class:`StashError` on zero or ambiguous matches.
     """
+    if not label.strip():
+        # An empty/blank label (e.g. an unset $LABEL shell variable) would
+        # substring-match EVERY entry — and with exactly one entry on the
+        # stack it would "unambiguously" resolve to someone's WIP. Fail closed
+        # before touching the stack.
+        raise StashError(
+            "empty/blank label — refusing to resolve. An empty label would match "
+            "every stash entry (is a shell variable unset?). Pass the exact label "
+            "substring."
+        )
     result = _git(["stash", "list", "--format=%H %gd: %gs"], cwd)
     if result.returncode != 0:
         raise StashError(f"git stash list failed: {result.stderr.strip()}")
@@ -116,6 +135,17 @@ def _cmd_apply(label: str, cwd: str) -> int:
     return result.returncode
 
 
+def _parse_dropped_hash(stdout: str) -> str | None:
+    """Extract the commit hash from git's ``Dropped <ref> (<hash>)`` output.
+
+    Matches only the parenthesized hex tail so a localized "Dropped" prefix
+    still parses. Returns ``None`` if no hash can be found — callers must
+    treat that as unconfirmed and fail closed.
+    """
+    found = re.findall(r"\(([0-9a-f]{7,64})\)", stdout)
+    return found[-1] if found else None
+
+
 def _cmd_drop(label: str, cwd: str) -> int:
     stash_hash, ref, entry = _resolve_label(label, cwd)
     # `git stash drop` only accepts a stash@{n} reflog ref, so re-verify the
@@ -133,7 +163,36 @@ def _cmd_drop(label: str, cwd: str) -> int:
     result = _git(["stash", "drop", ref], cwd)
     sys.stdout.write(result.stdout)
     sys.stderr.write(result.stderr)
-    return result.returncode
+    if result.returncode != 0:
+        return result.returncode
+    # POST-verify: git has no compare-and-swap drop, so the stack can still
+    # shift between the re-verify above and the drop itself. `git stash drop`
+    # prints the commit hash it actually removed — confirm it is the pinned
+    # one, and if a foreign entry was dropped instead, restore it and abort.
+    dropped = _parse_dropped_hash(result.stdout)
+    if dropped is None:
+        raise StashError(
+            f"drop succeeded but its output did not confirm which entry was removed "
+            f"(expected 'Dropped {ref} (<hash>)'). Inspect `git stash list` manually — "
+            f"the pinned target was {stash_hash}."
+        )
+    if not stash_hash.startswith(dropped):
+        subject_res = _git(["log", "-1", "--format=%s", dropped], cwd)
+        subject = subject_res.stdout.strip() or f"restored foreign stash {dropped[:12]}"
+        restore = _git(["stash", "store", "-m", subject, dropped], cwd)
+        if restore.returncode == 0:
+            rollback = f"The foreign entry was RESTORED via `git stash store` ({subject!r})."
+        else:
+            rollback = (
+                f"ROLLBACK FAILED ({restore.stderr.strip() or 'unknown error'}) — recover it "
+                f"manually: git stash store -m {subject!r} {dropped}"
+            )
+        raise StashError(
+            f"ABORT — the drop removed {dropped}, not the pinned target {stash_hash} "
+            f"(the shared stack shifted inside the drop window). {rollback}\n"
+            f"The target entry ({entry}) was NOT dropped — re-run to re-resolve the label."
+        )
+    return 0
 
 
 def _cmd_list(cwd: str) -> int:

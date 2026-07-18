@@ -206,7 +206,7 @@ The `stash` subcommand ships the race-safe discipline as a package capability:
 ```bash
 agentic-pr-dash stash push -m "<branch>: <purpose>"   # label is REQUIRED
 agentic-pr-dash stash apply "<label-substring>"       # applies by pinned COMMIT HASH
-agentic-pr-dash stash drop "<label-substring>"        # re-verifies ref==hash right before drop
+agentic-pr-dash stash drop "<label-substring>"        # re-verifies before AND after the drop
 agentic-pr-dash stash list                            # read-only
 ```
 
@@ -214,9 +214,13 @@ Semantics: the label is resolved to a `(commit hash, stash@{n})` pair in **one**
 `git stash list` invocation (hash pinned at the instant the index is read);
 `apply` acts on the commit hash directly (immune to index shifts); `drop`
 re-verifies `git rev-parse stash@{n}` still equals the pinned hash immediately
-before dropping and **aborts loudly** if the shared stack shifted. Zero or
-ambiguous label matches **fail closed**. There is deliberately no `pop` — it
-applies *and* drops in one step and cannot name a survivable undo.
+before dropping, then **post-verifies** the `Dropped <ref> (<hash>)` output —
+git has no compare-and-swap drop, so if the stack shifted inside the drop
+window and a foreign entry was removed, it is **restored** via
+`git stash store` and the command aborts loudly. Empty, blank, zero-match, or
+ambiguous labels **fail closed** (an empty label would substring-match every
+entry). There is deliberately no `pop` — it applies *and* drops in one step
+and cannot name a survivable undo.
 
 **Recommended consumer guard policy** (mirrors gaia's allowlist-of-canonical-forms
 posture, BOU-2031/PR #2577): rather than enumerating bad `git stash` shapes
@@ -227,9 +231,15 @@ route everything else to a prompt/deny:
 * `git stash push` whose only tokens are exactly one non-empty `-m|--message`
   label, optional `-u|--include-untracked`, and optional pathspecs after a
   trailing `--`.
-* `git stash apply|drop` of an explicit `stash@{n}` ref or stash commit hash.
+* `git stash apply` of an explicit stash **commit hash** — hash-pinned, immune
+  to index shifts. `stash@{n}` *index* forms are **not** allowlisted: they are
+  the same shifting-index race this wrapper exists to close (an index listed a
+  moment ago can point at a foreign entry by the time the command runs), and
+  `git stash drop` has no hash form or compare-and-swap at all — route apply
+  and drop through the wrapper instead.
 * `agentic-pr-dash stash <push|apply|drop|list> ...` — this wrapper.
-* Every other `git stash ...` shape (notably bare `push`, any `pop`) → ask/deny.
+* Every other `git stash ...` shape (notably bare `push`, any `pop`, and any
+  `stash@{n}` index form) → ask/deny.
 
 ## License
 
