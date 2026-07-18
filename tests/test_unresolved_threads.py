@@ -40,10 +40,13 @@ def test_resolved_thread_does_not_block(monkeypatch):
     assert mc.pr_has_unresolved_review_threads(5, ".") is False
 
 
-def test_outdated_thread_does_not_block(monkeypatch):
+def test_outdated_unresolved_thread_blocks(monkeypatch):
+    # BOU-2095 (PR #78 review): the completion gate deliberately leaves
+    # drift-outdated threads open, so the pending path must NOT hide them —
+    # unresolved means unaddressed, drift is not resolution.
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda pr, cwd=None: [_thread(outdated=True)])
-    assert mc.pr_has_unresolved_review_threads(5, ".") is False
+    assert mc.pr_has_unresolved_review_threads(5, ".") is True
 
 
 def test_no_threads_does_not_block(monkeypatch):
@@ -62,17 +65,20 @@ def test_get_unaddressed_comments_skips_outdated_thread(monkeypatch):
     assert github_api.get_unaddressed_comments(5, "2026-01-01T00:00:00Z", ".") == []
 
 
-# --- round-2 #3: outdated-only thread keeps a green-CI PR clean --------------
+# --- BOU-2095 (PR #78 review): outdated-only unresolved thread now blocks -----
+# (supersedes round-2 #3 "outdated keeps the PR clean": the evidence gate leaves
+# drift-outdated threads open ON PURPOSE, so the check must surface them)
 
-def test_check_outdated_only_thread_stays_clean(monkeypatch):
+def test_check_outdated_only_thread_blocks_with_details(monkeypatch):
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    # Authoritative thread check sees only an outdated thread -> not actionable.
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda pr, cwd=None: [_thread(outdated=True)])
     code, text = mc._check_worktree("/wt", "sess-A")
-    assert code == 0
-    assert text == "nothing pending"
+    assert code == 10
+    assert "## Review Comments" in text
+    assert "fix this" in text
+    assert "PR_NUMBER=5" in text
 
 
 # --- round-2 #4: old unresolved thread blocks AND hydrates the prompt --------

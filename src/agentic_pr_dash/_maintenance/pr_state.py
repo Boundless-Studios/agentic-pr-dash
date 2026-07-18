@@ -286,15 +286,23 @@ def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, boo
 
 
 def _unresolved_review_threads(pr_number: int, cwd: str):
-    """Non-outdated, unresolved review threads for a PR."""
+    """Unresolved review threads for a PR — INCLUDING outdated ones.
+
+    BOU-2095 (PR #78 review): the completion evidence gate deliberately leaves
+    a thread open when GitHub marks it outdated by pure line drift but its
+    anchored hunk was never edited. Filtering ``is_outdated`` here made exactly
+    those threads invisible to the pending/blocker path — the stop gate idled
+    and `complete` closed the bead while intentionally-kept-open feedback sat
+    unresolved. Unresolved means unaddressed; drift is not resolution.
+    """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     threads = github_api.get_review_threads(pr_number, cwd)
-    return [t for t in threads if not t.is_resolved and not t.is_outdated]
+    return [t for t in threads if not t.is_resolved]
 
 
 def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
-    """True if the PR has at least one non-outdated, unresolved review thread."""
+    """True if the PR has at least one unresolved review thread (outdated included)."""
     return bool(_unresolved_review_threads(pr_number, cwd))
 
 
