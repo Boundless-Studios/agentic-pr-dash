@@ -6,7 +6,7 @@ import subprocess
 import time
 
 from agentic_pr_dash.config import load as load_config
-from ._common import _resolve_owner_pid, _current_branch
+from ._common import _resolve_owner_pid, _current_branch, _repo_slug
 from .pr_state import _list_my_open_prs
 
 
@@ -269,6 +269,7 @@ def _collect_owned_worktrees(
     """
     from .markers import (  # noqa: PLC0415
         _live_foreign_owner,
+        _live_pr_owner_record,
         _marker_session_id,
         _read_marker,
         _session_is_live,
@@ -294,6 +295,13 @@ def _collect_owned_worktrees(
     )
 
     pr_map: dict | None = None  # lazy, budget-bounded gh fetch (at most once)
+    repo_slug: str | None = None  # lazy repo detection (at most once)
+
+    def _slug() -> str:
+        nonlocal repo_slug
+        if repo_slug is None:
+            repo_slug = _repo_slug(cwd)
+        return repo_slug
 
     def _branch_prs() -> dict:
         nonlocal pr_map
@@ -344,6 +352,17 @@ def _collect_owned_worktrees(
                 continue
             number, is_draft = cur
             if is_draft:
+                continue
+            # A dead MARKER does not mean the PR is ownerless (PR #82 review,
+            # P1): a LIVE session that repointed its worktree elsewhere leaves
+            # a dead marker here while still owning this ``(repo, pr)`` in the
+            # durable ledger. Overwriting the marker would make the takeover
+            # look self-owned to ``_check_worktree`` (which then skips its
+            # ``_live_pr_owner_record`` fallback) → concurrent maintenance
+            # against a live owner. Defer to any live durable owner.
+            if _live_pr_owner_record(
+                int(number), _slug(), session_id, worktree_path
+            ) is not None:
                 continue
             if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
                 _emit(worktree_path)

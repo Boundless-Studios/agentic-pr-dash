@@ -8,6 +8,7 @@ from .pr_state import _pr_open_state, _unpack_pr_open_state, _thread_is_p1
 from .markers import (
     _claim_pr,
     _live_foreign_owner,
+    _live_pr_owner_record,
     _marker_session_id,
     _read_marker,
     _session_is_live,
@@ -51,6 +52,18 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
                 if _live_foreign_owner(abs_wt, session_id):
                     continue
                 if marker_sid and _session_is_live(marker_sid, abs_wt):
+                    continue
+                # The marker checks above only see THIS worktree's marker
+                # (PR #82 review, P1): a LIVE session that repointed its
+                # worktree elsewhere leaves a dead marker here while still
+                # owning the same ``(repo, pr)`` in the durable ledger.
+                # Re-stamping the marker below would make the adoption look
+                # self-owned to ``_check_worktree`` (which then skips its
+                # ledger fallback) → concurrent maintenance against a live
+                # owner. Defer to any live durable owner instead.
+                if _live_pr_owner_record(
+                    e.pr, e.repo or target_repo, session_id, abs_wt
+                ) is not None:
                     continue
             state, url, has_fail, failing, review_decision, merge_state, mergeable = (
                 _unpack_pr_open_state(_pr_open_state(e.pr, cwd))

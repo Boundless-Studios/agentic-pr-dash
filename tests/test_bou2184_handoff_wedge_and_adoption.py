@@ -340,3 +340,81 @@ def test_adopt_orphan_prs_skips_present_worktree_with_live_marker_owner(
 
     assert adopted == []
     assert _marker_fields(wt)["session_id"] == "other-live-sess"
+
+
+# ---------------------------------------------------------------------------
+# 5) Durable-ledger ownership gates takeover (PR #82 review, P1): a dead
+#    marker does not mean the PR is ownerless. A LIVE session that repointed
+#    its worktree elsewhere leaves a dead marker behind while still owning the
+#    same (repo, pr) in the durable ledger; overwriting that marker would make
+#    _check_worktree treat the takeover as resolved self-ownership and skip its
+#    _live_pr_owner_record fallback — concurrent maintenance against a live
+#    owner. Both takeover paths must consult the durable resolver first.
+# ---------------------------------------------------------------------------
+
+def _liveness_only_for(monkeypatch, live_sid):
+    from agentic_pr_dash._maintenance import markers as _markers_mod
+
+    def fake(sid, cwd=None):
+        return sid == live_sid
+
+    monkeypatch.setattr(_markers_mod, "_session_is_live", fake)
+    monkeypatch.setattr(_reconcile_mod, "_session_is_live", fake)
+
+
+def test_dead_marker_takeover_defers_to_live_durable_ledger_owner(
+    tmp_path, monkeypatch, capsys
+):
+    anchor, sib, sib_wt = _sibling_fixture(tmp_path, monkeypatch)
+    # A LIVE session repointed its worktree away (dead marker here) but still
+    # owns (o/sib, 79) in the durable ledger — takeover must defer to it.
+    sl.append("live-owner-sess", pr=79, branch="bou-2155", worktree="", repo="o/sib")
+    _liveness_only_for(monkeypatch, "live-owner-sess")
+
+    args = argparse.Namespace(session_id="sess-X", cwd=str(anchor), pid=os.getpid())
+    rc = mc._cmd_list_owned(args)
+    assert rc == 0
+    out = [os.path.realpath(p) for p in capsys.readouterr().out.splitlines() if p.strip()]
+    assert os.path.realpath(str(sib_wt)) not in out
+    # Marker NOT overwritten — the live durable owner keeps sole ownership.
+    assert _marker_fields(sib_wt)["session_id"] == "dead-subagent-sess"
+
+
+def test_dead_marker_takeover_proceeds_when_durable_owner_dead(
+    tmp_path, monkeypatch, capsys
+):
+    anchor, sib, sib_wt = _sibling_fixture(tmp_path, monkeypatch)
+    # A stale ledger row from a DEAD session must not block takeover.
+    sl.append("stale-dead-owner", pr=79, branch="bou-2155", worktree="", repo="o/sib")
+
+    args = argparse.Namespace(session_id="sess-X", cwd=str(anchor), pid=os.getpid())
+    rc = mc._cmd_list_owned(args)
+    assert rc == 0
+    out = [os.path.realpath(p) for p in capsys.readouterr().out.splitlines() if p.strip()]
+    assert os.path.realpath(str(sib_wt)) in out
+    assert _marker_fields(sib_wt)["session_id"] == "sess-X"
+
+
+def test_adopt_orphan_prs_present_worktree_defers_to_live_durable_ledger_owner(
+    tmp_path, monkeypatch
+):
+    anchor = _make_repo(tmp_path / "anchor", slug="o/anchor")
+    wt = _add_worktree(anchor, tmp_path / "anchor-wt-9", "b-9")
+    _arm(wt, "dead-sess", 9, DEAD_PID)
+    repo_slug = mc._repo_slug(str(anchor))
+    sl.append("dead-sess", pr=9, branch="b-9", worktree=str(wt), repo=repo_slug)
+    # The live owner repointed its worktree elsewhere but still owns (repo, 9).
+    sl.append("live-owner-sess", pr=9, branch="b-9", worktree="", repo=repo_slug)
+    _liveness_only_for(monkeypatch, "live-owner-sess")
+
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state",
+                        lambda pr, cwd: ("open", f"https://x/pull/{pr}", False, []))
+    monkeypatch.setattr(github_api, "get_review_threads",
+                        lambda pr, cwd=None: [_thread()])
+
+    adopted = _reconcile_mod._adopt_orphan_prs("sess-X", str(anchor), os.getpid())
+
+    assert adopted == []
+    # Marker NOT re-stamped and no ledger entry claimed for this session.
+    assert _marker_fields(wt)["session_id"] == "dead-sess"
+    assert not any(e.pr == 9 for e in sl.read("sess-X", repo=repo_slug))
