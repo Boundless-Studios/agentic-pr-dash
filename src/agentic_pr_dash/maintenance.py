@@ -266,8 +266,9 @@ def build_maintenance_prompt(
             "Never use bare `git stash push`/`git stash pop` — the stash stack is shared "
             "across all worktrees of this repo and indexes shift under concurrent agents. "
             "Prefer stash-free flows; if you must stash, use "
-            "`agentic-pr-dash stash push -m \"<branch>: <purpose>\"` and "
-            "`agentic-pr-dash stash apply|drop \"<label>\"`.",
+            "`agentic-pr-dash stash push -m \"<branch>: <purpose>\"`, then restore with "
+            "`agentic-pr-dash stash apply \"<label>\"` or discard with "
+            "`agentic-pr-dash stash drop \"<label>\"`.",
         ])
 
     if pr.failing_checks:
