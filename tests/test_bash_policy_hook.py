@@ -204,6 +204,44 @@ def test_commit_hook_runs_only_for_git_commit(monkeypatch, tmp_path):
         mod.run_script = original
 
 
+def test_commit_hook_runs_for_absolute_path_git_commit(tmp_path):
+    """`/usr/bin/git commit` dispatches commit-only hooks (BOU-2147).
+
+    The detector matches the git token by basename, so a path-qualified git
+    cannot evade COMMIT_ONLY_HOOKS dispatch — while a path-qualified non-commit
+    git command still skips them.
+    """
+    ran: list[str] = []
+
+    import agentic_pr_dash.codex_hooks.run_bash_policy as mod
+    original = mod.run_script
+    mod.run_script = lambda path, text, *, base: ran.append(path) or 0
+    try:
+        # Absolute-path non-commit git → commit hook must NOT run
+        cmd_status = "/usr/bin/git status"
+        run_bash_policy.run([], [("ch", "commit-hook.py")], base_dir=tmp_path,
+                            payload_text=json.dumps(_make_bash_payload(cmd_status)),
+                            command=cmd_status)
+        assert ran == []
+
+        # Absolute-path git commit → commit hook MUST run
+        cmd_commit = "/usr/bin/git commit -m x"
+        run_bash_policy.run([], [("ch", "commit-hook.py")], base_dir=tmp_path,
+                            payload_text=json.dumps(_make_bash_payload(cmd_commit)),
+                            command=cmd_commit)
+        assert ran == ["commit-hook.py"]
+
+        # Homebrew-path git commit → commit hook MUST run too
+        ran.clear()
+        cmd_brew = "/opt/homebrew/bin/git commit -m x"
+        run_bash_policy.run([], [("ch", "commit-hook.py")], base_dir=tmp_path,
+                            payload_text=json.dumps(_make_bash_payload(cmd_brew)),
+                            command=cmd_brew)
+        assert ran == ["commit-hook.py"]
+    finally:
+        mod.run_script = original
+
+
 # ---------------------------------------------------------------------------
 # Legacy env alias for hook base dir
 # ---------------------------------------------------------------------------
@@ -241,6 +279,18 @@ def test_preferred_env_beats_legacy_env(monkeypatch, tmp_path):
     ("", False),
     ("git", False),
     ("git status", False),
+    # BOU-2147: path-qualified git matches by basename — an absolute-path git
+    # must not evade commit detection …
+    ("/usr/bin/git commit -m x", True),
+    ("/opt/homebrew/bin/git commit -m x", True),
+    ("../bin/git commit -m x", True),
+    ("/usr/bin/git -C subdir commit -m x", True),
+    ("env GIT_DIR=.git /usr/bin/git commit -m x", True),
+    # … while non-commit git and non-git lookalikes stay untouched.
+    ("/usr/bin/git status", False),
+    ("/usr/bin/git push", False),
+    ("/usr/bin/gitx commit -m x", False),
+    ("mygit commit -m x", False),
 ])
 def test_is_git_commit_command(cmd, expected):
     assert run_bash_policy.is_git_commit_command(cmd) == expected
