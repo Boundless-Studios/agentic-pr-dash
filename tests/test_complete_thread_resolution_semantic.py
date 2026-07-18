@@ -411,6 +411,91 @@ def test_bou2095_existing_completion_reply_resolves_as_retry(monkeypatch):
     assert resolved == ["t1"]
 
 
+def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch):
+    # PR #78 review (comment 3605704909): a historical completion marker whose
+    # thread was REOPENED by a later human follow-up is NOT evidence — the
+    # reviewer rejected the completion. Without hunk evidence the thread must
+    # stay open instead of short-circuiting on the stale marker.
+    thread = _thread(
+        "Guard against a None campaign here.",
+        replies=(
+            f"{COMPLETE_MARKER}\nAddressed by the local maintenance loop.",
+            "This was NOT addressed — the guard is still missing.",
+        ),
+    )
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=SPANS_ELSEWHERE_IN_FILE,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+
+
+def test_pr78_head_side_anchor_matching_only_old_span_not_resolved(monkeypatch):
+    # PR #78 review (comment 3605704914): a live thread's `line` is a HEAD-side
+    # coordinate. A rewrite whose OLD-side span happens to overlap that number
+    # (48-52) while the new-side content moved elsewhere (120-124) must not
+    # count as hunk evidence.
+    thread = _thread("Guard against a None campaign here.", line=50)
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=[(48, 52, 120, 124)],
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+
+
+def test_pr78_outdated_anchor_matching_only_new_span_not_resolved(monkeypatch):
+    # Mirror case: an outdated thread's `original_line` is a BASE-side
+    # coordinate; overlap with only the new-side span is not evidence.
+    thread = _thread(
+        "Guard against a None campaign here.",
+        outdated=True, line=None, original_line=122,
+    )
+    resolved, _ = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=[(48, 52, 120, 124)],
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+
+
+def test_pr78_left_open_outdated_thread_keeps_review_comments_blocker(
+        monkeypatch, capsys):
+    # PR #78 review (comment 3605704917, P1): a drift-outdated thread the gate
+    # deliberately leaves open must keep the bead open as a review_comments
+    # blocker — the downstream scan filters skip is_outdated, so without this
+    # `complete` would report "no blockers remain" and close the bead.
+    thread = _thread(
+        "Rename this variable for clarity.",
+        outdated=True, line=None, original_line=50,
+    )
+    resolved, _ = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=[(1, 0, 1, 3)],
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+    assert "remain unresolved" in captured.err
+
+
 def test_bou2095_file_level_comment_resolves_on_file_content_change(monkeypatch):
     # A file-level comment (no line anchor at all) anchors the whole file, so
     # any content change in the file is anchored-hunk evidence.
@@ -446,17 +531,27 @@ def test_bou2095_leaving_open_message_explains_hunk_mismatch(monkeypatch, capsys
 
 def test_spans_intersect_line_helper():
     spans = [(10, 12, 10, 14)]
-    # Inside the hunk (either side).
-    assert mc._spans_intersect_line(spans, 11) is True
+    # Inside the hunk, matched on the anchor's own side.
+    assert mc._spans_intersect_line(spans, 11, "new") is True
+    assert mc._spans_intersect_line(spans, 11, "old") is True
     # Within the ±context fuzz.
-    assert mc._spans_intersect_line(spans, 12 + mc._ANCHOR_CONTEXT_LINES) is True
-    assert mc._spans_intersect_line(spans, 10 - mc._ANCHOR_CONTEXT_LINES) is True
+    assert mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES, "new") is True
+    assert mc._spans_intersect_line(spans, 10 - mc._ANCHOR_CONTEXT_LINES, "new") is True
     # Beyond the fuzz.
-    assert mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES + 1) is False
-    assert mc._spans_intersect_line(spans, 1) is False
+    assert mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES + 1, "new") is False
+    assert mc._spans_intersect_line(spans, 1, "new") is False
+    # PR #78 review: each coordinate is compared ONLY against its own diff
+    # side — old-side overlap is not evidence for a head-side anchor and
+    # vice versa.
+    disjoint = [(48, 52, 120, 124)]
+    assert mc._spans_intersect_line(disjoint, 50, "old") is True
+    assert mc._spans_intersect_line(disjoint, 50, "new") is False
+    assert mc._spans_intersect_line(disjoint, 122, "new") is True
+    assert mc._spans_intersect_line(disjoint, 122, "old") is False
     # Empty side (pure insertion: old side (1, 0)) never matches on that side.
-    assert mc._spans_intersect_line([(1, 0, 1, 3)], 50) is False
-    assert mc._spans_intersect_line([], 5) is False
+    assert mc._spans_intersect_line([(1, 0, 1, 3)], 50, "old") is False
+    assert mc._spans_intersect_line([(1, 0, 1, 3)], 2, "old") is False
+    assert mc._spans_intersect_line([], 5, "new") is False
 
 
 def test_get_changed_line_spans_parses_real_git_diff(tmp_path):

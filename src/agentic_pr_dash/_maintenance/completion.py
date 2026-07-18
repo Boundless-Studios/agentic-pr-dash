@@ -30,29 +30,33 @@ _ANCHOR_CONTEXT_LINES = 3
 def _spans_intersect_line(
     spans: list[tuple[int, int, int, int]],
     anchor_line: int,
+    side: str,
 ) -> bool:
-    """True if any changed hunk touches ``anchor_line`` (± context fuzz).
+    """True if a changed hunk touches ``anchor_line`` (± context fuzz) on ``side``.
 
     ``spans`` come from :func:`agentic_pr_dash.github_api.get_changed_line_spans`
     — ``(old_start, old_end, new_start, new_end)`` per hunk, where an empty side
-    is encoded as ``end < start``. The anchor is checked against BOTH sides: a
-    non-outdated thread's ``line`` is head-side, an outdated thread's
-    ``original_line`` is base-side, and we deliberately do not guess which —
-    intersecting either side within the context window is accepted as evidence.
+    is encoded as ``end < start``. ``side`` names the diff side the anchor
+    coordinate lives on: a non-outdated thread's ``line`` is head-side
+    (``"new"``); an outdated thread's ``original_line`` is base-side
+    (``"old"``). Comparing a coordinate against the WRONG side let unrelated
+    hunks masquerade as evidence — e.g. a deletion above a live thread whose
+    old-side numbers happen to overlap the head-side anchor (PR #78 review).
     """
     for old_start, old_end, new_start, new_end in spans:
-        for start, end in ((old_start, old_end), (new_start, new_end)):
-            if end < start:  # empty side: pure insertion/deletion counterpart
-                continue
-            if start - _ANCHOR_CONTEXT_LINES <= anchor_line <= end + _ANCHOR_CONTEXT_LINES:
-                return True
+        start, end = (
+            (new_start, new_end) if side == "new" else (old_start, old_end)
+        )
+        if end < start:  # empty side: pure insertion/deletion counterpart
+            continue
+        if start - _ANCHOR_CONTEXT_LINES <= anchor_line <= end + _ANCHOR_CONTEXT_LINES:
+            return True
     return False
 
 
 def _thread_completion_evidence(
     thread,  # type: ignore[no-untyped-def]
     spans: list[tuple[int, int, int, int]] | None,
-    complete_marker: str,
 ) -> str | None:
     """Positive per-thread evidence that the completing commits addressed THIS thread.
 
@@ -61,25 +65,39 @@ def _thread_completion_evidence(
     silently resolving live feedback. Returns the evidence kind, or ``None``
     when there is none (caller must leave the thread OPEN):
 
-    - ``"reply"``  — a completion-marker reply already targets this thread
-      (an earlier `complete` run replied but the resolve mutation failed);
+    - ``"reply"``  — a completion-marker reply is the thread's TERMINAL state
+      per :func:`agentic_pr_dash.github_api._thread_state` (an earlier
+      `complete` run replied but the resolve mutation failed). A marker
+      followed by a human follow-up is ``reopened`` — the reviewer rejected
+      the completion — so a merely-historical marker is NOT evidence
+      (PR #78 review);
     - ``"hunk"``   — the completing commits changed content at the thread's
-      anchored line (± :data:`_ANCHOR_CONTEXT_LINES`);
+      anchored line (± :data:`_ANCHOR_CONTEXT_LINES`), compared on the diff
+      side the coordinate lives on (head-side ``line`` vs base-side
+      ``original_line``);
     - ``"file"``   — the thread is file-level (no line anchor at all) and the
       file's content changed; the whole file IS the anchor span.
 
     ``spans is None`` means the base..head diff was unavailable — that is
     absence of proof, never proof of absence, so it yields ``None``.
     """
-    for reply in thread.replies:
-        if complete_marker in (reply.body or ""):
-            return "reply"
+    from agentic_pr_dash.github_api import _thread_state  # noqa: PLC0415
+
+    replies_as_dicts = [
+        {"body": r.body, "created_at": r.created_at, "author": r.author}
+        for r in thread.replies
+    ]
+    state, _ = _thread_state(replies_as_dicts, top_author=thread.top.author)
+    if state == "completed":
+        return "reply"
     anchor_line = thread.top.line
+    anchor_side = "new"  # non-outdated `line` is a head-side coordinate
     if anchor_line is None:
         anchor_line = thread.top.original_line
+        anchor_side = "old"  # `original_line` is a base-side coordinate
     if anchor_line is None:
         return "file" if spans else None
-    if spans and _spans_intersect_line(spans, anchor_line):
+    if spans and _spans_intersect_line(spans, anchor_line, anchor_side):
         return "hunk"
     return None
 

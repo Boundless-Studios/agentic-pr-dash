@@ -349,6 +349,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 baseline, head_sha, path, cwd)
         return spans_by_path[path]
 
+    # BOU-2095 P1 (PR #78 review): every unresolved thread this run does NOT
+    # resolve — including `is_outdated` ones that the downstream
+    # blocker/pending filters would otherwise hide — must survive as a
+    # `review_comments` blocker below, or `complete` closes the bead while
+    # deliberately-left-open feedback still needs manual confirmation.
+    left_unresolved: list[str] = []
+
     threads = github_api.get_review_threads(resolved_pr_number, cwd)
     for thread in threads:
         if thread.is_resolved:
@@ -360,6 +367,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             and (path is None or path in touched)
         )
         if not addressed:
+            left_unresolved.append(thread.node_id)
             continue
         # BOU-2095: "anchor file touched" is necessary but NOT sufficient.
         # Require positive per-thread evidence — the completing commits changed
@@ -367,8 +375,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         # GitHub's "outdated" flag (pure line drift) is explicitly NOT evidence:
         # it used to widen resolution here and silently closed live feedback.
         spans = _spans_for(path) if path is not None else None
-        evidence = _thread_completion_evidence(thread, spans, COMPLETE_MARKER)
+        evidence = _thread_completion_evidence(thread, spans)
         if evidence is None:
+            left_unresolved.append(thread.node_id)
             anchor_line = (
                 thread.top.line if thread.top.line is not None
                 else thread.top.original_line
@@ -386,6 +395,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             continue
         elsewhere = _thread_elsewhere_refs(thread.top.body, path, touched)
         if elsewhere:
+            left_unresolved.append(thread.node_id)
             # BOU-1641: a thread anchored on file A whose real ask is an
             # untouched file B must not auto-resolve just because A was
             # addressed. BOU-2095 removed the former "anchor touched AND
@@ -403,6 +413,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             continue
         try:
             if not github_api.resolve_review_thread(thread.node_id, cwd):
+                left_unresolved.append(thread.node_id)
                 print(
                     f"warning: could not resolve thread {thread.node_id}; leaving open for retry",
                     file=sys.stderr,
@@ -421,6 +432,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             body = _completion_reply_body(COMPLETE_MARKER, path, commits_by_file, new_commits)
             github_api.reply_to_review_comment(resolved_pr_number, stub, body, cwd)
         except Exception as exc:  # noqa: BLE001
+            # The thread may or may not have been resolved before the error —
+            # count it as left open; a spurious blocker self-heals on the next
+            # `complete` run, a silently-dropped thread does not.
+            left_unresolved.append(thread.node_id)
             print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
 
     # force=True: re-resolve post-mutation state (threads were just
@@ -431,6 +446,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         remaining = ["unknown"]
     else:
         remaining = maintenance.blockers_for_pr(fresh)
+
+    # BOU-2095 P1 (PR #78 review): `blockers_for_pr` sees only the comments the
+    # scan path picked, and that path skips `is_outdated` threads — exactly the
+    # ones the evidence gate above deliberately leaves open on pure line drift.
+    # Without this, `complete` reports "no blockers remain" and closes the bead
+    # while intentionally-kept-open feedback still needs manual confirmation.
+    if left_unresolved and "review_comments" not in remaining:
+        remaining.append("review_comments")
+        print(
+            f"info: {len(left_unresolved)} review thread(s) remain unresolved "
+            f"({', '.join(left_unresolved)}); keeping review_comments blocker",
+            file=sys.stderr,
+        )
 
     _mark_maintenance_complete(maintenance, cwd, resolved_pr_number)
 
