@@ -164,6 +164,10 @@ def _is_transient_connectivity_failure(result: subprocess.CompletedProcess) -> b
 # than surface as a hard failure that misfires the poll loop.
 _RATE_LIMIT_STDERR_PATTERNS = (
     "rate limit exceeded",
+    # GraphQL's primary-quota phrasing differs from REST's: "GraphQL: API rate
+    # limit already exceeded" — the word "already" defeats the substring above,
+    # which made the exact BOU-1966 symptom unclassifiable as a rate-limit.
+    "rate limit already exceeded",
     "secondary rate limit",
     "exceeded a secondary rate",
     "submitted too quickly",
@@ -246,6 +250,14 @@ def _rate_limit_backoff_seconds(stderr: str, attempt: int) -> float:
 # (missing gh / auth / bad JSON) with a real quota wall.
 _RATE_LIMIT_SEEN = False
 
+# Monotonic count of gh calls that ULTIMATELY failed on a rate-limit (i.e.
+# after `_run`'s bounded retries). Unlike `_RATE_LIMIT_SEEN` it is NEVER reset:
+# span-based callers (the PR resolvers' detail-fetch guard, BOU-1966) compare
+# before/after counts to detect "a rate-limit happened during THIS span" even
+# when the tick-scoped flag was already set before the span began (e.g. by the
+# failed author-list call that routed them onto the REST fallback path).
+_RATE_LIMIT_EVENTS = 0
+
 
 def reset_rate_limit_seen() -> None:
     """Clear the rate-limit-seen flag (call at the start of a poll tick)."""
@@ -256,6 +268,14 @@ def reset_rate_limit_seen() -> None:
 def rate_limit_seen() -> bool:
     """True if any gh call since the last reset ultimately failed on a rate-limit."""
     return _RATE_LIMIT_SEEN
+
+
+def rate_limit_events() -> int:
+    """Monotonic count of rate-limited gh failures in this process (never reset).
+
+    Compare across a span of gh calls to detect a rate-limit DURING that span
+    regardless of the tick-scoped :func:`rate_limit_seen` state (BOU-1966)."""
+    return _RATE_LIMIT_EVENTS
 
 
 # ── Automation-token file source (BOU-1991) ────────────────────────────────
@@ -442,8 +462,9 @@ def _run(
     # Exhausted retries. Record a persistent rate-limit so a tick-based caller
     # can tell "GitHub was quota-limited" from a hard failure (BOU-1921 #62).
     if _is_rate_limit_failure(result):
-        global _RATE_LIMIT_SEEN
+        global _RATE_LIMIT_SEEN, _RATE_LIMIT_EVENTS
         _RATE_LIMIT_SEEN = True
+        _RATE_LIMIT_EVENTS += 1
     return result
 
 
@@ -481,6 +502,21 @@ class GhFailure:
     @property
     def command_str(self) -> str:
         return " ".join(self.command)
+
+    @property
+    def is_rate_limited(self) -> bool:
+        """True when this failure is a GitHub quota/rate-limit (primary or
+        secondary), as opposed to a missing-``gh`` / auth / malformed-output
+        failure.
+
+        Gate for the quota-safe REST fallback (BOU-1966): only a rate-limit
+        classified list failure may fall back to per-PR REST resolution — auth
+        and environment failures affect REST identically and keep failing
+        closed."""
+        if self.reason == "rate-limit":
+            return True
+        stderr = (self.stderr or "").lower()
+        return any(pat in stderr for pat in _RATE_LIMIT_STDERR_PATTERNS)
 
     def summary(self) -> str:
         """One-line classified cause for event logs and dashboards.
@@ -1024,6 +1060,115 @@ def _pr_full_payload(number: int, cwd: str | None = None) -> dict | None:
     except json.JSONDecodeError:
         return None
     return pr if isinstance(pr, dict) else None
+
+
+def _rest_repo_owner(cwd: str | None = None) -> str:
+    """Base-repo owner login via the REST ``repos`` endpoint (quota fallback).
+
+    :func:`get_repo_info` (``gh repo view``) resolves through GraphQL and
+    shares the exact quota bucket whose exhaustion routes callers onto the
+    BOU-1966 fallback, so the fallback resolves the owner via REST instead.
+    ``gh`` expands the ``{owner}/{repo}`` placeholders locally from the git
+    remote — no API call is spent on the placeholder resolution itself.
+    Returns ``""`` on any failure.
+    """
+    r = _run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json",
+         "repos/{owner}/{repo}", "--jq", ".owner.login"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
+def _rest_viewer_login(cwd: str | None = None) -> str:
+    """Authenticated identity's login via REST ``GET /user`` (quota fallback).
+
+    Resolves the ``@me`` author sentinel without GraphQL — ``gh pr list
+    --author @me`` runs through the exact quota bucket whose exhaustion routes
+    callers onto the BOU-1966 fallback. Returns ``""`` on any failure
+    (including a GitHub App installation token, which cannot call ``/user``) —
+    the fallback caller must then fail closed rather than adopt a PR whose
+    author it cannot verify (PR #77 review)."""
+    r = _run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json",
+         "user", "--jq", ".login"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
+# REST `mergeable` is a nullable boolean; GraphQL's is an enum. Normalize so a
+# quota-fallback payload reads identically to `gh pr list --json mergeable`.
+_REST_MERGEABLE_ENUM = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
+
+
+def _rest_pr_payload(number: int, cwd: str | None = None) -> dict | None:
+    """Full PR payload via REST ``pulls/{number}`` — the quota-safe twin of
+    :func:`_pr_full_payload` (BOU-1966).
+
+    ``gh pr view --json`` resolves through GraphQL, so when the GraphQL quota
+    is exhausted (the exact condition that routes callers here) it fails right
+    alongside the author list. ``GET /repos/{owner}/{repo}/pulls/{number}``
+    spends REST quota only. The payload is normalized to the
+    ``_PR_HEAD_FIELDS`` shape (plus ``mergeable``) so callers consume either
+    interchangeably. Returns ``None`` on any failure — the quota-fallback
+    caller stays fail-closed.
+    """
+    r = _run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json",
+         f"repos/{{owner}}/{{repo}}/pulls/{number}"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        pr = json.loads(r.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(pr, dict):
+        return None
+    return _normalize_rest_pr_payload(pr)
+
+
+def _normalize_rest_pr_payload(pr: dict) -> dict | None:
+    """Map a REST ``pulls/{number}`` payload onto the GraphQL field names the
+    resolution/gate paths consume (``_PR_HEAD_FIELDS`` + ``mergeable``)."""
+    number = pr.get("number")
+    if not isinstance(number, int):
+        return None
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    base = pr.get("base") if isinstance(pr.get("base"), dict) else {}
+    head_repo = head.get("repo") if isinstance(head.get("repo"), dict) else {}
+    head_owner = (
+        head_repo.get("owner") if isinstance(head_repo.get("owner"), dict) else {}
+    )
+    user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
+    return {
+        "number": number,
+        # REST `user` is the PR author; GraphQL serializes it as `author`.
+        # Carried so the quota fallback can preserve the author-scoped
+        # resolution contract (PR #77 review).
+        "author": {"login": str(user.get("login") or "")},
+        "title": pr.get("title") or "",
+        "body": pr.get("body") or "",
+        "url": pr.get("html_url") or "",
+        "isDraft": bool(pr.get("draft", False)),
+        # REST `mergeable_state` is GraphQL `mergeStateStatus` lowercased
+        # (clean/dirty/blocked/behind/unstable/draft/has_hooks/unknown).
+        "mergeStateStatus": str(pr.get("mergeable_state") or "unknown").upper(),
+        # Not exposed on the REST pulls resource; consumers treat "" as unknown.
+        "reviewDecision": "",
+        "headRefOid": str(head.get("sha") or ""),
+        "headRefName": str(head.get("ref") or ""),
+        "headRepositoryOwner": {"login": str(head_owner.get("login") or "")},
+        "baseRefName": str(base.get("ref") or ""),
+        "mergedAt": pr.get("merged_at"),
+        "mergeable": _REST_MERGEABLE_ENUM.get(pr.get("mergeable"), "UNKNOWN"),
+    }
 
 
 def _pr_head_owner(pr: dict) -> str:
