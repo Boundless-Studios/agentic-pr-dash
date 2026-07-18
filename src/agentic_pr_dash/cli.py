@@ -12,6 +12,7 @@ Subcommands:
     loop          Run check/fix/complete continuously, dispatching to a configured agent.
     serve         Run the web dashboard.
     observe       Inspect the observability event store (comment scans, dispatches, etc.).
+    stash         Race-safe labeled-stash push/apply/drop/list (shared cross-worktree stack).
 
 ``check/complete/arm/list-owned/stop-gate/reconcile-prs`` route into the stateless maintenance
 executor; ``record`` into the session registry; ``loop`` and ``serve`` are runtime
@@ -150,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if cmd == "observe":
         return _observe_main(rest)
+
+    if cmd == "stash":
+        from . import stash
+        return stash.main(rest)
 
     print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
