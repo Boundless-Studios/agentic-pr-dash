@@ -40,6 +40,7 @@ from agentic_pr_dash.codex_hooks._payload import (
     load_payload,
     normalized_payload,
 )
+from agentic_pr_dash.codex_hooks.command_parser import is_git_token
 
 
 # The leading path may be ``..``, ``../``, ``../..``, ``../../foo`` etc. —
@@ -281,7 +282,9 @@ def _segment_is_git_commit(segment: str) -> bool:
         return False
 
     token = tokens[index]
-    if token != "git" and not token.endswith("/git"):
+    # Match by basename so `/usr/bin/git commit` cannot evade commit-only hook
+    # dispatch (BOU-2147).
+    if not is_git_token(token):
         return False
 
     index += 1
