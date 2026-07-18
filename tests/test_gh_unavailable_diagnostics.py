@@ -265,16 +265,24 @@ _REST_PR_123 = {
     "mergeable": True,
     "mergeable_state": "clean",
     "merged_at": None,
+    "user": {"login": "octo"},
     "head": {"ref": "feature/x", "sha": "abc123", "repo": {"owner": {"login": "o"}}},
     "base": {"ref": "main"},
 }
 
 
-def _quota_dispatch_run(calls, *, rest_ok=True, head_numbers='[{"number": 123}]'):
+def _quota_dispatch_run(
+    calls, *, rest_ok=True, head_numbers='[{"number": 123}]',
+    pr_payload=None, viewer_ok=True,
+):
     """``github_api._run`` stub: the author list is GraphQL-quota-blocked while
     the REST endpoints answer (or 403 when ``rest_ok=False``). Records every
-    command so tests can assert which paths were (not) taken."""
+    command so tests can assert which paths were (not) taken. The viewer
+    lookup (``GET /user``, resolving the ``@me`` author) answers ``octo`` —
+    matching ``_REST_PR_123``'s author — unless ``viewer_ok=False``."""
     import json as _json
+
+    payload = _REST_PR_123 if pr_payload is None else pr_payload
 
     def run(cmd, timeout_s=20, cwd=None, env=None):
         calls.append(list(cmd))
@@ -283,12 +291,16 @@ def _quota_dispatch_run(calls, *, rest_ok=True, head_numbers='[{"number": 123}]'
             return _cp(returncode=1, stderr=_QUOTA_STDERR)
         if not rest_ok:
             return _cp(returncode=1, stderr="HTTP 403: API rate limit exceeded")
+        if joined.endswith("user --jq .login"):
+            if not viewer_ok:
+                return _cp(returncode=1, stderr="HTTP 403: Resource not accessible")
+            return _cp(stdout="octo\n")
         if ".owner.login" in joined:
             return _cp(stdout="o\n")
         if "pulls?head=" in joined:
             return _cp(stdout=head_numbers)
         if joined.endswith("pulls/123"):
-            return _cp(stdout=_json.dumps(_REST_PR_123))
+            return _cp(stdout=_json.dumps(payload))
         raise AssertionError(f"unexpected gh call: {joined}")
 
     return run
@@ -397,6 +409,69 @@ def test_quota_fallback_branch_without_rest_match_stays_fail_closed(monkeypatch)
         ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
 
 
+def test_quota_fallback_branch_rejects_foreign_author(monkeypatch):
+    # The normal path is author-scoped (`gh pr list --author <pr_author>`), so
+    # under rate limiting a shared-repo branch carrying ANOTHER maintainer's
+    # open PR must not be adopted as this session's PR (PR #77 review).
+    calls = []
+    foreign = dict(_REST_PR_123, user={"login": "mallory"})
+    monkeypatch.setattr(
+        github_api, "_run", _quota_dispatch_run(calls, pr_payload=foreign))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+
+    assert _pr_state_mod._resolve_pr_for_branch(
+        ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+    # The candidate WAS fetched and rejected on authorship, not on resolution.
+    assert any(" ".join(c).endswith("pulls/123") for c in calls)
+
+
+def test_quota_fallback_branch_fails_closed_when_viewer_unresolvable(monkeypatch):
+    # `pr_author = "@me"` needs the REST viewer login to verify authorship; if
+    # GET /user fails (e.g. an App installation token), authorship is
+    # unverifiable and the fallback must fail closed, not adopt the PR.
+    calls = []
+    monkeypatch.setattr(
+        github_api, "_run", _quota_dispatch_run(calls, viewer_ok=False))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+
+    assert _pr_state_mod._resolve_pr_for_branch(
+        ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+
+
+def test_quota_fallback_branch_explicit_author_skips_viewer_lookup(monkeypatch):
+    # A configured non-@me pr_author compares directly against the payload
+    # author — no GET /user call is spent (and none may be relied on: under an
+    # automation identity /user is exactly what's unavailable).
+    import types
+
+    from agentic_pr_dash import config as config_mod
+
+    calls = []
+    monkeypatch.setattr(
+        github_api, "_run", _quota_dispatch_run(calls, viewer_ok=False))
+    monkeypatch.setattr(_pr_state_mod, "_current_branch", lambda cwd: "feature/x")
+    fake_load = lambda cwd=None: types.SimpleNamespace(pr_author="octo")  # noqa: E731
+    # conftest's _isolate_config teardown calls config.load.cache_clear() while
+    # this patch may still be in place — give the fake a no-op.
+    fake_load.cache_clear = lambda: None
+    monkeypatch.setattr(config_mod, "load", fake_load)
+    _patch_detail_getters(monkeypatch)
+
+    pr = _pr_state_mod._resolve_pr_for_branch(".", force=True)
+    assert pr is not _pr_state_mod._GH_UNAVAILABLE and pr is not None
+    assert pr.number == 123
+    assert not any(" ".join(c).endswith("user --jq .login") for c in calls)
+
+
+def test_login_key_normalizes_app_and_bot_forms():
+    # gh's `--author` accepts `app/<name>` for Apps while REST serializes the
+    # same identity as `<name>[bot]`; logins are case-insensitive.
+    assert _pr_state_mod._login_key("app/gaia-bot") == "gaia-bot"
+    assert _pr_state_mod._login_key("gaia-bot[bot]") == "gaia-bot"
+    assert _pr_state_mod._login_key("Octo") == _pr_state_mod._login_key("octo")
+    assert _pr_state_mod._login_key("octo") != _pr_state_mod._login_key("mallory")
+
+
 def test_quota_fallback_detail_rate_limit_stays_fail_closed(monkeypatch):
     # REST resolves the PR, but a detail fetch ULTIMATELY rate-limits — the
     # empty detail results are unreliable, so the resolver must fail closed.
@@ -428,6 +503,7 @@ def test_rest_pr_payload_normalizes_to_graphql_shape(monkeypatch):
     payload = github_api._rest_pr_payload(123, cwd=".")
     assert payload == {
         "number": 123,
+        "author": {"login": "octo"},
         "title": "Quota-safe fallback",
         "body": "body",
         "url": "https://github.com/o/r/pull/123",

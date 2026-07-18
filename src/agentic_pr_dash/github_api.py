@@ -1078,6 +1078,25 @@ def _rest_repo_owner(cwd: str | None = None) -> str:
     return (r.stdout or "").strip()
 
 
+def _rest_viewer_login(cwd: str | None = None) -> str:
+    """Authenticated identity's login via REST ``GET /user`` (quota fallback).
+
+    Resolves the ``@me`` author sentinel without GraphQL — ``gh pr list
+    --author @me`` runs through the exact quota bucket whose exhaustion routes
+    callers onto the BOU-1966 fallback. Returns ``""`` on any failure
+    (including a GitHub App installation token, which cannot call ``/user``) —
+    the fallback caller must then fail closed rather than adopt a PR whose
+    author it cannot verify (PR #77 review)."""
+    r = _run(
+        ["gh", "api", "-H", "Accept: application/vnd.github+json",
+         "user", "--jq", ".login"],
+        cwd=cwd, timeout_s=30,
+    )
+    if r.returncode != 0:
+        return ""
+    return (r.stdout or "").strip()
+
+
 # REST `mergeable` is a nullable boolean; GraphQL's is an enum. Normalize so a
 # quota-fallback payload reads identically to `gh pr list --json mergeable`.
 _REST_MERGEABLE_ENUM = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
@@ -1123,8 +1142,13 @@ def _normalize_rest_pr_payload(pr: dict) -> dict | None:
     head_owner = (
         head_repo.get("owner") if isinstance(head_repo.get("owner"), dict) else {}
     )
+    user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
     return {
         "number": number,
+        # REST `user` is the PR author; GraphQL serializes it as `author`.
+        # Carried so the quota fallback can preserve the author-scoped
+        # resolution contract (PR #77 review).
+        "author": {"login": str(user.get("login") or "")},
         "title": pr.get("title") or "",
         "body": pr.get("body") or "",
         "url": pr.get("html_url") or "",

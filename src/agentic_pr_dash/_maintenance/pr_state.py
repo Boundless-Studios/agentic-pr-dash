@@ -50,12 +50,53 @@ def _rest_fallback_entry_by_number(pr_number: int, cwd: str):
     Returns the normalized payload dict, or ``None`` when the list failure was
     not quota-classified OR REST cannot verify the PR either — the caller stays
     fail-closed (``_GH_UNAVAILABLE``) in both cases.
+
+    Deliberately no ``pr_author`` check here (unlike the branch fallback): the
+    normal ``--pr N`` path also proceeds when the explicitly-named PR is absent
+    from the author-scoped list, so enforcing authorship only under quota would
+    make the fallback STRICTER than the path it substitutes for.
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     if not _list_failure_is_rate_limited():
         return None
     return github_api._rest_pr_payload(pr_number, cwd=cwd)
+
+
+def _login_key(login: str) -> str:
+    """Canonical form of a GitHub login for author comparison.
+
+    ``gh pr list --author`` accepts the ``app/<name>`` form for GitHub Apps
+    while REST serializes the same identity as ``<name>[bot]``, and logins are
+    case-insensitive — normalize both spellings so a configured bot author
+    matches its REST payload."""
+    login = login.strip()
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    if login.endswith("[bot]"):
+        login = login[: -len("[bot]")]
+    return login.lower()
+
+
+def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
+    """True when a REST fallback payload's author is the configured ``pr_author``.
+
+    The normal branch resolution only considers ``gh pr list --author
+    <pr_author>``, so the quota fallback must preserve that author-scoped
+    contract: on a shared-repo branch, another maintainer's open PR must not be
+    adopted (blocked on / serviced) as this session's PR (PR #77 review).
+    ``@me`` resolves via REST ``GET /user``; an unresolvable viewer or a
+    missing payload author fails closed."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
+
+    configured = _load_config(cwd).pr_author
+    expected = github_api._rest_viewer_login(cwd) if configured == "@me" else configured
+    author = raw.get("author")
+    actual = str(author.get("login") or "") if isinstance(author, dict) else ""
+    if not expected or not actual:
+        return False
+    return _login_key(actual) == _login_key(expected)
 
 
 def _rest_fallback_entry_for_branch(branch: str, cwd: str):
@@ -67,6 +108,11 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str):
     ALSO returns ``None`` (→ fail closed): the owner-qualified query cannot see
     a fork-backed head, so "no match" under quota exhaustion is weaker evidence
     than the author-scoped list and must not read as a verified "no PR".
+
+    Every candidate must ALSO match the configured ``pr_author`` — the normal
+    path is author-scoped, so a foreign maintainer's PR on a shared branch
+    must not be adopted under rate limiting (PR #77 review). No author-matching
+    candidate → ``None`` (fail closed).
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
@@ -78,10 +124,16 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str):
     numbers = github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
     if not numbers:
         return None
-    raw = github_api._rest_pr_payload(numbers[0], cwd=cwd)
-    if raw is None or str(raw.get("headRefName") or "") != branch:
-        return None
-    return raw
+    for number in numbers:
+        raw = github_api._rest_pr_payload(number, cwd=cwd)
+        if raw is None:
+            return None  # REST failure mid-verification → fail closed
+        if str(raw.get("headRefName") or "") != branch:
+            continue
+        if not _rest_payload_author_is_tracked(raw, cwd):
+            continue
+        return raw
+    return None
 
 
 def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
