@@ -233,10 +233,13 @@ def _safe_cwd() -> Path:
 
 def _detect_repo(cwd: Path) -> str | None:
     """Best-effort ``owner/name`` discovery from the local checkout."""
+    # Lazy import: github_api imports config, so a top-level import would cycle.
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         out = subprocess.run(
             ["gh", "repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"],
             cwd=cwd, capture_output=True, text=True, timeout=15,
+            env=github_api.automation_subprocess_env(),
         )
         if out.returncode == 0 and out.stdout.strip():
             return out.stdout.strip()

@@ -58,6 +58,19 @@ def test_prompt_is_tool_neutral_by_default(tmp_path):
     assert "agentic-pr-dash complete" in prompt
 
 
+def test_merge_conflict_prompt_spells_out_stash_commands(tmp_path):
+    # Each stash command must be complete and copy-pasteable on its own.
+    # An `apply|drop` shorthand pasted into a shell becomes a pipeline: apply
+    # runs label-less and the remainder executes as a bogus second command.
+    config.load.cache_clear()
+    prompt = maintenance.build_maintenance_prompt(
+        _pr(worktree_path=str(tmp_path), merge_state="DIRTY")
+    )
+    assert "apply|drop" not in prompt
+    assert 'agentic-pr-dash stash apply "<label>"' in prompt
+    assert 'agentic-pr-dash stash drop "<label>"' in prompt
+
+
 def test_prompt_template_override(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTIC_PR_DASH_PROMPT_TEMPLATE", "FOLLOW THE HOUSE RULES.")
     config.load.cache_clear()

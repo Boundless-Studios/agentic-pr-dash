@@ -174,6 +174,133 @@ def test_command_cli_name_honors_supplied_discovery_names():
     assert agents._command_cli_name("/usr/bin/aider --message x", {"aider"}) == "aider"
 
 
+def test_redact_command_for_display_removes_secret_values():
+    command = (
+        "env E2E_TEST_PASSWORD=supersecret GH_TOKEN=ghp_secret "
+        "codex exec --api-key sk-secret --auth-token=auth-secret --model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "supersecret" not in redacted
+    assert "ghp_secret" not in redacted
+    assert "sk-secret" not in redacted
+    assert "auth-secret" not in redacted
+    assert "E2E_TEST_PASSWORD=<redacted>" in redacted
+    assert "GH_TOKEN=<redacted>" in redacted
+    assert "--api-key <redacted>" in redacted
+    assert "--auth-token=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_redact_command_multiword_secret_value_swallowed_to_next_option():
+    """`ps` output loses shell quoting: a quoted multi-word secret value
+    arrives as separate tokens and every one of them must be redacted, not
+    just the first (PR #72 P2)."""
+    command = (
+        "codex exec --private-key -----BEGIN PRIVATE KEY----- abc123 "
+        "-----END PRIVATE KEY----- --model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "BEGIN" not in redacted
+    assert "abc123" not in redacted
+    assert "--private-key <redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_redact_command_inline_multiword_secret_value_swallowed():
+    """Multi-word secrets also leak through the inline --name=value form:
+    shlex yields `--private-key=-----BEGIN` plus tail fragments, which must be
+    swallowed just like the space-separated form (PR #72 P2)."""
+    command = (
+        "codex exec --private-key=-----BEGIN PRIVATE KEY----- abc123 "
+        "-----END PRIVATE KEY----- --model gpt-5 "
+        "--env=API_KEY=multi word-value --output out.txt"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "BEGIN" not in redacted
+    assert "abc123" not in redacted
+    assert "multi" not in redacted
+    assert "word-value" not in redacted
+    assert "--private-key=<redacted>" in redacted
+    assert "--env=API_KEY=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+    assert "--output" in redacted
+
+
+def test_redact_command_env_assignment_embedded_in_option_value():
+    """Wrapper forms like --env=GH_TOKEN=... hide the secret assignment in the
+    option VALUE; the outer name check alone must not let it through (PR #72 P2)."""
+    command = (
+        "codex exec --env=GH_TOKEN=ghp_secret --build-arg=API_KEY=sk-secret "
+        "--model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "ghp_secret" not in redacted
+    assert "sk-secret" not in redacted
+    assert "--env=GH_TOKEN=<redacted>" in redacted
+    assert "--build-arg=API_KEY=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_redact_unparsed_command_embedded_env_assignment():
+    """The unparsed fallback (unbalanced quote) must also catch secret
+    assignments embedded in option values (PR #72 P2)."""
+    command = "codex exec --env=GH_TOKEN=ghp_secret 'unterminated"
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "ghp_secret" not in redacted
+    assert "--env=GH_TOKEN=<redacted>" in redacted
+
+
+def test_redact_command_auth_header_style_option_names():
+    """--authorization / --auth-header carry credentials; the parsed-path name
+    check must cover the same auth forms as the fallback regex (PR #72 P2)."""
+    command = (
+        "codex exec --authorization Bearer-abc123 --auth-header=Basic-xyz789 "
+        "--model gpt-5"
+    )
+
+    redacted = agents._redact_command_for_display(command)
+
+    assert "Bearer-abc123" not in redacted
+    assert "Basic-xyz789" not in redacted
+    assert "--authorization <redacted>" in redacted
+    assert "--auth-header=<redacted>" in redacted
+    assert "--model gpt-5" in redacted
+
+
+def test_discover_active_agents_returns_redacted_command(tmp_path, monkeypatch):
+    command = "codex exec --token ghp_secret --prompt ok"
+    process_table = f"123 1 5.0 {command}\n"
+
+    monkeypatch.setattr(agents, "_run_process_table", lambda: process_table)
+    monkeypatch.setattr(agents, "_collect_cwds", lambda: {123: str(tmp_path)})
+
+    discovered = agents.discover_active_agents([str(tmp_path)])
+
+    assert discovered[str(tmp_path)][0].command == "codex exec --token <redacted> --prompt ok"
+
+
+def test_discover_feature_pipeline_agents_returns_redacted_command(tmp_path, monkeypatch):
+    command = "codex exec /feature-pipeline --linear-api-key lin_secret"
+    process_table = f"123 1 5.0 {command}\n"
+
+    monkeypatch.setattr(agents, "_run_process_table", lambda: process_table)
+    monkeypatch.setattr(agents, "_collect_cwds", lambda: {123: str(tmp_path)})
+
+    discovered = agents.discover_primary_feature_pipeline_agents([str(tmp_path)])
+
+    assert discovered[str(tmp_path)][0].command == "codex exec /feature-pipeline --linear-api-key <redacted>"
+
+
 def test_live_independent_owner_paths_registry_honors_discovery_names(tmp_path, monkeypatch):
     """A live registry session whose cli is NOT in the target repo's discovery_names
     (default: claude, codex) is not treated as an owner (PR #7 P2)."""

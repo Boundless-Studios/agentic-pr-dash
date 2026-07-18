@@ -219,6 +219,126 @@ def test_dispatch_classify_helpers():
     assert run_model_dispatch_logger.is_fallback("debugging", "opus") is False
 
 
+# ── model-dispatch ledger row stamping (BOU-2159) ────────────────────
+
+
+def test_dispatch_stamps_source_and_cwd(tmp_path, monkeypatch, capsys):
+    """Rows carry in-session provenance so scoped ledger replays can attribute
+    Agent dispatches instead of skipping them."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.delenv("MODEL_DISPATCH_EXTRA", raising=False)
+    payload = {"tool_name": "Agent", "tool_input": {"description": "Review the changes"}}
+    rc, _ = _run(run_model_dispatch_logger, payload, capsys=capsys)
+    assert rc == 0
+    entry = json.loads(log.read_text().strip())
+    assert entry["source"] == "session"
+    assert entry["cwd"] == str(tmp_path)
+
+
+def test_dispatch_cwd_falls_back_to_process_cwd(tmp_path, monkeypatch, capsys):
+    """CLAUDE_PROJECT_DIR-first, os.getcwd() fallback — same resolution as the
+    codex-dispatch logger."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("MODEL_DISPATCH_EXTRA", raising=False)
+    monkeypatch.chdir(tmp_path)
+    _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "build"}}, capsys=capsys)
+    entry = json.loads(log.read_text().strip())
+    assert entry["source"] == "session"
+    assert entry["cwd"] == os.getcwd()
+
+
+def test_dispatch_extra_fields_round_trip(tmp_path, monkeypatch, capsys):
+    """A wrapper hook injects verdict/task_type via MODEL_DISPATCH_EXTRA and the
+    fields land on the single upstream-written row (no double-write)."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "MODEL_DISPATCH_EXTRA",
+        json.dumps({"verdict": "no_findings", "task_type": "code_review"}),
+    )
+    payload = {"tool_name": "Agent", "tool_input": {"description": "Review the changes"}}
+    rc, _ = _run(run_model_dispatch_logger, payload, capsys=capsys)
+    assert rc == 0
+    entry = json.loads(log.read_text().strip())
+    assert entry["verdict"] == "no_findings"
+    assert entry["task_type"] == "code_review"
+    # Base shape and provenance stamps are intact alongside the extras.
+    assert entry["kind"] == "model_dispatch"
+    assert entry["response"] == "dispatched"
+    assert entry["source"] == "session"
+    assert entry["cwd"] == str(tmp_path)
+
+
+def test_dispatch_extra_fields_cannot_override_reserved(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv(
+        "MODEL_DISPATCH_EXTRA",
+        json.dumps({"source": "forged", "cwd": "/elsewhere", "kind": "bogus", "verdict": "found_criticals"}),
+    )
+    _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "Review the changes"}}, capsys=capsys)
+    entry = json.loads(log.read_text().strip())
+    assert entry["source"] == "session"
+    assert entry["cwd"] == str(tmp_path)
+    assert entry["kind"] == "model_dispatch"
+    assert entry["verdict"] == "found_criticals"
+
+
+@pytest.mark.parametrize("bad", ["{not json", '"a string"', "[1, 2]", ""])
+def test_dispatch_malformed_extra_ignored(tmp_path, monkeypatch, capsys, bad):
+    """Malformed extension payloads never block logging: the row is still
+    written with the provenance stamps and no extra keys."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("MODEL_DISPATCH_EXTRA", bad)
+    rc, _ = _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "build"}}, capsys=capsys)
+    assert rc == 0
+    entry = json.loads(log.read_text().strip())
+    assert entry["source"] == "session"
+    assert set(entry) == {"kind", "timestamp", "model", "prompt", "response", "source", "cwd"}
+
+
+def test_dispatch_extra_null_values_dropped(tmp_path, monkeypatch, capsys):
+    """An unparsed verdict (null) stays absent — absent fields are the tolerant
+    default for readers."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setenv("MODEL_DISPATCH_EXTRA", json.dumps({"verdict": None, "task_type": "code_review"}))
+    _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "Review the changes"}}, capsys=capsys)
+    entry = json.loads(log.read_text().strip())
+    assert "verdict" not in entry
+    assert entry["task_type"] == "code_review"
+
+
+def test_dispatch_legacy_row_shape_preserved(tmp_path, monkeypatch, capsys):
+    """Stamping is purely additive: the legacy base keys keep their exact shape
+    so pre-BOU-2159 readers keep parsing new rows, and readers written against
+    the new shape must tolerate legacy rows missing source/cwd."""
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.delenv("MODEL_DISPATCH_EXTRA", raising=False)
+    _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "Debug the failing test", "model": "sonnet"}}, capsys=capsys)
+    entry = json.loads(log.read_text().strip())
+    # Legacy shape is a strict subset of the new row.
+    assert {"kind", "timestamp", "model", "prompt", "response"} <= set(entry)
+    assert entry["kind"] == "model_dispatch"
+    assert entry["model"] == "sonnet-4.6"
+    assert entry["response"] == "dispatched"
+    # A legacy row (no source/cwd) is still valid input for tolerant readers.
+    legacy = {"kind": "model_dispatch", "timestamp": "t", "model": "m", "prompt": "p", "response": "dispatched"}
+    assert legacy.get("source") is None
+    assert legacy.get("cwd") is None
+
+
 # ── AgentFlow client ─────────────────────────────────────────────────
 
 

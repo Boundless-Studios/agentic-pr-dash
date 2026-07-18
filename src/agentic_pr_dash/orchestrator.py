@@ -302,8 +302,14 @@ class Orchestrator:
         # mid-enrichment, leave merged PRs pinned on the board. Other repos are
         # untouched (per-repo isolation).
         if raw_prs is None:
+            # Name the failure class (auth vs network vs rate-limit) instead of
+            # the bare "unavailable" — during BOU-1987 the undifferentiated
+            # message hid an expired-token 401 behind a network-looking outage.
+            failure = github_api.last_list_open_prs_failure()
+            detail = f" — {failure.summary()}" if failure else ""
             self.log(
-                f"Skipping refresh for {root}: could not list open PRs (GitHub API unavailable)",
+                f"Skipping refresh for {root}: could not list open PRs "
+                f"(GitHub API unavailable{detail})",
                 level="error",
             )
             return
