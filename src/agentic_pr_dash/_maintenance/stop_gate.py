@@ -168,7 +168,7 @@ def _stop_gate_impl(args) -> int:
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
-    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry  # noqa: PLC0415
+    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_prs  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
@@ -295,6 +295,39 @@ def _stop_gate_impl(args) -> int:
                 _save_stop_state(cwd, {"ts": now})
                 return 0
             if open_prs and not _await_alive(cwd, session_id):
+                # BOU-1962 (codex PR #75 review): when this session's waiter
+                # already verified exactly these PRs clean and clean-exited, a
+                # freshly demanded waiter would immediately clean-exit again —
+                # the prompt would be unsatisfiable until STOP_LOOP_THRESHOLD.
+                # This stop's own _check_worktree pass just found nothing
+                # pending, so only re-demand a waiter that would actually STAY
+                # alive: required CI running again (BOU-1789 watch-pending) or
+                # CI state unobservable this tick (fail toward coverage).
+                verified_clean = _read_clean_exit_prs(session_id)
+                if verified_clean and open_prs <= verified_clean:
+                    github_api.reset_checks_probe_failure_seen()
+                    detached_watch = {
+                        r["pr"]: bool(r.get("ci_watch_pending"))
+                        for r in _detached_records_across_roots(session_id, cwd)
+                        if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                    }
+                    ci_running = False
+                    for n in sorted(open_prs):
+                        if n in pr_to_wts:
+                            if any(github_api.required_checks_pending(n, wt)
+                                   for wt in _wts_for(n)):
+                                ci_running = True
+                                break
+                        elif detached_watch.get(n):
+                            ci_running = True
+                            break
+                    if (
+                        not ci_running
+                        and not github_api.checks_probe_failure_seen()
+                        and not github_api.rate_limit_seen()
+                    ):
+                        _save_stop_state(cwd, {"ts": now})
+                        return 0
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})

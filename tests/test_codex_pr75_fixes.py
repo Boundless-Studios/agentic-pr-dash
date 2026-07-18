@@ -1,0 +1,277 @@
+"""Regression tests for the codex PR #75 review findings (BOU-1962 hardening).
+
+1. A failed CI-watch probe must NOT read as "CI terminal": the clean-state
+   early exit needs a positive terminal-CI observation
+   (``github_api.checks_probe_failure_seen()``).
+2. A warn-only deferral (``NOT clean (no fix dispatched)``) means the PR HAS
+   blockers — the tick must not clean-exit.
+3. The waiter's clean exit records WHICH PRs it verified; the stop gate skips
+   the re-demand for marker-covered clean PRs (the demanded waiter would
+   immediately clean-exit again) but still demands one when required CI is
+   running (BOU-1789) or the probe is unobservable.
+"""
+from __future__ import annotations
+
+import json
+import os
+import types
+
+import pytest
+
+from agentic_pr_dash import config, github_api, maintenance_check as mc
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+
+SID = "sess-codex-pr75"
+
+
+@pytest.fixture(autouse=True)
+def _isolation(tmp_path, monkeypatch):
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "0")
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_LOOP_THRESHOLD", "3")
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger-unused"))
+    # Keep waiter pidfiles + clean-exit markers OUT of the real home dir.
+    monkeypatch.setenv("AGENTIC_PR_DASH_WAITER_DIR", str(tmp_path / "waiters"))
+    # Isolate from any real detached loop daemon.
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(tmp_path / "empty-daemons"))
+    config.load.cache_clear()
+    github_api.reset_rate_limit_seen()
+    github_api.reset_checks_probe_failure_seen()
+    yield
+    config.load.cache_clear()
+    github_api.reset_rate_limit_seen()
+    github_api.reset_checks_probe_failure_seen()
+
+
+def _await_args(tmp_path):
+    return [
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", str(os.getpid()),
+        "--max-wait=-1",
+        "--interval", "0",
+    ]
+
+
+def _wire_await(tmp_path, monkeypatch, wt):
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+
+# ---------------------------------------------------------------------------
+# Finding 2: failed watch-pending probe must suppress the clean exit
+# ---------------------------------------------------------------------------
+
+
+def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
+    """Tick 1: the CI-watch probe FAILS (returns False fail-safe but records the
+    failure) — the waiter must NOT clean-exit on unobserved CI state. Tick 2:
+    the probe succeeds terminal — clean exit fires."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    _wire_await(tmp_path, monkeypatch, wt)
+
+    tick_count = [0]
+    probe_calls = [0]
+
+    def fake_check(path, session_id, *, claim=True):
+        tick_count[0] += 1
+        if tick_count[0] > 3:
+            raise AssertionError("await did not exit once the probe was observable")
+        return 0, "nothing pending"
+
+    def fake_collect_watch_pending(owned, cwd, session_id):
+        probe_calls[0] += 1
+        if probe_calls[0] == 1:
+            # Simulate required_checks_pending failing on a non-rate-limit gh
+            # error: fail-safe False, but the failure is recorded.
+            github_api._note_checks_probe_failure()
+        return False
+
+    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert tick_count[0] == 2, "probe-failure tick must not clean-exit; next tick may"
+
+
+def test_required_checks_pending_records_probe_failure_on_gh_error(monkeypatch):
+    monkeypatch.setenv("AGENTIC_PR_DASH_REPO", "owner/name")
+    config.load.cache_clear()
+    monkeypatch.setattr(
+        github_api, "_run",
+        lambda cmd, **kw: types.SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    github_api.reset_checks_probe_failure_seen()
+    assert github_api.required_checks_pending(42) is False
+    assert github_api.checks_probe_failure_seen() is True
+    config.load.cache_clear()
+
+
+def test_required_checks_pending_null_rollup_is_valid_observation(monkeypatch):
+    """A null statusCheckRollup means NO checks on the head commit — a valid
+    terminal observation, not a probe failure."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_REPO", "owner/name")
+    config.load.cache_clear()
+    body = json.dumps({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+        {"commit": {"statusCheckRollup": None}}
+    ]}}}}})
+    monkeypatch.setattr(
+        github_api, "_run",
+        lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=body, stderr=""),
+    )
+    github_api.reset_checks_probe_failure_seen()
+    assert github_api.required_checks_pending(42) is False
+    assert github_api.checks_probe_failure_seen() is False
+    config.load.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Finding 3: warn-only deferral is NOT clean
+# ---------------------------------------------------------------------------
+
+
+def test_await_warn_only_deferral_suppresses_clean_exit(tmp_path, monkeypatch):
+    """A tick whose check defers with the warn-only marker (PR has blockers, a
+    live foreign owner is responsible) must not clean-exit; once the deferral
+    clears and the PR is genuinely clean, the waiter exits."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    _wire_await(tmp_path, monkeypatch, wt)
+
+    tick_count = [0]
+
+    def fake_check(path, session_id, *, claim=True):
+        tick_count[0] += 1
+        if tick_count[0] == 1:
+            return 0, (
+                "owned PR #5 has blockers ['review_comments']; deferring to "
+                f"live PR-watch owner session other — {_worktree_check_mod.WARN_ONLY_MARKER}"
+            )
+        if tick_count[0] > 3:
+            raise AssertionError("await did not exit once the deferral cleared")
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert tick_count[0] == 2, "warn-only deferral tick must not clean-exit"
+
+
+# ---------------------------------------------------------------------------
+# Finding 1: clean-exit marker <-> stop-gate re-demand
+# ---------------------------------------------------------------------------
+
+
+def _arm(tmp_path, pr_number: int):
+    wt = tmp_path / "worktree"
+    wt.mkdir(exist_ok=True)
+    mc._write_arm_marker(str(wt), SID, os.getpid(), pr_number)
+    return wt
+
+
+def test_await_clean_exit_writes_marker(tmp_path, monkeypatch):
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert _waiter_mod._read_clean_exit_prs(SID) == {42}
+
+
+def test_await_exit_10_clears_marker(tmp_path, monkeypatch):
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(
+        mc, "_check_worktree",
+        lambda path, sid, *, claim=True: (10, "needs review\nPR_NUMBER=42"),
+    )
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 10
+    assert _waiter_mod._read_clean_exit_prs(SID) == set()
+
+
+def _wire_stop_gate(tmp_path, monkeypatch, wt):
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+
+
+def test_stop_gate_skips_redemand_for_marker_covered_clean_pr(tmp_path, monkeypatch, capsys):
+    """Waiter verified PR #42 clean and exited → stop gate must NOT re-demand a
+    waiter that would immediately clean-exit again (CI terminal, observable)."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 0
+    assert "await" not in err.lower()
+
+
+def test_stop_gate_still_demands_waiter_when_ci_running_again(tmp_path, monkeypatch, capsys):
+    """Marker-covered PR whose required CI is running again: a waiter WOULD stay
+    alive (BOU-1789 watch-pending), so the demand stands."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: True)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#42" in err
+
+
+def test_stop_gate_still_demands_waiter_when_probe_unobservable(tmp_path, monkeypatch, capsys):
+    """Marker-covered PR whose CI probe fails: state unobservable → fail toward
+    coverage (demand the waiter; it suppresses ITS clean exit the same way)."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+
+    def failing_probe(n, cwd=None):
+        github_api._note_checks_probe_failure()
+        return False
+
+    monkeypatch.setattr(github_api, "required_checks_pending", failing_probe)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#42" in err
+
+
+def test_stop_gate_demands_waiter_for_pr_not_covered_by_marker(tmp_path, monkeypatch, capsys):
+    """A marker from an earlier clean exit does not cover a NEW PR — the demand
+    fires so the new PR gets its first waiter round."""
+    wt = _arm(tmp_path, 43)  # new PR; marker only covers 42
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#43" in err

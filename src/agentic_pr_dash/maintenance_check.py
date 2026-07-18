@@ -142,13 +142,16 @@ from ._maintenance.waiter import (  # noqa: F401, E402
     _await_alive,
     _detached_loop_alive,
     _detached_pending_entry,
+    _write_clean_exit_marker,
+    _clear_clean_exit_marker,
+    _read_clean_exit_prs,
 )
 
 
 # ---------------------------------------------------------------------------
 # worktree_check
 # ---------------------------------------------------------------------------
-from ._maintenance.worktree_check import _check_worktree  # noqa: F401, E402
+from ._maintenance.worktree_check import _check_worktree, WARN_ONLY_MARKER  # noqa: F401, E402
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +582,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # cleared each tick so a stale earlier rate-limit can't wedge the
             # waiter alive on a later observable tick (BOU-1921 #62).
             github_api.reset_rate_limit_seen()
+            # Same per-tick reset for the CI-watch probe failure flag: the
+            # clean exit below requires a POSITIVE terminal-CI observation
+            # this tick (codex PR #75 review).
+            github_api.reset_checks_probe_failure_seen()
 
             # Span every repo anchor the session owns PRs in (not just cwd's
             # maintenance roots), so the single session-scoped waiter honestly
@@ -600,6 +607,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
 
             pending: list[tuple[str, str]] = []
             gh_unobservable = False
+            warn_only_deferral = False
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
@@ -609,6 +617,12 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # state is UNOBSERVABLE, so this tick must not conclude
                     # "clean" (suppresses the BOU-1962 early exit below).
                     gh_unobservable = True
+                elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
+                    # Warn-only deferral: the PR HAS blockers but a live foreign
+                    # owner / active coordinator claim is responsible, so no fix
+                    # is dispatched here. The PR is explicitly NOT clean — this
+                    # tick must not clean-exit on it (codex PR #75 review).
+                    warn_only_deferral = True
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             _detached_this_tick: list[dict] = []
@@ -626,6 +640,8 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         pending.append(_detached_pending_entry(r))
 
             if pending:
+                # Feedback arrived — any earlier clean-exit verdict is stale.
+                _clear_clean_exit_marker(session_id)
                 print(_build_stop_block(pending))
                 print(
                     "[pr-watch] Feedback arrived on PR(s) you own — address it now "
@@ -663,8 +679,22 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 if (
                     not watch_pending
                     and not gh_unobservable
+                    and not warn_only_deferral
                     and not github_api.rate_limit_seen()
+                    # "CI terminal" must be a POSITIVE observation: a failed
+                    # watch-pending probe returns False fail-safe, which must
+                    # not read as terminal (codex PR #75 review).
+                    and not github_api.checks_probe_failure_seen()
                 ):
+                    # Record WHICH open PRs were verified clean so the stop
+                    # gate doesn't re-demand a waiter that would immediately
+                    # clean-exit again (codex PR #75 review).
+                    verified = set(_owned_open_pr_numbers(owned)) | {
+                        r["pr"]
+                        for r in _detached_this_tick
+                        if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                    }
+                    _write_clean_exit_marker(session_id, verified)
                     print(
                         "[pr-watch] all watched PRs are clean (no pending "
                         "feedback, required CI terminal); waiter exiting."

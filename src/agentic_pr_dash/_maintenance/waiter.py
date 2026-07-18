@@ -83,6 +83,52 @@ def _remove_await_pidfile(cwd: str, session_id: str = "") -> None:
         pass
 
 
+# ── BOU-1962 clean-exit marker (codex PR #75 review) ────────────────────────
+# When the waiter clean-exits (all watched PRs verified clean, required CI
+# terminal, tick observable) it records WHICH open PRs it verified. The stop
+# gate reads this so it doesn't re-demand a waiter that would immediately
+# clean-exit again — the demand is only re-issued for PRs the marker doesn't
+# cover, or when required CI is running again (a waiter would stay alive for
+# that, BOU-1789). Session-scoped, next to the waiter pidfile.
+
+
+def _clean_exit_marker_path(session_id: str) -> str:
+    from agentic_pr_dash import session_ledger as _sl  # noqa: PLC0415
+    safe = _sl._safe_session(session_id) if session_id else "unknown"
+    return os.path.join(_waiter_dir(), f"pr-watch.clean-exit.{safe}.json")
+
+
+def _write_clean_exit_marker(session_id: str, prs: set[int]) -> None:
+    """Record the waiter's clean-exit verdict for ``prs`` (best-effort)."""
+    import time  # noqa: PLC0415
+    path = _clean_exit_marker_path(session_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"prs": sorted(prs), "ts": time.time()}, fh)
+    except OSError:
+        pass
+
+
+def _clear_clean_exit_marker(session_id: str) -> None:
+    """Drop the clean-exit verdict (feedback arrived — state moved on)."""
+    try:
+        os.remove(_clean_exit_marker_path(session_id))
+    except OSError:
+        pass
+
+
+def _read_clean_exit_prs(session_id: str) -> set[int]:
+    """PR numbers the session's waiter last verified clean; empty when absent."""
+    try:
+        with open(_clean_exit_marker_path(session_id), encoding="utf-8") as fh:
+            data = json.load(fh)
+        prs = data.get("prs", []) if isinstance(data, dict) else []
+        return {int(n) for n in prs}
+    except (OSError, ValueError, TypeError):
+        return set()
+
+
 def _normalize_coverage_paths(paths) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()

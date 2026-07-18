@@ -254,6 +254,33 @@ def rate_limit_seen() -> bool:
     return _RATE_LIMIT_SEEN
 
 
+# Per-tick CI-watch-probe observation (codex PR #75 review, BOU-1962).
+# ``required_checks_pending`` is deliberately fail-safe: it returns False on any
+# gh/parse error so callers that merely PRIORITIZE on it never wedge. But the
+# await waiter's clean-state early exit needs a POSITIVE terminal-CI
+# observation — a failed probe returning False must not read as "CI terminal"
+# or the waiter could exit while a required check is still queued/in_progress
+# behind a non-rate-limit gh outage. Consumers reset this flag at the start of
+# a tick and read it after their probes, mirroring rate_limit_seen().
+_CHECKS_PROBE_FAILURE_SEEN = False
+
+
+def reset_checks_probe_failure_seen() -> None:
+    """Clear the checks-probe-failure flag (call before a tick's CI probes)."""
+    global _CHECKS_PROBE_FAILURE_SEEN
+    _CHECKS_PROBE_FAILURE_SEEN = False
+
+
+def checks_probe_failure_seen() -> bool:
+    """True if a required-checks probe since the last reset failed (state unobservable)."""
+    return _CHECKS_PROBE_FAILURE_SEEN
+
+
+def _note_checks_probe_failure() -> None:
+    global _CHECKS_PROBE_FAILURE_SEEN
+    _CHECKS_PROBE_FAILURE_SEEN = True
+
+
 # ── Automation-token file source (BOU-1991) ────────────────────────────────
 # The PR-automation GitHub App installation token lives in
 # $XDG_CONFIG_HOME/agentic-pr-dash/gh-automation-token and rotates roughly
@@ -1764,7 +1791,11 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     configured by branch protection that have not reported yet (the cli/cli#8855
     gap that ``gh pr checks`` misses). Paginates the contexts so a required
     pending context past the first 100 isn't missed. Returns ``False`` on any
-    error or when no required check is pending (fail-safe).
+    error or when no required check is pending (fail-safe) — but a gh/parse
+    failure additionally records ``checks_probe_failure_seen()`` so tick-based
+    consumers (the await waiter's clean exit) can tell "observed terminal" from
+    "probe failed" (codex PR #75 review). A ``null`` rollup is a VALID
+    observation (no status checks on the head commit), not a failure.
     """
     repo = _repo_for_cwd(cwd)
     if not repo or "/" not in repo:
@@ -1779,13 +1810,21 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
             cmd += ["-F", f"after={after}"]
         r = _run(cmd, cwd=cwd, timeout_s=30)
         if r.returncode != 0:
+            _note_checks_probe_failure()
             return False
         try:
             data = json.loads(r.stdout or "{}")
             rollup = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
                       ["commit"]["statusCheckRollup"])
-            contexts = rollup["contexts"]
         except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            _note_checks_probe_failure()
+            return False
+        if rollup is None:
+            return False  # observed: no status checks on the head commit
+        try:
+            contexts = rollup["contexts"]
+        except (KeyError, TypeError):
+            _note_checks_probe_failure()
             return False
         if any(_ctx_is_pending(ctx) for ctx in contexts.get("nodes", [])):
             return True
