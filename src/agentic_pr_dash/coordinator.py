@@ -86,15 +86,25 @@ def task_identity_for_pr(pr: PRData) -> TaskIdentity:
     )
 
 
-def _porcelain_path(line: str) -> str:
-    """Path component of one ``git status --porcelain`` line (rename target for
-    ``R`` lines, unquoted)."""
-    path = line[3:]
-    if " -> " in path:
-        path = path.split(" -> ", 1)[1]
+def _porcelain_unquote(path: str) -> str:
     if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
-        path = path[1:-1]
+        return path[1:-1]
     return path
+
+
+def _porcelain_paths(line: str) -> list[str]:
+    """All path components of one ``git status --porcelain`` line, unquoted.
+
+    Rename/copy lines (``R``/``C``) carry both sides as ``old -> new``. Both
+    are returned so a rename *out of* a real tracked file into the state dir
+    (or the legacy handoff filename) still registers the source path: such a
+    line counts as loop-generated only when every side is a loop artifact.
+    """
+    body = line[3:]
+    if " -> " in body:
+        old, new = body.split(" -> ", 1)
+        return [_porcelain_unquote(old), _porcelain_unquote(new)]
+    return [_porcelain_unquote(body)]
 
 
 def _is_loop_artifact(path: str, state_dir_name: str) -> bool:
@@ -133,7 +143,10 @@ def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
     dirty_lines = [
         line
         for line in status.stdout.splitlines()
-        if line and not _is_loop_artifact(_porcelain_path(line), state_dir_name)
+        if line
+        and not all(
+            _is_loop_artifact(p, state_dir_name) for p in _porcelain_paths(line)
+        )
     ]
     if status.returncode == 0 and dirty_lines:
         return True

@@ -135,6 +135,35 @@ def test_state_dir_artifacts_do_not_make_worktree_dirty(tmp_path):
     assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is True
 
 
+def test_rename_of_real_file_into_state_dir_counts_as_dirt(tmp_path):
+    """A staged rename ``R real.py -> .gaia/...`` keeps its SOURCE path in the
+    dirty decision: only renames whose both sides are loop artifacts are
+    ignored, so reclaim can never bulldoze an agent-staged source removal."""
+    repo = _make_repo(tmp_path / "repo", slug="o/r", state_dir=".gaia")
+    (repo / "real.py").write_text("code\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "base", cwd=repo)
+
+    # Rename a real tracked source file INTO the state dir.
+    (repo / ".gaia").mkdir(exist_ok=True)
+    _git("mv", "real.py", ".gaia/real.py", cwd=repo)
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is True
+
+
+def test_rename_between_loop_artifacts_is_not_dirt(tmp_path):
+    """Legacy tracked root handoff renamed into the state dir: both sides are
+    loop artifacts, so the rename stays reclaimable."""
+    repo = _make_repo(tmp_path / "repo", slug="o/r", state_dir=".gaia")
+    handoff = repo / maintenance.HANDOFF_FILENAME
+    handoff.write_text("# handoff\n")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-qm", "base", cwd=repo)
+
+    (repo / ".gaia").mkdir(exist_ok=True)
+    _git("mv", maintenance.HANDOFF_FILENAME, ".gaia/" + maintenance.HANDOFF_FILENAME, cwd=repo)
+    assert coordinator.worktree_has_dirty_or_unpushed_changes(str(repo)) is False
+
+
 def test_claim_with_only_loop_artifact_dirt_is_reclaimable(tmp_path, monkeypatch):
     """The live wedge: a released/reclaimable claim whose owner worktree is dirty
     ONLY by the loop's own handoff/state-dir writes must dispatch, not park in
