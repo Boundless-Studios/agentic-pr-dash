@@ -271,6 +271,7 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
                 root,
                 args.pid,
                 adopt_unmarked=False,
+                adopt_dead_markered=True,
             )
         for path in root_owned:
             if path not in seen:

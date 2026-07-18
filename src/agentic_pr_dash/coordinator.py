@@ -86,6 +86,36 @@ def task_identity_for_pr(pr: PRData) -> TaskIdentity:
     )
 
 
+def _porcelain_path(line: str) -> str:
+    """Path component of one ``git status --porcelain`` line (rename target for
+    ``R`` lines, unquoted)."""
+    path = line[3:]
+    if " -> " in path:
+        path = path.split(" -> ", 1)[1]
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        path = path[1:-1]
+    return path
+
+
+def _is_loop_artifact(path: str, state_dir_name: str) -> bool:
+    """True for files the maintenance loop/dashboard writes itself.
+
+    The loop's own artifacts must never count as worktree dirt for reclaim
+    purposes, or every handoff write self-wedges the claim into
+    ``manual_intervention`` (BOU-2184): the handoff prompt (legacy root-level
+    ``MAINTENANCE_HANDOFF.md`` copies included) and anything under the
+    worktree's configured state dir (``.agentic-pr-dash/`` by default, where
+    markers, maintenance state, and the handoff now live).
+    """
+    if path == maintenance.HANDOFF_FILENAME:
+        return True
+    if state_dir_name:
+        prefix = state_dir_name.rstrip("/")
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
     worktree = Path(path)
     if not worktree.is_dir():
@@ -96,10 +126,14 @@ def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
         text=True,
         timeout=10,
     )
+    try:
+        state_dir_name = load_config(str(worktree)).state_dir_name
+    except Exception:  # noqa: BLE001 - unparseable config must not break reclaim
+        state_dir_name = ""
     dirty_lines = [
         line
         for line in status.stdout.splitlines()
-        if line and line[3:] != maintenance.HANDOFF_FILENAME
+        if line and not _is_loop_artifact(_porcelain_path(line), state_dir_name)
     ]
     if status.returncode == 0 and dirty_lines:
         return True
