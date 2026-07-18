@@ -16,6 +16,20 @@ Repo config:
     ``MODEL_DISPATCH_BD_AUDIT=1`` (beads is a repo-specific tool, off by default
     so the upstream surface has no beads dependency).
 
+Row provenance (BOU-2159):
+  * every ledger row is stamped with ``source: "session"`` (this logger only
+    runs as a PostToolUse hook inside a live session) and ``cwd`` (the
+    session's project dir, ``CLAUDE_PROJECT_DIR``-first), so scoped replay
+    consumers — e.g. a review-budget breaker recomputing rounds from the
+    ledger — can attribute Agent-dispatch rows instead of skipping them;
+  * the invoking hook may extend the row via ``MODEL_DISPATCH_EXTRA``: a JSON
+    object (e.g. ``{"verdict": "no_findings", "task_type": "code_review"}``)
+    merged into the row before it is written. Reserved base keys are never
+    overwritten and null values are dropped. This lets a wrapper hook that
+    pre-reads the payload inject its parsed verdict without double-writing.
+    All fields are optional — readers must tolerate their absence, and legacy
+    rows (without ``source``/``cwd``) keep parsing unchanged.
+
 Runs after the Agent call completes, so it never blocks. ``SKIP_MODEL_DISPATCH=1``
 disables it entirely.
 """
@@ -77,6 +91,37 @@ _DEFAULT_MODEL = "opus-4.6"
 # fires ``spawn_agent`` (and the namespaced ``functions.spawn_agent`` shape seen
 # elsewhere in this package, e.g. ``run_arm_pr_watch``).
 _DISPATCH_TOOLS = {"Agent", "spawn_agent", "functions.spawn_agent"}
+
+# Base row keys the MODEL_DISPATCH_EXTRA extension may never overwrite
+# (BOU-2159): the core legacy shape plus the provenance stamps.
+_RESERVED_KEYS = frozenset(
+    {"kind", "timestamp", "model", "prompt", "response", "source", "cwd"}
+)
+
+
+def extra_fields() -> dict:
+    """Optional row extensions injected by the invoking hook (BOU-2159).
+
+    ``MODEL_DISPATCH_EXTRA`` holds a JSON object merged into the ledger row so
+    a wrapper hook (which pre-reads the PostToolUse payload and, e.g., parses
+    a review verdict from the subagent's report) can attribute the row without
+    writing a second one. Reserved base keys and null values are dropped;
+    malformed payloads are ignored — logging never blocks.
+    """
+    raw = os.environ.get("MODEL_DISPATCH_EXTRA")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in _RESERVED_KEYS and value is not None
+    }
 
 
 def classify(description: str, prompt: str, subagent_type: str) -> str:
@@ -174,6 +219,13 @@ def main() -> int:
         "model": model_name,
         "prompt": prompt_str,
         "response": "dispatched",
+        # Provenance stamps (BOU-2159): this hook only ever runs inside a live
+        # session, and cwd is the CLAUDE_PROJECT_DIR-first project identity —
+        # the same resolution the codex-dispatch logger uses — so scoped
+        # ledger replays can attribute Agent rows.
+        "source": "session",
+        "cwd": project_dir,
+        **extra_fields(),
     }
     _write_jsonl(log_path(project_dir), entry)
     _bd_audit(project_dir, model_name, prompt_str)
