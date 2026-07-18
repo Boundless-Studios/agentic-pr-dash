@@ -132,10 +132,14 @@ class GitHubIssuesTracker:
         self._repo = repo
 
     def _gh(self, args: list[str]) -> subprocess.CompletedProcess:
+        from agentic_pr_dash import github_api  # noqa: PLC0415
         full = ["gh", *args]
         if self._repo:
             full += ["--repo", self._repo]
-        return subprocess.run(full, capture_output=True, text=True, timeout=30)
+        return subprocess.run(
+            full, capture_output=True, text=True, timeout=30,
+            env=github_api.automation_subprocess_env(),
+        )
 
     def find_task(self, *, pr: int, branch: str, cwd: str | None = None) -> str | None:
         marker = self._MARKER.format(pr=pr)

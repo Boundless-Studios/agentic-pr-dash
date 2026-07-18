@@ -191,10 +191,12 @@ def find_prcreate_cwd(payload: dict) -> str | None:
 
 def _pr_is_draft(pr_number: int, cwd: str) -> bool:
     """Best-effort ``isDraft`` lookup; on any failure treat as non-draft (False)."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         r = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--json", "isDraft"],
             cwd=cwd, capture_output=True, text=True, timeout=20,
+            env=github_api.automation_subprocess_env(),
         )
     except (subprocess.TimeoutExpired, OSError):
         return False

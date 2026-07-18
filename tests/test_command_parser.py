@@ -10,9 +10,26 @@ from agentic_pr_dash.codex_hooks.command_parser import (
     effective_git_cwd,
     is_gh_pr_open,
     is_git_push,
+    is_git_token,
     parse_gh_pr_arm_target,
     split_command_segments,
 )
+
+
+# --- is_git_token -----------------------------------------------------------
+
+def test_is_git_token_matches_by_basename():
+    """BOU-2147: bare and path-qualified git both match; lookalikes don't."""
+    assert is_git_token("git") is True
+    assert is_git_token("/usr/bin/git") is True
+    assert is_git_token("/opt/homebrew/bin/git") is True
+    assert is_git_token("../bin/git") is True
+    assert is_git_token("bin/git") is True
+    assert is_git_token("mygit") is False
+    assert is_git_token("gitx") is False
+    assert is_git_token("/usr/bin/gitx") is False
+    assert is_git_token("git/") is False  # a directory, not an executable
+    assert is_git_token("") is False
 
 
 # --- split_command_segments -------------------------------------------------
@@ -101,6 +118,12 @@ def test_is_git_push_false_for_non_push_or_non_git():
     assert is_git_push("git status") is False
     assert is_git_push("gh pr create") is False
     assert is_git_push("") is False
+    assert is_git_push("/usr/bin/git status") is False
+    assert is_git_push("mygit push") is False
+
+
+def test_is_git_push_detects_homebrew_path_git():
+    assert is_git_push("/opt/homebrew/bin/git push origin HEAD") is True
 
 
 # --- effective_git_cwd ------------------------------------------------------

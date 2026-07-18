@@ -274,9 +274,129 @@ def rate_limit_events() -> int:
     return _RATE_LIMIT_EVENTS
 
 
+# ── Automation-token file source (BOU-1991) ────────────────────────────────
+# The PR-automation GitHub App installation token lives in
+# $XDG_CONFIG_HOME/agentic-pr-dash/gh-automation-token and rotates roughly
+# every 45 minutes (1-hour TTL). Long-lived processes (the dashboard server,
+# the maintenance loop) previously inherited GH_TOKEN once at spawn, which
+# forced their supervisor to RESTART them on every rotation — dropping all
+# in-memory poll state, user-visible as CI state vanishing from the board for
+# the first poll cycle after each restart. Instead, source the token from the
+# file per gh invocation: one stat() per call, re-reading only on mtime
+# change, so a rotation is picked up mid-flight with no restart.
+_TOKEN_FILE_CACHE: tuple[float, str] | None = None  # (mtime, token)
+
+
+def _automation_token_file() -> str:
+    config_home = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(config_home, "agentic-pr-dash", "gh-automation-token")
+
+
+def _read_automation_token() -> str | None:
+    """Current token from the rotating token file, mtime-cached.
+
+    Returns ``None`` when the file is absent/unreadable/empty. Rotation always
+    replaces the file atomically (fresh mtime), so an unchanged mtime means an
+    unchanged token by contract and the cached value is served without a read.
+    """
+    global _TOKEN_FILE_CACHE
+    path = _automation_token_file()
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        _TOKEN_FILE_CACHE = None
+        return None
+    if _TOKEN_FILE_CACHE is not None and _TOKEN_FILE_CACHE[0] == mtime:
+        return _TOKEN_FILE_CACHE[1] or None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            token = fh.readline().strip()
+    except OSError:
+        _TOKEN_FILE_CACHE = None
+        return None
+    _TOKEN_FILE_CACHE = (mtime, token)
+    return token or None
+
+
+# Sticky verdict for the initial-match opt-in heuristic (see
+# `_automation_identity_opted_in`). Memoized on first use so a later rotation
+# cannot flip a caller-provided PAT into "automation" mid-process.
+_SPAWN_TOKEN_WAS_AUTOMATION: bool | None = None
+
+
+def _automation_identity_opted_in() -> bool:
+    """True when this process's ``GH_TOKEN`` is the supervisor-provided
+    automation identity, so following the rotating token file is safe.
+
+    Merely having ``GH_TOKEN`` set is NOT enough (PR #73 review): a shell or
+    CI job may export its own PAT while the automation token file happens to
+    exist on the machine — silently replacing that PAT would change the
+    authenticated identity of every gh call. Opt-in signals, strongest first:
+
+    1. ``AGENTIC_PR_DASH_TOKEN_FROM_FILE=1`` — the explicit marker exported by
+       supervisors that sourced ``GH_TOKEN`` from the token file
+       (gh-automation-token.sh since BOU-1991).
+    2. Sticky initial match: the spawn-time ``GH_TOKEN`` equals the file's
+       token the FIRST time this is consulted. A caller-provided PAT never
+       matches the file; covers supervisors predating the marker. Memoized so
+       the verdict is stable for the process lifetime (the file rotating
+       AFTER a match is exactly the case we refresh for; a rotation BETWEEN
+       spawn and first gh call under a marker-less supervisor is a benign
+       miss — behavior degrades to the legacy inherit-spawn-env).
+    """
+    global _SPAWN_TOKEN_WAS_AUTOMATION
+    if os.environ.get("AGENTIC_PR_DASH_TOKEN_FROM_FILE") == "1":
+        return True
+    if _SPAWN_TOKEN_WAS_AUTOMATION is None:
+        spawn_token = os.environ.get("GH_TOKEN")
+        _SPAWN_TOKEN_WAS_AUTOMATION = bool(spawn_token) and spawn_token == _read_automation_token()
+    return _SPAWN_TOKEN_WAS_AUTOMATION
+
+
+def automation_subprocess_env(cmd: list[str] | None = None) -> dict[str, str] | None:
+    """Env for a gh subprocess with a fresh automation token, or ``None`` to inherit.
+
+    Public entry point for DIRECT ``subprocess.run(["gh", ...])`` call sites
+    that bypass `_run` (loop baseline lookups, maintenance pr_state, config
+    repo detection, ...) — long-lived processes must route gh spawns through
+    this or they keep the stale spawn-time token after a rotation (PR #73
+    review). Pass the command to no-op safely for non-gh spawns.
+
+    Returns ``None`` (inherit the process env unchanged) unless this process
+    opted into the automation identity AND the token file currently holds a
+    token different from the spawn-time env value.
+    """
+    if cmd is not None and (not cmd or os.path.basename(cmd[0]) != "gh"):
+        return None
+    spawn_token = os.environ.get("GH_TOKEN")
+    if not spawn_token:
+        return None
+    if not _automation_identity_opted_in():
+        return None
+    token = _read_automation_token()
+    if token is None or token == spawn_token:
+        return None
+    env = dict(os.environ)
+    env["GH_TOKEN"] = token
+    return env
+
+
+def _automation_env_refresh(cmd: list[str]) -> dict[str, str] | None:
+    """`_run_once`'s hook: fresh-token env for gh commands, ``None`` to inherit.
+
+    Explicit-env callers (`_resolve_fallback_env`) never reach this —
+    `_run_once` only consults it when ``env`` is ``None``.
+    """
+    return automation_subprocess_env(cmd)
+
+
 def _run_once(
     cmd: list[str], timeout_s: int = 20, cwd: str | None = None, env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess:
+    if env is None:
+        env = _automation_env_refresh(cmd)
     try:
         return subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout_s, cwd=cwd, env=env,
@@ -393,6 +513,32 @@ class GhFailure:
             return True
         stderr = (self.stderr or "").lower()
         return any(pat in stderr for pat in _RATE_LIMIT_STDERR_PATTERNS)
+
+    def summary(self) -> str:
+        """One-line classified cause for event logs and dashboards.
+
+        The bare "GitHub API unavailable" collapsed very different failure
+        modes (expired App token vs DNS outage vs quota wall) into one string
+        during the 2026-07-11 outage (BOU-1987); this names the class so the
+        operator's first look at the event log points at the right fix.
+        """
+        stderr = (self.stderr or "").strip()
+        lowered = stderr.lower()
+        first_line = stderr.splitlines()[0] if stderr else f"gh exited {self.returncode}"
+        if len(first_line) > 140:
+            first_line = first_line[:137] + "..."
+        probe = subprocess.CompletedProcess(self.command, self.returncode, "", stderr)
+        if "401" in lowered or "bad credentials" in lowered:
+            return f"auth failure — {first_line}"
+        if _is_rate_limit_failure(probe):
+            return f"rate-limited — {first_line}"
+        if _is_transient_connectivity_failure(probe):
+            return f"network unreachable — {first_line}"
+        if "timed out" in lowered:
+            return f"timeout — {first_line}"
+        if self.reason != "exit":
+            return f"{self.reason} — {first_line}"
+        return first_line
 
     def describe(self) -> str:
         """Multi-line operator-facing diagnostic + self-check + remediation."""

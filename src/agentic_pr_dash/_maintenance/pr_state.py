@@ -236,6 +236,8 @@ def _pr_draft_status(cwd: str, pr_number: int):
     """Optional[bool]: True=draft, False=non-draft, None=could-not-determine."""
     import json  # noqa: PLC0415
 
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
     try:
         result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--json", "isDraft"],
@@ -243,6 +245,7 @@ def _pr_draft_status(cwd: str, pr_number: int):
             capture_output=True,
             text=True,
             timeout=15,
+            env=github_api.automation_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -261,6 +264,8 @@ def _pr_head_branch(cwd: str, pr_number: int):
     """The PR's head branch name (``headRefName``), or ``None`` if gh can't say."""
     import json  # noqa: PLC0415
 
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
     try:
         result = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--json", "headRefName"],
@@ -268,6 +273,7 @@ def _pr_head_branch(cwd: str, pr_number: int):
             capture_output=True,
             text=True,
             timeout=15,
+            env=github_api.automation_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -302,6 +308,7 @@ def _gh_pr_list_json(
     """
     import json  # noqa: PLC0415
 
+    from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
     if timeout <= 0:
@@ -313,6 +320,7 @@ def _gh_pr_list_json(
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=github_api.automation_subprocess_env(),
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
