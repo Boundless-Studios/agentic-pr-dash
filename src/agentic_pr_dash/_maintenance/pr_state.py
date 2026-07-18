@@ -20,7 +20,120 @@ def _gh_unavailable_message(cwd: str | None = None) -> str:
             f"Re-run `gh pr list --author @me --state open`{where} from the same "
             "cwd and check `gh auth status`."
         )
-    return "could not list PRs (gh unavailable)\n" + failure.describe()
+    text = "could not list PRs (gh unavailable)\n" + failure.describe()
+    if failure.is_rate_limited:
+        text += (
+            "\n  note: the PR list was rate-limited and the per-PR REST "
+            "fallback could not fully verify the target PR either (BOU-1966); "
+            "this usually clears once the quota window resets."
+        )
+    return text
+
+
+def _list_failure_is_rate_limited() -> bool:
+    """True when the just-failed ``list_open_prs`` was quota/rate-limit classified.
+
+    Gate for the BOU-1966 quota-safe REST fallback: only a rate-limited author
+    list may fall back to per-PR REST resolution. Auth lapses, a missing ``gh``,
+    and malformed output keep failing closed — those failure modes affect the
+    REST path identically, so "verified via REST" would be meaningless there.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    failure = github_api.last_list_open_prs_failure()
+    return failure is not None and failure.is_rate_limited
+
+
+def _rest_fallback_entry_by_number(pr_number: int, cwd: str):
+    """Quota fallback (BOU-1966): raw PR entry for ``--pr N`` via pure REST.
+
+    Returns the normalized payload dict, or ``None`` when the list failure was
+    not quota-classified OR REST cannot verify the PR either — the caller stays
+    fail-closed (``_GH_UNAVAILABLE``) in both cases.
+
+    Deliberately no ``pr_author`` check here (unlike the branch fallback): the
+    normal ``--pr N`` path also proceeds when the explicitly-named PR is absent
+    from the author-scoped list, so enforcing authorship only under quota would
+    make the fallback STRICTER than the path it substitutes for.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not _list_failure_is_rate_limited():
+        return None
+    return github_api._rest_pr_payload(pr_number, cwd=cwd)
+
+
+def _login_key(login: str) -> str:
+    """Canonical form of a GitHub login for author comparison.
+
+    ``gh pr list --author`` accepts the ``app/<name>`` form for GitHub Apps
+    while REST serializes the same identity as ``<name>[bot]``, and logins are
+    case-insensitive — normalize both spellings so a configured bot author
+    matches its REST payload."""
+    login = login.strip()
+    if login.startswith("app/"):
+        login = login[len("app/"):]
+    if login.endswith("[bot]"):
+        login = login[: -len("[bot]")]
+    return login.lower()
+
+
+def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
+    """True when a REST fallback payload's author is the configured ``pr_author``.
+
+    The normal branch resolution only considers ``gh pr list --author
+    <pr_author>``, so the quota fallback must preserve that author-scoped
+    contract: on a shared-repo branch, another maintainer's open PR must not be
+    adopted (blocked on / serviced) as this session's PR (PR #77 review).
+    ``@me`` resolves via REST ``GET /user``; an unresolvable viewer or a
+    missing payload author fails closed."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
+
+    configured = _load_config(cwd).pr_author
+    expected = github_api._rest_viewer_login(cwd) if configured == "@me" else configured
+    author = raw.get("author")
+    actual = str(author.get("login") or "") if isinstance(author, dict) else ""
+    if not expected or not actual:
+        return False
+    return _login_key(actual) == _login_key(expected)
+
+
+def _rest_fallback_entry_for_branch(branch: str, cwd: str):
+    """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
+
+    Resolves owner (REST) → exact owner-qualified head numbers (REST) → full
+    payload (REST). Deliberately avoids ``gh pr list --head`` — that path is
+    GraphQL, exactly what is quota-blocked here. An empty exact-head result
+    ALSO returns ``None`` (→ fail closed): the owner-qualified query cannot see
+    a fork-backed head, so "no match" under quota exhaustion is weaker evidence
+    than the author-scoped list and must not read as a verified "no PR".
+
+    Every candidate must ALSO match the configured ``pr_author`` — the normal
+    path is author-scoped, so a foreign maintainer's PR on a shared branch
+    must not be adopted under rate limiting (PR #77 review). No author-matching
+    candidate → ``None`` (fail closed).
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not _list_failure_is_rate_limited():
+        return None
+    owner = github_api._rest_repo_owner(cwd)
+    if not owner:
+        return None
+    numbers = github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    if not numbers:
+        return None
+    for number in numbers:
+        raw = github_api._rest_pr_payload(number, cwd=cwd)
+        if raw is None:
+            return None  # REST failure mid-verification → fail closed
+        if str(raw.get("headRefName") or "") != branch:
+            continue
+        if not _rest_payload_author_is_tracked(raw, cwd):
+            continue
+        return raw
+    return None
 
 
 def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
@@ -44,30 +157,39 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # so a cached "list my open PRs" here collapses that fan-out onto one
     # underlying `gh` call within the TTL window instead of one per caller.
     prs = github_api.list_open_prs_cached(cwd, force=force)
-    if prs is None:
-        return _GH_UNAVAILABLE
-    if not prs:
-        return None
-
     raw: dict | None = None
-    for entry in prs:
-        if entry.get("headRefName") == branch:
-            raw = entry
-            break
-    if raw is None:
-        return None
+    if prs is None:
+        # Quota-safe REST fallback (BOU-1966): a rate-limited author list can
+        # still verify THIS branch's PR via per-PR REST calls. Any other
+        # failure mode (auth, missing gh) — and REST failing too — stays
+        # fail-closed.
+        raw = _rest_fallback_entry_for_branch(branch, cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+    else:
+        if not prs:
+            return None
+        for entry in prs:
+            if entry.get("headRefName") == branch:
+                raw = entry
+                break
+        if raw is None:
+            return None
 
     pr_number = int(raw["number"])
-    # Preserve a live gh-availability signal on the CACHED path (BOU-1923
-    # review). A warm snapshot skips the `list_open_prs` call that used to turn
-    # a current gh/rate-limit outage into _GH_UNAVAILABLE; the detail getters
-    # below then fail OPEN to empty values, so a warm cache + a concurrent
-    # GitHub outage would make a genuinely-blocked PR read as CLEAN. Watch the
-    # per-call rate-limit flag across the detail fetch: if a detail call trips
-    # it here, the empty results are unreliable — surface _GH_UNAVAILABLE (→
-    # stop-gate/check code 2) instead of a false "clean". We read (never reset)
-    # the flag, so the tick-based waiter's per-tick accumulation is untouched.
-    _rl_before = github_api.rate_limit_seen()
+    # Preserve a live gh-availability signal across the detail fetch (BOU-1923
+    # review, BOU-1966). A warm snapshot (or the REST fallback above) skips the
+    # `list_open_prs` failure that used to turn a current gh/rate-limit outage
+    # into _GH_UNAVAILABLE; the detail getters below then fail OPEN to empty
+    # values, so an outage during the fetch would make a genuinely-blocked PR
+    # read as CLEAN. Compare the monotonic rate-limit event COUNT across the
+    # span — the tick-scoped rate_limit_seen() flag is already set on the
+    # fallback path (by the failed list itself), so a boolean read cannot see
+    # NEW failures. If any detail call ultimately rate-limits here, the empty
+    # results are unreliable — surface _GH_UNAVAILABLE (→ stop-gate/check code
+    # 2) instead of a false "clean". We never reset the flag or the counter,
+    # so the tick-based waiter's per-tick accumulation is untouched.
+    _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -76,7 +198,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    if not _rl_before and github_api.rate_limit_seen():
+    if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
@@ -109,19 +231,27 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
 
     # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
     prs = github_api.list_open_prs_cached(cwd, force=force)
-    if prs is None:
-        return _GH_UNAVAILABLE
     raw: dict | None = None
-    if prs:
+    if prs is None:
+        # Quota-safe REST fallback (BOU-1966): see _resolve_pr_for_branch. A
+        # rate-limited author list still verifies an explicit --pr N via the
+        # REST pulls endpoint; anything unverifiable stays fail-closed.
+        raw = _rest_fallback_entry_by_number(pr_number, cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+    elif prs:
         for entry in prs:
             if entry.get("number") == pr_number:
                 raw = entry
                 break
 
-    # See _resolve_pr_for_branch: keep a live gh-availability signal on the
-    # cached path so a warm snapshot + a concurrent outage during the detail
-    # fetch surfaces _GH_UNAVAILABLE rather than a false "clean" (BOU-1923).
-    _rl_before = github_api.rate_limit_seen()
+    # See _resolve_pr_for_branch: keep a live gh-availability signal across the
+    # detail fetch so a warm snapshot (or REST-fallback resolution) + a
+    # concurrent outage during the fetch surfaces _GH_UNAVAILABLE rather than a
+    # false "clean" (BOU-1923, BOU-1966 — event-count compare, not the
+    # tick-scoped boolean, which the failed list already set on the fallback
+    # path).
+    _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [
@@ -130,7 +260,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
         if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
-    if not _rl_before and github_api.rate_limit_seen():
+    if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
@@ -286,15 +416,23 @@ def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, boo
 
 
 def _unresolved_review_threads(pr_number: int, cwd: str):
-    """Non-outdated, unresolved review threads for a PR."""
+    """Unresolved review threads for a PR — INCLUDING outdated ones.
+
+    BOU-2095 (PR #78 review): the completion evidence gate deliberately leaves
+    a thread open when GitHub marks it outdated by pure line drift but its
+    anchored hunk was never edited. Filtering ``is_outdated`` here made exactly
+    those threads invisible to the pending/blocker path — the stop gate idled
+    and `complete` closed the bead while intentionally-kept-open feedback sat
+    unresolved. Unresolved means unaddressed; drift is not resolution.
+    """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     threads = github_api.get_review_threads(pr_number, cwd)
-    return [t for t in threads if not t.is_resolved and not t.is_outdated]
+    return [t for t in threads if not t.is_resolved]
 
 
 def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
-    """True if the PR has at least one non-outdated, unresolved review thread."""
+    """True if the PR has at least one unresolved review thread (outdated included)."""
     return bool(_unresolved_review_threads(pr_number, cwd))
 
 

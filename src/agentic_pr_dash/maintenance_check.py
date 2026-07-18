@@ -119,6 +119,9 @@ from ._maintenance.completion import (  # noqa: F401, E402
     _ref_matches_touched,
     _thread_points_elsewhere,
     _thread_elsewhere_refs,
+    _thread_completion_evidence,
+    _spans_intersect_line,
+    _ANCHOR_CONTEXT_LINES,
     _FILE_REF_RE,
     _MODULE_REF_STOPWORDS,
 )
@@ -361,6 +364,24 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             touched.add(changed)
             commits_by_file.setdefault(changed, []).append((sha, msg))
 
+    # BOU-2095: per-anchor-path base..head hunk spans, resolved lazily and
+    # cached (several threads often share one file). ``None`` = diff
+    # unavailable = no evidence.
+    spans_by_path: dict[str, list[tuple[int, int, int, int]] | None] = {}
+
+    def _spans_for(path: str) -> list[tuple[int, int, int, int]] | None:
+        if path not in spans_by_path:
+            spans_by_path[path] = github_api.get_changed_line_spans(
+                baseline, head_sha, path, cwd)
+        return spans_by_path[path]
+
+    # BOU-2095 P1 (PR #78 review): every unresolved thread this run does NOT
+    # resolve — including `is_outdated` ones that the downstream
+    # blocker/pending filters would otherwise hide — must survive as a
+    # `review_comments` blocker below, or `complete` closes the bead while
+    # deliberately-left-open feedback still needs manual confirmation.
+    left_unresolved: list[str] = []
+
     threads = github_api.get_review_threads(resolved_pr_number, cwd)
     for thread in threads:
         if thread.is_resolved:
@@ -372,38 +393,53 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             and (path is None or path in touched)
         )
         if not addressed:
+            left_unresolved.append(thread.node_id)
+            continue
+        # BOU-2095: "anchor file touched" is necessary but NOT sufficient.
+        # Require positive per-thread evidence — the completing commits changed
+        # the thread's anchored hunk, or a completion reply already targets it.
+        # GitHub's "outdated" flag (pure line drift) is explicitly NOT evidence:
+        # it used to widen resolution here and silently closed live feedback.
+        spans = _spans_for(path) if path is not None else None
+        evidence = _thread_completion_evidence(thread, spans)
+        if evidence is None:
+            left_unresolved.append(thread.node_id)
+            anchor_line = (
+                thread.top.line if thread.top.line is not None
+                else thread.top.original_line
+            )
+            print(
+                f"info: leaving thread {thread.node_id} open — anchored file "
+                f"{path or '<none>'} was touched by the fixing commits, but the "
+                f"thread's anchored line "
+                f"({anchor_line if anchor_line is not None else '<none>'}) was "
+                f"not changed in {baseline or '<no baseline>'}..HEAD "
+                f"(outdated={thread.is_outdated}); file-touch/line-drift alone "
+                f"must not auto-resolve — needs manual confirmation",
+                file=sys.stderr,
+            )
             continue
         elsewhere = _thread_elsewhere_refs(thread.top.body, path, touched)
         if elsewhere:
-            # BOU-1748: the body mentions a file/module the fixing commits did not
-            # touch. Normally that is ambiguous (BOU-1641: a thread anchored on
-            # file A whose real ask is an untouched file B must not auto-resolve
-            # just because A was incidentally touched). BUT when the anchored file
-            # itself was changed by the fix AND GitHub now marks the thread
-            # outdated, the anchored lines were edited — the anchor-touch evidence
-            # outweighs a mere contextual mention of another file, so resolve.
-            anchor_touched_and_outdated = (
-                path is not None and path in touched and thread.is_outdated
-            )
-            if not anchor_touched_and_outdated:
-                print(
-                    f"info: leaving thread {thread.node_id} open — body references "
-                    f"{', '.join(elsewhere)} (not touched by the fixing commits) "
-                    f"and the anchored file was not conclusively addressed "
-                    f"(anchor={path or '<none>'}, outdated={thread.is_outdated}); "
-                    f"ambiguous resolution, needs manual confirmation",
-                    file=sys.stderr,
-                )
-                continue
+            left_unresolved.append(thread.node_id)
+            # BOU-1641: a thread anchored on file A whose real ask is an
+            # untouched file B must not auto-resolve just because A was
+            # addressed. BOU-2095 removed the former "anchor touched AND
+            # outdated" override (BOU-1748): outdated is line drift, not
+            # evidence, and a cross-file ask stays ambiguous even when the
+            # anchored hunk changed — leave it open for a human.
             print(
-                f"info: resolving thread {thread.node_id} on anchor evidence — "
-                f"body also mentions {', '.join(elsewhere)} (not touched), but the "
-                f"anchored file {path} was changed by the fix and the thread is "
-                f"outdated",
+                f"info: leaving thread {thread.node_id} open — body references "
+                f"{', '.join(elsewhere)} (not touched by the fixing commits); "
+                f"a cross-file ask cannot be confirmed by anchor edits alone "
+                f"(anchor={path or '<none>'}, outdated={thread.is_outdated}); "
+                f"ambiguous resolution, needs manual confirmation",
                 file=sys.stderr,
             )
+            continue
         try:
             if not github_api.resolve_review_thread(thread.node_id, cwd):
+                left_unresolved.append(thread.node_id)
                 print(
                     f"warning: could not resolve thread {thread.node_id}; leaving open for retry",
                     file=sys.stderr,
@@ -422,6 +458,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             body = _completion_reply_body(COMPLETE_MARKER, path, commits_by_file, new_commits)
             github_api.reply_to_review_comment(resolved_pr_number, stub, body, cwd)
         except Exception as exc:  # noqa: BLE001
+            # The thread may or may not have been resolved before the error —
+            # count it as left open; a spurious blocker self-heals on the next
+            # `complete` run, a silently-dropped thread does not.
+            left_unresolved.append(thread.node_id)
             print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
 
     # force=True: re-resolve post-mutation state (threads were just
@@ -432,6 +472,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         remaining = ["unknown"]
     else:
         remaining = maintenance.blockers_for_pr(fresh)
+
+    # BOU-2095 P1 (PR #78 review): `blockers_for_pr` sees only the comments the
+    # scan path picked, and that path skips `is_outdated` threads — exactly the
+    # ones the evidence gate above deliberately leaves open on pure line drift.
+    # Without this, `complete` reports "no blockers remain" and closes the bead
+    # while intentionally-kept-open feedback still needs manual confirmation.
+    if left_unresolved and "review_comments" not in remaining:
+        remaining.append("review_comments")
+        print(
+            f"info: {len(left_unresolved)} review thread(s) remain unresolved "
+            f"({', '.join(left_unresolved)}); keeping review_comments blocker",
+            file=sys.stderr,
+        )
 
     _mark_maintenance_complete(maintenance, cwd, resolved_pr_number)
 
