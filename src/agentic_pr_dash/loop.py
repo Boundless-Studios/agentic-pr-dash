@@ -30,6 +30,7 @@ from pathlib import Path
 
 from . import coordinator
 from ._maintenance import worktree_check
+from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
 from .config import load as load_config
@@ -167,14 +168,26 @@ def record_loop_health(
 
 
 def loop_health_ok(cwd: str, now: float | None = None) -> bool:
-    """True when the loop's health record is FRESH and executors are viable.
+    """True when the loop's health record is FRESH, executors are viable, AND
+    the process that recorded it is still alive.
 
-    Fail-closed: a missing/corrupt record, a stale heartbeat, or an explicit
-    ``executors_viable: false`` all return False — pid-alive alone must never
-    count as maintenance coverage (BOU-2086).
+    Fail-closed: a missing/corrupt record, a stale heartbeat, a non-boolean
+    ``executors_viable`` value, an explicit ``executors_viable: false``, or a
+    dead recorded pid all return False — pid-alive alone must never count as
+    maintenance coverage (BOU-2086).
     """
     entry = loop_health_entry(cwd)
-    if not entry.get("executors_viable"):
+    # Require a REAL boolean True. This health record is the fail-closed
+    # coverage signal, so a truthy-but-wrong value (e.g. the string "false"
+    # from a shell/tooling writer or a hand-edited file) must read as
+    # unhealthy (PR #76 review).
+    if entry.get("executors_viable") is not True:
+        return False
+    # The heartbeat must be tied to a live servicing process: the daemon
+    # pidfile can hold a supervisor/wrapper pid that outlives the python loop,
+    # and a one-shot healthy stamp (e.g. ``--once``) must not grant a whole
+    # freshness window after its writer exits (PR #76 review).
+    if not _pid_alive(str(entry.get("pid", ""))):
         return False
     try:
         heartbeat = float(entry["heartbeat"])

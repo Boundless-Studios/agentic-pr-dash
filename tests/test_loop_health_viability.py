@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 import types
 from pathlib import Path
@@ -110,6 +112,65 @@ def test_corrupt_health_record_fails_closed(tmp_path):
     _write_live_pidfile(tmp_path)
     data = loop._load_health(cwd)
     data[loop.LOOP_HEALTH_KEY] = {"executors_viable": True, "heartbeat": "not-a-ts"}
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_viable", ["false", "true", 1, "yes", [True]])
+def test_non_boolean_viability_value_fails_closed(tmp_path, bad_viable):
+    """``executors_viable`` must be a REAL boolean True — a truthy string like
+    "false" (shell/tooling writer, hand-edited or corrupt file) must read as
+    unhealthy, because this record is the fail-closed coverage signal
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": bad_viable,
+        "interval": 600,
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_dead_recorded_health_pid_is_not_coverage(tmp_path):
+    """A fresh viable heartbeat whose RECORDING process has exited must not
+    count: the daemon pidfile can hold a supervisor/wrapper pid that outlives
+    the python loop, so the heartbeat must be tied to a live servicing process
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)  # wrapper pid: alive (this test process)
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # reaped → pid guaranteed dead
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": proc.pid,
+        "executors_viable": True,
+        "interval": 600,
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_missing_recorded_health_pid_fails_closed(tmp_path):
+    """A viable record with no ``pid`` field cannot be tied to any live
+    servicing process → not coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "executors_viable": True,
+        "interval": 600,
+    }
     loop._save_health(cwd, data)
     assert loop.loop_health_ok(cwd) is False
     assert mc._detached_loop_alive(cwd) is False
