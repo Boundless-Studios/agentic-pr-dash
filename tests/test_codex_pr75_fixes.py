@@ -263,6 +263,82 @@ def test_stop_gate_still_demands_waiter_when_probe_unobservable(tmp_path, monkey
     assert "#42" in err
 
 
+def test_stop_gate_marker_skip_fails_closed_on_unobservable_check(tmp_path, monkeypatch, capsys):
+    """Round 2: a code-2 (gh unobservable) _check_worktree result means 'nothing
+    pending' was NOT established — the marker-skip must not fire; the demand
+    stands (fail toward coverage)."""
+    wt = _arm(tmp_path, 42)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
+                        lambda path, sid, *, claim=True: (2, "could not list PRs (gh unavailable)"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#42" in err
+
+
+def test_stop_gate_marker_skip_fails_closed_on_warn_only_deferral(tmp_path, monkeypatch, capsys):
+    """Round 2 (same class): a warn-only deferral means the PR HAS blockers a
+    foreign owner is servicing — not clean; the marker-skip must not fire."""
+    wt = _arm(tmp_path, 42)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(
+        _worktree_check_mod, "_check_worktree",
+        lambda path, sid, *, claim=True: (
+            0,
+            "owned PR #42 has blockers ['review_comments']; deferring to "
+            f"live PR-watch owner session other — {_worktree_check_mod.WARN_ONLY_MARKER}",
+        ),
+    )
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    _waiter_mod._write_clean_exit_marker(SID, {42})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "#42" in err
+
+
+def test_required_checks_pending_truncated_pagination_is_probe_failure(monkeypatch):
+    """Round 2: falling out of the rollup page loop with hasNextPage still true
+    means the observation was TRUNCATED — a required pending context may sit on
+    a later page, so this must record a probe failure, not read as terminal."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_REPO", "owner/name")
+    config.load.cache_clear()
+    monkeypatch.setattr(github_api, "_ROLLUP_MAX_PAGES", 2)
+
+    def _page(cursor):
+        return json.dumps({"data": {"repository": {"pullRequest": {"commits": {"nodes": [
+            {"commit": {"statusCheckRollup": {"contexts": {
+                "nodes": [{"__typename": "CheckRun", "status": "COMPLETED",
+                           "conclusion": "SUCCESS", "isRequired": True}],
+                "pageInfo": {"hasNextPage": True, "endCursor": cursor},
+            }}}}
+        ]}}}}})
+
+    calls = [0]
+
+    def fake_run(cmd, **kw):
+        calls[0] += 1
+        return types.SimpleNamespace(returncode=0, stdout=_page(f"c{calls[0]}"), stderr="")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    github_api.reset_checks_probe_failure_seen()
+    assert github_api.required_checks_pending(42) is False
+    assert github_api.checks_probe_failure_seen() is True
+    assert calls[0] == 2, "must stop at the page cap"
+    config.load.cache_clear()
+
+
 def test_stop_gate_demands_waiter_for_pr_not_covered_by_marker(tmp_path, monkeypatch, capsys):
     """A marker from an earlier clean exit does not cover a NEW PR — the demand
     fires so the new PR gets its first waiter round."""

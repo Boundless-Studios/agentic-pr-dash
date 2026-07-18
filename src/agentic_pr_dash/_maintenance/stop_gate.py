@@ -220,10 +220,22 @@ def _stop_gate_impl(args) -> int:
         owned = [cwd]
 
     pending: list[tuple[str, str]] = []
+    # An owned PR whose check was UNOBSERVABLE (code 2: gh could not resolve
+    # the PR / its blockers) or warn-only-deferred (exit 0 but the PR HAS
+    # blockers a foreign owner is servicing) must keep the stop gate
+    # fail-closed: neither state may feed the BOU-1962 marker-skip early
+    # return below (codex PR #75 review, round 2).
+    check_unobservable = False
+    check_warn_only = False
+    from .worktree_check import WARN_ONLY_MARKER  # noqa: PLC0415
     for worktree in owned:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
             pending.append((worktree, text))
+        elif code == 2:
+            check_unobservable = True
+        elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
+            check_warn_only = True
         elif code == 0 and session_id:
             marker = _read_marker(worktree) or {}
             if str(marker.get("pr", "")).isdigit():
@@ -304,7 +316,17 @@ def _stop_gate_impl(args) -> int:
                 # alive: required CI running again (BOU-1789 watch-pending) or
                 # CI state unobservable this tick (fail toward coverage).
                 verified_clean = _read_clean_exit_prs(session_id)
-                if verified_clean and open_prs <= verified_clean:
+                if (
+                    verified_clean
+                    and open_prs <= verified_clean
+                    # Fail closed: an unobservable or warn-only-deferred check
+                    # this pass means "nothing pending" was NOT established for
+                    # every owned PR — a CI-only probe below cannot stand in
+                    # for the blocked/unresolved-thread signal (codex PR #75
+                    # review, round 2).
+                    and not check_unobservable
+                    and not check_warn_only
+                ):
                     github_api.reset_checks_probe_failure_seen()
                     detached_watch = {
                         r["pr"]: bool(r.get("ci_watch_pending"))

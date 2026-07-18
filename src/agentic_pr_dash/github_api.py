@@ -2033,6 +2033,11 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
         if not page.get("hasNextPage") or not page.get("endCursor"):
             return False
         after = page["endCursor"]
+    # Fell out of the page loop with hasNextPage still true: the rollup was
+    # TRUNCATED at _ROLLUP_MAX_PAGES, so a required pending context on a later
+    # page may exist — this is an incomplete observation, not terminal CI
+    # (codex PR #75 review, round 2).
+    _note_checks_probe_failure()
     return False
 
 
