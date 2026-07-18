@@ -19,6 +19,7 @@ dependence on ``claude``/``codex``.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import shlex
 import shutil
@@ -167,14 +168,44 @@ def record_loop_health(
     _save_health(cwd, data)
 
 
+def _pid_state(pid: int) -> str | None:
+    """Best-effort process-state code for ``pid`` (e.g. ``"R"``, ``"S"``, ``"Z"``).
+
+    Linux: the field after the LAST ``)`` in ``/proc/<pid>/stat`` (the comm
+    field may itself contain parentheses). Elsewhere (macOS/BSD): ``ps -o
+    stat=``. Returns None when the state cannot be determined (no /proc entry,
+    ``ps`` missing/failed, permissions) so callers can keep the plain
+    ``kill(0)`` liveness verdict instead of manufacturing false-deads.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        fields = raw.rpartition(")")[2].split()
+        if fields:
+            return fields[0]
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    state = out.stdout.strip().split()
+    return state[0] if state else None
+
+
 def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     """True when the loop's health record is FRESH, executors are viable, AND
     the process that recorded it is still alive.
 
     Fail-closed: a missing/corrupt record, a stale heartbeat, a non-boolean
-    ``executors_viable`` value, an explicit ``executors_viable: false``, or a
-    dead recorded pid all return False — pid-alive alone must never count as
-    maintenance coverage (BOU-2086).
+    ``executors_viable`` value, an explicit ``executors_viable: false``, a
+    dead (or positively-identified zombie) recorded pid, or a non-finite
+    ``heartbeat``/``interval`` all return False — pid-alive alone must never
+    count as maintenance coverage (BOU-2086).
     """
     entry = loop_health_entry(cwd)
     # Require a REAL boolean True. This health record is the fail-closed
@@ -187,7 +218,16 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     # pidfile can hold a supervisor/wrapper pid that outlives the python loop,
     # and a one-shot healthy stamp (e.g. ``--once``) must not grant a whole
     # freshness window after its writer exits (PR #76 review).
-    if not _pid_alive(str(entry.get("pid", ""))):
+    pid_raw = str(entry.get("pid", ""))
+    if not _pid_alive(pid_raw):
+        return False
+    # ``os.kill(pid, 0)`` succeeds for zombies, so a crashed-but-unreaped loop
+    # child would still read as a live servicing process. Fail closed only on a
+    # POSITIVELY identified zombie; an unreadable/unknown state keeps the
+    # kill(0) verdict so permission quirks don't cause false-deads
+    # (PR #76 review).
+    state = _pid_state(int(pid_raw))
+    if state is not None and state.startswith("Z"):
         return False
     try:
         heartbeat = float(entry["heartbeat"])
@@ -197,6 +237,12 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
         interval = float(entry.get("interval") or _DEFAULT_TICK_INTERVAL_S)
     except (TypeError, ValueError):
         interval = _DEFAULT_TICK_INTERVAL_S
+    # JSON like ``1e309`` parses to inf: a non-finite heartbeat makes
+    # ``now - heartbeat`` -inf (granting coverage forever) and a non-finite
+    # interval makes the freshness window infinite — either way the record is
+    # invalid, so fail closed (PR #76 review).
+    if not math.isfinite(heartbeat) or not math.isfinite(interval):
+        return False
     max_age = max(LOOP_HEALTH_INTERVAL_MULTIPLIER * interval, LOOP_HEALTH_MIN_FRESH_S)
     now = time.time() if now is None else now
     return (now - heartbeat) <= max_age

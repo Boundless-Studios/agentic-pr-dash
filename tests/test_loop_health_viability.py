@@ -160,6 +160,98 @@ def test_dead_recorded_health_pid_is_not_coverage(tmp_path):
     assert mc._detached_loop_alive(cwd) is False
 
 
+def _write_loop_record(cwd: str, **overrides) -> None:
+    entry = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": True,
+        "interval": 600,
+    }
+    entry.update(overrides)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = entry
+    loop._save_health(cwd, data)
+
+
+def test_zombie_recorded_health_pid_is_not_coverage(tmp_path, monkeypatch):
+    """A zombie passes ``os.kill(pid, 0)``, so a crashed-but-unreaped loop
+    child would still count as coverage. The health check must positively
+    identify the zombie state and treat it as dead (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: "Z")
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_unreadable_pid_state_keeps_kill0_liveness(tmp_path, monkeypatch):
+    """State probes can fail (no /proc, ps missing, permissions). Only a
+    POSITIVE zombie identification may fail the record; an unknown state keeps
+    the kill(0) verdict so permission quirks don't cause false-deads."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: None)
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+def test_non_zombie_pid_state_keeps_coverage(tmp_path, monkeypatch):
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: "S+")
+    assert loop.loop_health_ok(cwd) is True
+
+
+def test_real_zombie_child_is_not_coverage(tmp_path):
+    """End-to-end platform check (/proc on Linux, ps elsewhere): a real
+    exited-but-unreaped child is a genuine zombie and must not grant
+    coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    proc = subprocess.Popen(  # noqa: S603 — NOT waited: becomes a zombie
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline and loop._pid_state(proc.pid) != "Z":
+            time.sleep(0.05)
+        if loop._pid_state(proc.pid) != "Z":
+            pytest.skip("child never observed as zombie on this platform")
+        _write_loop_record(cwd, pid=proc.pid)
+        assert loop.loop_health_ok(cwd) is False
+        assert mc._detached_loop_alive(cwd) is False
+    finally:
+        proc.wait()
+
+
+@pytest.mark.parametrize("bad_heartbeat", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_heartbeat_fails_closed(tmp_path, bad_heartbeat):
+    """JSON like ``"heartbeat": 1e309`` parses to ``inf`` → ``now - inf`` is
+    ``-inf``, which satisfies any max_age and grants coverage forever while the
+    recorded pid happens to exist (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=bad_heartbeat)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_interval", [float("inf"), float("nan")])
+def test_non_finite_interval_fails_closed(tmp_path, bad_interval):
+    """A non-finite ``interval`` makes the freshness window infinite, permitting
+    arbitrarily stale records — the record is invalid, fail closed even with a
+    fresh heartbeat (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=bad_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
 def test_missing_recorded_health_pid_fails_closed(tmp_path):
     """A viable record with no ``pid`` field cannot be tied to any live
     servicing process → not coverage."""
