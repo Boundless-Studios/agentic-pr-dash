@@ -80,6 +80,7 @@ _DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60  # 7 days
 # AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD.
 _DEFAULT_COMPACT_THRESHOLD = 5000
 _MAX_STATUS_REPORT_BYTES = 1_048_576
+_STATUS_DEDUPE_TOMBSTONES_PER_SESSION = 256
 
 _PRIVATE_REPORT_FIELDS = {
     "api_key",
@@ -525,6 +526,7 @@ def record_status_report(
             "checkpoint_fingerprint": report.checkpoint_fingerprint,
             "outbox_depth": report.outbox_depth,
             "harness_reported_at": timestamp,
+            "idempotency_keyed": True if report.event_id is not None else None,
         }
     )
     event_id = str(event["event_id"])
@@ -757,6 +759,8 @@ def active_sessions_for_worktree(
 def summarize_sessions(path: Path | None = None) -> SessionSummary:
     summary = SessionSummary()
     for event in read_events(path=path):
+        if event.get("event") == "harness_status_seen":
+            continue
         session_id = str(event.get("session_id") or "")
         if not session_id:
             continue
@@ -835,11 +839,16 @@ def _compact_registry_locked(
     latest_ts_by_session: dict[str, str] = {}
     latest_status_index_by_session: dict[str, int] = {}
     status_before_terminal_by_session: dict[str, int] = {}
+    keyed_history_indices_by_session: dict[str, list[int]] = {}
     for index, (_line, event) in enumerate(parsed):
         sid = str(event.get("session_id") or "")
         if not sid:
             continue
         event_name = str(event.get("event") or "")
+        if event_name == "harness_status_seen" or (
+            event_name == "harness_status" and event.get("idempotency_keyed") is True
+        ):
+            keyed_history_indices_by_session.setdefault(sid, []).append(index)
         if event_name == "harness_status":
             latest_status_index_by_session[sid] = index
         elif event_name in {"completed", "failed", "cleanup_completed"}:
@@ -847,7 +856,9 @@ def _compact_registry_locked(
             if prior_status is not None:
                 status_before_terminal_by_session[sid] = prior_status
         ts = str(event.get("timestamp") or "")
-        if ts >= latest_ts_by_session.get(sid, ""):
+        if event_name != "harness_status_seen" and ts >= latest_ts_by_session.get(
+            sid, ""
+        ):
             latest_ts_by_session[sid] = ts
             latest_event_by_session[sid] = event_name
 
@@ -860,20 +871,45 @@ def _compact_registry_locked(
 
     keep_status_indices = set(latest_status_index_by_session.values())
     keep_status_indices.update(status_before_terminal_by_session.values())
+    keep_dedupe_indices: set[int] = set()
+    for indices in keyed_history_indices_by_session.values():
+        tombstone_candidates = [
+            index for index in indices if index not in keep_status_indices
+        ]
+        keep_dedupe_indices.update(
+            tombstone_candidates[-_STATUS_DEDUPE_TOMBSTONES_PER_SESSION:]
+        )
     kept: list[str] = []
+    rewritten = False
     for index, (line, event) in enumerate(parsed):
         sid = str(event.get("session_id") or "")
         if sid in drop_sessions:
             continue
+        event_name = str(event.get("event") or "")
+        if event_name == "harness_status_seen":
+            if index in keep_dedupe_indices:
+                kept.append(line)
+            continue
         if (
             sid
-            and str(event.get("event") or "") == "harness_status"
+            and event_name == "harness_status"
             and index not in keep_status_indices
         ):
+            if index in keep_dedupe_indices:
+                tombstone = _clean_payload(
+                    {
+                        "event_id": event.get("event_id"),
+                        "session_id": sid,
+                        "event": "harness_status_seen",
+                        "timestamp": event.get("timestamp"),
+                    }
+                )
+                kept.append(json.dumps(tombstone, sort_keys=True))
+                rewritten = True
             continue
         kept.append(line)
     removed = len(parsed) - len(kept)
-    if removed <= 0:
+    if removed <= 0 and not rewritten:
         return 0
 
     target.parent.mkdir(parents=True, exist_ok=True)

@@ -89,9 +89,10 @@ transcripts, tool inputs/outputs, and similarly private fields are rejected and
 never written to the session registry.
 
 Producers that may retry delivery can add a stable `event_id` extension; repeat
-delivery of that ID is idempotent. Without an `event_id`, each invocation is a
-new observation, so unchanged periodic snapshots still refresh liveness and an
-A→B→A supervisor transition is preserved.
+delivery of any of the last 256 keyed observations per session is idempotent,
+including after registry compaction. Without an `event_id`, each invocation is
+a new observation, so unchanged periodic snapshots still refresh liveness and
+an A→B→A supervisor transition is preserved.
 
 ## Install
 

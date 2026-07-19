@@ -355,6 +355,55 @@ def test_auto_compaction_keeps_only_latest_status_per_active_session(
     assert state.supervisor_state == "state-4"
 
 
+def test_compaction_tombstone_rejects_delayed_retry_without_regressing_state(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "2")
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_READ_LIMIT", "0")
+
+    first = session_registry.record_status_report(
+        _report(event_id="observation-a", state="warning"),
+        path=registry,
+    )
+    session_registry.record_status_report(
+        _report(event_id="observation-b", state="running"),
+        path=registry,
+    )
+    retry = session_registry.record_status_report(
+        _report(event_id="observation-a", state="warning"),
+        path=registry,
+    )
+    events = session_registry.read_events(path=registry)
+    state = session_registry.summarize_sessions(path=registry).sessions[
+        "conversation-1"
+    ]
+
+    assert retry["event_id"] == first["event_id"]
+    assert [event["event"] for event in events] == [
+        "harness_status_seen",
+        "harness_status",
+    ]
+    assert state.supervisor_state == "running"
+
+
+def test_compaction_bounds_keyed_status_tombstones(tmp_path, monkeypatch):
+    registry = tmp_path / "events.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "0")
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_READ_LIMIT", "0")
+
+    for index in range(300):
+        session_registry.record_status_report(
+            _report(event_id=f"observation-{index}", state=f"state-{index}"),
+            path=registry,
+        )
+    session_registry.compact_registry(path=registry)
+    events = session_registry.read_events(path=registry)
+
+    assert sum(event["event"] == "harness_status_seen" for event in events) == 256
+    assert sum(event["event"] == "harness_status" for event in events) == 1
+
+
 def test_summary_preserves_multiple_conversations_per_worktree(tmp_path):
     registry = tmp_path / "events.jsonl"
     worktree = tmp_path / "worktree"
