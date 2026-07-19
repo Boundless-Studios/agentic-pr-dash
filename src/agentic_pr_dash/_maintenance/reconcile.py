@@ -5,7 +5,15 @@ import os
 
 from ._common import _resolve_owner_pid, _repo_slug, _current_branch
 from .pr_state import _pr_open_state, _unpack_pr_open_state, _thread_is_p1
-from .markers import _read_marker, _session_is_live, _claim_pr
+from .markers import (
+    _claim_pr,
+    _live_foreign_owner,
+    _live_pr_owner_record,
+    _marker_session_id,
+    _read_marker,
+    _session_is_live,
+    _write_arm_marker,
+)
 from .worktrees import (
     _iter_worktree_paths,
     _live_independent_owner_paths,
@@ -30,8 +38,33 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
             continue
         for e in session_ledger.read(other, repo=target_repo):
             abs_wt = os.path.abspath(e.worktree) if e.worktree else ""
-            if abs_wt and abs_wt in present and _worktree_is_for_entry(abs_wt, e):
-                continue
+            wt_present = bool(abs_wt) and abs_wt in present and _worktree_is_for_entry(abs_wt, e)
+            if wt_present:
+                # A present worktree used to be skipped outright on the theory
+                # the marker scan covers it — but the marker scan never takes
+                # over a worktree markered by ANOTHER session (BOU-1953), so a
+                # dead session's PR whose worktree still exists fell through
+                # every path and its blockers sat unserviced (BOU-2184). Skip
+                # only when a live owner (or this session) actually covers it.
+                marker_sid = _marker_session_id(abs_wt)
+                if marker_sid == session_id:
+                    continue
+                if _live_foreign_owner(abs_wt, session_id):
+                    continue
+                if marker_sid and _session_is_live(marker_sid, abs_wt):
+                    continue
+                # The marker checks above only see THIS worktree's marker
+                # (PR #82 review, P1): a LIVE session that repointed its
+                # worktree elsewhere leaves a dead marker here while still
+                # owning the same ``(repo, pr)`` in the durable ledger.
+                # Re-stamping the marker below would make the adoption look
+                # self-owned to ``_check_worktree`` (which then skips its
+                # ledger fallback) → concurrent maintenance against a live
+                # owner. Defer to any live durable owner instead.
+                if _live_pr_owner_record(
+                    e.pr, e.repo or target_repo, session_id, abs_wt
+                ) is not None:
+                    continue
             state, url, has_fail, failing, review_decision, merge_state, mergeable = (
                 _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
             )
@@ -50,9 +83,14 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
                 continue
             session_ledger.append(session_id, e.pr, e.branch, e.worktree,
                                   e.baseline_sha, repo=e.repo)
+            if wt_present:
+                # Make the adoption durable: re-stamp the dead owner's marker so
+                # subsequent list-owned/stop-gate scans see this session's
+                # ownership of the still-present worktree (BOU-2184).
+                _write_arm_marker(abs_wt, session_id, int(eff_pid), int(e.pr))
             adopted.append({
                 "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
-                "worktree_present": False, "unresolved_threads": len(unresolved),
+                "worktree_present": wt_present, "unresolved_threads": len(unresolved),
                 "ci_failing": has_fail, "failing_checks": failing,
                 "changes_requested": changes_requested,
                 "review_decision": review_decision,
@@ -150,9 +188,13 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
                                     prune_legacy=prune_legacy):
         records[rec["pr"]] = rec
 
-    # Only thread the flag when DISABLING adoption (sibling roots). The anchor
-    # path keeps the default call so its callers/stubs need no signature change.
-    collect_kwargs = {} if adopt_unmarked else {"adopt_unmarked": False}
+    # Only thread the flags when DISABLING unmarked adoption (sibling roots).
+    # The anchor path keeps the default call so its callers/stubs need no
+    # signature change. Sibling roots swap missed-arm pickup for dead-owner
+    # marker takeover so a dead sub-agent's armed PR still surfaces (BOU-2184).
+    collect_kwargs = (
+        {} if adopt_unmarked else {"adopt_unmarked": False, "adopt_dead_markered": True}
+    )
     for wt in _collect_owned_worktrees(session_id, cwd, pid, **collect_kwargs):
         marker = _read_marker(wt) or {}
         pr_raw = marker.get("pr")

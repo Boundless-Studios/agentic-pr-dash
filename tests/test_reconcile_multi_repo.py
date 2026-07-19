@@ -114,7 +114,7 @@ def test_same_pr_number_in_two_repos_does_not_collide(tmp_path, monkeypatch, cap
               repo=repo_sib)
 
     monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
-                        lambda sid, cwd, pid, *, adopt_unmarked=True: [])
+                        lambda sid, cwd, pid, **kw: [])
     monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
@@ -150,7 +150,7 @@ def test_legacy_entry_resolves_against_anchor_not_pruned_cross_repo(
               repo="")
 
     monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
-                        lambda sid, cwd, pid, *, adopt_unmarked=True: [])
+                        lambda sid, cwd, pid, **kw: [])
     monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 

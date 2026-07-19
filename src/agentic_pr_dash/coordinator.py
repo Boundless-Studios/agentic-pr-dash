@@ -86,6 +86,46 @@ def task_identity_for_pr(pr: PRData) -> TaskIdentity:
     )
 
 
+def _porcelain_unquote(path: str) -> str:
+    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
+        return path[1:-1]
+    return path
+
+
+def _porcelain_paths(line: str) -> list[str]:
+    """All path components of one ``git status --porcelain`` line, unquoted.
+
+    Rename/copy lines (``R``/``C``) carry both sides as ``old -> new``. Both
+    are returned so a rename *out of* a real tracked file into the state dir
+    (or the legacy handoff filename) still registers the source path: such a
+    line counts as loop-generated only when every side is a loop artifact.
+    """
+    body = line[3:]
+    if " -> " in body:
+        old, new = body.split(" -> ", 1)
+        return [_porcelain_unquote(old), _porcelain_unquote(new)]
+    return [_porcelain_unquote(body)]
+
+
+def _is_loop_artifact(path: str, state_dir_name: str) -> bool:
+    """True for files the maintenance loop/dashboard writes itself.
+
+    The loop's own artifacts must never count as worktree dirt for reclaim
+    purposes, or every handoff write self-wedges the claim into
+    ``manual_intervention`` (BOU-2184): the handoff prompt (legacy root-level
+    ``MAINTENANCE_HANDOFF.md`` copies included) and anything under the
+    worktree's configured state dir (``.agentic-pr-dash/`` by default, where
+    markers, maintenance state, and the handoff now live).
+    """
+    if path == maintenance.HANDOFF_FILENAME:
+        return True
+    if state_dir_name:
+        prefix = state_dir_name.rstrip("/")
+        if path == prefix or path.startswith(prefix + "/"):
+            return True
+    return False
+
+
 def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
     worktree = Path(path)
     if not worktree.is_dir():
@@ -96,10 +136,17 @@ def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
         text=True,
         timeout=10,
     )
+    try:
+        state_dir_name = load_config(str(worktree)).state_dir_name
+    except Exception:  # noqa: BLE001 - unparseable config must not break reclaim
+        state_dir_name = ""
     dirty_lines = [
         line
         for line in status.stdout.splitlines()
-        if line and line[3:] != maintenance.HANDOFF_FILENAME
+        if line
+        and not all(
+            _is_loop_artifact(p, state_dir_name) for p in _porcelain_paths(line)
+        )
     ]
     if status.returncode == 0 and dirty_lines:
         return True

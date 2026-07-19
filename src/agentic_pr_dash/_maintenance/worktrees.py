@@ -6,7 +6,7 @@ import subprocess
 import time
 
 from agentic_pr_dash.config import load as load_config
-from ._common import _resolve_owner_pid, _current_branch
+from ._common import _resolve_owner_pid, _current_branch, _repo_slug
 from .pr_state import _list_my_open_prs
 
 
@@ -218,6 +218,7 @@ def _collect_owned_worktrees(
     deadline: float | None = None,
     *,
     adopt_unmarked: bool = True,
+    adopt_dead_markered: bool = False,
 ) -> list[str]:
     """Return the worktree paths this session owns — markered OR adopted.
 
@@ -248,6 +249,17 @@ def _collect_owned_worktrees(
     ownership in configured sibling roots without claiming unrelated idle PRs
     merely because they belong to ``@me``.
 
+    ``adopt_dead_markered=True`` additionally takes over a worktree whose marker
+    names a DEAD session (no fresh heartbeat, no active fix-lease, owner pid
+    dead, session not live in the registry) when its branch has an open
+    non-draft ``@me`` PR (BOU-2184). Cross-root scans need this: a sub-agent
+    arms its own worktree in a sibling ``maintenance_repo_roots`` repo and then
+    exits, leaving a foreign-but-dead marker that the BOU-1953 gate below makes
+    permanently invisible to every other session — so the sibling repo's PR
+    never surfaced in ``list-owned``/``reconcile-prs``. A LIVE foreign owner
+    still always blocks takeover. Anchor roots keep this off: same-repo orphan
+    recovery stays with the ledger-based ``_adopt_orphan_prs`` path.
+
     ``_list_my_open_prs`` (a ``gh`` call) is fetched lazily and at most once, and
     only when a candidate actually needs the branch→PR map (an unmarked
     adoptable worktree, or one of ours to staleness-check). ``deadline`` is an
@@ -255,7 +267,14 @@ def _collect_owned_worktrees(
     and its subprocess timeout is capped to the remaining budget, so a single
     slow root cannot blow the Stop-hook deadline mid-scan (BOU-1787 review).
     """
-    from .markers import _live_foreign_owner, _marker_session_id, _read_marker, _write_arm_marker  # noqa: PLC0415
+    from .markers import (  # noqa: PLC0415
+        _live_foreign_owner,
+        _live_pr_owner_record,
+        _marker_session_id,
+        _read_marker,
+        _session_is_live,
+        _write_arm_marker,
+    )
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
@@ -276,6 +295,13 @@ def _collect_owned_worktrees(
     )
 
     pr_map: dict | None = None  # lazy, budget-bounded gh fetch (at most once)
+    repo_slug: str | None = None  # lazy repo detection (at most once)
+
+    def _slug() -> str:
+        nonlocal repo_slug
+        if repo_slug is None:
+            repo_slug = _repo_slug(cwd)
+        return repo_slug
 
     def _branch_prs() -> dict:
         nonlocal pr_map
@@ -302,15 +328,46 @@ def _collect_owned_worktrees(
                 _write_arm_marker(worktree_path, session_id, int(eff_pid), int(cur[0]))
             _emit(worktree_path)
             continue
-        if not adopt_unmarked:
-            continue
-        if _read_marker(worktree_path):
+        marker = _read_marker(worktree_path)
+        if marker:
             # Already carries SOME session's marker (foreign, live or dead —
             # ``_marker_session_id`` above already excluded the "already ours"
             # case). Only an explicit `arm` may claim an already-markered
             # worktree; a shared-repo `git worktree list` scan surfacing one of
             # "my" open GitHub PRs here is not evidence THIS session ever armed
-            # it (BOU-1953 root cause #3 — no cross-epic adoption).
+            # it (BOU-1953 root cause #3 — no cross-epic adoption)...
+            if not adopt_dead_markered:
+                continue
+            # ...EXCEPT when the caller opted into dead-owner takeover
+            # (cross-root scans, BOU-2184): a marker whose owning session is
+            # conclusively dead would otherwise hide this worktree's open
+            # non-draft ``@me`` PR from every session forever.
+            if _live_foreign_owner(worktree_path, session_id):
+                continue
+            owner_sid = marker.get("session_id", "")
+            if owner_sid and _session_is_live(owner_sid, worktree_path):
+                continue
+            cur = _branch_prs().get(branch)
+            if cur is None:
+                continue
+            number, is_draft = cur
+            if is_draft:
+                continue
+            # A dead MARKER does not mean the PR is ownerless (PR #82 review,
+            # P1): a LIVE session that repointed its worktree elsewhere leaves
+            # a dead marker here while still owning this ``(repo, pr)`` in the
+            # durable ledger. Overwriting the marker would make the takeover
+            # look self-owned to ``_check_worktree`` (which then skips its
+            # ``_live_pr_owner_record`` fallback) → concurrent maintenance
+            # against a live owner. Defer to any live durable owner.
+            if _live_pr_owner_record(
+                int(number), _slug(), session_id, worktree_path
+            ) is not None:
+                continue
+            if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
+                _emit(worktree_path)
+            continue
+        if not adopt_unmarked:
             continue
         prs = _branch_prs()
         if not prs:
@@ -366,6 +423,7 @@ def _reconcile_owned_across_roots(
                 pid,
                 deadline,
                 adopt_unmarked=False,
+                adopt_dead_markered=True,
             )
         for wt in root_owned:
             if wt not in seen:

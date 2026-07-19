@@ -24,7 +24,15 @@ def state_path(worktree_path: str, pr_number: int) -> Path:
 
 
 def handoff_path(worktree_path: str) -> Path:
-    return Path(worktree_path) / HANDOFF_FILENAME
+    """Where the maintenance handoff prompt is written for a worktree.
+
+    Lives inside the worktree's state dir (``.agentic-pr-dash/`` by default), NOT
+    at the worktree root: a root-level ``MAINTENANCE_HANDOFF.md`` ends up tracked
+    in some repos, so every handoff write dirtied the tree and self-wedged the
+    coordinator's reclaim dirty-check into ``manual_intervention`` (BOU-2184).
+    Legacy root-level copies are additionally excluded from that dirty-check.
+    """
+    return load_config(worktree_path).state_dir_for(worktree_path) / HANDOFF_FILENAME
 
 
 def pr_url(pr_number: int | str, fallback_url: str | None = None, *, cwd: str | None = None) -> str:
@@ -149,6 +157,7 @@ def queue_handoff(pr: PRData, prompt: str) -> MaintenanceState:
 
 def write_pipeline_handoff(state: MaintenanceState, prompt: str) -> None:
     path = handoff_path(state.worktree_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     body = (
         "# PR Dashboard Maintenance Handoff\n\n"
         f"PR: {pr_markdown_link(state.pr_number)}\n"
