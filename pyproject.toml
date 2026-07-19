@@ -16,6 +16,16 @@ keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review
 # arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
 dependencies = [
     "pydantic>=2.0",
+    # Pinned to an immutable commit (BOU-1812 CI fix): a mutable ``@main`` ref
+    # makes CI non-reproducible and can silently adopt a breaking change. Bump
+    # this sha deliberately, together with the call sites.
+    #
+    # ``d558062`` is agent-coordinator 0.2.0, which made ``lease_epoch`` a
+    # REQUIRED kwarg on ``TaskCoordinator.heartbeat_claim`` / ``release_claim``
+    # (fenced claims). Main briefly pinned back to ``8fa2034`` (0.1.0) because
+    # our facade still called the old signature; this branch (BOU-2195) is that
+    # deliberate adoption — ``coordinator.py`` now threads the lease epoch and
+    # ``loop.py`` treats ``StaleClaimError`` as a per-PR handoff.
     "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@d558062de240937295c120c4f9ef0d1b1d7cb229",
 ]
 

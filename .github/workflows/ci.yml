@@ -62,12 +62,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
       - name: Install
-        run: pip install -e ".[dev]"
+        # Install strictly from the committed uv.lock. `--locked` fails the build
+        # if uv.lock is out of date relative to pyproject.toml, so a dependency
+        # (notably the agent-coordinator git ref) can never silently re-resolve or
+        # drift the way the old mutable `@main` + `pip install -e` path did.
+        run: uv sync --locked --extra dev --python "${{ matrix.python-version }}"
       - name: Compile
-        run: python -m compileall src/agentic_pr_dash
+        run: uv run --no-sync python -m compileall src/agentic_pr_dash
       - name: Test
-        run: pytest -q
+        run: uv run --no-sync pytest -q
       - name: Build wheel (catches packaging/data-file regressions)
         run: |
           pip install build
