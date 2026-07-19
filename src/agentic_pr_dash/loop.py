@@ -192,6 +192,58 @@ def _save_health(cwd: str, data: dict) -> None:
         pass
 
 
+def _mutate_health(cwd: str, apply):
+    """Run ``apply(data)`` on the loaded health dict and persist it, serialized
+    by a cross-process exclusive lock. ``apply`` mutates ``data`` in place and
+    may return a value, which is returned to the caller.
+
+    :func:`_save_health` already writes atomically (os.replace), so a reader
+    never sees a torn JSON file. But atomicity does NOT prevent a lost UPDATE: a
+    bare load-modify-save is racy because two supported loop modes (a
+    machine-wide loop and a session-scoped loop) stamp the SAME repo-wide health
+    file. A machine tick can load, a session loop can then persist a
+    freshly-failed PR streak, and the machine tick's save (holding only
+    ``__loop__``) reverts the streak to absent — after which ``_loop_covers_pr``
+    again reads the repeatedly-failing PR as covered and suppresses its waiter.
+    Loading AND saving under the lock serializes the read-modify-write windows so
+    no writer clobbers another's committed streak (PR #76 review).
+
+    The lock is best-effort: on a platform without ``fcntl`` (non-POSIX) or if
+    the lock file can't be opened, it degrades to an unlocked mutate rather than
+    dropping the write entirely.
+    """
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError:  # pragma: no cover — non-POSIX: degrade to unlocked
+        fcntl = None  # type: ignore[assignment]
+    lock_fd: int | None = None
+    if fcntl is not None:
+        try:
+            hf = _health_file(cwd)
+            hf.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = hf.with_name(hf.name + ".lock")
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                lock_fd = None
+    try:
+        data = _load_health(cwd)
+        result = apply(data)
+        _save_health(cwd, data)
+        return result
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
 # ---------------------------------------------------------------------------
 # Loop health record (BOU-2086)
 # ---------------------------------------------------------------------------
@@ -242,6 +294,7 @@ def record_loop_health(
     interval: float | None = None,
     session_id: str = "",
     no_discover_worktrees: bool = False,
+    once: bool = False,
 ) -> None:
     """Persist the loop's heartbeat + executor-viability record (BOU-2086).
 
@@ -254,17 +307,21 @@ def record_loop_health(
     machine-wide coverage. It is ``"machine"`` ONLY when the loop enumerates
     every worktree in the repo — i.e. no ``--session-id`` AND full discovery.
     A ``--session-id`` loop is ``"session"`` (services only its own session's
-    worktrees) and a ``--no-discover-worktrees`` loop is ``"restricted"``
-    (services only its explicit ``--cwd`` set). Both still stamp the same
-    repo-wide health file, so if either read as machine-wide coverage it would
-    suppress waiters for worktrees it never inspects — only ``"machine"`` grants
+    worktrees), a ``--no-discover-worktrees`` loop is ``"restricted"`` (services
+    only its explicit ``--cwd`` set), and a ``--once`` loop is ``"oneshot"``
+    (``main()`` exits after this single tick, so its heartbeat is not durable
+    coverage — a stop-gate reached mid-tick must not suppress a waiter the
+    exiting one-shot will never replace). All still stamp the same repo-wide
+    health file, so if any read as machine-wide coverage it would suppress
+    waiters for worktrees/windows it never services — only ``"machine"`` grants
     coverage in :func:`loop_health_ok` (PR #76 review).
     """
-    data = _load_health(cwd)
     if session_id:
         scope = "session"
     elif no_discover_worktrees:
         scope = "restricted"
+    elif once:
+        scope = "oneshot"
     else:
         scope = "machine"
     entry: dict = {
@@ -283,8 +340,7 @@ def record_loop_health(
             entry["interval"] = float(interval)
         except (TypeError, ValueError):
             pass
-    data[LOOP_HEALTH_KEY] = entry
-    _save_health(cwd, data)
+    _mutate_health(cwd, lambda data: data.__setitem__(LOOP_HEALTH_KEY, entry))
 
 
 def _pid_state(pid: int) -> str | None:
@@ -361,14 +417,19 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     state = _pid_state(int(pid_raw))
     if state is not None and state.startswith("Z"):
         return False
-    # JSON integers are arbitrary-precision: a corrupt record with a 400-digit
-    # ``heartbeat``/``interval`` parses fine but overflows ``float()``. An
-    # uncaught OverflowError here would escape into the stop-gate's broad
-    # catch and read as a coverage release — treat it as an invalid record
-    # instead (PR #76 review).
+    # A present heartbeat came from JSON, where a real numeric value can only be
+    # an int or float. A decimal STRING ("123", or a shell writer's
+    # ``str(time.time())``) would be silently coerced by ``float()`` even though
+    # the fail-closed record is malformed — mirror the interval guard below and
+    # reject anything that isn't a real (non-bool) number (PR #76 review).
+    heartbeat_raw = entry.get("heartbeat")
+    if isinstance(heartbeat_raw, bool) or not isinstance(heartbeat_raw, (int, float)):
+        return False
+    # JSON integers are arbitrary-precision, so a 400-digit int passes the type
+    # guard but overflows ``float()`` — catch that instead of letting it escape.
     try:
-        heartbeat = float(entry["heartbeat"])
-    except (KeyError, TypeError, ValueError, OverflowError):
+        heartbeat = float(heartbeat_raw)
+    except (TypeError, ValueError, OverflowError):
         return False
     interval_raw = entry.get("interval", _DEFAULT_TICK_INTERVAL_S)
     # Only records written before interval persistence may use the default.
@@ -443,10 +504,13 @@ def _emit_loop_event(cwd: str, kind: str, pr: int | None, details: dict) -> None
 def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     """Record a new executor failure for ``pr``; return the new streak count."""
     key = str(pr)
-    data = _load_health(cwd)
-    new_streak = _entry_streak(data.get(key, {})) + 1
-    data[key] = {"streak": new_streak, "last_error": err, "updated": time.time()}
-    _save_health(cwd, data)
+
+    def _apply(data: dict) -> int:
+        streak = _entry_streak(data.get(key, {})) + 1
+        data[key] = {"streak": streak, "last_error": err, "updated": time.time()}
+        return streak
+
+    new_streak = _mutate_health(cwd, _apply)
     _emit_loop_event(cwd, "streak", pr, {"streak": new_streak, "last_error": err[:200]})
     return new_streak
 
@@ -500,10 +564,7 @@ def reset_executor_failure(cwd: str, pr: int | None) -> None:
     surfacing the stop-gate escalation block.
     """
     key = str(pr)
-    data = _load_health(cwd)
-    if key in data:
-        del data[key]
-        _save_health(cwd, data)
+    _mutate_health(cwd, lambda data: data.pop(key, None))
     _clear_escalation_entry(cwd, pr)
 
 
@@ -956,6 +1017,7 @@ def _tick(args, executor: str) -> None:
                 cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
                 session_id=args.session_id or "",
                 no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                once=bool(getattr(args, "once", False)),
             )
         if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
             continue
@@ -1009,6 +1071,7 @@ def _tick(args, executor: str) -> None:
                     cwd, executors_viable=False, errors=exec_errors, interval=interval,
                     session_id=args.session_id or "",
                     no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                    once=bool(getattr(args, "once", False)),
                 )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
@@ -1107,6 +1170,7 @@ def main(argv: list[str] | None = None) -> int:
                     cwd, executors_viable=False, errors=startup_errors,
                     interval=args.interval, session_id=args.session_id or "",
                     no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                    once=bool(getattr(args, "once", False)),
                 )
             except Exception:  # noqa: BLE001 — never mask the loud exit
                 pass

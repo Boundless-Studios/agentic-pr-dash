@@ -892,6 +892,119 @@ def test_health_file_round_trip_shape(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# One-shot (`--once`) loops are not machine-wide coverage (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_record_loop_health_once_is_not_machine_scope(tmp_path):
+    """A ``loop --once`` run performs a single tick and ``main()`` exits, so its
+    heartbeat is not durable machine-wide coverage. Even with full discovery and
+    no ``--session-id`` it must NOT stamp ``scope: machine`` (PR #76 review)."""
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600, once=True)
+    entry = loop.loop_health_entry(cwd)
+    assert entry.get("scope") != "machine"
+    assert loop.loop_health_ok(cwd) is False
+
+
+def test_once_tick_records_non_machine_coverage(monkeypatch, tmp_path):
+    """The ``--once`` path (``main`` → ``_tick`` with ``args.once``) must stamp a
+    non-machine record so a stop-gate reached mid one-shot tick can't read it as
+    durable coverage and suppress a waiter the exiting one-shot will never
+    replace (PR #76 review)."""
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor)); return 0
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: None)
+    # Full discovery, no session — the ONLY thing making this non-machine is --once.
+    loop._tick(_tick_args(once=True, session_id=""), "codex exec --full-auto {prompt}")
+    entry = loop.loop_health_entry(str(worktree))
+    assert entry.get("scope") != "machine"
+    assert loop.loop_health_ok(str(worktree)) is False
+
+
+def test_full_discovery_non_once_loop_still_machine_coverage(tmp_path):
+    """Boundary guard: the durable daemon (no ``--once``, no ``--session-id``,
+    full discovery) must still record ``scope: machine`` and grant coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600, once=False)
+    assert loop.loop_health_entry(cwd).get("scope") == "machine"
+    assert loop.loop_health_ok(cwd) is True
+
+
+# ---------------------------------------------------------------------------
+# String / non-numeric heartbeat rejection (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_string_heartbeat_fresh_timestamp_fails_closed(tmp_path):
+    """A decimal-STRING heartbeat that is a fresh timestamp (a shell/tooling
+    writer emitting ``str(time.time())``) was silently coerced by ``float()``
+    and granted coverage even though the fail-closed record is malformed — the
+    same corrupt state the interval path rejects (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=str(time.time()))
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_heartbeat", ["123.0", True, False, [], {}, None])
+def test_non_numeric_heartbeat_fails_closed(tmp_path, bad_heartbeat):
+    """Only a real (non-bool) int/float heartbeat is valid; strings, booleans,
+    containers, and null are corrupt state and must fail closed (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=bad_heartbeat)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+# ---------------------------------------------------------------------------
+# Serialized read-modify-write on the shared health file (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_health_writers_do_not_lose_streak(tmp_path):
+    """Two supported loop modes stamp the SAME repo-wide health file. Without
+    serialization a machine tick's ``record_loop_health`` load-modify-save
+    clobbers a per-PR streak a session loop persisted in the same window, so
+    ``_loop_covers_pr`` again reads the repeatedly-failing PR as covered and
+    suppresses its waiter. The health lock must serialize the writers so every
+    streak increment survives (PR #76 review)."""
+    import threading
+
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    n = 100
+    barrier = threading.Barrier(2)
+
+    def bump_streak():
+        barrier.wait()
+        for i in range(n):
+            loop.record_executor_failure(cwd, 7, f"boom{i}")
+
+    def stamp_health():
+        barrier.wait()
+        for _ in range(n):
+            loop.record_loop_health(cwd, executors_viable=True, interval=600)
+
+    threads = [threading.Thread(target=bump_streak), threading.Thread(target=stamp_health)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    data = loop._load_health(cwd)
+    assert data.get("7", {}).get("streak") == n
+    assert loop.LOOP_HEALTH_KEY in data
+
+
+# ---------------------------------------------------------------------------
 # Capability marker (inert-config detectability)
 # ---------------------------------------------------------------------------
 
