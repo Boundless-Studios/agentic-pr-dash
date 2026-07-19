@@ -460,6 +460,44 @@ def test_template_diagnostics_inside_details():
     assert "card-details" in html, "Expected class 'card-details' on the details element"
 
 
+def test_template_surfaces_harness_state_and_token_usage():
+    card = _minimal_card(
+        runtime_session_id="conversation-1",
+        runtime_chain_id="chain-1",
+        runtime_generation=2,
+        supervisor_state="awaiting_ack",
+        context_percent=67.5,
+        context_tokens=675_000,
+        window_tokens=1_000_000,
+        cumulative_tokens=9_500_000,
+        context_confidence="degraded",
+        runtime_quiescence="busy",
+        runtime_active_turns=1,
+        runtime_active_tools=2,
+        runtime_active_subagents=1,
+        runtime_active_critical_sections=0,
+        runtime_checkpoint_fingerprint="abc123",
+        runtime_outbox_depth=3,
+        runtime_status_stale=True,
+    )
+
+    html = _render_board([card])
+
+    assert "harness-summary" in html
+    assert "Awaiting Ack" in html
+    assert "67.5% context" in html
+    assert "Context 675,000 / 1,000,000 · 67.5%" in html
+    assert "Cumulative 9,500,000 tokens" in html
+    assert "chain-1" in html
+    assert "generation 2" in html
+    assert "degraded" in html
+    assert "busy" in html
+    assert "1 turn · 2 tools · 1 subagent · 0 critical" in html
+    assert "abc123" in html
+    assert "Outbox 3" in html
+    assert "Status stale" in html
+
+
 # ---------------------------------------------------------------------------
 # 3f. Ownership line rendering
 # ---------------------------------------------------------------------------

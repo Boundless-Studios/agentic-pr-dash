@@ -39,6 +39,61 @@ actively fixing it), **CI Pending**, and **Clean** (ready to merge). The board
 polls GitHub in the background; cards update live as CI finishes and agents make
 progress.
 
+### Harness status projection (optional)
+
+The dashboard can consume schema-v1 `StatusReport` JSON from
+[`agent-session-harness`](https://github.com/Boundless-Studios/agent-session-harness).
+This is a wire contract rather than a package dependency, so the dashboard can
+accept reports from any harness installation that emits the same versioned
+shape:
+
+```bash
+agent-session-harness report --state <supervisor-state.json> --json \
+  | agentic-pr-dash session-report --json --worktree-path "$PWD"
+```
+
+The command accepts one JSON object (up to 1 MiB) on standard input and returns
+the normalized event and session identifiers. A report contains native
+conversation identity, rotation identity, context usage, and activity:
+
+```json
+{
+  "schema_version": 1,
+  "runtime": "codex",
+  "state": "warning",
+  "chain_id": "pr-421-maintenance",
+  "conversation_id": "019abc...",
+  "generation": 2,
+  "context_percent": 67.5,
+  "context_tokens": 675000,
+  "window_tokens": 1000000,
+  "cumulative_tokens": 9500000,
+  "confidence": "confident",
+  "quiescence": "busy",
+  "active": {"turns": 1, "tools": 1, "subagents": 0, "critical_sections": 0},
+  "checkpoint_fingerprint": "abc123",
+  "outbox_depth": 0
+}
+```
+
+Fresh canonical status drives the card's working/idle state and exposes the
+supervisor phase, context/window/cumulative tokens, chain, generation,
+confidence, active work, checkpoint, and outbox depth. Reports older than 90
+seconds or with unknown quiescence fall back to the existing process/activity
+probes. Terminal lifecycle records stay terminal even if a late status report
+or heartbeat arrives, and when a worktree has rotated through multiple
+conversations the dashboard prefers its current non-terminal conversation.
+
+Unknown extension fields are tolerated for forward compatibility. Raw prompts,
+transcripts, tool inputs/outputs, and similarly private fields are rejected and
+never written to the session registry.
+
+Producers that may retry delivery can add a stable `event_id` extension; repeat
+delivery of any of the last 256 keyed observations per session is idempotent,
+including after registry compaction. Without an `event_id`, each invocation is
+a new observation, so unchanged periodic snapshots still refresh liveness and
+an A→B→A supervisor transition is preserved.
+
 ## Install
 
 ```bash
@@ -138,6 +193,11 @@ A second runner — say a detached `loop` running next to your in-editor session
 **defers** while another owner's heartbeat or fix lease is still fresh, and
 pid-liveness reaps a crashed owner immediately. The result: a PR is only ever
 worked by one agent at a time — no double-fixing, no clobbered commits.
+
+Coordinator-backed claims are fenced by the `agent-coordinator` v0.2.0 contract,
+pinned to its immutable commit (`d558062`). The dashboard carries both
+`claim_id` and the monotonic `lease_epoch` through heartbeat and release
+operations, so a stale owner cannot mutate a claim after it has been reclaimed.
 
 ![Agent holding the lease on a PR](docs/images/review-loop-card.png)
 

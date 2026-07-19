@@ -182,6 +182,19 @@ def _load_babysit_activity() -> tuple[dict[int, str], dict[str, str]]:
 # fixing does. CPU% can't make this distinction (idle REPLs + the watch loop's
 # own ticks both sit above the CPU floor).
 _ACTIVITY_DEBOUNCE_SECONDS = 20    # a turn must last this long to read as "working"
+_HARNESS_STATUS_STALE_SECONDS = 90
+_HARNESS_TRANSITION_STATES = {
+    "draining",
+    "checkpointing",
+    "checkpointed",
+    "fencing",
+    "fenced",
+    "stopping",
+    "stopped",
+    "claiming",
+    "launching",
+    "awaiting_ack",
+}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -196,7 +209,7 @@ def _parse_iso(value: str | None) -> datetime | None:
     return ts
 
 
-def _agent_activity_state(worktree_path: str | None) -> str:
+def _legacy_agent_activity_state(worktree_path: str | None) -> str:
     """Aggregate per-session turn state from the state-dir's agent-activity.json:
 
       "working" — a session is in a sustained turn: state busy, past the debounce,
@@ -240,7 +253,83 @@ def _agent_activity_state(worktree_path: str | None) -> str:
     return "idle"
 
 
-def _resolve_agent_working(worktree_path: str | None, live: bool) -> bool:
+def _harness_activity_state(
+    runtime_session: session_registry.RuntimeSessionState | None,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """Return fresh canonical activity, or ``none`` to preserve fallbacks."""
+    if runtime_session is None or runtime_session.is_terminal:
+        return "none"
+    if not _harness_report_is_fresh(runtime_session, now=now):
+        return "none"
+    if any(
+        (
+            runtime_session.active_turns,
+            runtime_session.active_tools,
+            runtime_session.active_subagents,
+            runtime_session.active_critical_sections,
+        )
+    ):
+        return "working"
+    if runtime_session.supervisor_state in _HARNESS_TRANSITION_STATES:
+        return "working"
+    if runtime_session.quiescence == "busy":
+        return "working"
+    if runtime_session.quiescence == "idle":
+        return "idle"
+    return "none"
+
+
+def _harness_report_is_fresh(
+    runtime_session: session_registry.RuntimeSessionState,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    reported_at = _parse_iso(runtime_session.harness_reported_at)
+    if reported_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return (current - reported_at).total_seconds() <= _HARNESS_STATUS_STALE_SECONDS
+
+
+def _runtime_session_is_live(
+    runtime_session: session_registry.RuntimeSessionState,
+) -> bool:
+    if runtime_session.is_terminal:
+        return False
+    if not runtime_session.harness_reported_at:
+        return True
+    if _harness_report_is_fresh(runtime_session):
+        return True
+    return session_registry.pid_is_live(runtime_session.pid)
+
+
+def _runtime_status_is_stale(
+    runtime_session: session_registry.RuntimeSessionState,
+) -> bool:
+    return bool(
+        runtime_session.harness_reported_at
+        and not runtime_session.is_terminal
+        and not _harness_report_is_fresh(runtime_session)
+    )
+
+
+def _agent_activity_state(
+    worktree_path: str | None,
+    runtime_session: session_registry.RuntimeSessionState | None = None,
+) -> str:
+    canonical = _harness_activity_state(runtime_session)
+    if canonical != "none":
+        return canonical
+    return _legacy_agent_activity_state(worktree_path)
+
+
+def _resolve_agent_working(
+    worktree_path: str | None,
+    live: bool,
+    runtime_session: session_registry.RuntimeSessionState | None = None,
+) -> bool:
     """Combine turn-state with live-process presence (PR #1918 review):
 
       * "working" → True (the owning pid was already verified alive).
@@ -248,7 +337,7 @@ def _resolve_agent_working(worktree_path: str | None, live: bool) -> bool:
         the whole point: don't show working between turns).
       * "none"    → defer to CPU-discovered presence (sessions without the hook).
     """
-    state = _agent_activity_state(worktree_path)
+    state = _agent_activity_state(worktree_path, runtime_session)
     if state == "working":
         return True
     if state == "idle":
@@ -407,13 +496,36 @@ def _runtime_session_for_worktree(
     if not worktree_path:
         return None
 
-    runtime_session = default_summary.by_worktree.get(worktree_path)
+    candidates = list(
+        default_summary.by_worktree_sessions.get(worktree_path)
+        or [
+            state
+            for state in default_summary.sessions.values()
+            if state.worktree_path == worktree_path
+        ]
+    )
     default_registry = session_registry.registry_path()
     worktree_registry = session_registry.registry_path(worktree_path)
     if worktree_registry != default_registry:
         target_summary = session_registry.summarize_sessions(path=worktree_registry)
-        runtime_session = target_summary.by_worktree.get(worktree_path) or runtime_session
-    return runtime_session
+        candidates.extend(
+            target_summary.by_worktree_sessions.get(worktree_path)
+            or [
+                state
+                for state in target_summary.sessions.values()
+                if state.worktree_path == worktree_path
+            ]
+        )
+    if not candidates:
+        return None
+    latest_by_session: dict[str, session_registry.RuntimeSessionState] = {}
+    for state in candidates:
+        current = latest_by_session.get(state.session_id)
+        if current is None or state.timestamp >= current.timestamp:
+            latest_by_session[state.session_id] = state
+    materialized = list(latest_by_session.values())
+    live = [state for state in materialized if _runtime_session_is_live(state)]
+    return max(live or materialized, key=lambda state: state.timestamp)
 
 
 def _repo_session_summary(
@@ -570,6 +682,39 @@ def _ownership_for_card(
     return result
 
 
+def _runtime_card_fields(
+    runtime_session: session_registry.RuntimeSessionState | None,
+) -> dict[str, object]:
+    if runtime_session is None:
+        return {}
+    return {
+        "runtime_session_id": runtime_session.session_id,
+        "runtime_chain_id": runtime_session.chain_id,
+        "runtime_generation": runtime_session.generation,
+        "supervisor_state": runtime_session.supervisor_state,
+        "context_percent": runtime_session.context_percent,
+        "context_tokens": runtime_session.context_tokens,
+        "window_tokens": runtime_session.window_tokens,
+        "cumulative_tokens": runtime_session.cumulative_tokens,
+        "context_confidence": runtime_session.context_confidence,
+        "runtime_quiescence": runtime_session.quiescence,
+        "runtime_active_turns": runtime_session.active_turns,
+        "runtime_active_tools": runtime_session.active_tools,
+        "runtime_active_subagents": runtime_session.active_subagents,
+        "runtime_active_critical_sections": runtime_session.active_critical_sections,
+        "runtime_checkpoint_fingerprint": runtime_session.checkpoint_fingerprint,
+        "runtime_outbox_depth": runtime_session.outbox_depth,
+        "runtime_status_stale": _runtime_status_is_stale(runtime_session),
+        "agent_name": runtime_session.agent_name,
+        "docker_mode": runtime_session.docker_mode,
+        "docker_daemon_name": runtime_session.docker_daemon_name,
+        "container_names": runtime_session.container_names,
+        "runtime_warnings": [runtime_session.warning]
+        if runtime_session.warning
+        else [],
+    }
+
+
 def _build_card_for_worktree(
     worktree: dict,
     pr: PRData | None,
@@ -582,7 +727,9 @@ def _build_card_for_worktree(
     if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
         agent_working = False
     else:
-        agent_working = _resolve_agent_working(worktree.get("path"), bool(fallback_agents))
+        agent_working = _resolve_agent_working(
+            worktree.get("path"), bool(fallback_agents), runtime_session
+        )
     status = _card_status(pr, agent_working)
     activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
     cleanup_candidate = False
@@ -640,13 +787,8 @@ def _build_card_for_worktree(
         cleanup_candidate=cleanup_candidate,
         escalated=pr.escalated if pr else False,
         escalated_reason=pr.escalated_reason if pr else None,
-        runtime_session_id=runtime_session.session_id if runtime_session else None,
-        agent_name=runtime_session.agent_name if runtime_session else None,
-        docker_mode=runtime_session.docker_mode if runtime_session else None,
-        docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
-        container_names=runtime_session.container_names if runtime_session else [],
-        runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
         pr_created_at=_pr_created_at,
+        **_runtime_card_fields(runtime_session),
         **_ownership,
     )
 
@@ -676,7 +818,9 @@ def _build_unassigned_pr_card(
     if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
         agent_working = False
     else:
-        agent_working = _resolve_agent_working(activity_worktree_path, bool(fallback_agents))
+        agent_working = _resolve_agent_working(
+            activity_worktree_path, bool(fallback_agents), runtime_session
+        )
     status = _card_status(pr, agent_working)
     activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
 
@@ -733,12 +877,7 @@ def _build_unassigned_pr_card(
         escalated=pr.escalated,
         escalated_reason=pr.escalated_reason,
         pr_created_at=pr.created_at,
-        runtime_session_id=runtime_session.session_id if runtime_session else None,
-        agent_name=runtime_session.agent_name if runtime_session else None,
-        docker_mode=runtime_session.docker_mode if runtime_session else None,
-        docker_daemon_name=runtime_session.docker_daemon_name if runtime_session else None,
-        container_names=runtime_session.container_names if runtime_session else [],
-        runtime_warnings=[runtime_session.warning] if runtime_session and runtime_session.warning else [],
+        **_runtime_card_fields(runtime_session),
         **_ownership,
     )
 
@@ -1147,6 +1286,21 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                     output_tail=["reproduced empty-tail bug", "adding regression test", "running unit"],
                 ),
                 runtime_session_id="sess-search-pagination",
+                runtime_chain_id="pr-421-maintenance",
+                runtime_generation=2,
+                supervisor_state="warning",
+                context_percent=67.5,
+                context_tokens=675_000,
+                window_tokens=1_000_000,
+                cumulative_tokens=9_500_000,
+                context_confidence="confident",
+                runtime_quiescence="busy",
+                runtime_active_turns=1,
+                runtime_active_tools=1,
+                runtime_active_subagents=0,
+                runtime_active_critical_sections=0,
+                runtime_checkpoint_fingerprint="abc123",
+                runtime_outbox_depth=0,
                 latest_commit_sha="b7c8d9e",
                 latest_commit_date="2026-05-25T15:09:00Z",
                 last_updated_label="30s ago",

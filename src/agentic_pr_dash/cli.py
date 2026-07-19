@@ -9,13 +9,14 @@ Subcommands:
     stop-gate     Stop-hook core: block idling while owned PRs have pending work.
     reconcile-prs List every PR a session owns (live + detached ledger), with state.
     record        Record a session lifecycle event (for the dashboard's live view).
+    session-report Ingest harness StatusReport v1 JSON from stdin.
     loop          Run check/fix/complete continuously, dispatching to a configured agent.
     serve         Run the web dashboard.
     observe       Inspect the observability event store (comment scans, dispatches, etc.).
     stash         Race-safe labeled-stash push/apply/drop/list (shared cross-worktree stack).
 
 ``check/complete/arm/list-owned/stop-gate/reconcile-prs`` route into the stateless maintenance
-executor; ``record`` into the session registry; ``loop`` and ``serve`` are runtime
+executor; ``record`` / ``session-report`` into the session registry; ``loop`` and ``serve`` are runtime
 drivers. Run ``agentic-pr-dash <cmd> --help`` for per-subcommand options.
 """
 
@@ -139,6 +140,10 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "record":
         from . import session_registry
         return session_registry.main([cmd, *rest])
+
+    if cmd == "session-report":
+        from . import session_registry
+        return session_registry.main(["report", *rest])
 
     if cmd == "loop":
         from . import loop

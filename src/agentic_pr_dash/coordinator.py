@@ -24,7 +24,7 @@ from agent_coordinator.store import JsonlClaimStore
 
 from .config import load as load_config
 from . import maintenance
-from .models import PRData
+from .models import ClaimHandle, PRData
 
 TASK_TYPE = "pr-maintenance"
 STORE_ENV = "AGENTIC_PR_DASH_COORDINATOR_STORE"
@@ -282,7 +282,7 @@ def claim_pr(
     pid: int | None,
     agent: str,
     lease_seconds: int,
-) -> ClaimRecord | None:
+) -> ClaimHandle | None:
     owner = OwnerIdentity(
         session_id=session_id,
         pid=pid,
@@ -290,26 +290,39 @@ def claim_pr(
         worktree_path=getattr(pr, "worktree_path", None),
     )
     try:
-        return _coordinator().claim_task(
+        record = _coordinator().claim_task(
             task_identity_for_pr(pr),
             owner,
             lease_seconds=lease_seconds,
+        )
+        return ClaimHandle(
+            claim_id=record.claim_id,
+            lease_epoch=record.lease_epoch,
         )
     except ClaimConflictError:
         return None
 
 
-def heartbeat_claim_id(claim_id: str, session_id: str, *, lease_seconds: int | None = None) -> None:
+def heartbeat_claim(
+    handle: ClaimHandle,
+    session_id: str,
+    *,
+    lease_seconds: int | None = None,
+) -> ClaimHandle:
     _coordinator().heartbeat_claim(
-        claim_id,
+        handle.claim_id,
         owner_session_id=session_id,
+        lease_epoch=handle.lease_epoch,
         lease_seconds=lease_seconds if lease_seconds is not None else load_config().lease_seconds,
     )
+    return handle
 
 
-def release_claim_id(claim_id: str, session_id: str, reason: str) -> None:
+def release_claim(handle: ClaimHandle, session_id: str, reason: str) -> ClaimHandle:
     _coordinator().release_claim(
-        claim_id,
+        handle.claim_id,
         owner_session_id=session_id,
+        lease_epoch=handle.lease_epoch,
         reason=reason,
     )
+    return handle

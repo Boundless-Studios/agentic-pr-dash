@@ -30,6 +30,8 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from agent_coordinator.service import StaleClaimError
+
 from . import coordinator
 from ._maintenance import worktree_check
 from ._maintenance._common import _pid_alive
@@ -791,12 +793,28 @@ def _parse_pr_number(check_stdout: str) -> int | None:
     return None
 
 
-def _parse_coordinator_claim_id(check_stdout: str) -> str | None:
-    for line in reversed(check_stdout.splitlines()):
+def _parse_coordinator_claim_handle(
+    check_stdout: str,
+) -> coordinator.ClaimHandle | None:
+    claim_id: str | None = None
+    lease_epoch: int | None = None
+    for line in check_stdout.splitlines():
         if line.startswith("COORDINATOR_CLAIM_ID="):
-            claim_id = line.split("=", 1)[1].strip()
-            return claim_id or None
-    return None
+            claim_id = line.split("=", 1)[1].strip() or None
+        elif line.startswith("COORDINATOR_LEASE_EPOCH="):
+            try:
+                lease_epoch = int(line.split("=", 1)[1].strip())
+            except ValueError:
+                return None
+    if claim_id is None or lease_epoch is None:
+        return None
+    try:
+        return coordinator.ClaimHandle(
+            claim_id=claim_id,
+            lease_epoch=lease_epoch,
+        )
+    except ValueError:
+        return None
 
 
 def _head_sha(cwd: str) -> str:
@@ -1045,13 +1063,16 @@ def _tick(args, executor: str) -> None:
                 _clear_recovered_streak(cwd)
             continue
         pr = _parse_pr_number(check.stdout)
-        claim_id = _parse_coordinator_claim_id(check.stdout)
+        claim_handle = _parse_coordinator_claim_handle(check.stdout)
         prompt = check.stdout
         baseline = _baseline_sha(cwd, pr)
         print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
         session = args.session_id or f"pid:{_loop_pid()}"
-        if claim_id:
-            coordinator.heartbeat_claim_id(claim_id, session)
+        if claim_handle:
+            try:
+                coordinator.heartbeat_claim(claim_handle, session)
+            except StaleClaimError:
+                continue
         serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
         if not serviced:
             # Primary (and fallback, if any) failed. Record the failure streak,
@@ -1075,17 +1096,23 @@ def _tick(args, executor: str) -> None:
                 )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
-            if claim_id:
+            if claim_handle:
                 reason = "all_executors_failed" if fallback else "executor_failed"
-                coordinator.release_claim_id(claim_id, session, reason)
+                try:
+                    coordinator.release_claim(claim_handle, session, reason)
+                except StaleClaimError:
+                    pass
             continue
         complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
         if pr is not None:
             complete_args += ["--pr", str(pr)]
         complete = subprocess.run(complete_args)
-        if claim_id:
+        if claim_handle:
             reason = "completed" if complete.returncode == 0 else "complete_failed"
-            coordinator.release_claim_id(claim_id, session, reason)
+            try:
+                coordinator.release_claim(claim_handle, session, reason)
+            except StaleClaimError:
+                continue
         # Reset the failure streak on a successful dispatch + complete.
         reset_executor_failure(cwd, pr)
 

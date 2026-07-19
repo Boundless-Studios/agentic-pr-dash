@@ -555,10 +555,10 @@ class Orchestrator:
                 )
             # Release any dashboard-held coordinator claim now that the work
             # is done (a stale claim would otherwise sit until lease expiry).
-            if pr.coordinator_claim_id:
+            if pr.coordinator_claim:
                 try:
-                    coordinator.release_claim_id(
-                        pr.coordinator_claim_id, DASHBOARD_OWNER_SESSION_ID, "completed"
+                    coordinator.release_claim(
+                        pr.coordinator_claim, DASHBOARD_OWNER_SESSION_ID, "completed"
                     )
                 except Exception as exc:  # best-effort; lease bounds it anyway
                     self.log(
@@ -566,7 +566,7 @@ class Orchestrator:
                         pr_number=num,
                         level="warn",
                     )
-                pr.coordinator_claim_id = None
+                pr.coordinator_claim = None
             pr.maintenance = None
             pr.activity_message = None
             pr.activity_source = None
@@ -738,7 +738,7 @@ class Orchestrator:
                 agent="agentic-pr-dash-dashboard",
                 lease_seconds=load_config(pr.worktree_path).lease_seconds,
             )
-            pr.coordinator_claim_id = claim.claim_id if claim else None
+            pr.coordinator_claim = claim
             self.log(
                 f"Queued PR maintenance for local agent: {', '.join(blockers)}",
                 pr_number=pr.number,

@@ -16,19 +16,17 @@ keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review
 # arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
 dependencies = [
     "pydantic>=2.0",
-    # Pinned to an immutable commit (BOU-1812 CI fix). The previous mutable
-    # ``@main`` ref made CI non-reproducible and, worse, silently adopted an
-    # upstream BREAKING change: agent-coordinator ``main`` advanced to a commit
-    # (``d558062``, 0.2.0) that added a REQUIRED ``lease_epoch`` kwarg to
-    # ``TaskCoordinator.release_claim``. Our ``release_claim_id`` facade and the
-    # existing coordinator tests still call the old signature, so every fresh
-    # ``@main`` install now fails ``test_coordinator`` /
-    # ``test_bou2184_handoff_wedge_and_adoption`` with a TypeError — regardless of
-    # branch. Pinning to ``8fa2034`` (0.1.0, the last commit whose ``release_claim``
-    # has no ``lease_epoch`` — the version green CI ran against) restores
-    # reproducible, passing CI. Adopting 0.2.0's lease-epoch semantics (facade +
-    # tests) is tracked as a follow-up; bump this sha deliberately then.
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@8fa2034eafc009dc5e65e40b289397f66cc35a5e",
+    # Pinned to an immutable commit (BOU-1812 CI fix): a mutable ``@main`` ref
+    # makes CI non-reproducible and can silently adopt a breaking change. Bump
+    # this sha deliberately, together with the call sites.
+    #
+    # ``d558062`` is agent-coordinator 0.2.0, which made ``lease_epoch`` a
+    # REQUIRED kwarg on ``TaskCoordinator.heartbeat_claim`` / ``release_claim``
+    # (fenced claims). Main briefly pinned back to ``8fa2034`` (0.1.0) because
+    # our facade still called the old signature; this branch (BOU-2195) is that
+    # deliberate adoption — ``coordinator.py`` now threads the lease epoch and
+    # ``loop.py`` treats ``StaleClaimError`` as a per-PR handoff.
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@d558062de240937295c120c4f9ef0d1b1d7cb229",
 ]
 
 [project.optional-dependencies]

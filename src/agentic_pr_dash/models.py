@@ -12,7 +12,7 @@ import os
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PRStatus(str, Enum):
@@ -35,6 +35,15 @@ class MaintenanceStatus(str, Enum):
     COMPLETE = "complete"
     STALE = "stale"
     FAILED = "failed"
+
+
+class ClaimHandle(BaseModel):
+    """Fenced coordinator ownership required for every claim mutation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str = Field(min_length=1)
+    lease_epoch: int = Field(ge=0)
 
 
 class CICheck(BaseModel):
@@ -201,9 +210,9 @@ class PRData(BaseModel):
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
-    # agent-coordinator claim the dashboard holds after handing maintenance off
-    # to the local agent; released when the PR goes clean.
-    coordinator_claim_id: str | None = None
+    # Fenced agent-coordinator claim held after dashboard handoff. Both values
+    # must survive until release; a bare claim id cannot reject stale owners.
+    coordinator_claim: ClaimHandle | None = None
     # True when at least one required CI check is still queued/in_progress.
     # Set by _check_worktree for non-draft PRs via github_api.required_checks_pending.
     ci_watch_pending: bool = False
@@ -258,6 +267,22 @@ class WorktreeCard(BaseModel):
     escalated: bool = False
     escalated_reason: str | None = None
     runtime_session_id: str | None = None
+    runtime_chain_id: str | None = None
+    runtime_generation: int | None = None
+    supervisor_state: str | None = None
+    context_percent: float | None = None
+    context_tokens: int | None = None
+    window_tokens: int | None = None
+    cumulative_tokens: int | None = None
+    context_confidence: str | None = None
+    runtime_quiescence: str | None = None
+    runtime_active_turns: int = 0
+    runtime_active_tools: int = 0
+    runtime_active_subagents: int = 0
+    runtime_active_critical_sections: int = 0
+    runtime_checkpoint_fingerprint: str | None = None
+    runtime_outbox_depth: int = 0
+    runtime_status_stale: bool = False
     agent_name: str | None = None
     docker_mode: str | None = None
     docker_daemon_name: str | None = None
@@ -290,6 +315,48 @@ class WorktreeCard(BaseModel):
         if dt is None:
             return ""
         return humanize_relative(dt)
+
+    @property
+    def supervisor_state_label(self) -> str:
+        return (self.supervisor_state or "").replace("_", " ").title()
+
+    @property
+    def context_usage_label(self) -> str | None:
+        values: list[str] = []
+        if self.context_tokens is not None and self.window_tokens is not None:
+            values.append(f"{self.context_tokens:,} / {self.window_tokens:,}")
+        if self.context_percent is not None:
+            values.append(f"{self.context_percent:.1f}%")
+        return f"Context {' · '.join(values)}" if values else None
+
+    @property
+    def cumulative_usage_label(self) -> str | None:
+        if self.cumulative_tokens is None:
+            return None
+        return f"Cumulative {self.cumulative_tokens:,} tokens"
+
+    @property
+    def runtime_activity_label(self) -> str | None:
+        if not self.runtime_quiescence and not any(
+            (
+                self.runtime_active_turns,
+                self.runtime_active_tools,
+                self.runtime_active_subagents,
+                self.runtime_active_critical_sections,
+            )
+        ):
+            return None
+        turn = "turn" if self.runtime_active_turns == 1 else "turns"
+        tool = "tool" if self.runtime_active_tools == 1 else "tools"
+        subagent = (
+            "subagent" if self.runtime_active_subagents == 1 else "subagents"
+        )
+        return (
+            f"{self.runtime_active_turns} {turn} · "
+            f"{self.runtime_active_tools} {tool} · "
+            f"{self.runtime_active_subagents} {subagent} · "
+            f"{self.runtime_active_critical_sections} critical"
+        )
 
     @property
     def agent_state(self) -> str:

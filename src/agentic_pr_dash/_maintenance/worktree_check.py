@@ -544,7 +544,7 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             ),
         )
 
-    coordinator_claim_id: str | None = None
+    coordinator_claim: coordinator.ClaimHandle | None = None
     coordinator_fingerprint: str | None = None
     if claim:
         # Creating/refreshing a claim is a WRITE — the passive stop-gate probe
@@ -565,8 +565,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
                 owner_desc="active agent-coordinator claim",
             )
         if claimed is not None:
-            coordinator_claim_id = claimed.claim_id
-            coordinator_fingerprint = claimed.task.fingerprint
+            coordinator_claim = claimed
+            coordinator_fingerprint = coordinator.fingerprint_for_pr(pr)
 
         # We will service: refresh the heartbeat and set the long fix lease.
         markers._touch_owner_heartbeat(cwd, self_session_id, True)
@@ -579,9 +579,10 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
     summary = maintenance.build_maintenance_summary(pr)
     text = f"{prompt}\nSUMMARY={summary}\nPR_NUMBER={pr.number}"
-    if coordinator_claim_id is not None:
+    if coordinator_claim is not None:
         text += (
-            f"\nCOORDINATOR_CLAIM_ID={coordinator_claim_id}"
+            f"\nCOORDINATOR_CLAIM_ID={coordinator_claim.claim_id}"
+            f"\nCOORDINATOR_LEASE_EPOCH={coordinator_claim.lease_epoch}"
             f"\nCOORDINATOR_TASK_FINGERPRINT={coordinator_fingerprint}"
         )
     return 10, text

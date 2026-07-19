@@ -104,8 +104,8 @@ def test_tick_increments_streak_on_spawn_failure(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", lambda cmd, *a, **k: fake_check(cmd, *a, **k))
     monkeypatch.setattr(loop, "_run_executor", boom)
-    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda *a, **k: None)
-    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop, "record_executor_failure",
                         lambda cwd, pr, err: recorded_failures.append((cwd, pr, err)) or 1)
     monkeypatch.setattr(loop, "_maybe_escalate", lambda *a, **k: None)
@@ -137,8 +137,8 @@ def test_tick_increments_streak_on_nonzero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: 1)  # non-zero
-    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda *a, **k: None)
-    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop, "record_executor_failure",
                         lambda cwd, pr, err: recorded_failures.append((cwd, pr, err)) or 1)
     monkeypatch.setattr(loop, "_maybe_escalate", lambda *a, **k: None)
@@ -176,8 +176,8 @@ def test_tick_resets_streak_on_success(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: 0)  # success
-    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda *a, **k: None)
-    monkeypatch.setattr(loop.coordinator, "release_claim_id", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop, "reset_executor_failure",
                         lambda cwd, pr: reset_calls.append((cwd, pr)))
 

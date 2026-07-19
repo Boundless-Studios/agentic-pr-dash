@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from threading import Event
+import time
 
 import pytest
 from agentic_pr_dash._maintenance import markers as _markers_mod
@@ -203,6 +206,47 @@ def test_record_event_self_compacts_over_threshold(tmp_path, monkeypatch):
 
     ids = {e["session_id"] for e in sr.read_events(path=reg)}
     assert ids == {"live"}, "self-compaction should drop the old terminal sessions"
+
+
+def test_compaction_cannot_replace_a_concurrent_append(tmp_path, monkeypatch):
+    from agentic_pr_dash import session_registry as sr
+
+    reg = tmp_path / "events.jsonl"
+    old = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat().replace(
+        "+00:00", "Z"
+    )
+    reg.write_text(
+        json.dumps(
+            {"session_id": "dead-old", "event": "completed", "timestamp": old}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    replace_reached = Event()
+    allow_replace = Event()
+    original_replace = sr.os.replace
+
+    def paused_replace(source, destination):
+        replace_reached.set()
+        assert allow_replace.wait(timeout=2)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(sr.os, "replace", paused_replace)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        compact = executor.submit(sr.compact_registry, path=reg, retention_seconds=1)
+        assert replace_reached.wait(timeout=2)
+        append = executor.submit(
+            sr.record_event,
+            event="started",
+            session_id="live",
+            path=reg,
+        )
+        time.sleep(0.02)
+        allow_replace.set()
+        assert compact.result(timeout=2) == 1
+        append.result(timeout=2)
+
+    assert {event["session_id"] for event in sr.read_events(path=reg)} == {"live"}
 
 
 # ---------------------------------------------------------------------------
