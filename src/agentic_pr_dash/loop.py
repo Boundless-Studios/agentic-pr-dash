@@ -129,6 +129,12 @@ _DEFAULT_TICK_INTERVAL_S = 600.0
 # multi-decade staleness window. No real maintenance loop ticks slower than
 # daily, so anything larger marks the record corrupt (PR #76 review).
 LOOP_HEALTH_MAX_INTERVAL_S = 86400.0
+# Tolerance for a heartbeat slightly AHEAD of the reader's clock (NTP nudges,
+# cross-process timer skew). Anything further in the future is a corrupt or
+# hand-written value (e.g. 1e308) or a large backward wall-clock jump — either
+# way ``now - heartbeat`` would be negative and the record would pass the
+# freshness check effectively forever, so fail closed (PR #76 review).
+LOOP_HEALTH_MAX_CLOCK_SKEW_S = 120.0
 
 
 def _pr_health_entries(data: dict) -> dict:
@@ -148,6 +154,7 @@ def record_loop_health(
     executors_viable: bool,
     errors: dict | None = None,
     interval: float | None = None,
+    session_id: str = "",
 ) -> None:
     """Persist the loop's heartbeat + executor-viability record (BOU-2086).
 
@@ -155,13 +162,23 @@ def record_loop_health(
     failure — so coverage readers can distinguish "daemon process exists" from
     "daemon can actually service PRs". ``errors`` retains the CONCRETE
     per-executor error strings (both primary and fallback) for diagnosis.
+
+    ``session_id`` is the loop's ``--session-id`` scope (empty for the
+    machine-wide daemon). It is persisted as ``scope`` so coverage readers can
+    tell a machine-wide heartbeat from a session-scoped one — a scoped loop
+    stamps the same repo-wide health file but only services its own session's
+    worktrees, so its heartbeat must never grant machine-wide coverage
+    (PR #76 review).
     """
     data = _load_health(cwd)
     entry: dict = {
         "heartbeat": time.time(),
         "pid": os.getpid(),
         "executors_viable": bool(executors_viable),
+        "scope": "session" if session_id else "machine",
     }
+    if session_id:
+        entry["session_id"] = str(session_id)[:200]
     clean_errors = {k: str(v)[:500] for k, v in (errors or {}).items() if v}
     if clean_errors:
         entry["errors"] = clean_errors
@@ -207,12 +224,14 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     """True when the loop's health record is FRESH, executors are viable, AND
     the process that recorded it is still alive.
 
-    Fail-closed: a missing/corrupt record, a stale heartbeat, a non-boolean
+    Fail-closed: a missing/corrupt record, a stale heartbeat, a heartbeat in
+    the future beyond ``LOOP_HEALTH_MAX_CLOCK_SKEW_S``, a non-boolean
     ``executors_viable`` value, an explicit ``executors_viable: false``, a
     dead (or positively-identified zombie) recorded pid, a non-finite
-    ``heartbeat``/``interval``, or an interval beyond
-    ``LOOP_HEALTH_MAX_INTERVAL_S`` all return False — pid-alive alone must
-    never count as maintenance coverage (BOU-2086).
+    ``heartbeat``/``interval``, an interval beyond
+    ``LOOP_HEALTH_MAX_INTERVAL_S``, or a record not written by the
+    machine-wide loop (``scope`` != ``"machine"``) all return False —
+    pid-alive alone must never count as maintenance coverage (BOU-2086).
     """
     entry = loop_health_entry(cwd)
     # Require a REAL boolean True. This health record is the fail-closed
@@ -220,6 +239,15 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     # from a shell/tooling writer or a hand-edited file) must read as
     # unhealthy (PR #76 review).
     if entry.get("executors_viable") is not True:
+        return False
+    # Require the record to have been written by the MACHINE-WIDE loop. A
+    # session-scoped ``loop --session-id ...`` runs the same _tick and stamps
+    # this same repo-wide health file, but only discovers worktrees owned by
+    # that session — its heartbeat is not machine-wide coverage and must not
+    # suppress other sessions' waiters. Absent scope (older snapshot,
+    # hand-written file) fails closed like any other unprovable record
+    # (PR #76 review).
+    if entry.get("scope") != "machine":
         return False
     # The heartbeat must be tied to a live servicing process: the daemon
     # pidfile can hold a supervisor/wrapper pid that outlives the python loop,
@@ -258,6 +286,12 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
         return False
     max_age = max(LOOP_HEALTH_INTERVAL_MULTIPLIER * interval, LOOP_HEALTH_MIN_FRESH_S)
     now = time.time() if now is None else now
+    # A finite heartbeat in the FUTURE (corrupt value like 1e308, or a large
+    # backward wall-clock adjustment) makes ``now - heartbeat`` negative and
+    # would satisfy any max_age indefinitely. Allow only a small clock-skew
+    # tolerance; beyond that the record is invalid (PR #76 review).
+    if heartbeat - now > LOOP_HEALTH_MAX_CLOCK_SKEW_S:
+        return False
     return (now - heartbeat) <= max_age
 
 
@@ -810,6 +844,7 @@ def _tick(args, executor: str) -> None:
             stamped_health_files.add(hf)
             record_loop_health(
                 cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
+                session_id=args.session_id or "",
             )
         if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
             continue
@@ -861,6 +896,7 @@ def _tick(args, executor: str) -> None:
             if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
                 record_loop_health(
                     cwd, executors_viable=False, errors=exec_errors, interval=interval,
+                    session_id=args.session_id or "",
                 )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
@@ -957,7 +993,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 record_loop_health(
                     cwd, executors_viable=False, errors=startup_errors,
-                    interval=args.interval,
+                    interval=args.interval, session_id=args.session_id or "",
                 )
             except Exception:  # noqa: BLE001 — never mask the loud exit
                 pass

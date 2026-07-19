@@ -101,6 +101,7 @@ def test_stale_heartbeat_is_not_coverage(tmp_path):
         "pid": os.getpid(),
         "executors_viable": True,
         "interval": 600,
+        "scope": "machine",
     }
     loop._save_health(cwd, data)
     assert loop.loop_health_ok(cwd) is False
@@ -131,6 +132,7 @@ def test_non_boolean_viability_value_fails_closed(tmp_path, bad_viable):
         "pid": os.getpid(),
         "executors_viable": bad_viable,
         "interval": 600,
+        "scope": "machine",
     }
     loop._save_health(cwd, data)
     assert loop.loop_health_ok(cwd) is False
@@ -154,6 +156,7 @@ def test_dead_recorded_health_pid_is_not_coverage(tmp_path):
         "pid": proc.pid,
         "executors_viable": True,
         "interval": 600,
+        "scope": "machine",
     }
     loop._save_health(cwd, data)
     assert loop.loop_health_ok(cwd) is False
@@ -166,6 +169,7 @@ def _write_loop_record(cwd: str, **overrides) -> None:
         "pid": os.getpid(),
         "executors_viable": True,
         "interval": 600,
+        "scope": "machine",
     }
     entry.update(overrides)
     data = loop._load_health(cwd)
@@ -321,10 +325,97 @@ def test_missing_recorded_health_pid_fails_closed(tmp_path):
         "heartbeat": time.time(),
         "executors_viable": True,
         "interval": 600,
+        "scope": "machine",
     }
     loop._save_health(cwd, data)
     assert loop.loop_health_ok(cwd) is False
     assert mc._detached_loop_alive(cwd) is False
+
+
+# ---------------------------------------------------------------------------
+# Machine-scope binding + future-heartbeat rejection (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_session_scoped_health_record_is_not_machine_coverage(tmp_path):
+    """A ``loop --session-id ...`` run executes the same ``_tick`` and stamps
+    the same repo-wide health file, but it only discovers worktrees owned by
+    that session. Its fresh viable record must NOT read as machine-wide
+    coverage, or waiters for other sessions' PRs would be suppressed while a
+    scoped loop never services them (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, session_id="sess-scoped",
+    )
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_machine_scope_recorded_by_default_and_grants_coverage(tmp_path):
+    """A loop started WITHOUT ``--session-id`` is the machine-wide daemon: its
+    record carries ``scope: machine`` and grants coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] == "machine"
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+@pytest.mark.parametrize(
+    "bad_scope", ["session", "", "MACHINE", 1, True, None, ["machine"]]
+)
+def test_non_machine_scope_fails_closed(tmp_path, bad_scope):
+    """Only the exact string ``"machine"`` grants coverage — any other value
+    (scoped writer, hand-edit, corruption) fails closed."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, scope=bad_scope)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_absent_scope_fails_closed(tmp_path):
+    """A record with NO scope field (older package snapshot, hand-written file)
+    cannot prove it was written by the machine-wide loop → not coverage,
+    consistent with the fail-closed posture for older snapshots."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": True,
+        "interval": 600,
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("future_offset", [1e308, 3600.0, 86400.0])
+def test_future_heartbeat_fails_closed(tmp_path, future_offset):
+    """A finite heartbeat in the FUTURE (corrupt/hand-written value like 1e308,
+    or a backward wall-clock jump) makes ``now - heartbeat`` negative, granting
+    coverage effectively forever while the pids stay live. Fail closed on
+    anything beyond a small clock-skew tolerance (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    hb = 1e308 if future_offset == 1e308 else time.time() + future_offset
+    _write_loop_record(cwd, heartbeat=hb)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_small_clock_skew_heartbeat_still_grants_coverage(tmp_path):
+    """Boundary guard: sub-tolerance forward skew (e.g. NTP nudge between
+    writer and reader hosts/processes) must not cause false-uncovered."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=time.time() + 30)
+    assert loop.loop_health_ok(cwd) is True
 
 
 # ---------------------------------------------------------------------------

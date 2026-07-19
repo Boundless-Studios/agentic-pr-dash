@@ -190,9 +190,12 @@ def _detached_loop_alive(cwd: str) -> bool:
     Fail-closed: an absent/stale/degraded record — including one written by an
     older package snapshot that never records health — means "not covered", which
     at worst forces a cheap per-session waiter. ``loop_health_ok`` additionally
-    requires the record's OWN recorded pid to be live and ``executors_viable``
-    to be a real boolean True, so a wrapper pid outliving a dead python loop
-    (or a corrupt health file) never suppresses the waiter (PR #76 review).
+    requires the record's OWN recorded pid to be live, ``executors_viable``
+    to be a real boolean True, AND the record's ``scope`` to be ``"machine"``,
+    so a wrapper pid outliving a dead python loop, a corrupt health file, or a
+    session-scoped ``loop --session-id`` writer (which stamps the same
+    repo-wide health file but only services its own session's worktrees)
+    never suppresses the waiter (PR #76 review).
     """
     cfg = load_config(cwd)
     if not cfg.maintenance_loop_machine_wide:
