@@ -171,7 +171,7 @@ def _load_health(cwd: str) -> dict:
         raw = _health_file(cwd).read_text(encoding="utf-8")
         data = __import__("json").loads(raw)
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
@@ -324,7 +324,7 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     the future beyond ``LOOP_HEALTH_MAX_CLOCK_SKEW_S``, a non-boolean
     ``executors_viable`` value, an explicit ``executors_viable: false``, a
     dead (or positively-identified zombie) recorded pid, a non-finite
-    ``heartbeat``/``interval``, an interval beyond
+    ``heartbeat``/``interval``, a present malformed interval, an interval beyond
     ``LOOP_HEALTH_MAX_INTERVAL_S``, or a record not written by the
     machine-wide loop (``scope`` != ``"machine"``) all return False —
     pid-alive alone must never count as maintenance coverage (BOU-2086).
@@ -370,14 +370,16 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
         heartbeat = float(entry["heartbeat"])
     except (KeyError, TypeError, ValueError, OverflowError):
         return False
+    interval_raw = entry.get("interval", _DEFAULT_TICK_INTERVAL_S)
+    # Only records written before interval persistence may use the default.
+    # A present value came from JSON, where a real numeric interval can only be
+    # an int or float; strings, containers, null, and booleans are corrupt state
+    # and must not silently receive a healthy 600-second freshness window.
+    if isinstance(interval_raw, bool) or not isinstance(interval_raw, (int, float)):
+        return False
     try:
-        interval = float(entry.get("interval") or _DEFAULT_TICK_INTERVAL_S)
-    except (TypeError, ValueError):
-        interval = _DEFAULT_TICK_INTERVAL_S
-    except OverflowError:
-        # Unlike unparseable garbage (which falls back to the default tick),
-        # an overflowing interval is an out-of-range value — same class as the
-        # finite-but-huge interval rejected below, so fail closed.
+        interval = float(interval_raw)
+    except (TypeError, ValueError, OverflowError):
         return False
     # JSON like ``1e309`` parses to inf: a non-finite heartbeat makes
     # ``now - heartbeat`` -inf (granting coverage forever) and a non-finite

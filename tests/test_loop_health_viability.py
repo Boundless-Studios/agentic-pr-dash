@@ -119,6 +119,28 @@ def test_corrupt_health_record_fails_closed(tmp_path):
     assert mc._detached_loop_alive(cwd) is False
 
 
+def test_recursive_json_decode_failure_fails_closed_without_raising(tmp_path, monkeypatch):
+    """Treat decoder recursion failures like any other corrupt health file.
+
+    Python versions differ on whether deeply nested valid JSON raises
+    ``RecursionError`` or ``JSONDecodeError``, so inject the former explicitly.
+    """
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    health_file = loop._health_file(cwd)
+    health_file.parent.mkdir(parents=True, exist_ok=True)
+    health_file.write_text("[]", encoding="utf-8")
+
+    def recursive_failure(_raw):
+        raise RecursionError("maximum recursion depth exceeded while decoding JSON")
+
+    monkeypatch.setattr(json, "loads", recursive_failure)
+
+    assert loop._load_health(cwd) == {}
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
 @pytest.mark.parametrize("bad_viable", ["false", "true", 1, "yes", [True]])
 def test_non_boolean_viability_value_fails_closed(tmp_path, bad_viable):
     """``executors_viable`` must be a REAL boolean True — a truthy string like
@@ -291,6 +313,28 @@ def test_non_finite_interval_fails_closed(tmp_path, bad_interval):
     _write_loop_record(cwd, interval=bad_interval)
     assert loop.loop_health_ok(cwd) is False
     assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_interval", ["bad", [], {}, None, False])
+def test_present_malformed_interval_fails_closed(tmp_path, bad_interval):
+    """Only an absent legacy interval may use the compatibility default."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=bad_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_absent_interval_uses_legacy_default(tmp_path):
+    """Records written before interval persistence remain valid while fresh."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY].pop("interval")
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
 
 
 @pytest.mark.parametrize("huge_interval", [1e308, 1e9])
