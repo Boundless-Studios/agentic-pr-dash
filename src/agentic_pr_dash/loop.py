@@ -123,6 +123,12 @@ LOOP_HEALTH_KEY = "__loop__"
 LOOP_HEALTH_MIN_FRESH_S = 900.0
 LOOP_HEALTH_INTERVAL_MULTIPLIER = 3.0
 _DEFAULT_TICK_INTERVAL_S = 600.0
+# Sanity ceiling on a recorded tick interval (one day). A finite-but-huge
+# interval (e.g. 1e308) passes isfinite yet overflows the freshness
+# multiplication to inf — and even a non-overflowing 1e9 would grant a
+# multi-decade staleness window. No real maintenance loop ticks slower than
+# daily, so anything larger marks the record corrupt (PR #76 review).
+LOOP_HEALTH_MAX_INTERVAL_S = 86400.0
 
 
 def _pr_health_entries(data: dict) -> dict:
@@ -203,9 +209,10 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
 
     Fail-closed: a missing/corrupt record, a stale heartbeat, a non-boolean
     ``executors_viable`` value, an explicit ``executors_viable: false``, a
-    dead (or positively-identified zombie) recorded pid, or a non-finite
-    ``heartbeat``/``interval`` all return False — pid-alive alone must never
-    count as maintenance coverage (BOU-2086).
+    dead (or positively-identified zombie) recorded pid, a non-finite
+    ``heartbeat``/``interval``, or an interval beyond
+    ``LOOP_HEALTH_MAX_INTERVAL_S`` all return False — pid-alive alone must
+    never count as maintenance coverage (BOU-2086).
     """
     entry = loop_health_entry(cwd)
     # Require a REAL boolean True. This health record is the fail-closed
@@ -242,6 +249,12 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     # interval makes the freshness window infinite — either way the record is
     # invalid, so fail closed (PR #76 review).
     if not math.isfinite(heartbeat) or not math.isfinite(interval):
+        return False
+    # isfinite alone is not enough: a finite-but-huge interval (1e308) still
+    # overflows the multiplication below to inf, accepting arbitrarily stale
+    # heartbeats. Bound the interval so the COMPUTED freshness window is
+    # always finite and sane (PR #76 review).
+    if interval > LOOP_HEALTH_MAX_INTERVAL_S:
         return False
     max_age = max(LOOP_HEALTH_INTERVAL_MULTIPLIER * interval, LOOP_HEALTH_MIN_FRESH_S)
     now = time.time() if now is None else now

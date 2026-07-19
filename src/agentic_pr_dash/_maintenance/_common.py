@@ -36,29 +36,41 @@ def _fix_lease_seconds() -> int:
     return load_config().lease_seconds
 
 
+# Real pids fit in 10 decimal digits (Linux pid_max caps at 2**22; even a full
+# 32-bit pid_t is 10 digits). Anything longer is corrupt — and must be rejected
+# BEFORE int(): Python 3.11+'s int-str conversion limit raises ValueError on
+# >4300-digit strings, ahead of any probe-level handling (PR #76 review).
+_PID_MAX_DIGITS = 10
+
+
 def _pid_alive(pid_raw: str) -> bool:
     """True only when ``pid_raw`` names a probe-ably live process.
 
     Fail closed on malformed input: ``str.isdigit()`` accepts non-ASCII
-    digits (e.g. ``"²"``) that ``int()`` rejects, and a huge decimal string
-    converts fine but overflows ``os.kill``'s C pid_t — either would raise
-    out of here and (via broad handlers upstream, e.g. the stop-gate's
-    catch-all) release an uncovered PR. Any conversion/probe error means
-    "not alive" (PR #76 review).
+    digits (e.g. ``"²"``) that ``int()`` rejects, an oversized decimal string
+    makes ``int()`` itself raise (3.11+ digit limit), and a huge-but-convertible
+    value overflows ``os.kill``'s C pid_t — any of these would raise out of
+    here and (via broad handlers upstream, e.g. the stop-gate's catch-all)
+    release an uncovered PR. Any conversion/probe error means "not alive"
+    (PR #76 review).
     """
     if not (pid_raw.isascii() and pid_raw.isdigit()):
         return False
-    pid = int(pid_raw)
-    if pid <= 0:
-        # kill(0, 0) probes the whole process group, not a recorded process.
+    if len(pid_raw) > _PID_MAX_DIGITS:
         return False
     try:
+        pid = int(pid_raw)
+        if pid <= 0:
+            # kill(0, 0) probes the whole process group, not a recorded process.
+            return False
         os.kill(pid, 0)  # signal 0: existence probe only
     except ProcessLookupError:
         return False
     except PermissionError:
         return True  # alive, owned by another uid
-    except (OverflowError, OSError):
+    except (ValueError, OverflowError, OSError):
+        # ValueError is unreachable given the guards above; kept so a future
+        # guard regression still fails closed instead of raising.
         return False
     return True
 

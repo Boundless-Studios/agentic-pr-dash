@@ -179,6 +179,7 @@ def _write_loop_record(cwd: str, **overrides) -> None:
         "²",  # str.isdigit() True, but int() raises ValueError
         "١٢٣",  # non-ASCII decimal digits: int() accepts, but not a recorded pid
         10**20,  # int() fine, os.kill overflows C pid_t → OverflowError
+        "9" * 5000,  # >4300 ASCII digits: int() itself raises ValueError (3.11+ limit)
         "0",  # kill(0, 0) probes the process group, not a recorded process
         "-1",
         "12x",
@@ -197,7 +198,9 @@ def test_malformed_health_pid_fails_closed_without_raising(tmp_path, bad_pid):
     assert mc._detached_loop_alive(cwd) is False
 
 
-@pytest.mark.parametrize("bad_pid", ["²", "١٢٣", str(10**20), "0", "-1", "12x", ""])
+@pytest.mark.parametrize(
+    "bad_pid", ["²", "١٢٣", str(10**20), "9" * 5000, "0", "-1", "12x", ""]
+)
 def test_pid_alive_malformed_input_is_false_not_raise(bad_pid):
     """The shared ``_pid_alive`` helper (waiter/markers/ownership/stop-gate all
     use it) must fail closed on any unconvertible or unprobe-able pid string."""
@@ -283,6 +286,29 @@ def test_non_finite_interval_fails_closed(tmp_path, bad_interval):
     _write_loop_record(cwd, interval=bad_interval)
     assert loop.loop_health_ok(cwd) is False
     assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("huge_interval", [1e308, 1e9])
+def test_oversized_finite_interval_fails_closed(tmp_path, huge_interval):
+    """A finite-but-huge ``interval`` (e.g. ``1e308``) passes ``isfinite`` yet
+    ``LOOP_HEALTH_INTERVAL_MULTIPLIER * interval`` overflows to ``inf`` — and
+    even a non-overflowing 1e9 grants a ~95-year freshness window. Either way
+    the record cannot describe a real ticking loop, so it must not count as
+    coverage (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=huge_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_max_sane_interval_still_grants_coverage(tmp_path):
+    """Boundary guard: the oversized-interval rejection must not over-tighten —
+    an interval at the sanity bound with a fresh heartbeat stays healthy."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=loop.LOOP_HEALTH_MAX_INTERVAL_S)
+    assert loop.loop_health_ok(cwd) is True
 
 
 def test_missing_recorded_health_pid_fails_closed(tmp_path):
