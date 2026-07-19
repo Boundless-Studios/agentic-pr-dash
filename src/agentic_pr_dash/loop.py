@@ -19,6 +19,8 @@ dependence on ``claude``/``codex``.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import os
 import shlex
 import shutil
@@ -30,6 +32,7 @@ from pathlib import Path
 
 from . import coordinator
 from ._maintenance import worktree_check
+from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
 from .config import load as load_config
@@ -50,6 +53,23 @@ def _daemon_dir(cwd: str) -> Path:
     return Path.home() / ".claude" / "daemons"
 
 
+def _raw_repo_identity(cwd: str) -> str:
+    """The RAW (un-sanitized) canonical repo identity for ``cwd``.
+
+    ``owner/name`` when resolvable (so the loop writer and the stop-gate /
+    orchestrator readers agree regardless of whether they run from the worktree
+    or the main checkout), else the worktree dir name, else ``"repo"``.
+    """
+    repo = load_config(cwd).resolved_repo(Path(cwd))
+    return repo or Path(cwd).resolve().name or "repo"
+
+
+def _sanitized_repo_slug(raw: str) -> str:
+    """Filesystem-safe form of ``raw`` (``/`` and other non-``[A-Za-z0-9-_.]``
+    chars → ``-``)."""
+    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+
+
 @lru_cache(maxsize=64)
 def _repo_slug(cwd: str) -> str:
     """Filesystem-safe identifier for the repo a worktree belongs to.
@@ -62,19 +82,87 @@ def _repo_slug(cwd: str) -> str:
     the *filename* by repo keeps the JSON keys as bare PR numbers, so the
     stop-gate / dashboard readers (which parse ``int(key)``) stay valid.
 
-    Uses ``resolved_repo`` (canonical ``owner/name``) so the loop writer and the
-    stop-gate / orchestrator readers derive the SAME slug regardless of whether
-    they run from the worktree or the main checkout. Cached because that resolve
-    can shell out to ``gh``/``git`` and is hit on every streak read.
+    Cached because the repo resolve can shell out to ``gh``/``git`` and is hit
+    on every streak read.
     """
-    repo = load_config(cwd).resolved_repo(Path(cwd))
-    raw = repo or Path(cwd).resolve().name or "repo"
-    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    raw = _raw_repo_identity(cwd)
+    safe = _sanitized_repo_slug(raw)
+    # Sanitizing ``/`` to ``-`` collapses distinct repos ("acme/foo-bar" and
+    # "acme-foo/bar" both become "acme-foo-bar"), so two independent repos
+    # sharing the daemon dir would read/write the SAME health/escalation file
+    # — one repo's healthy record would grant stop-gate coverage to a repo the
+    # loop never services. Suffix a digest of the RAW identity so distinct
+    # repos can never share a file (PR #76 review).
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}-{digest}"
+
+
+@lru_cache(maxsize=64)
+def _legacy_repo_slug(cwd: str) -> str:
+    """The pre-PR#76 slug (sanitized identity, NO digest suffix).
+
+    Retained ONLY so :func:`_migrate_legacy_state` can find health/escalation
+    files an OLDER install wrote under the digest-less name and move them to the
+    current name — so streaks and escalation markers survive an in-place upgrade
+    (PR #76 review)."""
+    return _sanitized_repo_slug(_raw_repo_identity(cwd))
+
+
+def _health_filename(slug: str) -> str:
+    return f"pr-maintenance-loop.health.{slug}.json"
+
+
+def _escalated_filename(slug: str) -> str:
+    return f"pr-maintenance-loop.escalated.{slug}.json"
+
+
+@lru_cache(maxsize=64)
+def _migrate_legacy_state(cwd: str) -> None:
+    """One-time, best-effort migration of pre-PR#76 loop state (BOU-2086).
+
+    PR #76 appended an ``sha256`` digest to :func:`_repo_slug` so distinct repos
+    sharing the daemon dir can no longer collide on one health/escalation file.
+    That rename orphans every file an older install wrote under the digest-less
+    slug: the per-PR executor-failure streaks read back as zero and escalation
+    markers disappear, so a PR that had reached the escalation threshold would
+    resume being treated as loop-covered after the upgrade. Move the legacy
+    files to the new names on first access.
+
+    Only migrates when the NEW file is ABSENT, so it never clobbers fresh
+    post-upgrade state. If two repos collided on the legacy slug (the very case
+    the digest fixed), the first to migrate wins the shared file and the other
+    starts clean — no worse than the pre-fix collision it replaces. Routed
+    through both path funnels (:func:`_health_file` /
+    :func:`_escalated_marker_path`) so every reader — including the stop-gate's
+    ``_read_escalation_marker`` — triggers it; lru_cached to run once per cwd.
+    """
+    # Best-effort and fail-safe: resolving the slug can shell out to git/gh, and
+    # a migration miss only reverts to the pre-fix (state-reset) behavior — it
+    # must NEVER raise into the path funnels that call this, or health/escalation
+    # resolution (and the loop) would break. Swallow everything.
+    try:
+        legacy_slug = _legacy_repo_slug(cwd)
+        new_slug = _repo_slug(cwd)
+        if legacy_slug == new_slug:
+            return
+        daemon_dir = _daemon_dir(cwd)
+        for filename in (_health_filename, _escalated_filename):
+            new_path = daemon_dir / filename(new_slug)
+            legacy_path = daemon_dir / filename(legacy_slug)
+            try:
+                if new_path.exists() or not legacy_path.exists():
+                    continue
+                os.replace(legacy_path, new_path)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 — migration is best-effort; never break path resolution
+        pass
 
 
 def _health_file(cwd: str) -> Path:
     """Path to the per-repo loop health JSON file."""
-    return _daemon_dir(cwd) / f"pr-maintenance-loop.health.{_repo_slug(cwd)}.json"
+    _migrate_legacy_state(cwd)
+    return _daemon_dir(cwd) / _health_filename(_repo_slug(cwd))
 
 
 def _load_health(cwd: str) -> dict:
@@ -83,7 +171,7 @@ def _load_health(cwd: str) -> dict:
         raw = _health_file(cwd).read_text(encoding="utf-8")
         data = __import__("json").loads(raw)
         return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return {}
 
 
@@ -102,6 +190,279 @@ def _save_health(cwd: str, data: dict) -> None:
         os.replace(tmp_path, hf)
     except OSError:
         pass
+
+
+def _mutate_health(cwd: str, apply):
+    """Run ``apply(data)`` on the loaded health dict and persist it, serialized
+    by a cross-process exclusive lock. ``apply`` mutates ``data`` in place and
+    may return a value, which is returned to the caller.
+
+    :func:`_save_health` already writes atomically (os.replace), so a reader
+    never sees a torn JSON file. But atomicity does NOT prevent a lost UPDATE: a
+    bare load-modify-save is racy because two supported loop modes (a
+    machine-wide loop and a session-scoped loop) stamp the SAME repo-wide health
+    file. A machine tick can load, a session loop can then persist a
+    freshly-failed PR streak, and the machine tick's save (holding only
+    ``__loop__``) reverts the streak to absent — after which ``_loop_covers_pr``
+    again reads the repeatedly-failing PR as covered and suppresses its waiter.
+    Loading AND saving under the lock serializes the read-modify-write windows so
+    no writer clobbers another's committed streak (PR #76 review).
+
+    The lock is best-effort: on a platform without ``fcntl`` (non-POSIX) or if
+    the lock file can't be opened, it degrades to an unlocked mutate rather than
+    dropping the write entirely.
+    """
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError:  # pragma: no cover — non-POSIX: degrade to unlocked
+        fcntl = None  # type: ignore[assignment]
+    lock_fd: int | None = None
+    if fcntl is not None:
+        try:
+            hf = _health_file(cwd)
+            hf.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = hf.with_name(hf.name + ".lock")
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        except OSError:
+            if lock_fd is not None:
+                try:
+                    os.close(lock_fd)
+                except OSError:
+                    pass
+                lock_fd = None
+    try:
+        data = _load_health(cwd)
+        result = apply(data)
+        _save_health(cwd, data)
+        return result
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+
+
+# ---------------------------------------------------------------------------
+# Loop health record (BOU-2086)
+# ---------------------------------------------------------------------------
+# Reserved (non-numeric) key in the per-repo health file holding the LOOP's own
+# health record — heartbeat + executor viability — alongside the per-PR streak
+# entries (whose keys are bare PR numbers). Coverage checks require this record
+# to be FRESH and viable; a live wrapper/daemon PID alone is not proof the loop
+# can actually dispatch an executor (both executors can be unreachable while the
+# process idles), so pid-alive-only coverage left red PRs unwatched.
+LOOP_HEALTH_KEY = "__loop__"
+
+# Freshness floor (seconds) for the loop heartbeat. The effective max age is
+# max(LOOP_HEALTH_INTERVAL_MULTIPLIER * recorded tick interval, this floor) so a
+# short-interval loop isn't declared stale during one long executor dispatch.
+LOOP_HEALTH_MIN_FRESH_S = 900.0
+LOOP_HEALTH_INTERVAL_MULTIPLIER = 3.0
+_DEFAULT_TICK_INTERVAL_S = 600.0
+# Sanity ceiling on a recorded tick interval (one day). A finite-but-huge
+# interval (e.g. 1e308) passes isfinite yet overflows the freshness
+# multiplication to inf — and even a non-overflowing 1e9 would grant a
+# multi-decade staleness window. No real maintenance loop ticks slower than
+# daily, so anything larger marks the record corrupt (PR #76 review).
+LOOP_HEALTH_MAX_INTERVAL_S = 86400.0
+# Tolerance for a heartbeat slightly AHEAD of the reader's clock (NTP nudges,
+# cross-process timer skew). Anything further in the future is a corrupt or
+# hand-written value (e.g. 1e308) or a large backward wall-clock jump — either
+# way ``now - heartbeat`` would be negative and the record would pass the
+# freshness check effectively forever, so fail closed (PR #76 review).
+LOOP_HEALTH_MAX_CLOCK_SKEW_S = 120.0
+
+
+def _pr_health_entries(data: dict) -> dict:
+    """The per-PR streak entries of a health dict (drops the loop record)."""
+    return {k: v for k, v in data.items() if k != LOOP_HEALTH_KEY}
+
+
+def loop_health_entry(cwd: str) -> dict:
+    """The loop's own health record from the per-repo health file, or {}."""
+    entry = _load_health(cwd).get(LOOP_HEALTH_KEY)
+    return entry if isinstance(entry, dict) else {}
+
+
+def record_loop_health(
+    cwd: str,
+    *,
+    executors_viable: bool,
+    errors: dict | None = None,
+    interval: float | None = None,
+    session_id: str = "",
+    no_discover_worktrees: bool = False,
+    once: bool = False,
+) -> None:
+    """Persist the loop's heartbeat + executor-viability record (BOU-2086).
+
+    Written on every tick (viable or not) and on startup executor-validation
+    failure — so coverage readers can distinguish "daemon process exists" from
+    "daemon can actually service PRs". ``errors`` retains the CONCRETE
+    per-executor error strings (both primary and fallback) for diagnosis.
+
+    The record's ``scope`` tells coverage readers whether this heartbeat is
+    machine-wide coverage. It is ``"machine"`` ONLY when the loop enumerates
+    every worktree in the repo — i.e. no ``--session-id`` AND full discovery.
+    A ``--session-id`` loop is ``"session"`` (services only its own session's
+    worktrees), a ``--no-discover-worktrees`` loop is ``"restricted"`` (services
+    only its explicit ``--cwd`` set), and a ``--once`` loop is ``"oneshot"``
+    (``main()`` exits after this single tick, so its heartbeat is not durable
+    coverage — a stop-gate reached mid-tick must not suppress a waiter the
+    exiting one-shot will never replace). All still stamp the same repo-wide
+    health file, so if any read as machine-wide coverage it would suppress
+    waiters for worktrees/windows it never services — only ``"machine"`` grants
+    coverage in :func:`loop_health_ok` (PR #76 review).
+    """
+    if session_id:
+        scope = "session"
+    elif no_discover_worktrees:
+        scope = "restricted"
+    elif once:
+        scope = "oneshot"
+    else:
+        scope = "machine"
+    entry: dict = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": bool(executors_viable),
+        "scope": scope,
+    }
+    if session_id:
+        entry["session_id"] = str(session_id)[:200]
+    clean_errors = {k: str(v)[:500] for k, v in (errors or {}).items() if v}
+    if clean_errors:
+        entry["errors"] = clean_errors
+    if interval is not None:
+        try:
+            entry["interval"] = float(interval)
+        except (TypeError, ValueError):
+            pass
+    _mutate_health(cwd, lambda data: data.__setitem__(LOOP_HEALTH_KEY, entry))
+
+
+def _pid_state(pid: int) -> str | None:
+    """Best-effort process-state code for ``pid`` (e.g. ``"R"``, ``"S"``, ``"Z"``).
+
+    Linux: the field after the LAST ``)`` in ``/proc/<pid>/stat`` (the comm
+    field may itself contain parentheses). Elsewhere (macOS/BSD): ``ps -o
+    stat=``. Returns None when the state cannot be determined (no /proc entry,
+    ``ps`` missing/failed, permissions) so callers can keep the plain
+    ``kill(0)`` liveness verdict instead of manufacturing false-deads.
+    """
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        fields = raw.rpartition(")")[2].split()
+        if fields:
+            return fields[0]
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    state = out.stdout.strip().split()
+    return state[0] if state else None
+
+
+def loop_health_ok(cwd: str, now: float | None = None) -> bool:
+    """True when the loop's health record is FRESH, executors are viable, AND
+    the process that recorded it is still alive.
+
+    Fail-closed: a missing/corrupt record, a stale heartbeat, a heartbeat in
+    the future beyond ``LOOP_HEALTH_MAX_CLOCK_SKEW_S``, a non-boolean
+    ``executors_viable`` value, an explicit ``executors_viable: false``, a
+    dead (or positively-identified zombie) recorded pid, a non-finite
+    ``heartbeat``/``interval``, a present malformed interval, an interval beyond
+    ``LOOP_HEALTH_MAX_INTERVAL_S``, or a record not written by the
+    machine-wide loop (``scope`` != ``"machine"``) all return False —
+    pid-alive alone must never count as maintenance coverage (BOU-2086).
+    """
+    entry = loop_health_entry(cwd)
+    # Require a REAL boolean True. This health record is the fail-closed
+    # coverage signal, so a truthy-but-wrong value (e.g. the string "false"
+    # from a shell/tooling writer or a hand-edited file) must read as
+    # unhealthy (PR #76 review).
+    if entry.get("executors_viable") is not True:
+        return False
+    # Require the record to have been written by the MACHINE-WIDE loop. A
+    # session-scoped ``loop --session-id ...`` (scope "session") and a
+    # ``loop --no-discover-worktrees`` (scope "restricted") both run the same
+    # _tick and stamp this same repo-wide health file, but each services only a
+    # subset of the repo's worktrees — their heartbeats are not machine-wide
+    # coverage and must not suppress waiters for worktrees they never inspect.
+    # Absent scope (older snapshot, hand-written file) fails closed like any
+    # other unprovable record (PR #76 review).
+    if entry.get("scope") != "machine":
+        return False
+    # The heartbeat must be tied to a live servicing process: the daemon
+    # pidfile can hold a supervisor/wrapper pid that outlives the python loop,
+    # and a one-shot healthy stamp (e.g. ``--once``) must not grant a whole
+    # freshness window after its writer exits (PR #76 review).
+    pid_raw = str(entry.get("pid", ""))
+    if not _pid_alive(pid_raw):
+        return False
+    # ``os.kill(pid, 0)`` succeeds for zombies, so a crashed-but-unreaped loop
+    # child would still read as a live servicing process. Fail closed only on a
+    # POSITIVELY identified zombie; an unreadable/unknown state keeps the
+    # kill(0) verdict so permission quirks don't cause false-deads
+    # (PR #76 review).
+    state = _pid_state(int(pid_raw))
+    if state is not None and state.startswith("Z"):
+        return False
+    # A present heartbeat came from JSON, where a real numeric value can only be
+    # an int or float. A decimal STRING ("123", or a shell writer's
+    # ``str(time.time())``) would be silently coerced by ``float()`` even though
+    # the fail-closed record is malformed — mirror the interval guard below and
+    # reject anything that isn't a real (non-bool) number (PR #76 review).
+    heartbeat_raw = entry.get("heartbeat")
+    if isinstance(heartbeat_raw, bool) or not isinstance(heartbeat_raw, (int, float)):
+        return False
+    # JSON integers are arbitrary-precision, so a 400-digit int passes the type
+    # guard but overflows ``float()`` — catch that instead of letting it escape.
+    try:
+        heartbeat = float(heartbeat_raw)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    interval_raw = entry.get("interval", _DEFAULT_TICK_INTERVAL_S)
+    # Only records written before interval persistence may use the default.
+    # A present value came from JSON, where a real numeric interval can only be
+    # an int or float; strings, containers, null, and booleans are corrupt state
+    # and must not silently receive a healthy 600-second freshness window.
+    if isinstance(interval_raw, bool) or not isinstance(interval_raw, (int, float)):
+        return False
+    try:
+        interval = float(interval_raw)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    # JSON like ``1e309`` parses to inf: a non-finite heartbeat makes
+    # ``now - heartbeat`` -inf (granting coverage forever) and a non-finite
+    # interval makes the freshness window infinite — either way the record is
+    # invalid, so fail closed (PR #76 review).
+    if not math.isfinite(heartbeat) or not math.isfinite(interval):
+        return False
+    # isfinite alone is not enough: a finite-but-huge interval (1e308) still
+    # overflows the multiplication below to inf, accepting arbitrarily stale
+    # heartbeats. Bound the interval so the COMPUTED freshness window is
+    # always finite and sane (PR #76 review).
+    if interval > LOOP_HEALTH_MAX_INTERVAL_S:
+        return False
+    max_age = max(LOOP_HEALTH_INTERVAL_MULTIPLIER * interval, LOOP_HEALTH_MIN_FRESH_S)
+    now = time.time() if now is None else now
+    # A finite heartbeat in the FUTURE (corrupt value like 1e308, or a large
+    # backward wall-clock adjustment) makes ``now - heartbeat`` negative and
+    # would satisfy any max_age indefinitely. Allow only a small clock-skew
+    # tolerance; beyond that the record is invalid (PR #76 review).
+    if heartbeat - now > LOOP_HEALTH_MAX_CLOCK_SKEW_S:
+        return False
+    return (now - heartbeat) <= max_age
 
 
 def _entry_streak(entry: object) -> int:
@@ -143,10 +504,13 @@ def _emit_loop_event(cwd: str, kind: str, pr: int | None, details: dict) -> None
 def record_executor_failure(cwd: str, pr: int | None, err: str) -> int:
     """Record a new executor failure for ``pr``; return the new streak count."""
     key = str(pr)
-    data = _load_health(cwd)
-    new_streak = _entry_streak(data.get(key, {})) + 1
-    data[key] = {"streak": new_streak, "last_error": err, "updated": time.time()}
-    _save_health(cwd, data)
+
+    def _apply(data: dict) -> int:
+        streak = _entry_streak(data.get(key, {})) + 1
+        data[key] = {"streak": streak, "last_error": err, "updated": time.time()}
+        return streak
+
+    new_streak = _mutate_health(cwd, _apply)
     _emit_loop_event(cwd, "streak", pr, {"streak": new_streak, "last_error": err[:200]})
     return new_streak
 
@@ -157,7 +521,8 @@ def _escalated_marker_path(cwd: str) -> Path:
     Repo-scoped for the same reason as :func:`_health_file` — so PRs with the
     same number in different repos don't share an escalation marker.
     """
-    return _daemon_dir(cwd) / f"pr-maintenance-loop.escalated.{_repo_slug(cwd)}.json"
+    _migrate_legacy_state(cwd)
+    return _daemon_dir(cwd) / _escalated_filename(_repo_slug(cwd))
 
 
 def _clear_escalation_entry(cwd: str, pr: int | None) -> None:
@@ -199,10 +564,7 @@ def reset_executor_failure(cwd: str, pr: int | None) -> None:
     surfacing the stop-gate escalation block.
     """
     key = str(pr)
-    data = _load_health(cwd)
-    if key in data:
-        del data[key]
-        _save_health(cwd, data)
+    _mutate_health(cwd, lambda data: data.pop(key, None))
     _clear_escalation_entry(cwd, pr)
 
 
@@ -227,7 +589,10 @@ def _clear_recovered_streak(cwd: str) -> None:
     closes that gap. Cheap-guarded: only resolves the PR via ``gh`` when this
     repo actually has recorded streak/escalation state.
     """
-    if not _load_health(cwd) and not _load_escalation(cwd):
+    # Only the per-PR streak entries gate this guard — the loop's own health
+    # record (LOOP_HEALTH_KEY) is persistent, so counting it would turn the
+    # cheap-guard into a `gh pr view` per worktree per tick (BOU-2086).
+    if not _pr_health_entries(_load_health(cwd)) and not _load_escalation(cwd):
         return
     import json as _json  # noqa: PLC0415
     from agentic_pr_dash import github_api  # noqa: PLC0415
@@ -250,11 +615,15 @@ def _clear_recovered_streak(cwd: str) -> None:
 
 
 def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
-    """True when the detached loop is alive AND the failure streak < threshold.
+    """True when the detached loop is alive+healthy AND the streak < threshold.
 
     When the streak reaches the threshold the loop has repeatedly failed to fix
     the PR, so it no longer counts as coverage — the stop-gate must force a
     per-session waiter to bring the issue to the user.
+
+    ``_detached_loop_alive`` itself requires a fresh, executors-viable loop
+    health record (BOU-2086), so a wrapper pid that is alive while the python
+    loop exited (or can dispatch neither executor) is NOT coverage.
     """
     from ._maintenance.waiter import _detached_loop_alive  # noqa: PLC0415
     if not _detached_loop_alive(cwd):
@@ -532,46 +901,58 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
     return subprocess.run(parts, cwd=cwd).returncode
 
 
-def _try_run(executor: str, prompt: str, cwd: str) -> int | None:
-    """Run an executor; return its exit code, or ``None`` if it couldn't spawn.
+_SPAWN_FAILED_PREFIX = "spawn failed: "
+
+
+def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
+    """Run an executor; return ``(exit code | None, concrete error text)``.
 
     The executor binary may be missing from PATH (OSError/FileNotFoundError) or
     otherwise fail to launch. Returning ``None`` lets the caller treat "couldn't
     launch" the same as "ran and failed" for fallback purposes, without killing
-    the whole loop on one bad spawn.
+    the whole loop on one bad spawn. The error text retains the CONCRETE cause
+    (the spawn exception, or the exit code) instead of collapsing it (BOU-2086);
+    it is ``""`` on success.
     """
     try:
-        return _run_executor(executor, prompt, cwd)
+        rc = _run_executor(executor, prompt, cwd)
     except Exception as exc:
         print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
-        return None
+        return None, f"{_SPAWN_FAILED_PREFIX}{exc}"
+    return rc, ("" if rc == 0 else f"exit {rc}")
 
 
-def _dispatch_with_fallback(primary: str, fallback: str, prompt: str, cwd: str, pr: int | None) -> bool:
+def _dispatch_with_fallback(
+    primary: str, fallback: str, prompt: str, cwd: str, pr: int | None
+) -> tuple[bool, dict[str, str]]:
     """Dispatch the fix to the primary executor, falling back on any failure.
 
     Chain (BOU-1734): run ``primary``; if it fails (non-zero exit or a failed
     spawn) and a ``fallback`` is configured, run the same prompt through the
     fallback; if BOTH fail, report a clear error rather than silently leaving the
-    PR. Returns ``True`` when some executor serviced the PR (exit 0).
+    PR. Returns ``(serviced, errors)``: ``serviced`` is True when some executor
+    serviced the PR (exit 0); ``errors`` maps ``"primary"``/``"fallback"`` to the
+    concrete per-executor failure text (BOU-2086) — empty when serviced.
     """
-    rc = _try_run(primary, prompt, cwd)
+    rc, err = _try_run(primary, prompt, cwd)
     if rc == 0:
-        return True
+        return True, {}
+    errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
     if not fallback:
         # Legacy single-executor behavior: leave the PR for the next tick.
         print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
-        return False
+        return False, errors
     print(f"[agentic-pr-dash] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
-    rc2 = _try_run(fallback, prompt, cwd)
+    rc2, err2 = _try_run(fallback, prompt, cwd)
     if rc2 == 0:
-        return True
+        return True, {}
+    errors["fallback"] = f"{_executor_program(fallback) or fallback}: {err2}"
     print(
         f"[agentic-pr-dash] ERROR: both executors failed for PR #{pr} "
         f"(primary={rc}, fallback={rc2}); leaving for next tick",
         file=sys.stderr,
     )
-    return False
+    return False, errors
 
 
 def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
@@ -594,11 +975,50 @@ def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
     return False
 
 
+def _tick_executor_viability(executor: str, fallback: str) -> tuple[bool, dict[str, str]]:
+    """Re-check executor resolvability for this tick (BOU-2086).
+
+    Viable means the loop can dispatch AT LEAST one executor: the primary
+    resolves, or a configured fallback resolves (a broken primary still gets
+    serviced via the fallback chain). Returns ``(viable, errors)`` with the
+    concrete per-executor validation errors retained.
+    """
+    errors: dict[str, str] = {}
+    primary_err = _validate_executor(executor)
+    if primary_err:
+        errors["primary"] = primary_err
+    fallback_err = None
+    if fallback:
+        fallback_err = _validate_executor(fallback)
+        if fallback_err:
+            errors["fallback"] = fallback_err
+    viable = primary_err is None or (bool(fallback) and fallback_err is None)
+    return viable, errors
+
+
 def _tick(args, executor: str) -> None:
     fallback = getattr(args, "fallback_executor", "") or ""
+    # Heartbeat + viability (BOU-2086): stamp each serviced repo's health file
+    # once per tick so coverage readers can require a FRESH, executors-viable
+    # loop rather than trusting a live pid alone.
+    tick_viable, tick_errors = _tick_executor_viability(executor, fallback)
+    interval = getattr(args, "interval", None)
+    stamped_health_files: set[Path] = set()
     for cwd in _discover_cwds(args):
         if not Path(cwd).is_dir():
             continue
+        try:
+            hf = _health_file(cwd)
+        except Exception:  # noqa: BLE001 — heartbeat is best-effort
+            hf = None
+        if hf is not None and hf not in stamped_health_files:
+            stamped_health_files.add(hf)
+            record_loop_health(
+                cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
+                session_id=args.session_id or "",
+                no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                once=bool(getattr(args, "once", False)),
+            )
         if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
             continue
         check = subprocess.run(
@@ -632,11 +1052,27 @@ def _tick(args, executor: str) -> None:
         session = args.session_id or f"pid:{_loop_pid()}"
         if claim_id:
             coordinator.heartbeat_claim_id(claim_id, session)
-        if not _dispatch_with_fallback(executor, fallback, prompt, cwd, pr):
+        serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
+        if not serviced:
             # Primary (and fallback, if any) failed. Record the failure streak,
             # then release the claim so the PR is not left wrongly owned until
-            # the lease expires, then move on.
-            err_summary = f"executor exit non-zero or spawn-failed for PR #{pr}"
+            # the lease expires, then move on. Retain the CONCRETE per-executor
+            # errors in the streak record (BOU-2086) instead of a generic line.
+            detail = "; ".join(f"{k}: {v}" for k, v in exec_errors.items())
+            err_summary = (
+                f"executor dispatch failed for PR #{pr}: {detail}"
+                if detail else f"executor exit non-zero or spawn-failed for PR #{pr}"
+            )
+            # Every attempted executor failed to even SPAWN → the loop cannot
+            # currently dispatch anything: downgrade this repo's viability record
+            # immediately rather than waiting for the next tick's validation.
+            if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
+                record_loop_health(
+                    cwd, executors_viable=False, errors=exec_errors, interval=interval,
+                    session_id=args.session_id or "",
+                    no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                    once=bool(getattr(args, "once", False)),
+                )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
             if claim_id:
@@ -708,10 +1144,15 @@ def main(argv: list[str] | None = None) -> int:
     # Validate the executor up-front (BOU-1637): catch a missing/misconfigured
     # command at startup, not on the first dispatch tick (where a PR would already
     # be claimed). Fail loudly with exit 2 so a supervisor sees the misconfig.
+    # Validate BOTH the primary and the fallback before exiting (BOU-2086) so a
+    # DEGRADED health record retaining every concrete error is persisted — the
+    # wrapper daemon's pid can stay "running" after this exit, and pid-alive
+    # alone must never read as coverage.
+    startup_errors: dict[str, str] = {}
     executor_error = _validate_executor(executor)
     if executor_error:
+        startup_errors["primary"] = executor_error
         print(f"agentic-pr-dash loop: {executor_error}", file=sys.stderr)
-        return 2
 
     # Validate the fallback the same way when one is configured, so a broken
     # fallback (typo, uninstalled agent) is caught at startup rather than only
@@ -719,8 +1160,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.fallback_executor:
         fallback_error = _validate_executor(args.fallback_executor)
         if fallback_error:
+            startup_errors["fallback"] = fallback_error
             print(f"agentic-pr-dash loop (fallback): {fallback_error}", file=sys.stderr)
-            return 2
+
+    if startup_errors:
+        for cwd in args.cwd:
+            try:
+                record_loop_health(
+                    cwd, executors_viable=False, errors=startup_errors,
+                    interval=args.interval, session_id=args.session_id or "",
+                    no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+                    once=bool(getattr(args, "once", False)),
+                )
+            except Exception:  # noqa: BLE001 — never mask the loud exit
+                pass
+        return 2
 
     if args.once:
         _tick(args, executor)

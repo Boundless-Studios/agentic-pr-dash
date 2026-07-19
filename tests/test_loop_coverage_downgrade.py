@@ -50,10 +50,22 @@ def _write_live_pidfile(tmp_path: Path) -> None:
     (daemon_dir / "pr-maintenance-loop.pid").write_text(str(os.getpid()), encoding="utf-8")
 
 
+def _write_healthy_loop(*cwds: str) -> None:
+    """Stamp a fresh, executors-viable loop health record for each repo scope.
+
+    Coverage requires this beyond a live pid since BOU-2086; write it for every
+    cwd whose (per-repo) health file a coverage lookup may consult — stop-gate
+    tests resolve both the armed worktree and the anchor cwd.
+    """
+    for cwd in cwds:
+        loop.record_loop_health(cwd, executors_viable=True, interval=600)
+
+
 def test_loop_covers_pr_true_when_alive_and_no_streak(tmp_path, monkeypatch):
-    """_loop_covers_pr returns True when loop is alive and streak == 0."""
+    """_loop_covers_pr returns True when loop is alive+healthy and streak == 0."""
     cwd = str(tmp_path)
     _write_live_pidfile(tmp_path)
+    _write_healthy_loop(cwd)
     # No streak recorded
     assert loop._loop_covers_pr(cwd, 42) is True
 
@@ -62,6 +74,7 @@ def test_loop_covers_pr_false_when_streak_at_threshold(tmp_path, monkeypatch):
     """_loop_covers_pr returns False when streak >= threshold."""
     cwd = str(tmp_path)
     _write_live_pidfile(tmp_path)
+    _write_healthy_loop(cwd)
     # Simulate streak at threshold (3)
     monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 3)
     assert loop._loop_covers_pr(cwd, 42) is False
@@ -81,7 +94,8 @@ def test_loop_does_not_cover_pr_owned_by_live_session(tmp_path, monkeypatch):
     the session's own waiter alive instead of idling on phantom loop coverage."""
     cwd = str(tmp_path)
     _write_live_pidfile(tmp_path)
-    # Loop alive, zero streak — would normally count as coverage...
+    _write_healthy_loop(cwd)
+    # Loop alive+healthy, zero streak — would normally count as coverage...
     monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 0)
     # ...but a live in-session owner holds this worktree's marker (pid alive).
     mc._write_arm_marker(cwd, "live-session-x", os.getpid(), 42)
@@ -92,6 +106,7 @@ def test_stop_gate_loop_alive_streak_at_threshold_forces_waiter(tmp_path, monkey
     """Loop alive but streak >= threshold → loop does not cover PR → stop-gate returns 2."""
     wt = _make_armed_worktree(tmp_path, SID, 42)
     _write_live_pidfile(tmp_path)
+    _write_healthy_loop(str(tmp_path), str(wt))
 
     monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
                         lambda path, sid, *, claim=True: (0, "nothing pending"))
@@ -99,7 +114,7 @@ def test_stop_gate_loop_alive_streak_at_threshold_forces_waiter(tmp_path, monkey
                         lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
-    # Loop is alive but streak at threshold → not covering
+    # Loop is alive+healthy but streak at threshold → not covering
     monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 3)
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -111,6 +126,7 @@ def test_stop_gate_loop_alive_zero_streak_returns_0(tmp_path, monkeypatch, capsy
     """Loop alive and streak == 0 → loop covers PR → stop-gate returns 0."""
     wt = _make_armed_worktree(tmp_path, SID, 42)
     _write_live_pidfile(tmp_path)
+    _write_healthy_loop(str(tmp_path), str(wt))
 
     monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
                         lambda path, sid, *, claim=True: (0, "nothing pending"))

@@ -1,0 +1,1017 @@
+"""Loop health must reflect executor viability, not just a live PID (BOU-2086).
+
+The machine-wide maintenance daemon could report healthy/running (wrapper pid
+alive) and count as stop-gate coverage even when it could dispatch NEITHER
+executor — e.g. the python loop exited 2 at startup validation because the
+fallback (claude) was missing from PATH, while the wrapper pidfile stayed
+"running". A red PR then idled with zero real coverage.
+
+These tests pin the fail-closed contract:
+  - the loop persists a heartbeat + executor-viability record every tick;
+  - startup validation failure persists a DEGRADED record retaining BOTH
+    primary and fallback error strings (and validates both before exiting);
+  - ``_detached_loop_alive`` / ``_loop_covers_pr`` require a FRESH, viable
+    record beyond pid-alive;
+  - the stop-gate forces a per-session waiter when the loop is unhealthy;
+  - dispatch failures retain the concrete per-executor error text;
+  - a capability marker makes inert config keys on old snapshots detectable.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import types
+from pathlib import Path
+
+import pytest
+
+from agentic_pr_dash import config, loop, maintenance_check as mc
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
+from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+
+SID = "sess-health-viability"
+
+
+@pytest.fixture(autouse=True)
+def _isolation(monkeypatch, tmp_path):
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "0")
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_LOOP_THRESHOLD", "3")
+    monkeypatch.setenv("GAIA_DAEMON_DIR", str(tmp_path / "daemons"))
+    monkeypatch.setenv("GAIA_MAINTENANCE_LOOP_MACHINE_WIDE", "true")
+    monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "3")
+    config.load.cache_clear()
+    yield
+    config.load.cache_clear()
+
+
+def _write_live_pidfile(tmp_path: Path) -> None:
+    daemon_dir = tmp_path / "daemons"
+    daemon_dir.mkdir(parents=True, exist_ok=True)
+    (daemon_dir / "pr-maintenance-loop.pid").write_text(str(os.getpid()), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Coverage requires a fresh, executors-viable health record
+# ---------------------------------------------------------------------------
+
+
+def test_pid_alive_without_health_record_is_not_coverage(tmp_path):
+    """A live loop pid with NO health record must not count as coverage —
+    exactly the BOU-2086 incident shape (wrapper pid alive, python loop dead)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    assert mc._detached_loop_alive(cwd) is False
+    assert loop._loop_covers_pr(cwd, 42) is False
+
+
+def test_fresh_viable_health_record_grants_coverage(tmp_path):
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    assert mc._detached_loop_alive(cwd) is True
+    assert loop._loop_covers_pr(cwd, 42) is True
+
+
+def test_degraded_record_is_not_coverage(tmp_path):
+    """executors_viable=False (both executors unreachable) → uncovered."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=False,
+        errors={"primary": "codex: not found", "fallback": "claude: not found"},
+        interval=600,
+    )
+    assert mc._detached_loop_alive(cwd) is False
+    assert loop._loop_covers_pr(cwd, 42) is False
+
+
+def test_stale_heartbeat_is_not_coverage(tmp_path):
+    """A viable record whose heartbeat is older than the freshness window
+    (max(3×interval, floor)) means the loop stopped ticking → uncovered."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time() - 7200,  # 2h ago >> max(3*600, 900)
+        "pid": os.getpid(),
+        "executors_viable": True,
+        "interval": 600,
+        "scope": "machine",
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_corrupt_health_record_fails_closed(tmp_path):
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {"executors_viable": True, "heartbeat": "not-a-ts"}
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_recursive_json_decode_failure_fails_closed_without_raising(tmp_path, monkeypatch):
+    """Treat decoder recursion failures like any other corrupt health file.
+
+    Python versions differ on whether deeply nested valid JSON raises
+    ``RecursionError`` or ``JSONDecodeError``, so inject the former explicitly.
+    """
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    health_file = loop._health_file(cwd)
+    health_file.parent.mkdir(parents=True, exist_ok=True)
+    health_file.write_text("[]", encoding="utf-8")
+
+    def recursive_failure(_raw):
+        raise RecursionError("maximum recursion depth exceeded while decoding JSON")
+
+    monkeypatch.setattr(json, "loads", recursive_failure)
+
+    assert loop._load_health(cwd) == {}
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_viable", ["false", "true", 1, "yes", [True]])
+def test_non_boolean_viability_value_fails_closed(tmp_path, bad_viable):
+    """``executors_viable`` must be a REAL boolean True — a truthy string like
+    "false" (shell/tooling writer, hand-edited or corrupt file) must read as
+    unhealthy, because this record is the fail-closed coverage signal
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": bad_viable,
+        "interval": 600,
+        "scope": "machine",
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_dead_recorded_health_pid_is_not_coverage(tmp_path):
+    """A fresh viable heartbeat whose RECORDING process has exited must not
+    count: the daemon pidfile can hold a supervisor/wrapper pid that outlives
+    the python loop, so the heartbeat must be tied to a live servicing process
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)  # wrapper pid: alive (this test process)
+    proc = subprocess.Popen(  # noqa: S603
+        [sys.executable, "-c", "pass"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    proc.wait()  # reaped → pid guaranteed dead
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": proc.pid,
+        "executors_viable": True,
+        "interval": 600,
+        "scope": "machine",
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def _write_loop_record(cwd: str, **overrides) -> None:
+    entry = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": True,
+        "interval": 600,
+        "scope": "machine",
+    }
+    entry.update(overrides)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = entry
+    loop._save_health(cwd, data)
+
+
+@pytest.mark.parametrize(
+    "bad_pid",
+    [
+        "²",  # str.isdigit() True, but int() raises ValueError
+        "١٢٣",  # non-ASCII decimal digits: int() accepts, but not a recorded pid
+        10**20,  # int() fine, os.kill overflows C pid_t → OverflowError
+        "9" * 5000,  # >4300 ASCII digits: int() itself raises ValueError (3.11+ limit)
+        "0",  # kill(0, 0) probes the process group, not a recorded process
+        "-1",
+        "12x",
+        "",
+    ],
+)
+def test_malformed_health_pid_fails_closed_without_raising(tmp_path, bad_pid):
+    """A corrupt/hand-written pid in an otherwise viable health record must
+    read as unhealthy, NOT raise: an escaping OverflowError/ValueError would be
+    swallowed by the stop-gate's broad handler and release an uncovered PR
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, pid=bad_pid)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize(
+    "bad_pid", ["²", "١٢٣", str(10**20), "9" * 5000, "0", "-1", "12x", ""]
+)
+def test_pid_alive_malformed_input_is_false_not_raise(bad_pid):
+    """The shared ``_pid_alive`` helper (waiter/markers/ownership/stop-gate all
+    use it) must fail closed on any unconvertible or unprobe-able pid string."""
+    from agentic_pr_dash._maintenance._common import _pid_alive
+
+    assert _pid_alive(bad_pid) is False
+
+
+def test_zombie_recorded_health_pid_is_not_coverage(tmp_path, monkeypatch):
+    """A zombie passes ``os.kill(pid, 0)``, so a crashed-but-unreaped loop
+    child would still count as coverage. The health check must positively
+    identify the zombie state and treat it as dead (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: "Z")
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_unreadable_pid_state_keeps_kill0_liveness(tmp_path, monkeypatch):
+    """State probes can fail (no /proc, ps missing, permissions). Only a
+    POSITIVE zombie identification may fail the record; an unknown state keeps
+    the kill(0) verdict so permission quirks don't cause false-deads."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: None)
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+def test_non_zombie_pid_state_keeps_coverage(tmp_path, monkeypatch):
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    monkeypatch.setattr(loop, "_pid_state", lambda pid: "S+")
+    assert loop.loop_health_ok(cwd) is True
+
+
+def test_real_zombie_child_is_not_coverage(tmp_path):
+    """End-to-end platform check (/proc on Linux, ps elsewhere): a real
+    exited-but-unreaped child is a genuine zombie and must not grant
+    coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    proc = subprocess.Popen(  # noqa: S603 — NOT waited: becomes a zombie
+        [sys.executable, "-c", "pass"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        deadline = time.time() + 10.0
+        while time.time() < deadline and loop._pid_state(proc.pid) != "Z":
+            time.sleep(0.05)
+        if loop._pid_state(proc.pid) != "Z":
+            pytest.skip("child never observed as zombie on this platform")
+        _write_loop_record(cwd, pid=proc.pid)
+        assert loop.loop_health_ok(cwd) is False
+        assert mc._detached_loop_alive(cwd) is False
+    finally:
+        proc.wait()
+
+
+@pytest.mark.parametrize("bad_heartbeat", [float("inf"), float("-inf"), float("nan")])
+def test_non_finite_heartbeat_fails_closed(tmp_path, bad_heartbeat):
+    """JSON like ``"heartbeat": 1e309`` parses to ``inf`` → ``now - inf`` is
+    ``-inf``, which satisfies any max_age and grants coverage forever while the
+    recorded pid happens to exist (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=bad_heartbeat)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_interval", [float("inf"), float("nan")])
+def test_non_finite_interval_fails_closed(tmp_path, bad_interval):
+    """A non-finite ``interval`` makes the freshness window infinite, permitting
+    arbitrarily stale records — the record is invalid, fail closed even with a
+    fresh heartbeat (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=bad_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_interval", ["bad", [], {}, None, False])
+def test_present_malformed_interval_fails_closed(tmp_path, bad_interval):
+    """Only an absent legacy interval may use the compatibility default."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=bad_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_absent_interval_uses_legacy_default(tmp_path):
+    """Records written before interval persistence remain valid while fresh."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY].pop("interval")
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+@pytest.mark.parametrize("huge_interval", [1e308, 1e9])
+def test_oversized_finite_interval_fails_closed(tmp_path, huge_interval):
+    """A finite-but-huge ``interval`` (e.g. ``1e308``) passes ``isfinite`` yet
+    ``LOOP_HEALTH_INTERVAL_MULTIPLIER * interval`` overflows to ``inf`` — and
+    even a non-overflowing 1e9 grants a ~95-year freshness window. Either way
+    the record cannot describe a real ticking loop, so it must not count as
+    coverage (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=huge_interval)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_max_sane_interval_still_grants_coverage(tmp_path):
+    """Boundary guard: the oversized-interval rejection must not over-tighten —
+    an interval at the sanity bound with a fresh heartbeat stays healthy."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, interval=loop.LOOP_HEALTH_MAX_INTERVAL_S)
+    assert loop.loop_health_ok(cwd) is True
+
+
+def test_missing_recorded_health_pid_fails_closed(tmp_path):
+    """A viable record with no ``pid`` field cannot be tied to any live
+    servicing process → not coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "executors_viable": True,
+        "interval": 600,
+        "scope": "machine",
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+# ---------------------------------------------------------------------------
+# Machine-scope binding + future-heartbeat rejection (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_session_scoped_health_record_is_not_machine_coverage(tmp_path):
+    """A ``loop --session-id ...`` run executes the same ``_tick`` and stamps
+    the same repo-wide health file, but it only discovers worktrees owned by
+    that session. Its fresh viable record must NOT read as machine-wide
+    coverage, or waiters for other sessions' PRs would be suppressed while a
+    scoped loop never services them (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, session_id="sess-scoped",
+    )
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_machine_scope_recorded_by_default_and_grants_coverage(tmp_path):
+    """A loop started WITHOUT ``--session-id`` is the machine-wide daemon: its
+    record carries ``scope: machine`` and grants coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] == "machine"
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+@pytest.mark.parametrize(
+    "bad_scope", ["session", "", "MACHINE", 1, True, None, ["machine"]]
+)
+def test_non_machine_scope_fails_closed(tmp_path, bad_scope):
+    """Only the exact string ``"machine"`` grants coverage — any other value
+    (scoped writer, hand-edit, corruption) fails closed."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, scope=bad_scope)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_absent_scope_fails_closed(tmp_path):
+    """A record with NO scope field (older package snapshot, hand-written file)
+    cannot prove it was written by the machine-wide loop → not coverage,
+    consistent with the fail-closed posture for older snapshots."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    data = loop._load_health(cwd)
+    data[loop.LOOP_HEALTH_KEY] = {
+        "heartbeat": time.time(),
+        "pid": os.getpid(),
+        "executors_viable": True,
+        "interval": 600,
+    }
+    loop._save_health(cwd, data)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("future_offset", [1e308, 3600.0, 86400.0])
+def test_future_heartbeat_fails_closed(tmp_path, future_offset):
+    """A finite heartbeat in the FUTURE (corrupt/hand-written value like 1e308,
+    or a backward wall-clock jump) makes ``now - heartbeat`` negative, granting
+    coverage effectively forever while the pids stay live. Fail closed on
+    anything beyond a small clock-skew tolerance (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    hb = 1e308 if future_offset == 1e308 else time.time() + future_offset
+    _write_loop_record(cwd, heartbeat=hb)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_small_clock_skew_heartbeat_still_grants_coverage(tmp_path):
+    """Boundary guard: sub-tolerance forward skew (e.g. NTP nudge between
+    writer and reader hosts/processes) must not cause false-uncovered."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=time.time() + 30)
+    assert loop.loop_health_ok(cwd) is True
+
+
+# ---------------------------------------------------------------------------
+# Restricted (--no-discover-worktrees) loops are not machine-wide coverage
+# (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_no_discover_worktrees_loop_is_not_machine_coverage(tmp_path):
+    """A ``loop --no-discover-worktrees --cwd <one>`` run has no ``--session-id``
+    but services ONLY the explicit ``--cwd`` worktree (``_discover_cwds`` returns
+    ``list(args.cwd)``). It still stamps the same repo-wide health file, so if its
+    record read as machine-wide coverage it would suppress waiters for every OTHER
+    worktree in the repo that it never inspects. Its heartbeat must fail closed as
+    non-machine coverage (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, no_discover_worktrees=True,
+    )
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] != "machine"
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_full_discovery_loop_without_session_still_machine_coverage(tmp_path):
+    """Boundary guard: the real machine-wide daemon (no ``--session-id`` AND full
+    discovery) must still record ``scope: machine`` and grant coverage — the
+    restricted-loop fix must not disarm the legitimate daemon."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, no_discover_worktrees=False,
+    )
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] == "machine"
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+# ---------------------------------------------------------------------------
+# Overflowing integer time values + repo-slug collisions (PR #76 review, round 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["heartbeat", "interval"])
+def test_overlarge_int_time_value_fails_closed_not_raise(tmp_path, field):
+    """JSON permits arbitrary-precision integers: a corrupt record with a
+    400-digit ``heartbeat``/``interval`` parses fine, but ``float()`` raises
+    ``OverflowError`` — which previously escaped ``loop_health_ok`` and was
+    swallowed by the stop-gate's broad catch into a wrongful coverage release.
+    The record is invalid: fail closed, never raise (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, **{field: 10**400})
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_colliding_repo_names_do_not_share_health_coverage(tmp_path, monkeypatch):
+    """``acme/foo-bar`` and ``acme-foo/bar`` both sanitize to ``acme-foo-bar``,
+    so two independent repos sharing the daemon dir would read/write the SAME
+    health file — a healthy loop servicing only the first repo would grant
+    coverage to the second indefinitely. The slug must be collision-resistant
+    (PR #76 review)."""
+    daemons = tmp_path / "daemons"
+    daemons.mkdir(parents=True, exist_ok=True)
+    pidfile = daemons / "pr-maintenance-loop.pid"
+    cwd_a = tmp_path / "wt-a"
+    cwd_b = tmp_path / "wt-b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+    repos = {"wt-a": "acme/foo-bar", "wt-b": "acme-foo/bar"}
+
+    class _Cfg:
+        maintenance_loop_pidfile = pidfile
+
+        def __init__(self, repo: str) -> None:
+            self._repo = repo
+
+        def resolved_repo(self, path) -> str:
+            return self._repo
+
+    monkeypatch.setattr(loop, "load_config", lambda cwd: _Cfg(repos[Path(cwd).name]))
+    loop._repo_slug.cache_clear()
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(str(cwd_a), executors_viable=True, interval=600)
+    # Distinct repos must never share a health file...
+    assert loop._health_file(str(cwd_a)) != loop._health_file(str(cwd_b))
+    # ...so repo A's healthy record covers A but never B.
+    assert loop.loop_health_ok(str(cwd_a)) is True
+    assert loop.loop_health_ok(str(cwd_b)) is False
+
+
+# ---------------------------------------------------------------------------
+# Pre-PR#76 loop state survives the digest-slug upgrade (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def _pin_repo_identity(monkeypatch, tmp_path, repo="acme/upgrade-repo"):
+    """Pin ``resolved_repo`` so the legacy (digest-less) and new (digest-suffixed)
+    slug filenames are deterministic, and point the daemon dir at the test's
+    tmp daemons dir. Returns (daemons_dir, legacy_slug, new_slug)."""
+    daemons = tmp_path / "daemons"
+    daemons.mkdir(parents=True, exist_ok=True)
+    pidfile = daemons / "pr-maintenance-loop.pid"
+
+    class _Cfg:
+        maintenance_loop_pidfile = pidfile
+        escalation_failure_threshold = 3
+
+        def resolved_repo(self, path) -> str:
+            return repo
+
+    monkeypatch.setattr(loop, "load_config", lambda cwd: _Cfg())
+    loop._repo_slug.cache_clear()
+    for name in ("_legacy_repo_slug", "_migrate_legacy_state"):
+        fn = getattr(loop, name, None)
+        if fn is not None and hasattr(fn, "cache_clear"):
+            fn.cache_clear()
+    legacy_slug = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in repo)
+    new_slug = f"{legacy_slug}-{hashlib.sha256(repo.encode()).hexdigest()[:8]}"
+    return daemons, legacy_slug, new_slug
+
+
+def test_legacy_slug_health_streaks_migrate_on_upgrade(tmp_path, monkeypatch):
+    """An in-place upgrade to the digest-suffixed slug orphans the old health
+    file: a per-PR executor-failure streak written by the prior install would
+    read back as 0, so a PR that had reached the escalation threshold would
+    resume being treated as loop-covered. The streak must survive the upgrade
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_health = daemons / f"pr-maintenance-loop.health.{legacy_slug}.json"
+    legacy_health.write_text(
+        json.dumps({"42": {"streak": 3, "last_error": "boom"}}), encoding="utf-8"
+    )
+    assert loop.executor_failure_streak(cwd, 42) == 3
+    assert (daemons / f"pr-maintenance-loop.health.{new_slug}.json").exists()
+
+
+def test_legacy_slug_escalation_marker_migrates_on_upgrade(tmp_path, monkeypatch):
+    """Escalation markers written under the old slug must not silently disappear
+    on upgrade — the stop-gate reader must still surface the escalated PR
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_marker = daemons / f"pr-maintenance-loop.escalated.{legacy_slug}.json"
+    legacy_marker.write_text(
+        json.dumps({"42": {"streak": 3, "escalated_at": time.time()}}), encoding="utf-8"
+    )
+    info = _stop_gate_mod._read_escalation_marker(cwd)
+    assert "42" in info
+    assert (daemons / f"pr-maintenance-loop.escalated.{new_slug}.json").exists()
+
+
+def test_migration_never_clobbers_fresh_new_slug_state(tmp_path, monkeypatch):
+    """Guard: when the NEW digest-suffixed file already exists (post-upgrade
+    state), a leftover legacy file must never be migrated over it — fresh state
+    wins and the legacy file is left untouched."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_health = daemons / f"pr-maintenance-loop.health.{legacy_slug}.json"
+    new_health = daemons / f"pr-maintenance-loop.health.{new_slug}.json"
+    legacy_health.write_text(json.dumps({"42": {"streak": 3}}), encoding="utf-8")
+    new_health.write_text(json.dumps({"42": {"streak": 1}}), encoding="utf-8")
+    assert loop.executor_failure_streak(cwd, 42) == 1
+    assert legacy_health.exists()
+
+
+# ---------------------------------------------------------------------------
+# Startup validation persists a degraded record with BOTH error strings
+# ---------------------------------------------------------------------------
+
+
+def test_startup_validation_failure_writes_degraded_record_with_both_errors(
+    tmp_path, capsys,
+):
+    cwd = str(tmp_path)
+    rc = loop.main([
+        "--once", "--cwd", cwd,
+        "--executor", "definitely-not-a-real-primary-xyz {prompt}",
+        "--fallback-executor", "definitely-not-a-real-fallback-xyz {prompt}",
+    ])
+    assert rc == 2
+    err = capsys.readouterr().err
+    # BOTH errors are printed, not just the first one hit.
+    assert "definitely-not-a-real-primary-xyz" in err
+    assert "definitely-not-a-real-fallback-xyz" in err
+
+    entry = loop.loop_health_entry(cwd)
+    assert entry.get("executors_viable") is False
+    errors = entry.get("errors", {})
+    assert "definitely-not-a-real-primary-xyz" in errors.get("primary", "")
+    assert "definitely-not-a-real-fallback-xyz" in errors.get("fallback", "")
+    # And the degraded record denies coverage even with a live wrapper pid.
+    _write_live_pidfile(tmp_path)
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_startup_validation_failure_fallback_only_still_records_both_shape(
+    tmp_path, capsys,
+):
+    """Primary fine, fallback broken → still exit 2 (unchanged) and the record
+    retains the concrete fallback error at the startup-validation path."""
+    cwd = str(tmp_path)
+    rc = loop.main([
+        "--once", "--cwd", cwd,
+        "--executor", "python3 -c {prompt}",
+        "--fallback-executor", "definitely-not-a-real-fallback-xyz {prompt}",
+    ])
+    assert rc == 2
+    assert "definitely-not-a-real-fallback-xyz" in capsys.readouterr().err
+    entry = loop.loop_health_entry(cwd)
+    assert entry.get("executors_viable") is False
+    assert "definitely-not-a-real-fallback-xyz" in entry.get("errors", {}).get("fallback", "")
+    assert "primary" not in entry.get("errors", {})
+
+
+# ---------------------------------------------------------------------------
+# Stop-gate fails closed (forces a waiter) when the loop is unhealthy
+# ---------------------------------------------------------------------------
+
+
+def _run_stop_gate(tmp_path, monkeypatch) -> int:
+    wt = tmp_path / "worktree"
+    wt.mkdir(exist_ok=True)
+    mc._write_arm_marker(str(wt), SID, os.getpid(), 42)
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(loop, "executor_failure_streak", lambda cwd, pr: 0)
+    return mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+
+
+def test_stop_gate_forces_waiter_when_loop_pid_alive_but_no_health(
+    tmp_path, monkeypatch, capsys,
+):
+    """The incident shape: wrapper pid alive, streak 0, but no health record —
+    the stop-gate must NOT idle on phantom coverage; it forces a waiter."""
+    _write_live_pidfile(tmp_path)
+    rc = _run_stop_gate(tmp_path, monkeypatch)
+    err = capsys.readouterr().err
+    assert rc == 2, f"Expected 2 (unhealthy loop is not coverage), got {rc}; stderr={err!r}"
+    assert "waiter" in err.lower()
+
+
+def test_stop_gate_forces_waiter_when_loop_degraded(tmp_path, monkeypatch, capsys):
+    _write_live_pidfile(tmp_path)
+    for cwd in (str(tmp_path), str(tmp_path / "worktree")):
+        loop.record_loop_health(
+            cwd, executors_viable=False,
+            errors={"primary": "codex: spawn failed", "fallback": "claude: spawn failed"},
+            interval=600,
+        )
+    rc = _run_stop_gate(tmp_path, monkeypatch)
+    err = capsys.readouterr().err
+    assert rc == 2, f"Expected 2 (degraded loop is not coverage), got {rc}; stderr={err!r}"
+
+
+# ---------------------------------------------------------------------------
+# Tick heartbeat + concrete dispatch-error retention
+# ---------------------------------------------------------------------------
+
+
+def _tick_args(**kw):
+    base = dict(no_discover_worktrees=False, session_id="sess", cwd=["/repo"],
+                fallback_executor="claude --dangerously-skip-permissions -p {prompt}",
+                interval=600)
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def _wire_tick(monkeypatch, worktree, *, run_executor, check_rc=loop.CHECK_WORK_FOUND):
+    calls: list = []
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            return types.SimpleNamespace(
+                returncode=check_rc,
+                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stderr="",
+            )
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "complete" in cmd:
+            calls.append(("complete", cmd))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[0] == "gh":
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(worktree)])
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
+    monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    monkeypatch.setattr(loop, "_run_executor",
+                        lambda executor, prompt, cwd: run_executor(executor, calls))
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim_id",
+                        lambda claim_id, session_id, reason: calls.append(("release", reason)))
+    return calls
+
+
+def test_tick_writes_heartbeat_record(monkeypatch, tmp_path):
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor))
+        return 0
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    # Deterministic viability regardless of the host PATH.
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: None)
+    loop._tick(_tick_args(), "codex exec --full-auto {prompt}")
+
+    entry = loop.loop_health_entry(str(worktree))
+    assert entry.get("executors_viable") is True
+    assert float(entry.get("heartbeat", 0)) > 0
+    assert float(entry.get("interval", 0)) == 600.0
+
+
+def test_tick_records_nonviable_when_no_executor_resolves(monkeypatch, tmp_path):
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor))
+        return 1
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: f"{executor.split()[0]!r} was not found on PATH")
+    loop._tick(_tick_args(), "codex exec --full-auto {prompt}")
+
+    entry = loop.loop_health_entry(str(worktree))
+    assert entry.get("executors_viable") is False
+    assert "primary" in entry.get("errors", {})
+    assert "fallback" in entry.get("errors", {})
+
+
+def test_dispatch_spawn_failures_retain_concrete_errors_and_degrade(
+    monkeypatch, tmp_path,
+):
+    """Both executors fail to SPAWN mid-run → the streak record retains the
+    concrete per-executor exception text and viability is downgraded."""
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor))
+        raise FileNotFoundError(f"No such file or directory: {executor.split()[0]!r}")
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: None)
+    loop._tick(_tick_args(), "codex exec --full-auto {prompt}")
+
+    cwd = str(worktree)
+    assert loop.executor_failure_streak(cwd, 7) == 1
+    last_error = loop._load_health(cwd)["7"]["last_error"]
+    assert "spawn failed" in last_error
+    assert "'codex'" in last_error and "'claude'" in last_error
+    # Both-spawn-failure downgrades the viability record immediately.
+    entry = loop.loop_health_entry(cwd)
+    assert entry.get("executors_viable") is False
+    assert "spawn failed" in entry.get("errors", {}).get("primary", "")
+    assert "spawn failed" in entry.get("errors", {}).get("fallback", "")
+
+
+def test_nonzero_exit_keeps_viability_but_retains_exit_codes(monkeypatch, tmp_path):
+    """Executors that RUN but fail (rate-limit etc.) are still viable — only the
+    streak grows, with concrete exit codes retained."""
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor))
+        return 3
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: None)
+    loop._tick(_tick_args(), "codex exec --full-auto {prompt}")
+
+    cwd = str(worktree)
+    assert loop.loop_health_entry(cwd).get("executors_viable") is True
+    last_error = loop._load_health(cwd)["7"]["last_error"]
+    assert "exit 3" in last_error and "codex" in last_error and "claude" in last_error
+
+
+# ---------------------------------------------------------------------------
+# Health-file hygiene with the reserved loop key
+# ---------------------------------------------------------------------------
+
+
+def test_loop_key_does_not_trip_recovered_streak_guard(monkeypatch, tmp_path):
+    """The persistent loop record must not defeat _clear_recovered_streak's
+    cheap-guard (which would add a `gh pr view` per worktree per tick)."""
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+
+    def _boom(*a, **k):
+        raise AssertionError("gh must not be invoked when only the loop record exists")
+
+    monkeypatch.setattr(loop.subprocess, "run", _boom)
+    loop._clear_recovered_streak(cwd)  # no per-PR entries → returns before gh
+
+
+def test_streak_reset_preserves_loop_record(tmp_path):
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    loop.record_executor_failure(cwd, 42, "boom")
+    assert loop.executor_failure_streak(cwd, 42) == 1
+    loop.reset_executor_failure(cwd, 42)
+    assert loop.executor_failure_streak(cwd, 42) == 0
+    assert loop.loop_health_entry(cwd).get("executors_viable") is True
+
+
+def test_health_file_round_trip_shape(tmp_path):
+    cwd = str(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=False, errors={"primary": "p-err", "fallback": "f-err"},
+        interval=60,
+    )
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    entry = raw[loop.LOOP_HEALTH_KEY]
+    assert entry["executors_viable"] is False
+    assert entry["errors"] == {"primary": "p-err", "fallback": "f-err"}
+    assert entry["interval"] == 60.0
+    assert isinstance(entry["pid"], int)
+
+
+# ---------------------------------------------------------------------------
+# One-shot (`--once`) loops are not machine-wide coverage (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_record_loop_health_once_is_not_machine_scope(tmp_path):
+    """A ``loop --once`` run performs a single tick and ``main()`` exits, so its
+    heartbeat is not durable machine-wide coverage. Even with full discovery and
+    no ``--session-id`` it must NOT stamp ``scope: machine`` (PR #76 review)."""
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600, once=True)
+    entry = loop.loop_health_entry(cwd)
+    assert entry.get("scope") != "machine"
+    assert loop.loop_health_ok(cwd) is False
+
+
+def test_once_tick_records_non_machine_coverage(monkeypatch, tmp_path):
+    """The ``--once`` path (``main`` → ``_tick`` with ``args.once``) must stamp a
+    non-machine record so a stop-gate reached mid one-shot tick can't read it as
+    durable coverage and suppress a waiter the exiting one-shot will never
+    replace (PR #76 review)."""
+    worktree = tmp_path / "wt"; worktree.mkdir()
+
+    def run_executor(executor, calls):
+        calls.append(("executor", executor)); return 0
+
+    _wire_tick(monkeypatch, worktree, run_executor=run_executor)
+    monkeypatch.setattr(loop, "_validate_executor", lambda executor: None)
+    # Full discovery, no session — the ONLY thing making this non-machine is --once.
+    loop._tick(_tick_args(once=True, session_id=""), "codex exec --full-auto {prompt}")
+    entry = loop.loop_health_entry(str(worktree))
+    assert entry.get("scope") != "machine"
+    assert loop.loop_health_ok(str(worktree)) is False
+
+
+def test_full_discovery_non_once_loop_still_machine_coverage(tmp_path):
+    """Boundary guard: the durable daemon (no ``--once``, no ``--session-id``,
+    full discovery) must still record ``scope: machine`` and grant coverage."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600, once=False)
+    assert loop.loop_health_entry(cwd).get("scope") == "machine"
+    assert loop.loop_health_ok(cwd) is True
+
+
+# ---------------------------------------------------------------------------
+# String / non-numeric heartbeat rejection (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_string_heartbeat_fresh_timestamp_fails_closed(tmp_path):
+    """A decimal-STRING heartbeat that is a fresh timestamp (a shell/tooling
+    writer emitting ``str(time.time())``) was silently coerced by ``float()``
+    and granted coverage even though the fail-closed record is malformed — the
+    same corrupt state the interval path rejects (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=str(time.time()))
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_heartbeat", ["123.0", True, False, [], {}, None])
+def test_non_numeric_heartbeat_fails_closed(tmp_path, bad_heartbeat):
+    """Only a real (non-bool) int/float heartbeat is valid; strings, booleans,
+    containers, and null are corrupt state and must fail closed (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, heartbeat=bad_heartbeat)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+# ---------------------------------------------------------------------------
+# Serialized read-modify-write on the shared health file (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_health_writers_do_not_lose_streak(tmp_path):
+    """Two supported loop modes stamp the SAME repo-wide health file. Without
+    serialization a machine tick's ``record_loop_health`` load-modify-save
+    clobbers a per-PR streak a session loop persisted in the same window, so
+    ``_loop_covers_pr`` again reads the repeatedly-failing PR as covered and
+    suppresses its waiter. The health lock must serialize the writers so every
+    streak increment survives (PR #76 review)."""
+    import threading
+
+    cwd = str(tmp_path)
+    loop.record_loop_health(cwd, executors_viable=True, interval=600)
+    n = 100
+    barrier = threading.Barrier(2)
+
+    def bump_streak():
+        barrier.wait()
+        for i in range(n):
+            loop.record_executor_failure(cwd, 7, f"boom{i}")
+
+    def stamp_health():
+        barrier.wait()
+        for _ in range(n):
+            loop.record_loop_health(cwd, executors_viable=True, interval=600)
+
+    threads = [threading.Thread(target=bump_streak), threading.Thread(target=stamp_health)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    data = loop._load_health(cwd)
+    assert data.get("7", {}).get("streak") == n
+    assert loop.LOOP_HEALTH_KEY in data
+
+
+# ---------------------------------------------------------------------------
+# Capability marker (inert-config detectability)
+# ---------------------------------------------------------------------------
+
+
+def test_capability_marker_exposes_shipped_features():
+    assert config.has_capability("escalation_failure_threshold") is True
+    assert config.has_capability("loop_health_executor_viability") is True
+    assert config.has_capability("definitely-not-a-capability") is False
+    # The set itself is importable for external (wrapper-side) probes.
+    assert "loop_health_executor_viability" in config.CAPABILITIES
