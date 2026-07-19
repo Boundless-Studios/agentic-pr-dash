@@ -19,6 +19,7 @@ dependence on ``claude``/``codex``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import shlex
@@ -71,7 +72,15 @@ def _repo_slug(cwd: str) -> str:
     """
     repo = load_config(cwd).resolved_repo(Path(cwd))
     raw = repo or Path(cwd).resolve().name or "repo"
-    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    # Sanitizing ``/`` to ``-`` collapses distinct repos ("acme/foo-bar" and
+    # "acme-foo/bar" both become "acme-foo-bar"), so two independent repos
+    # sharing the daemon dir would read/write the SAME health/escalation file
+    # — one repo's healthy record would grant stop-gate coverage to a repo the
+    # loop never services. Suffix a digest of the RAW identity so distinct
+    # repos can never share a file (PR #76 review).
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+    return f"{safe}-{digest}"
 
 
 def _health_file(cwd: str) -> Path:
@@ -264,14 +273,24 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     state = _pid_state(int(pid_raw))
     if state is not None and state.startswith("Z"):
         return False
+    # JSON integers are arbitrary-precision: a corrupt record with a 400-digit
+    # ``heartbeat``/``interval`` parses fine but overflows ``float()``. An
+    # uncaught OverflowError here would escape into the stop-gate's broad
+    # catch and read as a coverage release — treat it as an invalid record
+    # instead (PR #76 review).
     try:
         heartbeat = float(entry["heartbeat"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, OverflowError):
         return False
     try:
         interval = float(entry.get("interval") or _DEFAULT_TICK_INTERVAL_S)
     except (TypeError, ValueError):
         interval = _DEFAULT_TICK_INTERVAL_S
+    except OverflowError:
+        # Unlike unparseable garbage (which falls back to the default tick),
+        # an overflowing interval is an out-of-range value — same class as the
+        # finite-but-huge interval rejected below, so fail closed.
+        return False
     # JSON like ``1e309`` parses to inf: a non-finite heartbeat makes
     # ``now - heartbeat`` -inf (granting coverage forever) and a non-finite
     # interval makes the freshness window infinite — either way the record is

@@ -419,6 +419,60 @@ def test_small_clock_skew_heartbeat_still_grants_coverage(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Overflowing integer time values + repo-slug collisions (PR #76 review, round 7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["heartbeat", "interval"])
+def test_overlarge_int_time_value_fails_closed_not_raise(tmp_path, field):
+    """JSON permits arbitrary-precision integers: a corrupt record with a
+    400-digit ``heartbeat``/``interval`` parses fine, but ``float()`` raises
+    ``OverflowError`` — which previously escaped ``loop_health_ok`` and was
+    swallowed by the stop-gate's broad catch into a wrongful coverage release.
+    The record is invalid: fail closed, never raise (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, **{field: 10**400})
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_colliding_repo_names_do_not_share_health_coverage(tmp_path, monkeypatch):
+    """``acme/foo-bar`` and ``acme-foo/bar`` both sanitize to ``acme-foo-bar``,
+    so two independent repos sharing the daemon dir would read/write the SAME
+    health file — a healthy loop servicing only the first repo would grant
+    coverage to the second indefinitely. The slug must be collision-resistant
+    (PR #76 review)."""
+    daemons = tmp_path / "daemons"
+    daemons.mkdir(parents=True, exist_ok=True)
+    pidfile = daemons / "pr-maintenance-loop.pid"
+    cwd_a = tmp_path / "wt-a"
+    cwd_b = tmp_path / "wt-b"
+    cwd_a.mkdir()
+    cwd_b.mkdir()
+    repos = {"wt-a": "acme/foo-bar", "wt-b": "acme-foo/bar"}
+
+    class _Cfg:
+        maintenance_loop_pidfile = pidfile
+
+        def __init__(self, repo: str) -> None:
+            self._repo = repo
+
+        def resolved_repo(self, path) -> str:
+            return self._repo
+
+    monkeypatch.setattr(loop, "load_config", lambda cwd: _Cfg(repos[Path(cwd).name]))
+    loop._repo_slug.cache_clear()
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(str(cwd_a), executors_viable=True, interval=600)
+    # Distinct repos must never share a health file...
+    assert loop._health_file(str(cwd_a)) != loop._health_file(str(cwd_b))
+    # ...so repo A's healthy record covers A but never B.
+    assert loop.loop_health_ok(str(cwd_a)) is True
+    assert loop.loop_health_ok(str(cwd_b)) is False
+
+
+# ---------------------------------------------------------------------------
 # Startup validation persists a degraded record with BOTH error strings
 # ---------------------------------------------------------------------------
 
