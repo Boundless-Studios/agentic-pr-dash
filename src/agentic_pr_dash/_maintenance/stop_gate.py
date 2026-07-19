@@ -316,6 +316,13 @@ def _stop_gate_impl(args) -> int:
                 # alive: required CI running again (BOU-1789 watch-pending) or
                 # CI state unobservable this tick (fail toward coverage).
                 verified_clean = _read_clean_exit_keys(session_id)
+                # A blocker-status read that failed DURING the _check_worktree
+                # pass above (get_ci_checks / its REST fallback unobservable)
+                # means this stop's "nothing pending" was computed blind —
+                # capture it BEFORE the scoped reset below or the marker-skip
+                # would treat the blind result as clean (codex PR #75 review,
+                # round 5).
+                check_probe_failed = github_api.checks_probe_failure_seen()
                 # Scope the probe-failure flag to the observations that feed
                 # THIS clean-exit decision: reset BEFORE the detached-record
                 # read below, so a failed/truncated CI probe while building
@@ -352,9 +359,11 @@ def _stop_gate_impl(args) -> int:
                     # this pass means "nothing pending" was NOT established for
                     # every owned PR — a CI-only probe below cannot stand in
                     # for the blocked/unresolved-thread signal (codex PR #75
-                    # review, round 2).
+                    # review, round 2). Same for a failed blocker-status read
+                    # during the check pass (round 5).
                     and not check_unobservable
                     and not check_warn_only
+                    and not check_probe_failed
                 ):
                     # ANY open detached record with required CI running keeps
                     # the demand alive — never collapse same-numbered records

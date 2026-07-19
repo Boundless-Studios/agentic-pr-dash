@@ -211,6 +211,28 @@ def _await_watch_pending_this_tick(
     )
 
 
+def _marker_pr_still_current(worktree: str, pr_number: int) -> bool:
+    """True iff ``worktree``'s CURRENT branch still resolves to open PR
+    ``pr_number``.
+
+    The clean-exit verified set may only contain PRs this tick actually
+    observed. The armed marker names the PR the worktree owned when it was
+    armed — if the worktree has since been repointed to another branch,
+    ``_check_worktree`` verified THAT branch's PR (or none), not the marker's,
+    and the ledger still treats the matching marker as proof the worktree
+    covers the PR, so it isn't probed as detached either. Recording the marker
+    PR as verified-clean would then let the stop gate's marker coverage
+    suppress the waiter while the original PR's feedback goes unobserved
+    (codex PR #75 review, round 5). Resolution failures return False — fail
+    closed: unverifiable is not verified.
+    """
+    branch = _current_branch(worktree)
+    if not branch:
+        return False
+    resolved = _resolve_open_pr_for_branch(worktree, branch)
+    return resolved is not None and resolved[0] == pr_number
+
+
 def _cmd_check(args: argparse.Namespace) -> int:
     code, text = _check_worktree(args.cwd, args.session_id or "")
     print(text)
@@ -726,6 +748,15 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # limit), the watched PRs are CLEAN: exit 0 now instead of sleeping
             # until the deadline — or forever with `--max-wait < 0`. The
             # detached pr-maintenance-loop remains the durable backstop.
+            # A detached record whose state read failed ("unknown", a
+            # non-rate-limit gh error — the rate-limit case is caught by
+            # rate_limit_seen()) is an UNOBSERVED possibly-open PR: its
+            # review/merge/CI state was never seen this tick, so the tick must
+            # not conclude "clean" (codex PR #75 review, round 5).
+            unknown_detached = any(
+                r.get("state") == "unknown" for r in _detached_this_tick
+            )
+
             watch_pending: bool | None = None
             if not getattr(args, "keep_alive_without_prs", False):
                 watch_pending = _await_watch_pending_this_tick(
@@ -734,6 +765,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 if (
                     not watch_pending
                     and not gh_unobservable
+                    and not unknown_detached
                     and not warn_only_deferral
                     and not github_api.rate_limit_seen()
                     # "CI terminal" must be a POSITIVE observation: a failed
@@ -745,10 +777,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # gate doesn't re-demand a waiter that would immediately
                     # clean-exit again (codex PR #75 review). Keys are
                     # repo-qualified so the same PR number in two maintenance
-                    # repos stays distinct (round 3).
+                    # repos stays distinct (round 3). Only PRs whose worktree
+                    # still RESOLVES to them were actually observed by this
+                    # tick's checks — a stale marker PR must not be recorded
+                    # verified (round 5).
                     verified = {
                         _clean_exit_key(_repo_slug(wt), n)
                         for wt, n in _owned_open_pr_pairs(owned)
+                        if _marker_pr_still_current(wt, n)
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick

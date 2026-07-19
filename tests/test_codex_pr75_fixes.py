@@ -193,6 +193,10 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_check_worktree",
                         lambda path, sid, *, claim=True: (0, "nothing pending"))
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    # The worktree still resolves to the marker PR (round 5: only PRs the tick
+    # actually observed may be recorded verified-clean).
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature-42")
+    monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: (42, False))
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
@@ -479,3 +483,124 @@ def test_stop_gate_marker_skip_preserves_detached_probe_failure(tmp_path, monkey
     err = capsys.readouterr().err
     assert rc == 2, "unobserved detached CI state must fail toward coverage"
     assert "#7" in err
+
+
+# ---------------------------------------------------------------------------
+# Round 5: (a) a failed get_ci_checks blocker read is unobservable, not "no
+# checks"; (b) the clean-exit verified set may only contain PRs the tick
+# actually observed (worktree still resolves to the marker PR); (c) a detached
+# record whose state could not be read ("unknown") keeps the waiter alive.
+# ---------------------------------------------------------------------------
+
+
+def test_get_ci_checks_unobservable_records_probe_failure(monkeypatch):
+    """Both the `gh pr checks` JSON read and the REST fallback's head-SHA
+    resolution fail: [] must be flagged unobservable, not read as no-checks."""
+    monkeypatch.setattr(
+        github_api, "_run",
+        lambda cmd, **kw: types.SimpleNamespace(returncode=1, stdout="", stderr="boom"),
+    )
+    github_api.reset_checks_probe_failure_seen()
+    assert github_api.get_ci_checks(42) == []
+    assert github_api.checks_probe_failure_seen() is True
+
+
+def test_get_ci_checks_rest_checkrun_read_failure_records_probe_failure(monkeypatch):
+    """The REST fallback resolves the head SHA but the check-runs/status reads
+    fail: still unobservable."""
+    def fake_run(cmd, **kw):
+        joined = " ".join(cmd)
+        if "pulls/" in joined:
+            return types.SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    github_api.reset_checks_probe_failure_seen()
+    assert github_api.get_ci_checks(42) == []
+    assert github_api.checks_probe_failure_seen() is True
+
+
+def test_await_clean_exit_excludes_stale_marker_pr(tmp_path, monkeypatch):
+    """The armed marker names PR #42 but the worktree was repointed to a branch
+    with NO open PR: the tick never observed #42, so the clean-exit marker must
+    not record it as verified (stop-gate marker coverage would otherwise
+    suppress the waiter while #42's feedback goes unobserved)."""
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "no open PR for this branch"))
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "repointed-branch")
+    monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: None)
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert _waiter_mod._read_clean_exit_keys(SID) == set()
+
+
+def test_await_clean_exit_excludes_marker_pr_when_branch_resolves_elsewhere(tmp_path, monkeypatch):
+    """Marker names #42 but the worktree's current branch resolves to open PR
+    #43: the tick verified #43, not #42 — #42 must not be recorded clean."""
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "other-feature")
+    monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: (43, False))
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert _marker_key(wt, 42) not in _waiter_mod._read_clean_exit_keys(SID)
+
+
+def test_await_unknown_detached_state_suppresses_clean_exit(tmp_path, monkeypatch):
+    """Tick 1: a detached ledger PR's state read failed (state="unknown", a
+    non-rate-limit gh error) — its review/merge/CI state was never observed, so
+    the clean exit must not fire. Tick 2: the record resolves — clean exit."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+    _wire_await(tmp_path, monkeypatch, wt)
+
+    tick = [0]
+
+    def fake_check(path, sid, *, claim=True):
+        tick[0] += 1
+        if tick[0] > 3:
+            raise AssertionError("await did not exit once the record resolved")
+        return 0, "nothing pending"
+
+    unknown = dict(_detached_record(9, "org-a/repo-a", ci_watch_pending=False),
+                   state="unknown", url="(pr 9)")
+
+    def fake_detached(sid, cwd, include_legacy=True, prune_legacy=True):
+        return [unknown] if tick[0] <= 1 else []
+
+    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
+
+    rc = mc.main(_await_args(tmp_path))
+    assert rc == 0
+    assert tick[0] == 2, "unknown-state detached tick must not clean-exit"
+
+
+def test_stop_gate_marker_skip_fails_closed_on_blocker_read_probe_failure(tmp_path, monkeypatch, capsys):
+    """A get_ci_checks failure during the _check_worktree pass (BEFORE the
+    marker-skip's scoped flag reset) means 'nothing pending' was computed
+    blind — the marker-skip must not fire (fail toward coverage)."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+
+    def blind_check(path, sid, *, claim=True):
+        github_api._note_checks_probe_failure()  # blocker-status read failed
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", blind_check)
+    _waiter_mod._write_clean_exit_marker(SID, {_marker_key(wt, 42)})
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2, "blind blocker read must fail toward coverage"
+    assert "#42" in err

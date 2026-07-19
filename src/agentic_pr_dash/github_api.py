@@ -1920,6 +1920,12 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
     )
     sha = (r.stdout or "").strip()
     if r.returncode != 0 or not sha:
+        # Head-SHA resolution failed: the blocker-status read is UNOBSERVABLE,
+        # not "no checks". Record it so tick consumers (await clean exit /
+        # stop-gate marker skip) don't treat the empty result as a positive
+        # clean observation — this is the path where BOTH the `gh pr checks`
+        # JSON read and the REST fallback died (codex PR #75 review, round 5).
+        _note_checks_probe_failure()
         return []
 
     checks = []
@@ -2075,6 +2081,11 @@ def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
                 checks.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    else:
+        # The check-runs read failed: whatever this call returns is missing an
+        # entire status mechanism — an unobservable read, not an observation of
+        # "no check runs" (codex PR #75 review, round 5).
+        _note_checks_probe_failure()
 
     checks.extend(_get_commit_statuses(sha, cwd))
 
@@ -2107,6 +2118,9 @@ def _get_commit_statuses(sha: str, cwd: str | None = None) -> list[dict]:
         cwd=cwd, timeout_s=20,
     )
     if r.returncode != 0:
+        # Same unobservability contract as the check-runs read above: a failed
+        # commit-status read may hide an external-CI failure (round 5).
+        _note_checks_probe_failure()
         return []
     out: list[dict] = []
     for line in r.stdout.strip().split("\n"):
