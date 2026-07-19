@@ -526,7 +526,7 @@ def record_status_report(
             "checkpoint_fingerprint": report.checkpoint_fingerprint,
             "outbox_depth": report.outbox_depth,
             "harness_reported_at": timestamp,
-            "idempotency_keyed": True if report.event_id is not None else None,
+            "idempotency_keyed": report.event_id is not None,
         }
     )
     event_id = str(event["event_id"])
@@ -846,7 +846,8 @@ def _compact_registry_locked(
             continue
         event_name = str(event.get("event") or "")
         if event_name == "harness_status_seen" or (
-            event_name == "harness_status" and event.get("idempotency_keyed") is True
+            event_name == "harness_status"
+            and event.get("idempotency_keyed") is not False
         ):
             keyed_history_indices_by_session.setdefault(sid, []).append(index)
         if event_name == "harness_status":

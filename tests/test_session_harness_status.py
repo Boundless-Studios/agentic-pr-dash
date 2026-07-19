@@ -351,6 +351,7 @@ def test_auto_compaction_keeps_only_latest_status_per_active_session(
     ]
 
     assert [event["event"] for event in events] == ["harness_status"]
+    assert events[0]["idempotency_keyed"] is False
     assert state.generation == 4
     assert state.supervisor_state == "state-4"
 
@@ -402,6 +403,37 @@ def test_compaction_bounds_keyed_status_tombstones(tmp_path, monkeypatch):
 
     assert sum(event["event"] == "harness_status_seen" for event in events) == 256
     assert sum(event["event"] == "harness_status" for event in events) == 1
+
+
+def test_compaction_conservatively_tombstones_pre_marker_statuses(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "0")
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_READ_LIMIT", "0")
+    session_registry.record_status_report(
+        _report(event_id="observation-a", state="warning"),
+        path=registry,
+    )
+    session_registry.record_status_report(
+        _report(event_id="observation-b", state="running"),
+        path=registry,
+    )
+    pre_marker_events = session_registry.read_events(path=registry)
+    for event in pre_marker_events:
+        event.pop("idempotency_keyed", None)
+    registry.write_text(
+        "".join(json.dumps(event) + "\n" for event in pre_marker_events),
+        encoding="utf-8",
+    )
+
+    session_registry.compact_registry(path=registry)
+    events = session_registry.read_events(path=registry)
+
+    assert [event["event"] for event in events] == [
+        "harness_status_seen",
+        "harness_status",
+    ]
 
 
 def test_summary_preserves_multiple_conversations_per_worktree(tmp_path):
