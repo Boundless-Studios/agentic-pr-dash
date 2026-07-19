@@ -436,11 +436,17 @@ def _parse_status_report(payload: dict[str, Any]) -> HarnessStatusReport:
 def _status_event_id(
     producer_event_id: str | None,
     worktree_path: str,
+    session_id: str,
+    chain_id: str,
+    generation: int,
 ) -> str:
     source_id = producer_event_id or uuid.uuid4().hex
     canonical = json.dumps(
         {
+            "chain_id": chain_id,
+            "generation": generation,
             "producer_event_id": source_id,
+            "session_id": session_id,
             "worktree_path": worktree_path,
         },
         sort_keys=True,
@@ -487,7 +493,13 @@ def record_status_report(
     )
     event = _clean_payload(
         {
-            "event_id": _status_event_id(report.event_id, resolved_worktree),
+            "event_id": _status_event_id(
+                report.event_id,
+                resolved_worktree,
+                session_id,
+                report.chain_id,
+                report.generation,
+            ),
             "session_id": session_id,
             "event": "harness_status",
             "timestamp": timestamp,
@@ -517,9 +529,10 @@ def record_status_report(
     )
     event_id = str(event["event_id"])
     with _registry_write_lock(target):
-        existing = _registry_event_by_id(target, event_id)
-        if existing is not None:
-            return existing
+        if report.event_id is not None:
+            existing = _registry_event_by_id(target, event_id)
+            if existing is not None:
+                return existing
         with target.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(event, sort_keys=True) + "\n")
     try:
@@ -815,16 +828,28 @@ def _compact_registry_locked(
             parsed.append((line, event))
 
     # Decide per session: terminal in latest state AND its newest event is stale.
+    # Harness reports are snapshots rather than an audit log, so retain only the
+    # latest report for each session (plus the latest report before a terminal
+    # event, which preserves runtime details after completion).
     latest_event_by_session: dict[str, str] = {}
     latest_ts_by_session: dict[str, str] = {}
-    for _line, event in parsed:
+    latest_status_index_by_session: dict[str, int] = {}
+    status_before_terminal_by_session: dict[str, int] = {}
+    for index, (_line, event) in enumerate(parsed):
         sid = str(event.get("session_id") or "")
         if not sid:
             continue
+        event_name = str(event.get("event") or "")
+        if event_name == "harness_status":
+            latest_status_index_by_session[sid] = index
+        elif event_name in {"completed", "failed", "cleanup_completed"}:
+            prior_status = latest_status_index_by_session.get(sid)
+            if prior_status is not None:
+                status_before_terminal_by_session[sid] = prior_status
         ts = str(event.get("timestamp") or "")
         if ts >= latest_ts_by_session.get(sid, ""):
             latest_ts_by_session[sid] = ts
-            latest_event_by_session[sid] = str(event.get("event") or "")
+            latest_event_by_session[sid] = event_name
 
     drop_sessions: set[str] = set()
     for sid, last_event in latest_event_by_session.items():
@@ -833,11 +858,20 @@ def _compact_registry_locked(
         if latest_ts_by_session.get(sid, "") < cutoff_iso:
             drop_sessions.add(sid)
 
-    if not drop_sessions:
-        return 0
-
-    kept = [line for line, event in parsed
-            if str(event.get("session_id") or "") not in drop_sessions]
+    keep_status_indices = set(latest_status_index_by_session.values())
+    keep_status_indices.update(status_before_terminal_by_session.values())
+    kept: list[str] = []
+    for index, (line, event) in enumerate(parsed):
+        sid = str(event.get("session_id") or "")
+        if sid in drop_sessions:
+            continue
+        if (
+            sid
+            and str(event.get("event") or "") == "harness_status"
+            and index not in keep_status_indices
+        ):
+            continue
+        kept.append(line)
     removed = len(parsed) - len(kept)
     if removed <= 0:
         return 0

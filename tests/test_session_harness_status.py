@@ -304,6 +304,57 @@ def test_concurrent_duplicate_producer_event_is_appended_once(
     assert len(session_registry.read_events(path=registry)) == 1
 
 
+def test_producer_event_id_is_namespaced_by_session_identity(tmp_path):
+    registry = tmp_path / "events.jsonl"
+
+    first = session_registry.record_status_report(
+        _report(event_id="1", conversation_id="conversation-1"),
+        path=registry,
+    )
+    second = session_registry.record_status_report(
+        _report(event_id="1", conversation_id="conversation-2"),
+        path=registry,
+    )
+
+    assert first["event_id"] != second["event_id"]
+    assert len(session_registry.read_events(path=registry)) == 2
+
+
+def test_non_keyed_report_skips_idempotency_scan(tmp_path, monkeypatch):
+    registry = tmp_path / "events.jsonl"
+
+    def fail_lookup(*args, **kwargs):
+        raise AssertionError("non-keyed reports must not scan the registry")
+
+    monkeypatch.setattr(session_registry, "_registry_event_by_id", fail_lookup)
+
+    session_registry.record_status_report(_report(), path=registry)
+
+    assert len(session_registry.read_events(path=registry)) == 1
+
+
+def test_auto_compaction_keeps_only_latest_status_per_active_session(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "3")
+    monkeypatch.setenv("AGENTIC_PR_DASH_REGISTRY_READ_LIMIT", "0")
+
+    for generation in range(5):
+        session_registry.record_status_report(
+            _report(generation=generation, state=f"state-{generation}"),
+            path=registry,
+        )
+    events = session_registry.read_events(path=registry)
+    state = session_registry.summarize_sessions(path=registry).sessions[
+        "conversation-1"
+    ]
+
+    assert [event["event"] for event in events] == ["harness_status"]
+    assert state.generation == 4
+    assert state.supervisor_state == "state-4"
+
+
 def test_summary_preserves_multiple_conversations_per_worktree(tmp_path):
     registry = tmp_path / "events.jsonl"
     worktree = tmp_path / "worktree"
