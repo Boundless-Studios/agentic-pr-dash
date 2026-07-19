@@ -30,6 +30,8 @@ import time
 from functools import lru_cache
 from pathlib import Path
 
+from agent_coordinator.service import StaleClaimError
+
 from . import coordinator
 from ._maintenance import worktree_check
 from ._maintenance._common import _pid_alive
@@ -1067,7 +1069,10 @@ def _tick(args, executor: str) -> None:
         print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
         session = args.session_id or f"pid:{_loop_pid()}"
         if claim_handle:
-            coordinator.heartbeat_claim(claim_handle, session)
+            try:
+                coordinator.heartbeat_claim(claim_handle, session)
+            except StaleClaimError:
+                continue
         serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
         if not serviced:
             # Primary (and fallback, if any) failed. Record the failure streak,
@@ -1093,7 +1098,10 @@ def _tick(args, executor: str) -> None:
             _maybe_escalate(cwd, pr, err_summary, new_streak)
             if claim_handle:
                 reason = "all_executors_failed" if fallback else "executor_failed"
-                coordinator.release_claim(claim_handle, session, reason)
+                try:
+                    coordinator.release_claim(claim_handle, session, reason)
+                except StaleClaimError:
+                    pass
             continue
         complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
         if pr is not None:
@@ -1101,7 +1109,10 @@ def _tick(args, executor: str) -> None:
         complete = subprocess.run(complete_args)
         if claim_handle:
             reason = "completed" if complete.returncode == 0 else "complete_failed"
-            coordinator.release_claim(claim_handle, session, reason)
+            try:
+                coordinator.release_claim(claim_handle, session, reason)
+            except StaleClaimError:
+                continue
         # Reset the failure streak on a successful dispatch + complete.
         reset_executor_failure(cwd, pr)
 

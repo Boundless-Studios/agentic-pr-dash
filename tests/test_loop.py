@@ -4,6 +4,10 @@ import os
 import subprocess
 import types
 
+import pytest
+
+from agent_coordinator.service import StaleClaimError
+
 from agentic_pr_dash import loop
 from agentic_pr_dash import worktrees
 
@@ -397,3 +401,65 @@ def test_tick_releases_claim_when_executor_launch_raises(monkeypatch, tmp_path):
 
     assert ("heartbeat", "claim-1", 4, "sess-1") in calls
     assert ("release", "claim-1", 4, "sess-1", "executor_failed") in calls
+
+
+@pytest.mark.parametrize("stale_operation", ["heartbeat", "release"])
+def test_tick_treats_stale_claim_as_handoff_and_continues(
+    monkeypatch, tmp_path, stale_operation,
+):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    calls = []
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
+            cwd = cmd[cmd.index("--cwd") + 1]
+            calls.append(("check", cwd))
+            if cwd == str(first):
+                return types.SimpleNamespace(
+                    returncode=loop.CHECK_WORK_FOUND,
+                    stdout=(
+                        "fix prompt\nPR_NUMBER=7\n"
+                        "COORDINATOR_CLAIM_ID=claim-1\n"
+                        "COORDINATOR_LEASE_EPOCH=4\n"
+                    ),
+                    stderr="",
+                )
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "complete" in cmd:
+            calls.append(("complete", cmd))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected subprocess.run call: {cmd}")
+
+    def heartbeat_claim(handle, session_id):
+        calls.append(("heartbeat", handle.claim_id, handle.lease_epoch, session_id))
+        if stale_operation == "heartbeat":
+            raise StaleClaimError(expected_epoch=5, received_epoch=4)
+
+    def release_claim(handle, session_id, reason):
+        calls.append(("release", handle.claim_id, handle.lease_epoch, session_id, reason))
+        if stale_operation == "release":
+            raise StaleClaimError(expected_epoch=5, received_epoch=4)
+
+    monkeypatch.setattr(loop, "_discover_cwds", lambda args: [str(first), str(second)])
+    monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
+    monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
+    monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
+    monkeypatch.setattr(loop.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        loop,
+        "_run_executor",
+        lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0,
+    )
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim", heartbeat_claim)
+    monkeypatch.setattr(loop.coordinator, "release_claim", release_claim)
+
+    loop._tick(_args(cwd=["/repo/root"], session_id="sess-1"), "codex {prompt}")
+
+    assert ("check", str(second)) in calls
+    if stale_operation == "heartbeat":
+        assert ("executor", str(first)) not in calls
+    else:
+        assert ("executor", str(first)) in calls
