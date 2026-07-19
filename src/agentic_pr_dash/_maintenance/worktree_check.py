@@ -177,7 +177,7 @@ def _clear_no_progress(cwd: str) -> None:
         _write_no_progress(cwd, data)
 
 
-def _owner_progress_state(marker_cwd: str, owner: str) -> str:
+def _owner_progress_state(marker_cwd: str, owner: str, pr_number: int) -> str:
     """Classify the owner's marker as ``fixing`` / ``idle`` / ``unknown``.
 
       * ``fixing``  — an ACTIVE fix-lease: the owner last stamped its heartbeat
@@ -186,16 +186,27 @@ def _owner_progress_state(marker_cwd: str, owner: str) -> str:
         recently and reported "nothing pending" while blockers persist. This is
         the exact false-negative that strands the PR — the only state a
         no-progress tick is counted against.
-      * ``unknown`` — no readable marker for ``owner`` / a stale heartbeat: we
-        cannot POSITIVELY confirm the owner ticked-and-found-nothing, so we do
-        NOT count a no-progress tick (stay conservative and keep deferring).
+      * ``unknown`` — no readable marker for ``owner`` / the marker names a
+        DIFFERENT PR / a stale heartbeat: we cannot POSITIVELY confirm the owner
+        ticked-and-found-nothing FOR THIS PR, so we do NOT count a no-progress
+        tick (stay conservative and keep deferring).
 
     A merely-fresh heartbeat is deliberately NOT treated as progress: the stuck
     "nothing pending" owner refreshes its heartbeat every tick while popping the
     fix-lease — that IS the ``idle`` signal we reclaim on.
+
+    The marker's ``pr`` MUST equal ``pr_number`` (P1, codex PR #83 review): a live
+    session can hold LEDGER ownership of several PRs while its worktree marker
+    names only its *current* branch's PR (``markers._live_pr_owner_record``). So a
+    fresh-heartbeat/no-lease marker for a DIFFERENT PR is not evidence that this
+    PR was reported idle — treating it as such would reclaim a ledger-owned PR the
+    live owner never surfaced, defeating the ledger gate's no-concurrent-
+    maintenance guarantee.
     """
     fields = markers._read_marker(marker_cwd)
     if not fields or fields.get("session_id", "") != owner:
+        return "unknown"
+    if str(fields.get("pr", "")) != str(pr_number):
         return "unknown"
     if markers._fix_lease_active(fields.get("fix_lease_until", "")):
         return "fixing"
@@ -205,6 +216,25 @@ def _owner_progress_state(marker_cwd: str, owner: str) -> str:
         if value
     )
     return "idle" if heartbeat_fresh else "unknown"
+
+
+def _hydrate_unresolved_threads(pr, cwd: str) -> None:
+    """Merge live unresolved review threads into ``pr.review_comments`` in place.
+
+    A read-only gh query. Uses ``setdefault`` semantics (keep any comment already
+    present, add thread-only ones) so an already-hydrated PR is not disturbed —
+    the single source of truth shared by the reclaim fingerprint and the main
+    service path, so both compute the SAME fully-hydrated fingerprint.
+    """
+    thread_comments = completion._review_comments_from_threads(
+        pr_state._unresolved_review_threads(pr.number, cwd)
+    )
+    if not thread_comments:
+        return
+    merged = {c.id: c for c in pr.review_comments}
+    for c in thread_comments:
+        merged.setdefault(c.id, c)
+    pr.review_comments = list(merged.values())
 
 
 def _should_reclaim_stuck_owner(
@@ -232,7 +262,7 @@ def _should_reclaim_stuck_owner(
         return False
     from agentic_pr_dash import coordinator  # noqa: PLC0415
 
-    state = _owner_progress_state(marker_cwd, owner)
+    state = _owner_progress_state(marker_cwd, owner, pr.number)
     if state == "fixing":
         _clear_no_progress(cwd)  # actively servicing → progress; reset the streak
         return False
@@ -241,6 +271,15 @@ def _should_reclaim_stuck_owner(
         # deferring without advancing (or resetting) the streak, so a transient
         # unreadable marker neither reclaims nor wipes a real streak.
         return False
+    # Hydrate live unresolved review threads BEFORE fingerprinting (P2, codex PR
+    # #83 review). ``_resolve_and_blockers`` only fetches threads when the PR has
+    # NO other blocker; a PR that already has e.g. failed CI keeps its
+    # un-hydrated ``review_comments`` here, so a newly-added GraphQL-only
+    # unresolved thread would leave the fingerprint unchanged and fail to reset
+    # the streak (wrongly counting toward reclaim). Merge threads in so the
+    # fingerprint tracks the SAME fully-hydrated blocker state the coordinator
+    # claims on — a new thread now changes the fingerprint and resets the streak.
+    _hydrate_unresolved_threads(pr, cwd)
     fingerprint = coordinator.fingerprint_for_pr(pr)
     count = _record_no_progress_tick(
         cwd, owner=owner, pr_number=pr.number, fingerprint=fingerprint
@@ -469,14 +508,7 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # Merge live unresolved threads into review_comments for accurate
     # fingerprinting (so both modes compute the SAME defer decision) and a
     # complete maintenance prompt. Read-only gh query.
-    thread_comments = completion._review_comments_from_threads(
-        pr_state._unresolved_review_threads(pr.number, cwd)
-    )
-    if thread_comments:
-        merged = {c.id: c for c in pr.review_comments}
-        for c in thread_comments:
-            merged.setdefault(c.id, c)
-        pr.review_comments = list(merged.values())
+    _hydrate_unresolved_threads(pr, cwd)
 
     live_fingerprint = coordinator.fingerprint_for_pr(pr)
     active_fingerprint = coordinator.active_claim_fingerprint_for_pr(pr)

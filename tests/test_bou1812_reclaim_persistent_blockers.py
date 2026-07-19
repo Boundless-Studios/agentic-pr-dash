@@ -28,6 +28,8 @@ import pytest
 
 from agentic_pr_dash import config, maintenance_check
 from agentic_pr_dash.models import PRData, PRStatus, ReviewComment
+from agentic_pr_dash._maintenance import _common as _common_mod
+from agentic_pr_dash._maintenance import completion as _completion_mod
 from agentic_pr_dash._maintenance import markers as _markers_mod
 from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
@@ -256,3 +258,140 @@ def test_streak_resets_when_owner_starts_fixing(monkeypatch, tmp_path):
     code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 10, text
     assert "PR_NUMBER=42" in text
+
+
+# ---------------------------------------------------------------------------
+# Codex PR #83 review — P2: hydrate unresolved threads before fingerprinting
+# ---------------------------------------------------------------------------
+
+def _ci_pr(worktree: Path, *, number: int = 43) -> PRData:
+    """A CI-failing PR — ``blockers_for_pr`` returns a non-empty set, so
+    ``_resolve_and_blockers`` does NOT fetch unresolved review threads."""
+    return PRData(
+        number=number, title="ci red", branch="feature/ci",
+        url=f"https://github.com/Boundless-Studios/gaia-free/pull/{number}",
+        worktree_path=str(worktree), status=PRStatus.CI_FAILING,
+        failing_checks=["ci/integration"], latest_commit_sha="deadbeef",
+    )
+
+
+def test_new_unresolved_thread_on_ci_pr_resets_streak(monkeypatch, tmp_path):
+    """P2 regression: a PR that already has a primary blocker (failed CI) never
+    triggers ``_resolve_and_blockers``' thread fallback, so the reclaim path must
+    hydrate unresolved threads ITSELF before fingerprinting. A NEW GraphQL-only
+    thread appearing on tick 2 must change the fingerprint and RESET the streak —
+    without the fix the fingerprint is unchanged, the streak reaches the
+    threshold, and the loop wrongly reclaims."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_RECLAIM_NO_PROGRESS_THRESHOLD", "2")
+    config.load.cache_clear()
+    worktree = tmp_path / "wt"; worktree.mkdir()
+    pr = _ci_pr(worktree)
+    _stub_boundaries(monkeypatch, pr)
+    _idle_owner_marker(worktree, pr=43)
+
+    # Per-tick unresolved threads: none on tick 1, a NEW thread on tick 2+.
+    new_comment = ReviewComment(
+        id=555, author="human", body="please change this",
+        created_at="2026-07-01T00:00:00Z",
+    )
+    threads_by_tick = [[], [new_comment], [new_comment]]
+    state = {"i": 0}
+
+    def fake_unresolved(n, cwd):
+        return threads_by_tick[min(state["i"], len(threads_by_tick) - 1)]
+
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", fake_unresolved)
+    # Identity: our fake threads ARE already ReviewComment records.
+    monkeypatch.setattr(
+        _completion_mod, "_review_comments_from_threads", lambda threads: list(threads)
+    )
+
+    # Tick 1 — no thread: streak = 1, defer.
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 0, text
+    assert _wc.WARN_ONLY_MARKER in text
+    state["i"] = 1
+
+    # Tick 2 — a NEW thread changed the fingerprint: streak RESETS to 1, defer
+    # (would be reclaim at streak==threshold 2 without the hydrate fix).
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 0, text
+    assert _wc.WARN_ONLY_MARKER in text
+
+    # Tick 3 — same thread persists (fingerprint stable): streak = 2 → reclaim,
+    # proving the reset only cost one tick and legitimate reclaim still fires.
+    state["i"] = 2
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 10, text
+    assert "PR_NUMBER=43" in text
+
+
+# ---------------------------------------------------------------------------
+# Codex PR #83 review — P1: the marker must cover the RECLAIMED PR
+# ---------------------------------------------------------------------------
+
+def _stub_ledger_gate(monkeypatch, pr, ledger_cwd):
+    """Reach the LEDGER gate: no marker-gate owner, ownership resolved from the
+    durable ledger to ``OWNER`` whose marker lives in ``ledger_cwd``."""
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda n, cwd: [])
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda cwd: None)
+    monkeypatch.setattr(_worktrees_mod, "_marker_pr", lambda cwd: None)
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_paths", lambda paths, sid: set()
+    )
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(_common_mod, "_repo_slug", lambda cwd: "acme/repo")
+    monkeypatch.setattr(
+        _markers_mod, "_live_pr_owner_record",
+        lambda pr_number, repo, sid, cwd: (OWNER, str(ledger_cwd)),
+    )
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, owner: True)  # wake-capable
+    from agentic_pr_dash import github_api
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd: False)
+    monkeypatch.setattr(github_api, "get_failed_logs", lambda sha, checks, cwd: {})
+
+
+def test_ledger_owner_marker_for_different_pr_is_not_reclaimed(monkeypatch, tmp_path):
+    """P1 regression: a live session can hold LEDGER ownership of several PRs
+    while its worktree marker names only its CURRENT branch's PR. An idle marker
+    for a DIFFERENT PR (#99) must NOT be read as 'this PR (#43) reported idle' —
+    so PR #43 is deferred to FOREVER, never reclaimed, no matter how many ticks.
+    Without the marker-pr check this reclaims after the threshold."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_RECLAIM_NO_PROGRESS_THRESHOLD", "2")
+    config.load.cache_clear()
+    worktree = tmp_path / "wt"; worktree.mkdir()
+    ledger_cwd = tmp_path / "owner-wt"; ledger_cwd.mkdir()
+    pr = _ci_pr(worktree, number=43)
+    _stub_ledger_gate(monkeypatch, pr, ledger_cwd)
+    # Owner's marker is idle but names PR #99, NOT #43.
+    _idle_owner_marker(ledger_cwd, pr=99)
+
+    for i in range(5):  # well past the threshold
+        code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+        assert code == 0, f"tick {i}: {text}"
+        assert _wc.WARN_ONLY_MARKER in text  # defers, never reclaims
+        assert "(ledger)" in text
+        assert "COORDINATOR_CLAIM_ID=" not in text
+
+
+def test_ledger_owner_marker_for_same_pr_still_reclaims(monkeypatch, tmp_path):
+    """P1 positive control: when the ledger owner's marker names THE SAME PR (#43)
+    and is idle, the legitimate reclaim still fires after the threshold — the
+    marker-pr guard doesn't over-block genuine no-progress reclaim."""
+    monkeypatch.setenv("AGENTIC_PR_DASH_RECLAIM_NO_PROGRESS_THRESHOLD", "2")
+    config.load.cache_clear()
+    worktree = tmp_path / "wt"; worktree.mkdir()
+    ledger_cwd = tmp_path / "owner-wt"; ledger_cwd.mkdir()
+    pr = _ci_pr(worktree, number=43)
+    _stub_ledger_gate(monkeypatch, pr, ledger_cwd)
+    _idle_owner_marker(ledger_cwd, pr=43)  # marker covers THE reclaimed PR
+
+    # Tick 1 defers (streak 1); tick 2 reclaims (streak 2 == threshold).
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 0, text
+    assert _wc.WARN_ONLY_MARKER in text
+    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 10, text
+    assert "PR_NUMBER=43" in text
