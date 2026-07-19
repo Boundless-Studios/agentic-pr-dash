@@ -736,6 +736,8 @@ header h1 {
 .harness-state-draining,
 .harness-state-checkpointing { color: var(--warn); }
 .harness-context { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.harness-stale,
+.runtime-stale { color: var(--warn); }
 .runtime-context,
 .runtime-cumulative,
 .runtime-chain,
@@ -743,6 +745,7 @@ header h1 {
 .runtime-active-counts,
 .runtime-checkpoint,
 .runtime-outbox,
+.runtime-stale,
 .runtime-supervisor-state { margin-top: 3px; }
 .runtime-warning { color: var(--warn); font-size: 10px; }
 

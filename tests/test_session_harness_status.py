@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor
+import time
 
 import pytest
 
@@ -75,15 +77,31 @@ def test_status_report_projects_usage_identity_and_activity(tmp_path, monkeypatc
     assert state.worktree_path == str(worktree.resolve())
 
 
-def test_status_report_rejects_invalid_contract_and_private_payloads(tmp_path):
+def test_status_report_rejects_invalid_contract(tmp_path):
     with pytest.raises(ValueError, match="schema_version"):
         session_registry.record_status_report(
             _report(schema_version=2),
             path=tmp_path / "invalid.jsonl",
         )
-    with pytest.raises(ValueError, match="prompt_text"):
+
+
+@pytest.mark.parametrize(
+    "private_field",
+    (
+        "prompt_text",
+        "raw_transcript",
+        "tool_input",
+        "tool_output",
+        "messages",
+        "password",
+        "api_key",
+        "environment",
+    ),
+)
+def test_status_report_rejects_private_payloads(tmp_path, private_field):
+    with pytest.raises(ValueError, match=private_field):
         session_registry.record_status_report(
-            _report(prompt_text="must never be persisted"),
+            _report(**{private_field: "must never be persisted"}),
             path=tmp_path / "private.jsonl",
         )
 
@@ -154,13 +172,135 @@ def test_late_status_or_heartbeat_cannot_resurrect_terminal_conversation(tmp_pat
     assert state.is_terminal is True
 
 
-def test_duplicate_status_report_is_idempotent(tmp_path):
+def test_duplicate_producer_event_id_is_idempotent(tmp_path, monkeypatch):
     registry = tmp_path / "events.jsonl"
+    times = iter(("2026-07-19T10:00:00Z", "2026-07-19T10:00:05Z"))
+    monkeypatch.setattr(session_registry, "_utc_now", lambda: next(times))
+
+    first = session_registry.record_status_report(
+        _report(event_id="observation-1"), path=registry
+    )
+    second = session_registry.record_status_report(
+        _report(event_id="observation-1"), path=registry
+    )
+
+    assert second == first
+    assert len(session_registry.read_events(path=registry)) == 1
+
+
+def test_duplicate_status_event_id_is_idempotent_across_busy_registry(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    monkeypatch.setattr(session_registry, "_utc_now", lambda: "2026-07-19T10:00:00Z")
+    first = session_registry.record_status_report(
+        _report(event_id="observation-1"), path=registry
+    )
+    with registry.open("a", encoding="utf-8") as handle:
+        for index in range(300):
+            handle.write(
+                json.dumps(
+                    {
+                        "event_id": f"other-{index}",
+                        "event": "heartbeat",
+                        "session_id": f"other-session-{index}",
+                        "timestamp": "2026-07-19T10:00:00Z",
+                    }
+                )
+                + "\n"
+            )
+
+    second = session_registry.record_status_report(
+        _report(event_id="observation-1"), path=registry
+    )
+    matching = [
+        event
+        for event in session_registry.read_events(path=registry, limit=0)
+        if event.get("event_id") == first["event_id"]
+    ]
+
+    assert second["event_id"] == first["event_id"]
+    assert len(matching) == 1
+
+
+def test_unchanged_status_report_refreshes_after_observation_window(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    times = iter(("2026-07-19T10:00:00Z", "2026-07-19T10:02:00Z"))
+    monkeypatch.setattr(session_registry, "_utc_now", lambda: next(times))
 
     first = session_registry.record_status_report(_report(), path=registry)
     second = session_registry.record_status_report(_report(), path=registry)
+    state = session_registry.summarize_sessions(path=registry).sessions["conversation-1"]
 
-    assert first["event_id"] == second["event_id"]
+    assert first["event_id"] != second["event_id"]
+    assert len(session_registry.read_events(path=registry)) == 2
+    assert state.harness_reported_at == "2026-07-19T10:02:00Z"
+
+
+def test_status_report_a_b_a_transition_is_not_mistaken_for_retry(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    times = iter(
+        (
+            "2026-07-19T10:00:00Z",
+            "2026-07-19T10:00:05Z",
+            "2026-07-19T10:00:10Z",
+        )
+    )
+    monkeypatch.setattr(session_registry, "_utc_now", lambda: next(times))
+
+    session_registry.record_status_report(_report(state="warning"), path=registry)
+    session_registry.record_status_report(_report(state="draining"), path=registry)
+    session_registry.record_status_report(_report(state="warning"), path=registry)
+    state = session_registry.summarize_sessions(path=registry).sessions["conversation-1"]
+
+    assert len(session_registry.read_events(path=registry)) == 3
+    assert state.supervisor_state == "warning"
+
+
+def test_unknown_extensions_do_not_change_idempotence_or_persist(tmp_path):
+    registry = tmp_path / "events.jsonl"
+
+    first = session_registry.record_status_report(
+        _report(event_id="observation-1", future_metric={"value": 1}),
+        path=registry,
+    )
+    second = session_registry.record_status_report(
+        _report(event_id="observation-1", future_metric={"value": 2}),
+        path=registry,
+    )
+
+    assert second == first
+    assert "future_metric" not in first
+    assert "observation-1" not in first["event_id"]
+    assert len(session_registry.read_events(path=registry)) == 1
+
+
+def test_concurrent_duplicate_producer_event_is_appended_once(
+    tmp_path, monkeypatch
+):
+    registry = tmp_path / "events.jsonl"
+    original_lookup = session_registry._registry_event_by_id
+
+    def delayed_lookup(*args, **kwargs):
+        existing = original_lookup(*args, **kwargs)
+        time.sleep(0.02)
+        return existing
+
+    monkeypatch.setattr(session_registry, "_registry_event_by_id", delayed_lookup)
+    payload = _report(event_id="observation-1")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda _: session_registry.record_status_report(payload, path=registry),
+                range(2),
+            )
+        )
+
+    assert results[0] == results[1]
     assert len(session_registry.read_events(path=registry)) == 1
 
 

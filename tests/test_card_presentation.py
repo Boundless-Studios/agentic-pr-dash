@@ -478,6 +478,7 @@ def test_template_surfaces_harness_state_and_token_usage():
         runtime_active_critical_sections=0,
         runtime_checkpoint_fingerprint="abc123",
         runtime_outbox_depth=3,
+        runtime_status_stale=True,
     )
 
     html = _render_board([card])
@@ -494,6 +495,7 @@ def test_template_surfaces_harness_state_and_token_usage():
     assert "1 turn · 2 tools · 1 subagent · 0 critical" in html
     assert "abc123" in html
     assert "Outbox 3" in html
+    assert "Status stale" in html
 
 
 # ---------------------------------------------------------------------------

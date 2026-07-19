@@ -43,7 +43,7 @@ class ClaimHandle(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     claim_id: str = Field(min_length=1)
-    lease_epoch: int = Field(ge=1)
+    lease_epoch: int = Field(ge=0)
 
 
 class CICheck(BaseModel):
@@ -282,6 +282,7 @@ class WorktreeCard(BaseModel):
     runtime_active_critical_sections: int = 0
     runtime_checkpoint_fingerprint: str | None = None
     runtime_outbox_depth: int = 0
+    runtime_status_stale: bool = False
     agent_name: str | None = None
     docker_mode: str | None = None
     docker_daemon_name: str | None = None

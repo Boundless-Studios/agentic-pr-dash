@@ -10,6 +10,8 @@ paths preserve Gaia compatibility, but the registry is configured through
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterator
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -80,15 +82,33 @@ _DEFAULT_COMPACT_THRESHOLD = 5000
 _MAX_STATUS_REPORT_BYTES = 1_048_576
 
 _PRIVATE_REPORT_FIELDS = {
+    "api_key",
+    "api_keys",
+    "authorization",
+    "credential",
+    "credentials",
+    "env",
+    "environment",
+    "environment_variables",
+    "message",
+    "messages",
+    "password",
+    "passwords",
     "prompt",
+    "prompts",
     "prompt_text",
     "raw_prompt",
+    "raw_transcript",
     "transcript",
+    "transcripts",
     "transcript_body",
     "tool_input",
     "tool_inputs",
+    "tool_output",
+    "tool_outputs",
     "tool_arguments",
     "secret",
+    "secrets",
     "secret_value",
 }
 
@@ -119,6 +139,7 @@ class HarnessStatusReport(BaseModel):
     model_config = ConfigDict(extra="allow", frozen=True)
 
     schema_version: Literal[1]
+    event_id: str | None = Field(default=None, min_length=1, max_length=240)
     runtime: Literal["claude", "codex"]
     state: str = Field(min_length=1, max_length=64)
     chain_id: str = Field(min_length=1, max_length=240)
@@ -229,6 +250,25 @@ class SessionSummary:
 
 def registry_path(cwd: str | None = None) -> Path:
     return _default_registry(cwd)
+
+
+@contextmanager
+def _registry_write_lock(target: Path) -> Iterator[None]:
+    """Serialize registry append/dedupe/compaction across local processes."""
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError as exc:  # pragma: no cover - supported hosts are POSIX
+        raise RuntimeError(
+            "exclusive session-registry locking is unavailable"
+        ) from exc
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.with_name(f".{target.name}.lock")
+    with lock_path.open("a", encoding="utf-8") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
 
 
 def new_session_id(prefix: str = "gaia") -> str:
@@ -352,8 +392,9 @@ def record_event(
             or None,
         }
     )
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    with _registry_write_lock(target):
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, sort_keys=True) + "\n")
     # Amortized self-compaction (BOU-1637): once the registry crosses a line
     # threshold, drop old terminal sessions so the append-only file can't grow
     # without bound. Best-effort and atomic — a failure here never blocks the
@@ -392,16 +433,34 @@ def _parse_status_report(payload: dict[str, Any]) -> HarnessStatusReport:
         raise ValueError(f"invalid StatusReport: {exc}") from exc
 
 
-def _status_event_id(report: HarnessStatusReport, worktree_path: str) -> str:
+def _status_event_id(
+    producer_event_id: str | None,
+    worktree_path: str,
+) -> str:
+    source_id = producer_event_id or uuid.uuid4().hex
     canonical = json.dumps(
         {
-            "report": report.model_dump(mode="json"),
+            "producer_event_id": source_id,
             "worktree_path": worktree_path,
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return "harness-status-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _registry_event_by_id(target: Path, event_id: str) -> dict[str, Any] | None:
+    if not target.exists():
+        return None
+    with target.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                existing = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(existing, dict) and existing.get("event_id") == event_id:
+                return existing
+    return None
 
 
 def record_status_report(
@@ -428,7 +487,7 @@ def record_status_report(
     )
     event = _clean_payload(
         {
-            "event_id": _status_event_id(report, resolved_worktree),
+            "event_id": _status_event_id(report.event_id, resolved_worktree),
             "session_id": session_id,
             "event": "harness_status",
             "timestamp": timestamp,
@@ -457,14 +516,12 @@ def record_status_report(
         }
     )
     event_id = str(event["event_id"])
-    if any(
-        existing.get("event_id") == event_id
-        for existing in read_events(path=target, limit=256)
-    ):
-        return event
-    target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(event, sort_keys=True) + "\n")
+    with _registry_write_lock(target):
+        existing = _registry_event_by_id(target, event_id)
+        if existing is not None:
+            return existing
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
     try:
         _maybe_compact(target)
     except Exception:  # noqa: BLE001 - report persistence already succeeded
@@ -730,6 +787,17 @@ def compact_registry(path: Path | None = None, *, retention_seconds: int | None 
     live session behind a wall of ancient terminal noise.
     """
     target = path or registry_path()
+    if not target.exists():
+        return 0
+    with _registry_write_lock(target):
+        return _compact_registry_locked(target, retention_seconds=retention_seconds)
+
+
+def _compact_registry_locked(
+    target: Path,
+    *,
+    retention_seconds: int | None = None,
+) -> int:
     if not target.exists():
         return 0
     retention = retention_seconds if retention_seconds is not None else _retention_seconds()

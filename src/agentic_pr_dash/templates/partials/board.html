@@ -54,13 +54,16 @@
                 <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
             </div>
 
-            {% if card.supervisor_state or card.context_percent is not none %}
+            {% if card.supervisor_state or card.context_percent is not none or card.runtime_status_stale %}
             <div class="harness-summary">
                 {% if card.supervisor_state %}
                 <span class="harness-state harness-state-{{ card.supervisor_state }}">{{ card.supervisor_state_label }}</span>
                 {% endif %}
                 {% if card.context_percent is not none %}
                 <span class="harness-context">{{ "%.1f" | format(card.context_percent) }}% context</span>
+                {% endif %}
+                {% if card.runtime_status_stale %}
+                <span class="harness-stale">Status stale</span>
                 {% endif %}
             </div>
             {% endif %}
@@ -139,7 +142,7 @@
                 card.maintenance.failure_reason or
                 card.maintenance.output_tail
             ) %}
-            {% set has_runtime_detail = card.docker_mode or card.runtime_session_id or card.container_names or card.runtime_warnings or card.supervisor_state or card.context_usage_label or card.cumulative_usage_label or card.runtime_chain_id or card.runtime_quiescence or card.runtime_checkpoint_fingerprint or card.runtime_outbox_depth %}
+            {% set has_runtime_detail = card.docker_mode or card.runtime_session_id or card.container_names or card.runtime_warnings or card.supervisor_state or card.context_usage_label or card.cumulative_usage_label or card.runtime_chain_id or card.runtime_quiescence or card.runtime_checkpoint_fingerprint or card.runtime_outbox_depth or card.runtime_status_stale %}
             {% set has_diag = has_maintenance_detail or has_runtime_detail or card.failing_checks or card.agent_output or card.runner_indicator_label or card.agent_failure_reason or card.latest_commit_sha %}
             {% if has_diag %}
             <details class="card-details">
@@ -176,6 +179,7 @@
                     {% if card.supervisor_state %}
                     <div class="runtime-supervisor-state">Supervisor: {{ card.supervisor_state_label }}</div>
                     {% endif %}
+                    {% if card.runtime_status_stale %}<div class="runtime-stale">Status stale · using legacy activity fallback</div>{% endif %}
                     {% if card.context_usage_label %}<div class="runtime-context">{{ card.context_usage_label }}</div>{% endif %}
                     {% if card.cumulative_usage_label %}<div class="runtime-cumulative">{{ card.cumulative_usage_label }}</div>{% endif %}
                     {% if card.runtime_chain_id %}

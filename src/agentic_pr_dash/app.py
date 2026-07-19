@@ -259,17 +259,9 @@ def _harness_activity_state(
     now: datetime | None = None,
 ) -> str:
     """Return fresh canonical activity, or ``none`` to preserve fallbacks."""
-    if (
-        runtime_session is None
-        or runtime_session.is_terminal
-        or not runtime_session.harness_reported_at
-    ):
+    if runtime_session is None or runtime_session.is_terminal:
         return "none"
-    reported_at = _parse_iso(runtime_session.harness_reported_at)
-    if reported_at is None:
-        return "none"
-    current = now or datetime.now(timezone.utc)
-    if (current - reported_at).total_seconds() > _HARNESS_STATUS_STALE_SECONDS:
+    if not _harness_report_is_fresh(runtime_session, now=now):
         return "none"
     if any(
         (
@@ -287,6 +279,40 @@ def _harness_activity_state(
     if runtime_session.quiescence == "idle":
         return "idle"
     return "none"
+
+
+def _harness_report_is_fresh(
+    runtime_session: session_registry.RuntimeSessionState,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    reported_at = _parse_iso(runtime_session.harness_reported_at)
+    if reported_at is None:
+        return False
+    current = now or datetime.now(timezone.utc)
+    return (current - reported_at).total_seconds() <= _HARNESS_STATUS_STALE_SECONDS
+
+
+def _runtime_session_is_live(
+    runtime_session: session_registry.RuntimeSessionState,
+) -> bool:
+    if runtime_session.is_terminal:
+        return False
+    if not runtime_session.harness_reported_at:
+        return True
+    if _harness_report_is_fresh(runtime_session):
+        return True
+    return session_registry.pid_is_live(runtime_session.pid)
+
+
+def _runtime_status_is_stale(
+    runtime_session: session_registry.RuntimeSessionState,
+) -> bool:
+    return bool(
+        runtime_session.harness_reported_at
+        and not runtime_session.is_terminal
+        and not _harness_report_is_fresh(runtime_session)
+    )
 
 
 def _agent_activity_state(
@@ -498,7 +524,7 @@ def _runtime_session_for_worktree(
         if current is None or state.timestamp >= current.timestamp:
             latest_by_session[state.session_id] = state
     materialized = list(latest_by_session.values())
-    live = [state for state in materialized if not state.is_terminal]
+    live = [state for state in materialized if _runtime_session_is_live(state)]
     return max(live or materialized, key=lambda state: state.timestamp)
 
 
@@ -678,6 +704,7 @@ def _runtime_card_fields(
         "runtime_active_critical_sections": runtime_session.active_critical_sections,
         "runtime_checkpoint_fingerprint": runtime_session.checkpoint_fingerprint,
         "runtime_outbox_depth": runtime_session.outbox_depth,
+        "runtime_status_stale": _runtime_status_is_stale(runtime_session),
         "agent_name": runtime_session.agent_name,
         "docker_mode": runtime_session.docker_mode,
         "docker_daemon_name": runtime_session.docker_daemon_name,

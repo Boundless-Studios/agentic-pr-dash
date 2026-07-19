@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 import subprocess
 
 import pytest
 
-from agent_coordinator.models import OwnerIdentity
+from agent_coordinator.models import ClaimRecord, OwnerIdentity
 from agent_coordinator.service import StaleClaimError, TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
 from agentic_pr_dash import coordinator, maintenance
@@ -89,6 +89,54 @@ def test_claim_handle_carries_epoch_through_heartbeat_and_release(tmp_path, monk
     assert handle == coordinator.ClaimHandle(claim_id=handle.claim_id, lease_epoch=1)
     assert coordinator.heartbeat_claim(handle, "owner-1", lease_seconds=600) == handle
     assert coordinator.release_claim(handle, "owner-1", "completed") == handle
+
+
+def test_claim_handle_accepts_legacy_epoch_zero():
+    handle = coordinator.ClaimHandle(claim_id="legacy-claim", lease_epoch=0)
+
+    assert handle.lease_epoch == 0
+
+
+def test_claim_pr_preserves_legacy_active_claim_epoch_zero(tmp_path, monkeypatch):
+    store_path = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store_path))
+    pr = _pr()
+    now = datetime.now(timezone.utc)
+    legacy = ClaimRecord(
+        claim_id="legacy-claim",
+        task=coordinator.task_identity_for_pr(pr),
+        owner=OwnerIdentity(
+            session_id="owner-1",
+            pid=os.getpid(),
+            worktree_path=pr.worktree_path,
+        ),
+        claimed_at=now,
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(seconds=300),
+        lease_epoch=0,
+    )
+    legacy_payload = legacy.to_dict()
+    legacy_payload.pop("lease_epoch")
+    JsonlClaimStore(store_path).append_event(
+        {
+            "event": "claimed",
+            "timestamp": now.isoformat().replace("+00:00", "Z"),
+            "claim": legacy_payload,
+        }
+    )
+
+    handle = coordinator.claim_pr(
+        pr,
+        session_id="owner-1",
+        pid=os.getpid(),
+        agent="codex",
+        lease_seconds=300,
+    )
+
+    assert handle == coordinator.ClaimHandle(
+        claim_id="legacy-claim",
+        lease_epoch=0,
+    )
 
 
 def test_stale_claim_handle_epoch_is_rejected(tmp_path, monkeypatch):

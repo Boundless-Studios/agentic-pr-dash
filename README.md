@@ -88,6 +88,11 @@ Unknown extension fields are tolerated for forward compatibility. Raw prompts,
 transcripts, tool inputs/outputs, and similarly private fields are rejected and
 never written to the session registry.
 
+Producers that may retry delivery can add a stable `event_id` extension; repeat
+delivery of that ID is idempotent. Without an `event_id`, each invocation is a
+new observation, so unchanged periodic snapshots still refresh liveness and an
+A→B→A supervisor transition is preserved.
+
 ## Install
 
 ```bash
@@ -188,10 +193,10 @@ A second runner — say a detached `loop` running next to your in-editor session
 pid-liveness reaps a crashed owner immediately. The result: a PR is only ever
 worked by one agent at a time — no double-fixing, no clobbered commits.
 
-Coordinator-backed claims are fenced by the immutable
-`agent-coordinator` v0.2.0 contract. The dashboard carries both `claim_id` and
-the monotonic `lease_epoch` through heartbeat and release operations, so a stale
-owner cannot mutate a claim after it has been reclaimed.
+Coordinator-backed claims are fenced by the `agent-coordinator` v0.2.0 contract,
+pinned to its immutable commit (`d558062`). The dashboard carries both
+`claim_id` and the monotonic `lease_epoch` through heartbeat and release
+operations, so a stale owner cannot mutate a claim after it has been reclaimed.
 
 ![Agent holding the lease on a PR](docs/images/review-loop-card.png)
 

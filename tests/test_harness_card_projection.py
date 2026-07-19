@@ -99,6 +99,39 @@ def test_runtime_selection_prefers_live_conversation_over_newer_terminal_one():
     assert app._runtime_session_for_worktree("/tmp/worktree", summary) is active
 
 
+def test_runtime_selection_does_not_prefer_abandoned_stale_report_over_terminal():
+    stale = _session(
+        session_id="stale",
+        timestamp="2026-07-19T10:00:00Z",
+        harness_reported_at=(
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat(),
+    )
+    terminal = _session(
+        session_id="terminal",
+        event="completed",
+        timestamp="2026-07-19T10:01:00Z",
+    )
+    summary = session_registry.SessionSummary(
+        sessions={"stale": stale, "terminal": terminal}
+    )
+    summary.reindex()
+
+    assert app._runtime_session_for_worktree("/tmp/worktree", summary) is terminal
+
+
+def test_runtime_card_marks_stale_harness_projection():
+    stale = _session(
+        harness_reported_at=(
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).isoformat()
+    )
+
+    fields = app._runtime_card_fields(stale)
+
+    assert fields["runtime_status_stale"] is True
+
+
 def test_worktree_card_projects_full_harness_status(monkeypatch):
     runtime_session = _session()
     pr = PRData(
