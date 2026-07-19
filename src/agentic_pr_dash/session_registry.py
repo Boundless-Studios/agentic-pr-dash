@@ -10,14 +10,18 @@ paths preserve Gaia compatibility, but the registry is configured through
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from .config import load as load_config
 
@@ -73,10 +77,62 @@ _DEFAULT_RETENTION_SECONDS = 7 * 24 * 60 * 60  # 7 days
 # self-compacts (drops old terminal sessions). Override / disable (0) via
 # AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD.
 _DEFAULT_COMPACT_THRESHOLD = 5000
+_MAX_STATUS_REPORT_BYTES = 1_048_576
+
+_PRIVATE_REPORT_FIELDS = {
+    "prompt",
+    "prompt_text",
+    "raw_prompt",
+    "transcript",
+    "transcript_body",
+    "tool_input",
+    "tool_inputs",
+    "tool_arguments",
+    "secret",
+    "secret_value",
+}
 
 # Launch sources that are the dashboard's OWN automation, not an independent
 # session whose worktree we should defer to.
 DASHBOARD_LAUNCH_SOURCES = ("agentic-pr-dash", "pr-dashboard")
+
+
+class HarnessActiveCounts(BaseModel):
+    """Forward-compatible copy of ``StatusReport.active`` schema v1."""
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    turns: int = Field(ge=0)
+    tools: int = Field(ge=0)
+    subagents: int = Field(ge=0)
+    critical_sections: int = Field(ge=0)
+
+
+class HarnessStatusReport(BaseModel):
+    """Local wire model for ``agent_session_harness.report.StatusReport`` v1.
+
+    The harness does not yet have an immutable release for the dashboard to
+    depend on. Keeping the small published JSON contract local avoids a mutable
+    Git dependency while allowing additive fields in future v1 producers.
+    """
+
+    model_config = ConfigDict(extra="allow", frozen=True)
+
+    schema_version: Literal[1]
+    runtime: Literal["claude", "codex"]
+    state: str = Field(min_length=1, max_length=64)
+    chain_id: str = Field(min_length=1, max_length=240)
+    conversation_id: str | None
+    generation: int = Field(ge=0)
+    context_percent: float | None = Field(ge=0)
+    context_tokens: int | None = Field(ge=0)
+    window_tokens: int | None = Field(gt=0)
+    cumulative_tokens: int | None = Field(ge=0)
+    confidence: Literal["confident", "degraded", "unknown"]
+    quiescence: Literal["idle", "busy", "unknown"]
+    active: HarnessActiveCounts
+    checkpoint_fingerprint: str | None
+    outbox_depth: int = Field(ge=0)
 
 
 def _read_limit() -> int | None:
@@ -114,6 +170,22 @@ class RuntimeSessionState:
     exit_code: int | None = None
     failure_reason: str | None = None
     is_feature_pipeline: bool = False
+    chain_id: str | None = None
+    generation: int | None = None
+    supervisor_state: str | None = None
+    context_percent: float | None = None
+    context_tokens: int | None = None
+    window_tokens: int | None = None
+    cumulative_tokens: int | None = None
+    context_confidence: str | None = None
+    quiescence: str | None = None
+    active_turns: int = 0
+    active_tools: int = 0
+    active_subagents: int = 0
+    active_critical_sections: int = 0
+    checkpoint_fingerprint: str | None = None
+    outbox_depth: int = 0
+    harness_reported_at: str | None = None
 
     @property
     def is_terminal(self) -> bool:
@@ -132,6 +204,23 @@ class RuntimeSessionState:
 class SessionSummary:
     sessions: dict[str, RuntimeSessionState] = field(default_factory=dict)
     by_worktree: dict[str, RuntimeSessionState] = field(default_factory=dict)
+    by_worktree_sessions: dict[str, list[RuntimeSessionState]] = field(
+        default_factory=dict
+    )
+
+    def reindex(self) -> None:
+        grouped: dict[str, list[RuntimeSessionState]] = {}
+        for state in self.sessions.values():
+            if state.worktree_path:
+                grouped.setdefault(state.worktree_path, []).append(state)
+        for states in grouped.values():
+            states.sort(key=lambda item: item.timestamp, reverse=True)
+        self.by_worktree_sessions = grouped
+        self.by_worktree = {
+            worktree: states[0]
+            for worktree, states in grouped.items()
+            if states
+        }
 
     @property
     def recent(self) -> list[RuntimeSessionState]:
@@ -276,6 +365,113 @@ def record_event(
     return payload
 
 
+def _private_report_field(value: object) -> str | None:
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key).strip().lower().replace("-", "_")
+            if key in _PRIVATE_REPORT_FIELDS:
+                return key
+            found = _private_report_field(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _private_report_field(child)
+            if found:
+                return found
+    return None
+
+
+def _parse_status_report(payload: dict[str, Any]) -> HarnessStatusReport:
+    private_field = _private_report_field(payload)
+    if private_field:
+        raise ValueError(f"private field is not allowed in StatusReport: {private_field}")
+    try:
+        return HarnessStatusReport.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"invalid StatusReport: {exc}") from exc
+
+
+def _status_event_id(report: HarnessStatusReport, worktree_path: str) -> str:
+    canonical = json.dumps(
+        {
+            "report": report.model_dump(mode="json"),
+            "worktree_path": worktree_path,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return "harness-status-" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def record_status_report(
+    payload: dict[str, Any],
+    *,
+    worktree_path: str | None = None,
+    branch: str | None = None,
+    pid: int | None = None,
+    agent_name: str | None = None,
+    launch_source: str | None = None,
+    path: Path | None = None,
+) -> dict[str, Any]:
+    """Validate and append one canonical harness ``StatusReport`` projection."""
+    report = _parse_status_report(payload)
+    resolved_worktree = str(
+        Path(worktree_path or _env("PROJECT_DIR") or os.getcwd())
+        .expanduser()
+        .resolve()
+    )
+    target = path or registry_path(resolved_worktree)
+    timestamp = _utc_now()
+    session_id = report.conversation_id or (
+        f"{report.chain_id}:generation:{report.generation}"
+    )
+    event = _clean_payload(
+        {
+            "event_id": _status_event_id(report, resolved_worktree),
+            "session_id": session_id,
+            "event": "harness_status",
+            "timestamp": timestamp,
+            "cli": report.runtime,
+            "agent_name": agent_name,
+            "launch_source": launch_source,
+            "pid": pid,
+            "worktree_path": resolved_worktree,
+            "branch": branch or _git_branch(resolved_worktree),
+            "chain_id": report.chain_id,
+            "generation": report.generation,
+            "supervisor_state": report.state,
+            "context_percent": report.context_percent,
+            "context_tokens": report.context_tokens,
+            "window_tokens": report.window_tokens,
+            "cumulative_tokens": report.cumulative_tokens,
+            "context_confidence": report.confidence,
+            "quiescence": report.quiescence,
+            "active_turns": report.active.turns,
+            "active_tools": report.active.tools,
+            "active_subagents": report.active.subagents,
+            "active_critical_sections": report.active.critical_sections,
+            "checkpoint_fingerprint": report.checkpoint_fingerprint,
+            "outbox_depth": report.outbox_depth,
+            "harness_reported_at": timestamp,
+        }
+    )
+    event_id = str(event["event_id"])
+    if any(
+        existing.get("event_id") == event_id
+        for existing in read_events(path=target, limit=256)
+    ):
+        return event
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, sort_keys=True) + "\n")
+    try:
+        _maybe_compact(target)
+    except Exception:  # noqa: BLE001 - report persistence already succeeded
+        pass
+    return event
+
+
 def _compact_threshold() -> int:
     raw = os.environ.get("AGENTIC_PR_DASH_REGISTRY_COMPACT_THRESHOLD", "")
     if raw == "":
@@ -341,6 +537,14 @@ def read_events(path: Path | None = None, limit: int | None = None) -> list[dict
 
 
 def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> RuntimeSessionState:
+    incoming_event = str(event.get("event") or "unknown")
+    if (
+        state is not None
+        and state.is_terminal
+        and incoming_event
+        not in {"started", "completed", "failed", "cleanup_completed"}
+    ):
+        return state
     if state is None:
         state = RuntimeSessionState(
             session_id=str(event.get("session_id") or ""),
@@ -370,7 +574,10 @@ def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> Ru
     # overwrite it, or the dashboard's liveness gate would probe a dead hook
     # pid and filter out an actually-live session. A fresh `started` (session
     # ids are reused across worktree-console relaunches) does update it.
-    if str(event.get("event")) == "started" and event.get("pid") is not None:
+    if (
+        str(event.get("event")) == "started"
+        or (str(event.get("event")) == "harness_status" and state.pid is None)
+    ) and event.get("pid") is not None:
         state.pid = int(event["pid"])
     for field_name in ("ppid", "pr_number", "exit_code"):
         value = event.get(field_name)
@@ -386,6 +593,34 @@ def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> Ru
         state.container_names = _coerce_list(event["container_names"])
     if event.get("ports"):
         state.ports = _coerce_dict(event["ports"])
+    if incoming_event == "harness_status":
+        for field_name in (
+            "chain_id",
+            "supervisor_state",
+            "context_confidence",
+            "quiescence",
+            "checkpoint_fingerprint",
+            "harness_reported_at",
+        ):
+            value = event.get(field_name)
+            if value not in (None, ""):
+                setattr(state, field_name, str(value))
+        for field_name in (
+            "generation",
+            "context_tokens",
+            "window_tokens",
+            "cumulative_tokens",
+            "active_turns",
+            "active_tools",
+            "active_subagents",
+            "active_critical_sections",
+            "outbox_depth",
+        ):
+            value = event.get(field_name)
+            if value is not None:
+                setattr(state, field_name, int(value))
+        if event.get("context_percent") is not None:
+            state.context_percent = float(event["context_percent"])
     return state
 
 
@@ -457,8 +692,7 @@ def summarize_sessions(path: Path | None = None) -> SessionSummary:
             continue
         state = _merge_event(summary.sessions.get(session_id), event)
         summary.sessions[session_id] = state
-        if state.worktree_path:
-            summary.by_worktree[state.worktree_path] = state
+    summary.reindex()
     return summary
 
 
@@ -585,6 +819,37 @@ def _record_from_args(args: argparse.Namespace) -> int:
     return 0
 
 
+def _report_from_args(args: argparse.Namespace) -> int:
+    raw = sys.stdin.read(_MAX_STATUS_REPORT_BYTES + 1)
+    if len(raw.encode("utf-8")) > _MAX_STATUS_REPORT_BYTES:
+        raise ValueError("StatusReport JSON exceeds the 1 MiB limit")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid StatusReport JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("StatusReport JSON must be an object")
+    event = record_status_report(
+        payload,
+        worktree_path=args.worktree_path,
+        branch=args.branch,
+        pid=args.pid,
+        agent_name=args.agent_name,
+        launch_source=args.launch_source,
+    )
+    print(
+        json.dumps(
+            {
+                "event_id": event["event_id"],
+                "ok": True,
+                "session_id": event["session_id"],
+            },
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Record Gaia runtime session events")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -610,6 +875,14 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--failure-reason")
     record.add_argument("--feature-pipeline", action="store_true")
     record.set_defaults(func=_record_from_args)
+    report = subparsers.add_parser("report")
+    report.add_argument("--json", action="store_true", required=True)
+    report.add_argument("--worktree-path")
+    report.add_argument("--branch")
+    report.add_argument("--pid", type=int)
+    report.add_argument("--agent-name")
+    report.add_argument("--launch-source")
+    report.set_defaults(func=_report_from_args)
     args = parser.parse_args(argv)
     return args.func(args)
 
