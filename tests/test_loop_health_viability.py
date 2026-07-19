@@ -173,6 +173,39 @@ def _write_loop_record(cwd: str, **overrides) -> None:
     loop._save_health(cwd, data)
 
 
+@pytest.mark.parametrize(
+    "bad_pid",
+    [
+        "²",  # str.isdigit() True, but int() raises ValueError
+        "١٢٣",  # non-ASCII decimal digits: int() accepts, but not a recorded pid
+        10**20,  # int() fine, os.kill overflows C pid_t → OverflowError
+        "0",  # kill(0, 0) probes the process group, not a recorded process
+        "-1",
+        "12x",
+        "",
+    ],
+)
+def test_malformed_health_pid_fails_closed_without_raising(tmp_path, bad_pid):
+    """A corrupt/hand-written pid in an otherwise viable health record must
+    read as unhealthy, NOT raise: an escaping OverflowError/ValueError would be
+    swallowed by the stop-gate's broad handler and release an uncovered PR
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    _write_loop_record(cwd, pid=bad_pid)
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+@pytest.mark.parametrize("bad_pid", ["²", "١٢٣", str(10**20), "0", "-1", "12x", ""])
+def test_pid_alive_malformed_input_is_false_not_raise(bad_pid):
+    """The shared ``_pid_alive`` helper (waiter/markers/ownership/stop-gate all
+    use it) must fail closed on any unconvertible or unprobe-able pid string."""
+    from agentic_pr_dash._maintenance._common import _pid_alive
+
+    assert _pid_alive(bad_pid) is False
+
+
 def test_zombie_recorded_health_pid_is_not_coverage(tmp_path, monkeypatch):
     """A zombie passes ``os.kill(pid, 0)``, so a crashed-but-unreaped loop
     child would still count as coverage. The health check must positively

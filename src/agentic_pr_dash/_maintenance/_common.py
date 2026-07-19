@@ -37,15 +37,28 @@ def _fix_lease_seconds() -> int:
 
 
 def _pid_alive(pid_raw: str) -> bool:
-    if not pid_raw.isdigit():
+    """True only when ``pid_raw`` names a probe-ably live process.
+
+    Fail closed on malformed input: ``str.isdigit()`` accepts non-ASCII
+    digits (e.g. ``"²"``) that ``int()`` rejects, and a huge decimal string
+    converts fine but overflows ``os.kill``'s C pid_t — either would raise
+    out of here and (via broad handlers upstream, e.g. the stop-gate's
+    catch-all) release an uncovered PR. Any conversion/probe error means
+    "not alive" (PR #76 review).
+    """
+    if not (pid_raw.isascii() and pid_raw.isdigit()):
+        return False
+    pid = int(pid_raw)
+    if pid <= 0:
+        # kill(0, 0) probes the whole process group, not a recorded process.
         return False
     try:
-        os.kill(int(pid_raw), 0)  # signal 0: existence probe only
+        os.kill(pid, 0)  # signal 0: existence probe only
     except ProcessLookupError:
         return False
     except PermissionError:
         return True  # alive, owned by another uid
-    except OSError:
+    except (OverflowError, OSError):
         return False
     return True
 
