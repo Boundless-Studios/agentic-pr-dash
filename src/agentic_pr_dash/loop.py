@@ -53,6 +53,23 @@ def _daemon_dir(cwd: str) -> Path:
     return Path.home() / ".claude" / "daemons"
 
 
+def _raw_repo_identity(cwd: str) -> str:
+    """The RAW (un-sanitized) canonical repo identity for ``cwd``.
+
+    ``owner/name`` when resolvable (so the loop writer and the stop-gate /
+    orchestrator readers agree regardless of whether they run from the worktree
+    or the main checkout), else the worktree dir name, else ``"repo"``.
+    """
+    repo = load_config(cwd).resolved_repo(Path(cwd))
+    return repo or Path(cwd).resolve().name or "repo"
+
+
+def _sanitized_repo_slug(raw: str) -> str:
+    """Filesystem-safe form of ``raw`` (``/`` and other non-``[A-Za-z0-9-_.]``
+    chars → ``-``)."""
+    return "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+
+
 @lru_cache(maxsize=64)
 def _repo_slug(cwd: str) -> str:
     """Filesystem-safe identifier for the repo a worktree belongs to.
@@ -65,14 +82,11 @@ def _repo_slug(cwd: str) -> str:
     the *filename* by repo keeps the JSON keys as bare PR numbers, so the
     stop-gate / dashboard readers (which parse ``int(key)``) stay valid.
 
-    Uses ``resolved_repo`` (canonical ``owner/name``) so the loop writer and the
-    stop-gate / orchestrator readers derive the SAME slug regardless of whether
-    they run from the worktree or the main checkout. Cached because that resolve
-    can shell out to ``gh``/``git`` and is hit on every streak read.
+    Cached because the repo resolve can shell out to ``gh``/``git`` and is hit
+    on every streak read.
     """
-    repo = load_config(cwd).resolved_repo(Path(cwd))
-    raw = repo or Path(cwd).resolve().name or "repo"
-    safe = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in raw)
+    raw = _raw_repo_identity(cwd)
+    safe = _sanitized_repo_slug(raw)
     # Sanitizing ``/`` to ``-`` collapses distinct repos ("acme/foo-bar" and
     # "acme-foo/bar" both become "acme-foo-bar"), so two independent repos
     # sharing the daemon dir would read/write the SAME health/escalation file
@@ -83,9 +97,72 @@ def _repo_slug(cwd: str) -> str:
     return f"{safe}-{digest}"
 
 
+@lru_cache(maxsize=64)
+def _legacy_repo_slug(cwd: str) -> str:
+    """The pre-PR#76 slug (sanitized identity, NO digest suffix).
+
+    Retained ONLY so :func:`_migrate_legacy_state` can find health/escalation
+    files an OLDER install wrote under the digest-less name and move them to the
+    current name — so streaks and escalation markers survive an in-place upgrade
+    (PR #76 review)."""
+    return _sanitized_repo_slug(_raw_repo_identity(cwd))
+
+
+def _health_filename(slug: str) -> str:
+    return f"pr-maintenance-loop.health.{slug}.json"
+
+
+def _escalated_filename(slug: str) -> str:
+    return f"pr-maintenance-loop.escalated.{slug}.json"
+
+
+@lru_cache(maxsize=64)
+def _migrate_legacy_state(cwd: str) -> None:
+    """One-time, best-effort migration of pre-PR#76 loop state (BOU-2086).
+
+    PR #76 appended an ``sha256`` digest to :func:`_repo_slug` so distinct repos
+    sharing the daemon dir can no longer collide on one health/escalation file.
+    That rename orphans every file an older install wrote under the digest-less
+    slug: the per-PR executor-failure streaks read back as zero and escalation
+    markers disappear, so a PR that had reached the escalation threshold would
+    resume being treated as loop-covered after the upgrade. Move the legacy
+    files to the new names on first access.
+
+    Only migrates when the NEW file is ABSENT, so it never clobbers fresh
+    post-upgrade state. If two repos collided on the legacy slug (the very case
+    the digest fixed), the first to migrate wins the shared file and the other
+    starts clean — no worse than the pre-fix collision it replaces. Routed
+    through both path funnels (:func:`_health_file` /
+    :func:`_escalated_marker_path`) so every reader — including the stop-gate's
+    ``_read_escalation_marker`` — triggers it; lru_cached to run once per cwd.
+    """
+    # Best-effort and fail-safe: resolving the slug can shell out to git/gh, and
+    # a migration miss only reverts to the pre-fix (state-reset) behavior — it
+    # must NEVER raise into the path funnels that call this, or health/escalation
+    # resolution (and the loop) would break. Swallow everything.
+    try:
+        legacy_slug = _legacy_repo_slug(cwd)
+        new_slug = _repo_slug(cwd)
+        if legacy_slug == new_slug:
+            return
+        daemon_dir = _daemon_dir(cwd)
+        for filename in (_health_filename, _escalated_filename):
+            new_path = daemon_dir / filename(new_slug)
+            legacy_path = daemon_dir / filename(legacy_slug)
+            try:
+                if new_path.exists() or not legacy_path.exists():
+                    continue
+                os.replace(legacy_path, new_path)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001 — migration is best-effort; never break path resolution
+        pass
+
+
 def _health_file(cwd: str) -> Path:
     """Path to the per-repo loop health JSON file."""
-    return _daemon_dir(cwd) / f"pr-maintenance-loop.health.{_repo_slug(cwd)}.json"
+    _migrate_legacy_state(cwd)
+    return _daemon_dir(cwd) / _health_filename(_repo_slug(cwd))
 
 
 def _load_health(cwd: str) -> dict:
@@ -164,6 +241,7 @@ def record_loop_health(
     errors: dict | None = None,
     interval: float | None = None,
     session_id: str = "",
+    no_discover_worktrees: bool = False,
 ) -> None:
     """Persist the loop's heartbeat + executor-viability record (BOU-2086).
 
@@ -172,19 +250,28 @@ def record_loop_health(
     "daemon can actually service PRs". ``errors`` retains the CONCRETE
     per-executor error strings (both primary and fallback) for diagnosis.
 
-    ``session_id`` is the loop's ``--session-id`` scope (empty for the
-    machine-wide daemon). It is persisted as ``scope`` so coverage readers can
-    tell a machine-wide heartbeat from a session-scoped one — a scoped loop
-    stamps the same repo-wide health file but only services its own session's
-    worktrees, so its heartbeat must never grant machine-wide coverage
-    (PR #76 review).
+    The record's ``scope`` tells coverage readers whether this heartbeat is
+    machine-wide coverage. It is ``"machine"`` ONLY when the loop enumerates
+    every worktree in the repo — i.e. no ``--session-id`` AND full discovery.
+    A ``--session-id`` loop is ``"session"`` (services only its own session's
+    worktrees) and a ``--no-discover-worktrees`` loop is ``"restricted"``
+    (services only its explicit ``--cwd`` set). Both still stamp the same
+    repo-wide health file, so if either read as machine-wide coverage it would
+    suppress waiters for worktrees it never inspects — only ``"machine"`` grants
+    coverage in :func:`loop_health_ok` (PR #76 review).
     """
     data = _load_health(cwd)
+    if session_id:
+        scope = "session"
+    elif no_discover_worktrees:
+        scope = "restricted"
+    else:
+        scope = "machine"
     entry: dict = {
         "heartbeat": time.time(),
         "pid": os.getpid(),
         "executors_viable": bool(executors_viable),
-        "scope": "session" if session_id else "machine",
+        "scope": scope,
     }
     if session_id:
         entry["session_id"] = str(session_id)[:200]
@@ -250,12 +337,13 @@ def loop_health_ok(cwd: str, now: float | None = None) -> bool:
     if entry.get("executors_viable") is not True:
         return False
     # Require the record to have been written by the MACHINE-WIDE loop. A
-    # session-scoped ``loop --session-id ...`` runs the same _tick and stamps
-    # this same repo-wide health file, but only discovers worktrees owned by
-    # that session — its heartbeat is not machine-wide coverage and must not
-    # suppress other sessions' waiters. Absent scope (older snapshot,
-    # hand-written file) fails closed like any other unprovable record
-    # (PR #76 review).
+    # session-scoped ``loop --session-id ...`` (scope "session") and a
+    # ``loop --no-discover-worktrees`` (scope "restricted") both run the same
+    # _tick and stamp this same repo-wide health file, but each services only a
+    # subset of the repo's worktrees — their heartbeats are not machine-wide
+    # coverage and must not suppress waiters for worktrees they never inspect.
+    # Absent scope (older snapshot, hand-written file) fails closed like any
+    # other unprovable record (PR #76 review).
     if entry.get("scope") != "machine":
         return False
     # The heartbeat must be tied to a live servicing process: the daemon
@@ -367,7 +455,8 @@ def _escalated_marker_path(cwd: str) -> Path:
     Repo-scoped for the same reason as :func:`_health_file` — so PRs with the
     same number in different repos don't share an escalation marker.
     """
-    return _daemon_dir(cwd) / f"pr-maintenance-loop.escalated.{_repo_slug(cwd)}.json"
+    _migrate_legacy_state(cwd)
+    return _daemon_dir(cwd) / _escalated_filename(_repo_slug(cwd))
 
 
 def _clear_escalation_entry(cwd: str, pr: int | None) -> None:
@@ -864,6 +953,7 @@ def _tick(args, executor: str) -> None:
             record_loop_health(
                 cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
                 session_id=args.session_id or "",
+                no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
             )
         if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
             continue
@@ -916,6 +1006,7 @@ def _tick(args, executor: str) -> None:
                 record_loop_health(
                     cwd, executors_viable=False, errors=exec_errors, interval=interval,
                     session_id=args.session_id or "",
+                    no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
                 )
             new_streak = record_executor_failure(cwd, pr, err_summary)
             _maybe_escalate(cwd, pr, err_summary, new_streak)
@@ -1013,6 +1104,7 @@ def main(argv: list[str] | None = None) -> int:
                 record_loop_health(
                     cwd, executors_viable=False, errors=startup_errors,
                     interval=args.interval, session_id=args.session_id or "",
+                    no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
                 )
             except Exception:  # noqa: BLE001 — never mask the loud exit
                 pass

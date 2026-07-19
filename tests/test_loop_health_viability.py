@@ -18,6 +18,7 @@ These tests pin the fail-closed contract:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -419,6 +420,45 @@ def test_small_clock_skew_heartbeat_still_grants_coverage(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Restricted (--no-discover-worktrees) loops are not machine-wide coverage
+# (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def test_no_discover_worktrees_loop_is_not_machine_coverage(tmp_path):
+    """A ``loop --no-discover-worktrees --cwd <one>`` run has no ``--session-id``
+    but services ONLY the explicit ``--cwd`` worktree (``_discover_cwds`` returns
+    ``list(args.cwd)``). It still stamps the same repo-wide health file, so if its
+    record read as machine-wide coverage it would suppress waiters for every OTHER
+    worktree in the repo that it never inspects. Its heartbeat must fail closed as
+    non-machine coverage (PR #76 review)."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, no_discover_worktrees=True,
+    )
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] != "machine"
+    assert loop.loop_health_ok(cwd) is False
+    assert mc._detached_loop_alive(cwd) is False
+
+
+def test_full_discovery_loop_without_session_still_machine_coverage(tmp_path):
+    """Boundary guard: the real machine-wide daemon (no ``--session-id`` AND full
+    discovery) must still record ``scope: machine`` and grant coverage — the
+    restricted-loop fix must not disarm the legitimate daemon."""
+    cwd = str(tmp_path)
+    _write_live_pidfile(tmp_path)
+    loop.record_loop_health(
+        cwd, executors_viable=True, interval=600, no_discover_worktrees=False,
+    )
+    raw = json.loads(loop._health_file(cwd).read_text(encoding="utf-8"))
+    assert raw[loop.LOOP_HEALTH_KEY]["scope"] == "machine"
+    assert loop.loop_health_ok(cwd) is True
+    assert mc._detached_loop_alive(cwd) is True
+
+
+# ---------------------------------------------------------------------------
 # Overflowing integer time values + repo-slug collisions (PR #76 review, round 7)
 # ---------------------------------------------------------------------------
 
@@ -470,6 +510,82 @@ def test_colliding_repo_names_do_not_share_health_coverage(tmp_path, monkeypatch
     # ...so repo A's healthy record covers A but never B.
     assert loop.loop_health_ok(str(cwd_a)) is True
     assert loop.loop_health_ok(str(cwd_b)) is False
+
+
+# ---------------------------------------------------------------------------
+# Pre-PR#76 loop state survives the digest-slug upgrade (PR #76 review)
+# ---------------------------------------------------------------------------
+
+
+def _pin_repo_identity(monkeypatch, tmp_path, repo="acme/upgrade-repo"):
+    """Pin ``resolved_repo`` so the legacy (digest-less) and new (digest-suffixed)
+    slug filenames are deterministic, and point the daemon dir at the test's
+    tmp daemons dir. Returns (daemons_dir, legacy_slug, new_slug)."""
+    daemons = tmp_path / "daemons"
+    daemons.mkdir(parents=True, exist_ok=True)
+    pidfile = daemons / "pr-maintenance-loop.pid"
+
+    class _Cfg:
+        maintenance_loop_pidfile = pidfile
+        escalation_failure_threshold = 3
+
+        def resolved_repo(self, path) -> str:
+            return repo
+
+    monkeypatch.setattr(loop, "load_config", lambda cwd: _Cfg())
+    loop._repo_slug.cache_clear()
+    for name in ("_legacy_repo_slug", "_migrate_legacy_state"):
+        fn = getattr(loop, name, None)
+        if fn is not None and hasattr(fn, "cache_clear"):
+            fn.cache_clear()
+    legacy_slug = "".join(c if (c.isalnum() or c in "-_.") else "-" for c in repo)
+    new_slug = f"{legacy_slug}-{hashlib.sha256(repo.encode()).hexdigest()[:8]}"
+    return daemons, legacy_slug, new_slug
+
+
+def test_legacy_slug_health_streaks_migrate_on_upgrade(tmp_path, monkeypatch):
+    """An in-place upgrade to the digest-suffixed slug orphans the old health
+    file: a per-PR executor-failure streak written by the prior install would
+    read back as 0, so a PR that had reached the escalation threshold would
+    resume being treated as loop-covered. The streak must survive the upgrade
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_health = daemons / f"pr-maintenance-loop.health.{legacy_slug}.json"
+    legacy_health.write_text(
+        json.dumps({"42": {"streak": 3, "last_error": "boom"}}), encoding="utf-8"
+    )
+    assert loop.executor_failure_streak(cwd, 42) == 3
+    assert (daemons / f"pr-maintenance-loop.health.{new_slug}.json").exists()
+
+
+def test_legacy_slug_escalation_marker_migrates_on_upgrade(tmp_path, monkeypatch):
+    """Escalation markers written under the old slug must not silently disappear
+    on upgrade — the stop-gate reader must still surface the escalated PR
+    (PR #76 review)."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_marker = daemons / f"pr-maintenance-loop.escalated.{legacy_slug}.json"
+    legacy_marker.write_text(
+        json.dumps({"42": {"streak": 3, "escalated_at": time.time()}}), encoding="utf-8"
+    )
+    info = _stop_gate_mod._read_escalation_marker(cwd)
+    assert "42" in info
+    assert (daemons / f"pr-maintenance-loop.escalated.{new_slug}.json").exists()
+
+
+def test_migration_never_clobbers_fresh_new_slug_state(tmp_path, monkeypatch):
+    """Guard: when the NEW digest-suffixed file already exists (post-upgrade
+    state), a leftover legacy file must never be migrated over it — fresh state
+    wins and the legacy file is left untouched."""
+    cwd = str(tmp_path)
+    daemons, legacy_slug, new_slug = _pin_repo_identity(monkeypatch, tmp_path)
+    legacy_health = daemons / f"pr-maintenance-loop.health.{legacy_slug}.json"
+    new_health = daemons / f"pr-maintenance-loop.health.{new_slug}.json"
+    legacy_health.write_text(json.dumps({"42": {"streak": 3}}), encoding="utf-8")
+    new_health.write_text(json.dumps({"42": {"streak": 1}}), encoding="utf-8")
+    assert loop.executor_failure_streak(cwd, 42) == 1
+    assert legacy_health.exists()
 
 
 # ---------------------------------------------------------------------------
