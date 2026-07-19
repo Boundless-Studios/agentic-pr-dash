@@ -717,6 +717,33 @@ header h1 {
 
 .runtime-session { margin-top: 3px; font-size: 10px; }
 .runtime-session code { font-size: 10px; color: var(--text-muted); }
+.harness-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 5px 0 2px;
+  font-size: 10px;
+}
+.harness-state {
+  padding: 2px 6px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  border-radius: 999px;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  font-weight: 600;
+}
+.harness-state-warning,
+.harness-state-draining,
+.harness-state-checkpointing { color: var(--warn); }
+.harness-context { color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.runtime-context,
+.runtime-cumulative,
+.runtime-chain,
+.runtime-confidence,
+.runtime-active-counts,
+.runtime-checkpoint,
+.runtime-outbox,
+.runtime-supervisor-state { margin-top: 3px; }
 .runtime-warning { color: var(--warn); font-size: 10px; }
 
 /* ─── Card actions ───────────────────────────────────────────────────────── */
