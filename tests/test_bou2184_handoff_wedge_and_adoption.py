@@ -186,8 +186,13 @@ def test_claim_with_only_loop_artifact_dirt_is_reclaimable(tmp_path, monkeypatch
         lease_seconds=300,
         now=BASE_TIME,
     )
-    coord.release_claim(claim.claim_id, owner_session_id="agentic-pr-dash-dashboard",
-                        reason="failed", now=BASE_TIME)
+    coord.release_claim(
+        claim.claim_id,
+        owner_session_id="agentic-pr-dash-dashboard",
+        lease_epoch=claim.lease_epoch,
+        reason="failed",
+        now=BASE_TIME,
+    )
 
     decision = coordinator.dispatch_decision_for_pr(pr, now=BASE_TIME)
 

@@ -745,7 +745,11 @@ def _wire_tick(monkeypatch, worktree, *, run_executor, check_rc=loop.CHECK_WORK_
         if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
             return types.SimpleNamespace(
                 returncode=check_rc,
-                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stdout=(
+                    "fix prompt\nPR_NUMBER=7\n"
+                    "COORDINATOR_CLAIM_ID=claim-1\n"
+                    "COORDINATOR_LEASE_EPOCH=4\n"
+                ),
                 stderr="",
             )
         if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "complete" in cmd:
@@ -762,9 +766,9 @@ def _wire_tick(monkeypatch, worktree, *, run_executor, check_rc=loop.CHECK_WORK_
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor",
                         lambda executor, prompt, cwd: run_executor(executor, calls))
-    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id", lambda claim_id, session_id: None)
-    monkeypatch.setattr(loop.coordinator, "release_claim_id",
-                        lambda claim_id, session_id, reason: calls.append(("release", reason)))
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda handle, session_id: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim",
+                        lambda handle, session_id, reason: calls.append(("release", reason)))
     return calls
 
 

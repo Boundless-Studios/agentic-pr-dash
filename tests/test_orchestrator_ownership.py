@@ -101,7 +101,7 @@ def test_dashboard_skips_dispatch_when_live_in_session_owner_holds_marker(monkey
 
     # The dashboard deferred: no maintenance queued and no coordinator claim.
     assert pr.maintenance is None
-    assert pr.coordinator_claim_id is None
+    assert pr.coordinator_claim is None
     # Nothing claimed it, so it stays dispatchable (for the live session / an
     # unowned-worktree takeover later) — the dashboard simply stood down.
     assert pr_coordinator.dispatch_decision_for_pr(pr).should_dispatch is True

@@ -2,8 +2,10 @@ from datetime import datetime, timezone
 import os
 import subprocess
 
+import pytest
+
 from agent_coordinator.models import OwnerIdentity
-from agent_coordinator.service import TaskCoordinator
+from agent_coordinator.service import StaleClaimError, TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
 from agentic_pr_dash import coordinator, maintenance
 from agentic_pr_dash.models import PRData, ReviewComment
@@ -72,6 +74,44 @@ def test_fingerprint_is_stable_and_changes_with_blocker_details():
     assert first != changed_comment
 
 
+def test_claim_handle_carries_epoch_through_heartbeat_and_release(tmp_path, monkeypatch):
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+
+    handle = coordinator.claim_pr(
+        _pr(),
+        session_id="owner-1",
+        pid=os.getpid(),
+        agent="codex",
+        lease_seconds=300,
+    )
+
+    assert handle == coordinator.ClaimHandle(claim_id=handle.claim_id, lease_epoch=1)
+    assert coordinator.heartbeat_claim(handle, "owner-1", lease_seconds=600) == handle
+    assert coordinator.release_claim(handle, "owner-1", "completed") == handle
+
+
+def test_stale_claim_handle_epoch_is_rejected(tmp_path, monkeypatch):
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+    handle = coordinator.claim_pr(
+        _pr(),
+        session_id="owner-1",
+        pid=os.getpid(),
+        agent="codex",
+        lease_seconds=300,
+    )
+    stale = coordinator.ClaimHandle(
+        claim_id=handle.claim_id,
+        lease_epoch=handle.lease_epoch + 1,
+    )
+
+    with pytest.raises(StaleClaimError):
+        coordinator.heartbeat_claim(stale, "owner-1")
+    with pytest.raises(StaleClaimError):
+        coordinator.release_claim(stale, "owner-1", "completed")
+
+
 def test_active_claim_suppresses_duplicate_dispatch(tmp_path, monkeypatch):
     store = tmp_path / "claims.jsonl"
     monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
@@ -102,7 +142,13 @@ def test_released_claim_requeues_current_blockers(tmp_path, monkeypatch):
         lease_seconds=300,
         now=BASE_TIME,
     )
-    coord.release_claim(claim.claim_id, owner_session_id="owner-1", reason="failed", now=BASE_TIME)
+    coord.release_claim(
+        claim.claim_id,
+        owner_session_id="owner-1",
+        lease_epoch=claim.lease_epoch,
+        reason="failed",
+        now=BASE_TIME,
+    )
 
     decision = coordinator.dispatch_decision_for_pr(pr, now=BASE_TIME)
 
@@ -140,7 +186,13 @@ def test_dirty_released_owner_blocks_unsafe_takeover(tmp_path, monkeypatch):
         lease_seconds=300,
         now=BASE_TIME,
     )
-    coord.release_claim(claim.claim_id, owner_session_id="owner-1", reason="failed", now=BASE_TIME)
+    coord.release_claim(
+        claim.claim_id,
+        owner_session_id="owner-1",
+        lease_epoch=claim.lease_epoch,
+        reason="failed",
+        now=BASE_TIME,
+    )
     monkeypatch.setattr(coordinator, "worktree_has_dirty_or_unpushed_changes", lambda path: path == owner_worktree)
 
     decision = coordinator.dispatch_decision_for_pr(pr, now=BASE_TIME)

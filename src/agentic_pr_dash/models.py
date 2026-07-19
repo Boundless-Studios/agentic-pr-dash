@@ -12,7 +12,7 @@ import os
 from datetime import datetime, timezone
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class PRStatus(str, Enum):
@@ -35,6 +35,15 @@ class MaintenanceStatus(str, Enum):
     COMPLETE = "complete"
     STALE = "stale"
     FAILED = "failed"
+
+
+class ClaimHandle(BaseModel):
+    """Fenced coordinator ownership required for every claim mutation."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    claim_id: str = Field(min_length=1)
+    lease_epoch: int = Field(ge=1)
 
 
 class CICheck(BaseModel):
@@ -201,9 +210,9 @@ class PRData(BaseModel):
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
-    # agent-coordinator claim the dashboard holds after handing maintenance off
-    # to the local agent; released when the PR goes clean.
-    coordinator_claim_id: str | None = None
+    # Fenced agent-coordinator claim held after dashboard handoff. Both values
+    # must survive until release; a bare claim id cannot reject stale owners.
+    coordinator_claim: ClaimHandle | None = None
     # True when at least one required CI check is still queued/in_progress.
     # Set by _check_worktree for non-draft PRs via github_api.required_checks_pending.
     ci_watch_pending: bool = False

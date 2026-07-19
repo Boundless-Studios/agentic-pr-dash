@@ -34,7 +34,11 @@ def _wire(monkeypatch, worktree, *, run_executor):
         if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "check" in cmd:
             return types.SimpleNamespace(
                 returncode=loop.CHECK_WORK_FOUND,
-                stdout="fix prompt\nPR_NUMBER=7\nCOORDINATOR_CLAIM_ID=claim-1\n",
+                stdout=(
+                    "fix prompt\nPR_NUMBER=7\n"
+                    "COORDINATOR_CLAIM_ID=claim-1\n"
+                    "COORDINATOR_LEASE_EPOCH=4\n"
+                ),
                 stderr="",
             )
         if cmd[:3] == [loop.sys.executable, "-m", "agentic_pr_dash"] and "complete" in cmd:
@@ -51,10 +55,12 @@ def _wire(monkeypatch, worktree, *, run_executor):
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor",
                         lambda executor, prompt, cwd: run_executor(executor, calls))
-    monkeypatch.setattr(loop.coordinator, "heartbeat_claim_id",
-                        lambda claim_id, session_id: None)
-    monkeypatch.setattr(loop.coordinator, "release_claim_id",
-                        lambda claim_id, session_id, reason: calls.append(("release", reason)))
+    monkeypatch.setattr(loop.coordinator, "heartbeat_claim",
+                        lambda handle, session_id: None)
+    monkeypatch.setattr(loop.coordinator, "release_claim",
+                        lambda handle, session_id, reason: calls.append(
+                            ("release", handle.claim_id, handle.lease_epoch, reason)
+                        ))
     return calls
 
 
@@ -68,10 +74,10 @@ def test_primary_success_never_runs_fallback(monkeypatch, tmp_path):
     calls = _wire(monkeypatch, worktree, run_executor=run_executor)
     loop._tick(_args(cwd=["/repo"], session_id="sess-1"), PRIMARY)
 
-    executors_run = [e for tag, e in calls if tag == "executor"]
+    executors_run = [entry[1] for entry in calls if entry[0] == "executor"]
     assert executors_run == [PRIMARY]                 # only the primary ran
     assert any(tag == "complete" for tag, *_ in calls)
-    assert ("release", "completed") in calls
+    assert ("release", "claim-1", 4, "completed") in calls
 
 
 def test_primary_fails_fallback_succeeds_services_pr(monkeypatch, tmp_path):
@@ -84,10 +90,10 @@ def test_primary_fails_fallback_succeeds_services_pr(monkeypatch, tmp_path):
     calls = _wire(monkeypatch, worktree, run_executor=run_executor)
     loop._tick(_args(cwd=["/repo"], session_id="sess-1"), PRIMARY)
 
-    executors_run = [e for tag, e in calls if tag == "executor"]
+    executors_run = [entry[1] for entry in calls if entry[0] == "executor"]
     assert executors_run == [PRIMARY, FALLBACK]       # fell back to claude
     assert any(tag == "complete" for tag, *_ in calls)  # PR serviced via fallback
-    assert ("release", "completed") in calls
+    assert ("release", "claim-1", 4, "completed") in calls
 
 
 def test_both_executors_fail_reports_error_and_skips_complete(monkeypatch, tmp_path, capsys):
@@ -100,9 +106,9 @@ def test_both_executors_fail_reports_error_and_skips_complete(monkeypatch, tmp_p
     calls = _wire(monkeypatch, worktree, run_executor=run_executor)
     loop._tick(_args(cwd=["/repo"], session_id="sess-1"), PRIMARY)
 
-    executors_run = [e for tag, e in calls if tag == "executor"]
+    executors_run = [entry[1] for entry in calls if entry[0] == "executor"]
     assert executors_run == [PRIMARY, FALLBACK]       # both attempted
     assert not any(tag == "complete" for tag, *_ in calls)  # PR NOT serviced
-    assert ("release", "all_executors_failed") in calls
+    assert ("release", "claim-1", 4, "all_executors_failed") in calls
     err = capsys.readouterr().err
     assert "ERROR" in err and "PR #7" in err          # error reported, not silent
