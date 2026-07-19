@@ -168,7 +168,7 @@ def _stop_gate_impl(args) -> int:
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from .worktree_check import _check_worktree  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
-    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry  # noqa: PLC0415
+    from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_keys, _clean_exit_key  # noqa: PLC0415
     import time  # noqa: PLC0415
     import sys  # noqa: PLC0415
 
@@ -220,10 +220,22 @@ def _stop_gate_impl(args) -> int:
         owned = [cwd]
 
     pending: list[tuple[str, str]] = []
+    # An owned PR whose check was UNOBSERVABLE (code 2: gh could not resolve
+    # the PR / its blockers) or warn-only-deferred (exit 0 but the PR HAS
+    # blockers a foreign owner is servicing) must keep the stop gate
+    # fail-closed: neither state may feed the BOU-1962 marker-skip early
+    # return below (codex PR #75 review, round 2).
+    check_unobservable = False
+    check_warn_only = False
+    from .worktree_check import WARN_ONLY_MARKER  # noqa: PLC0415
     for worktree in owned:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
             pending.append((worktree, text))
+        elif code == 2:
+            check_unobservable = True
+        elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
+            check_warn_only = True
         elif code == 0 and session_id:
             marker = _read_marker(worktree) or {}
             if str(marker.get("pr", "")).isdigit():
@@ -295,6 +307,83 @@ def _stop_gate_impl(args) -> int:
                 _save_stop_state(cwd, {"ts": now})
                 return 0
             if open_prs and not _await_alive(cwd, session_id):
+                # BOU-1962 (codex PR #75 review): when this session's waiter
+                # already verified exactly these PRs clean and clean-exited, a
+                # freshly demanded waiter would immediately clean-exit again —
+                # the prompt would be unsatisfiable until STOP_LOOP_THRESHOLD.
+                # This stop's own _check_worktree pass just found nothing
+                # pending, so only re-demand a waiter that would actually STAY
+                # alive: required CI running again (BOU-1789 watch-pending) or
+                # CI state unobservable this tick (fail toward coverage).
+                verified_clean = _read_clean_exit_keys(session_id)
+                # A blocker-status read that failed DURING the _check_worktree
+                # pass above (get_ci_checks / its REST fallback unobservable)
+                # means this stop's "nothing pending" was computed blind —
+                # capture it BEFORE the scoped reset below or the marker-skip
+                # would treat the blind result as clean (codex PR #75 review,
+                # round 5).
+                check_probe_failed = github_api.checks_probe_failure_seen()
+                # Scope the probe-failure flag to the observations that feed
+                # THIS clean-exit decision: reset BEFORE the detached-record
+                # read below, so a failed/truncated CI probe while building
+                # those records (required_checks_pending inside
+                # _detached_pr_records) is still visible at the final
+                # checks_probe_failure_seen() gate — a detached PR has no
+                # worktree in pr_to_wts to re-probe, so that read is its only
+                # observation (codex PR #75 review, round 4).
+                github_api.reset_checks_probe_failure_seen()
+                # Repo-qualified identities for every open PR the demand would
+                # cover — the SAME number in two maintenance repos must stay
+                # distinct in both the marker-coverage and CI-watch reads
+                # (codex PR #75 review, round 3).
+                open_detached_records = [
+                    r for r in _detached_records_across_roots(session_id, cwd)
+                    if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                ]
+                from ._common import _repo_slug as _slug  # noqa: PLC0415
+                open_keys = {
+                    _clean_exit_key(_slug(wt), n)
+                    for n, wts in pr_to_wts.items()
+                    if n in open_prs
+                    for wt in wts
+                } | {
+                    _clean_exit_key(r.get("repo", ""), r["pr"])
+                    for r in open_detached_records
+                    if r["pr"] in open_prs
+                }
+                if (
+                    verified_clean
+                    and open_keys
+                    and open_keys <= verified_clean
+                    # Fail closed: an unobservable or warn-only-deferred check
+                    # this pass means "nothing pending" was NOT established for
+                    # every owned PR — a CI-only probe below cannot stand in
+                    # for the blocked/unresolved-thread signal (codex PR #75
+                    # review, round 2). Same for a failed blocker-status read
+                    # during the check pass (round 5).
+                    and not check_unobservable
+                    and not check_warn_only
+                    and not check_probe_failed
+                ):
+                    # ANY open detached record with required CI running keeps
+                    # the demand alive — never collapse same-numbered records
+                    # across repos to a last-wins value (round 3).
+                    ci_running = any(
+                        r.get("ci_watch_pending") for r in open_detached_records
+                    )
+                    if not ci_running:
+                        for n in sorted(open_prs):
+                            if any(github_api.required_checks_pending(n, wt)
+                                   for wt in pr_to_wts.get(n, ())):
+                                ci_running = True
+                                break
+                    if (
+                        not ci_running
+                        and not github_api.checks_probe_failure_seen()
+                        and not github_api.rate_limit_seen()
+                    ):
+                        _save_stop_state(cwd, {"ts": now})
+                        return 0
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})

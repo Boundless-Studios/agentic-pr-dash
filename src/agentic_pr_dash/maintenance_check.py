@@ -102,6 +102,7 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _extract_pr_number,
     _build_stop_block,
     _owned_open_pr_numbers,
+    _owned_open_pr_pairs,
     _build_waiter_block,
     _stop_gate_impl,
     _record_has_blockers,
@@ -145,13 +146,17 @@ from ._maintenance.waiter import (  # noqa: F401, E402
     _await_alive,
     _detached_loop_alive,
     _detached_pending_entry,
+    _write_clean_exit_marker,
+    _clear_clean_exit_marker,
+    _read_clean_exit_keys,
+    _clean_exit_key,
 )
 
 
 # ---------------------------------------------------------------------------
 # worktree_check
 # ---------------------------------------------------------------------------
-from ._maintenance.worktree_check import _check_worktree  # noqa: F401, E402
+from ._maintenance.worktree_check import _check_worktree, WARN_ONLY_MARKER  # noqa: F401, E402
 
 
 # ---------------------------------------------------------------------------
@@ -181,6 +186,51 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
         if maintenance.watch_pending_for_pr(pr):
             return True
     return False
+
+
+def _await_watch_pending_this_tick(
+    owned: list[str],
+    detached_records: list[dict],
+    cwd: str,
+    session_id: str,
+) -> bool:
+    """Watch-pending across BOTH live worktrees and detached (ledger-only) PRs.
+
+    A session can own a PR solely through the ledger, so ``owned`` may be empty
+    while its required CI is still running (codex PR #50 review). Shared by the
+    BOU-1962 clean-state early exit and the ``--max-wait`` deadline path so both
+    apply the same definition of "required CI still running".
+    """
+    detached_watch_pending = any(
+        r.get("ci_watch_pending")
+        and r.get("state") not in ("merged", "closed", "draft", "unknown")
+        for r in detached_records
+    )
+    return detached_watch_pending or _collect_await_watch_pending(
+        owned, cwd, session_id
+    )
+
+
+def _marker_pr_still_current(worktree: str, pr_number: int) -> bool:
+    """True iff ``worktree``'s CURRENT branch still resolves to open PR
+    ``pr_number``.
+
+    The clean-exit verified set may only contain PRs this tick actually
+    observed. The armed marker names the PR the worktree owned when it was
+    armed — if the worktree has since been repointed to another branch,
+    ``_check_worktree`` verified THAT branch's PR (or none), not the marker's,
+    and the ledger still treats the matching marker as proof the worktree
+    covers the PR, so it isn't probed as detached either. Recording the marker
+    PR as verified-clean would then let the stop gate's marker coverage
+    suppress the waiter while the original PR's feedback goes unobserved
+    (codex PR #75 review, round 5). Resolution failures return False — fail
+    closed: unverifiable is not verified.
+    """
+    branch = _current_branch(worktree)
+    if not branch:
+        return False
+    resolved = _resolve_open_pr_for_branch(worktree, branch)
+    return resolved is not None and resolved[0] == pr_number
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -610,6 +660,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # cleared each tick so a stale earlier rate-limit can't wedge the
             # waiter alive on a later observable tick (BOU-1921 #62).
             github_api.reset_rate_limit_seen()
+            # Same per-tick reset for the CI-watch probe failure flag: the
+            # clean exit below requires a POSITIVE terminal-CI observation
+            # this tick (codex PR #75 review).
+            github_api.reset_checks_probe_failure_seen()
 
             # Span every repo anchor the session owns PRs in (not just cwd's
             # maintenance roots), so the single session-scoped waiter honestly
@@ -630,10 +684,23 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
+            gh_unobservable = False
+            warn_only_deferral = False
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     pending.append((worktree, text))
+                elif code == 2:
+                    # gh could not resolve this worktree's PR this tick — its
+                    # state is UNOBSERVABLE, so this tick must not conclude
+                    # "clean" (suppresses the BOU-1962 early exit below).
+                    gh_unobservable = True
+                elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
+                    # Warn-only deferral: the PR HAS blockers but a live foreign
+                    # owner / active coordinator claim is responsible, so no fix
+                    # is dispatched here. The PR is explicitly NOT clean — this
+                    # tick must not clean-exit on it (codex PR #75 review).
+                    warn_only_deferral = True
                 _touch_owner_heartbeat(worktree, session_id, code == 10)
 
             _detached_this_tick: list[dict] = []
@@ -651,6 +718,8 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         pending.append(_detached_pending_entry(r))
 
             if pending:
+                # Feedback arrived — any earlier clean-exit verdict is stale.
+                _clear_clean_exit_marker(session_id)
                 print(_build_stop_block(pending))
                 print(
                     "[pr-watch] Feedback arrived on PR(s) you own — address it now "
@@ -671,20 +740,72 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             ):
                 return 0
 
+            # BOU-1962: clean-state early exit. `pending` is empty here (the
+            # return-10 above fired otherwise), so no owned or detached PR has
+            # an actionable blocker. If required CI is also TERMINAL (not
+            # watch-pending — the same probe the deadline path uses, so the
+            # BOU-1789 stay-alive-while-CI-runs behavior is preserved) and PR
+            # state was actually observable this tick (no gh outage, no rate
+            # limit), the watched PRs are CLEAN: exit 0 now instead of sleeping
+            # until the deadline — or forever with `--max-wait < 0`. The
+            # detached pr-maintenance-loop remains the durable backstop.
+            # A detached record whose state read failed ("unknown", a
+            # non-rate-limit gh error — the rate-limit case is caught by
+            # rate_limit_seen()) is an UNOBSERVED possibly-open PR: its
+            # review/merge/CI state was never seen this tick, so the tick must
+            # not conclude "clean" (codex PR #75 review, round 5).
+            unknown_detached = any(
+                r.get("state") == "unknown" for r in _detached_this_tick
+            )
+
+            watch_pending: bool | None = None
+            if not getattr(args, "keep_alive_without_prs", False):
+                watch_pending = _await_watch_pending_this_tick(
+                    owned, _detached_this_tick, cwd, session_id
+                )
+                if (
+                    not watch_pending
+                    and not gh_unobservable
+                    and not unknown_detached
+                    and not warn_only_deferral
+                    and not github_api.rate_limit_seen()
+                    # "CI terminal" must be a POSITIVE observation: a failed
+                    # watch-pending probe returns False fail-safe, which must
+                    # not read as terminal (codex PR #75 review).
+                    and not github_api.checks_probe_failure_seen()
+                ):
+                    # Record WHICH open PRs were verified clean so the stop
+                    # gate doesn't re-demand a waiter that would immediately
+                    # clean-exit again (codex PR #75 review). Keys are
+                    # repo-qualified so the same PR number in two maintenance
+                    # repos stays distinct (round 3). Only PRs whose worktree
+                    # still RESOLVES to them were actually observed by this
+                    # tick's checks — a stale marker PR must not be recorded
+                    # verified (round 5).
+                    verified = {
+                        _clean_exit_key(_repo_slug(wt), n)
+                        for wt, n in _owned_open_pr_pairs(owned)
+                        if _marker_pr_still_current(wt, n)
+                    } | {
+                        _clean_exit_key(r.get("repo", ""), r["pr"])
+                        for r in _detached_this_tick
+                        if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                    }
+                    _write_clean_exit_marker(session_id, verified)
+                    print(
+                        "[pr-watch] all watched PRs are clean (no pending "
+                        "feedback, required CI terminal); waiter exiting."
+                    )
+                    return 0
+
             if deadline is not None and time.time() >= deadline:
-                # Watch-pending across BOTH live worktrees and detached
-                # (ledger-only) PRs — a session can own a PR solely through the
-                # ledger, so `owned` may be empty while its required CI is still
-                # running (codex PR #50 review).
-                detached_watch_pending = any(
-                    r.get("ci_watch_pending")
-                    and r.get("state") not in ("merged", "closed", "draft", "unknown")
-                    for r in _detached_this_tick
-                )
-                watch_pending = (
-                    detached_watch_pending
-                    or _collect_await_watch_pending(owned, cwd, session_id)
-                )
+                # Reuse this tick's watch-pending probe when the clean-exit
+                # path already ran it (identical inputs within the tick);
+                # compute it here otherwise (keep_alive_without_prs sessions).
+                if watch_pending is None:
+                    watch_pending = _await_watch_pending_this_tick(
+                        owned, _detached_this_tick, cwd, session_id
+                    )
                 # Read the flag AFTER the watch-pending probe so a quota wall hit
                 # by THAT call is captured too (a PR with running CI must not lose
                 # its waiter on a rate-limited tick) (BOU-1921 #62).

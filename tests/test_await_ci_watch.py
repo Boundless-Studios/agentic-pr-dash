@@ -103,3 +103,123 @@ def test_await_returns_0_when_max_wait_expires_and_no_watch_pending(tmp_path, mo
         "--interval", "0",
     ])
     assert rc == 0, f"Expected 0 (max-wait expired, nothing pending), got {rc}"
+
+
+def test_await_pending_ci_transition_to_clean_exits_0(tmp_path, monkeypatch, capsys):
+    """BOU-1962 + BOU-1789: pending-CI → clean transition.
+
+    Tick 1: nothing pending but required CI still running (watch-pending) —
+            the waiter must STAY ALIVE (BOU-1789), even with no deadline.
+    Tick 2: CI terminal, still nothing pending — the waiter must exit 0
+            promptly (clean-state early exit), not spin forever on
+            ``--max-wait=-1``.
+    """
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+
+    tick_count = [0]
+    watch_calls = [0]
+
+    def fake_check(path, session_id, *, claim=True):
+        tick_count[0] += 1
+        if tick_count[0] > 3:
+            raise AssertionError("await did not exit after CI turned terminal")
+        return 0, "nothing pending"
+
+    def fake_collect_watch_pending(owned, cwd, session_id):
+        watch_calls[0] += 1
+        # Tick 1: CI still running. Tick 2+: terminal.
+        return watch_calls[0] == 1
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", str(os.getpid()),
+        "--max-wait=-1",  # no deadline — old behavior would spin forever
+        "--interval", "0",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0, f"Expected 0 (clean after CI completed), got {rc}"
+    assert tick_count[0] == 2, "waiter must survive the watch-pending tick, then exit"
+    assert "clean" in out.lower()
+
+
+def test_await_gh_unobservable_tick_suppresses_clean_exit(tmp_path, monkeypatch, capsys):
+    """A tick where the PR is unobservable (gh unavailable, check code 2) must
+    NOT be concluded clean; the waiter stays alive and exits once observable."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+
+    tick_count = [0]
+
+    def fake_check(path, session_id, *, claim=True):
+        tick_count[0] += 1
+        if tick_count[0] == 1:
+            return 2, "could not list PRs (gh unavailable)"
+        if tick_count[0] > 3:
+            raise AssertionError("await did not exit once PR state was observable")
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(mc, "_check_worktree", fake_check)
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", str(os.getpid()),
+        "--max-wait=-1",
+        "--interval", "0",
+    ])
+    assert rc == 0
+    assert tick_count[0] == 2, "unobservable tick must not clean-exit; next tick may"
+
+
+def test_await_keep_alive_without_prs_suppresses_clean_exit(tmp_path, monkeypatch, capsys):
+    """``--keep-alive-without-prs`` sessions never take the clean-state early
+    exit; they still exit through the max-wait deadline path as before."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", str(os.getpid()),
+        "--max-wait", "0",
+        "--interval", "0",
+        "--keep-alive-without-prs",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "max-wait" in out.lower()
+    assert "all watched prs are clean" not in out.lower()

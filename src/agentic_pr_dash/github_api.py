@@ -278,6 +278,33 @@ def rate_limit_events() -> int:
     return _RATE_LIMIT_EVENTS
 
 
+# Per-tick CI-watch-probe observation (codex PR #75 review, BOU-1962).
+# ``required_checks_pending`` is deliberately fail-safe: it returns False on any
+# gh/parse error so callers that merely PRIORITIZE on it never wedge. But the
+# await waiter's clean-state early exit needs a POSITIVE terminal-CI
+# observation — a failed probe returning False must not read as "CI terminal"
+# or the waiter could exit while a required check is still queued/in_progress
+# behind a non-rate-limit gh outage. Consumers reset this flag at the start of
+# a tick and read it after their probes, mirroring rate_limit_seen().
+_CHECKS_PROBE_FAILURE_SEEN = False
+
+
+def reset_checks_probe_failure_seen() -> None:
+    """Clear the checks-probe-failure flag (call before a tick's CI probes)."""
+    global _CHECKS_PROBE_FAILURE_SEEN
+    _CHECKS_PROBE_FAILURE_SEEN = False
+
+
+def checks_probe_failure_seen() -> bool:
+    """True if a required-checks probe since the last reset failed (state unobservable)."""
+    return _CHECKS_PROBE_FAILURE_SEEN
+
+
+def _note_checks_probe_failure() -> None:
+    global _CHECKS_PROBE_FAILURE_SEEN
+    _CHECKS_PROBE_FAILURE_SEEN = True
+
+
 # ── Automation-token file source (BOU-1991) ────────────────────────────────
 # The PR-automation GitHub App installation token lives in
 # $XDG_CONFIG_HOME/agentic-pr-dash/gh-automation-token and rotates roughly
@@ -1893,6 +1920,12 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
     )
     sha = (r.stdout or "").strip()
     if r.returncode != 0 or not sha:
+        # Head-SHA resolution failed: the blocker-status read is UNOBSERVABLE,
+        # not "no checks". Record it so tick consumers (await clean exit /
+        # stop-gate marker skip) don't treat the empty result as a positive
+        # clean observation — this is the path where BOTH the `gh pr checks`
+        # JSON read and the REST fallback died (codex PR #75 review, round 5).
+        _note_checks_probe_failure()
         return []
 
     checks = []
@@ -1965,7 +1998,11 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     configured by branch protection that have not reported yet (the cli/cli#8855
     gap that ``gh pr checks`` misses). Paginates the contexts so a required
     pending context past the first 100 isn't missed. Returns ``False`` on any
-    error or when no required check is pending (fail-safe).
+    error or when no required check is pending (fail-safe) — but a gh/parse
+    failure additionally records ``checks_probe_failure_seen()`` so tick-based
+    consumers (the await waiter's clean exit) can tell "observed terminal" from
+    "probe failed" (codex PR #75 review). A ``null`` rollup is a VALID
+    observation (no status checks on the head commit), not a failure.
     """
     repo = _repo_for_cwd(cwd)
     if not repo or "/" not in repo:
@@ -1980,13 +2017,21 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
             cmd += ["-F", f"after={after}"]
         r = _run(cmd, cwd=cwd, timeout_s=30)
         if r.returncode != 0:
+            _note_checks_probe_failure()
             return False
         try:
             data = json.loads(r.stdout or "{}")
             rollup = (data["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]
                       ["commit"]["statusCheckRollup"])
-            contexts = rollup["contexts"]
         except (json.JSONDecodeError, KeyError, TypeError, IndexError):
+            _note_checks_probe_failure()
+            return False
+        if rollup is None:
+            return False  # observed: no status checks on the head commit
+        try:
+            contexts = rollup["contexts"]
+        except (KeyError, TypeError):
+            _note_checks_probe_failure()
             return False
         if any(_ctx_is_pending(ctx) for ctx in contexts.get("nodes", [])):
             return True
@@ -1994,6 +2039,11 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
         if not page.get("hasNextPage") or not page.get("endCursor"):
             return False
         after = page["endCursor"]
+    # Fell out of the page loop with hasNextPage still true: the rollup was
+    # TRUNCATED at _ROLLUP_MAX_PAGES, so a required pending context on a later
+    # page may exist — this is an incomplete observation, not terminal CI
+    # (codex PR #75 review, round 2).
+    _note_checks_probe_failure()
     return False
 
 
@@ -2031,6 +2081,11 @@ def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
                 checks.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
+    else:
+        # The check-runs read failed: whatever this call returns is missing an
+        # entire status mechanism — an unobservable read, not an observation of
+        # "no check runs" (codex PR #75 review, round 5).
+        _note_checks_probe_failure()
 
     checks.extend(_get_commit_statuses(sha, cwd))
 
@@ -2063,6 +2118,9 @@ def _get_commit_statuses(sha: str, cwd: str | None = None) -> list[dict]:
         cwd=cwd, timeout_s=20,
     )
     if r.returncode != 0:
+        # Same unobservability contract as the check-runs read above: a failed
+        # commit-status read may hide an external-CI failure (round 5).
+        _note_checks_probe_failure()
         return []
     out: list[dict] = []
     for line in r.stdout.strip().split("\n"):

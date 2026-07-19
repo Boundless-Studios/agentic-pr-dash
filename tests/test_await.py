@@ -187,8 +187,60 @@ def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
     ])
     out = capsys.readouterr().out
     assert rc == 0
-    # Should print a note about max-wait
-    assert "max-wait" in out.lower() or "re-arm" in out.lower()
+    # BOU-1962: a clean owned worktree now exits via the clean-state early
+    # exit before the deadline message; either exit reason is a valid 0.
+    assert (
+        "clean" in out.lower()
+        or "max-wait" in out.lower()
+        or "re-arm" in out.lower()
+    )
+
+
+def test_await_exits_0_promptly_when_owned_pr_clean_infinite_max_wait(
+    tmp_path, monkeypatch, capsys
+):
+    """BOU-1962: an owned worktree with a CLEAN PR (no pending feedback, CI
+    terminal) exits 0 on the first tick — even with ``--max-wait=-1`` (no
+    deadline), which previously spun forever and needed a manual kill."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+
+    tick_count = [0]
+
+    def _clean_check(path, session_id, *, claim=True):
+        tick_count[0] += 1
+        if tick_count[0] > 3:
+            raise AssertionError("await did not exit on a clean PR (BOU-1962)")
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)]
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(mc, "_check_worktree", _clean_check)
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    # Required CI terminal — nothing watch-pending.
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr("time.sleep", lambda s: None)
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "12345",
+        "--max-wait=-1",
+        "--interval", "0",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0, f"Expected 0 (clean-state early exit), got {rc}"
+    assert tick_count[0] == 1, "clean exit should fire on the first tick"
+    assert "clean" in out.lower()
+    assert not _await_pidfile_path(str(tmp_path)).exists()
 
 
 def test_await_stamps_heartbeat_each_tick(tmp_path, monkeypatch):
