@@ -53,6 +53,11 @@ CAPABILITIES: frozenset[str] = frozenset({
     # coverage checks (``_detached_loop_alive`` / ``_loop_covers_pr``) require
     # it fresh — pid-alive alone never counts as coverage.
     "loop_health_executor_viability",
+    # BOU-1812: the "defer to live owner" path reclaims a demonstrably-stuck
+    # owner (same real blockers, no fix-lease progress) after
+    # ``reclaim_no_progress_threshold`` consecutive ticks instead of deferring
+    # forever.
+    "reclaim_no_progress_threshold",
 })
 
 
@@ -181,6 +186,22 @@ class Config:
     capable of covering the PR autonomously, the stop-gate forces a per-session
     waiter, and an iTerm2 notification is sent. Resolved from:
     ``AGENTIC_PR_DASH_ESCALATION_THRESHOLD`` env > toml ``escalation_failure_threshold`` > 3.
+    """
+
+    reclaim_no_progress_threshold: int = 3
+    """Consecutive "defer to live owner" ticks — while an owned PR keeps the SAME
+    real blockers and the owner shows no fix-lease progress — before the detached
+    loop RECLAIMS the PR instead of deferring (BOU-1812).
+
+    Defense-in-depth for the "defer to live owner" path: a live owner whose
+    Stop-gate keeps returning a FALSE-NEGATIVE "nothing pending" while the PR has
+    real blockers would otherwise be deferred to forever, so the blocker is
+    serviced by neither side. When the streak of no-progress ticks reaches this
+    value the loop takes over. A live, actively-progressing owner (active
+    fix-lease, or a changing blocker set) resets the streak and keeps ownership,
+    so only the demonstrably-stuck defer is broken. Resolved from:
+    ``AGENTIC_PR_DASH_RECLAIM_NO_PROGRESS_THRESHOLD`` env > toml
+    ``reclaim_no_progress_threshold`` > 3.
     """
 
     maintenance_repo_roots: tuple[str, ...] = ()
@@ -395,6 +416,22 @@ def load(cwd: str | None = None) -> Config:
     if esc_threshold < 1:
         esc_threshold = 3
 
+    # reclaim_no_progress_threshold: env > toml > 3. Same clamp/fallback as the
+    # escalation threshold — an invalid or <1 value must not make load() raise or
+    # let the loop reclaim on a single tick (which would steal from a briefly-idle
+    # live owner), so fall back to the safe default.
+    reclaim_threshold_raw = (
+        os.environ.get("AGENTIC_PR_DASH_RECLAIM_NO_PROGRESS_THRESHOLD")
+        or os.environ.get("GAIA_PR_WATCH_RECLAIM_NO_PROGRESS_THRESHOLD")
+        or proj.get("reclaim_no_progress_threshold", 3)
+    )
+    try:
+        reclaim_threshold = int(reclaim_threshold_raw)
+    except (TypeError, ValueError):
+        reclaim_threshold = 3
+    if reclaim_threshold < 1:
+        reclaim_threshold = 3
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
@@ -407,6 +444,7 @@ def load(cwd: str | None = None) -> Config:
         maintenance_loop_machine_wide=machine_wide,
         maintenance_repo_roots=tuple(maintenance_repo_roots),
         escalation_failure_threshold=esc_threshold,
+        reclaim_no_progress_threshold=reclaim_threshold,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,
