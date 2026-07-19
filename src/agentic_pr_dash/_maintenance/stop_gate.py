@@ -316,6 +316,15 @@ def _stop_gate_impl(args) -> int:
                 # alive: required CI running again (BOU-1789 watch-pending) or
                 # CI state unobservable this tick (fail toward coverage).
                 verified_clean = _read_clean_exit_keys(session_id)
+                # Scope the probe-failure flag to the observations that feed
+                # THIS clean-exit decision: reset BEFORE the detached-record
+                # read below, so a failed/truncated CI probe while building
+                # those records (required_checks_pending inside
+                # _detached_pr_records) is still visible at the final
+                # checks_probe_failure_seen() gate — a detached PR has no
+                # worktree in pr_to_wts to re-probe, so that read is its only
+                # observation (codex PR #75 review, round 4).
+                github_api.reset_checks_probe_failure_seen()
                 # Repo-qualified identities for every open PR the demand would
                 # cover — the SAME number in two maintenance repos must stay
                 # distinct in both the marker-coverage and CI-watch reads
@@ -347,7 +356,6 @@ def _stop_gate_impl(args) -> int:
                     and not check_unobservable
                     and not check_warn_only
                 ):
-                    github_api.reset_checks_probe_failure_seen()
                     # ANY open detached record with required CI running keeps
                     # the demand alive — never collapse same-numbered records
                     # across repos to a last-wins value (round 3).

@@ -442,3 +442,40 @@ def test_stop_gate_marker_skip_covers_multi_repo_identities_when_all_clean(tmp_p
     err = capsys.readouterr().err
     assert rc == 0
     assert "await" not in err.lower()
+
+
+# ---------------------------------------------------------------------------
+# Round 4: a failed CI probe during the detached-record read must survive the
+# marker-skip's flag reset (a detached PR has no worktree to re-probe)
+# ---------------------------------------------------------------------------
+
+
+def test_stop_gate_marker_skip_preserves_detached_probe_failure(tmp_path, monkeypatch, capsys):
+    """Round 4: the detached record's ``ci_watch_pending`` was computed by a
+    probe that FAILED (fail-safe ``False`` + module failure flag). The
+    marker-skip's flag reset must not discard that observation and clean-exit:
+    the detached PR has no worktree in ``pr_to_wts`` with which to re-probe, so
+    the record-build read is its ONLY CI observation this pass."""
+    wt = _arm(tmp_path, 42)
+    _wire_stop_gate(tmp_path, monkeypatch, wt)
+
+    def detached_with_failed_probe(sid, cwd):
+        # Mimic required_checks_pending failing inside _detached_pr_records:
+        # the record carries the fail-safe False, the module flag the failure.
+        github_api._note_checks_probe_failure()
+        return [_detached_record(7, "org-a/repo-a", ci_watch_pending=False)]
+
+    monkeypatch.setattr(_worktrees_mod, "_detached_records_across_roots",
+                        detached_with_failed_probe)
+    # Marker covers EVERY open identity, worktree CI terminal + observable —
+    # the ONLY stay-alive signal is the detached read's probe failure.
+    _waiter_mod._write_clean_exit_marker(SID, {
+        _marker_key(wt, 42),
+        _waiter_mod._clean_exit_key("org-a/repo-a", 7),
+    })
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd=None: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+    assert rc == 2, "unobserved detached CI state must fail toward coverage"
+    assert "#7" in err
