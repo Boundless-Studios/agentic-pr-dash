@@ -124,6 +124,44 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     return None
 
 
+def marker_owner_view(cwd: str) -> dict | None:
+    """Read-only marker-derived ownership of the worktree at ``cwd`` (BOU-2223).
+
+    Returns ``None`` when no marker exists. Otherwise a dict with the marker's
+    ``session_id`` / ``pid`` / ``pr`` / ``provenance`` plus ``live``, computed with
+    the SAME three-tier rule ``_live_foreign_owner`` applies — fresh heartbeat, or
+    an unexpired fix-lease, or (the robust fallback) a still-alive owner pid.
+
+    This is an extraction for the ownership parity harness, not a behaviour change:
+    ``_live_foreign_owner`` keeps its own inlined logic because it additionally
+    filters to a *different* session and emits the unparseable-lease warnings that
+    its callers depend on. This view answers "who does the marker name, and is that
+    owner live?" for any session, including ourselves.
+    """
+    fields = _read_marker(cwd)
+    if fields is None:
+        return None
+    owner = fields.get("session_id", "")
+    live = any(
+        _heartbeat_fresh(value, cwd)
+        for value in (fields.get("last_heartbeat", ""), fields.get("heartbeat", ""))
+        if value
+    )
+    if not live:
+        live = _fix_lease_active(fields.get("fix_lease_until", ""))
+    if not live:
+        live = _pid_alive(fields.get("pid", ""))
+    pr_raw = fields.get("pr", "")
+    pid_raw = fields.get("pid", "")
+    return {
+        "session_id": owner,
+        "pid": int(pid_raw) if pid_raw.isascii() and pid_raw.isdigit() else None,
+        "pr": int(pr_raw) if str(pr_raw).isdigit() else None,
+        "provenance": fields.get("provenance", "") or "armed",
+        "live": bool(owner) and live,
+    }
+
+
 def _live_pr_owner_record(
     pr_number: int, repo: str, self_session_id: str, cwd: str | None = None
 ) -> tuple[str, str] | None:
@@ -258,6 +296,28 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
                 os.remove(tmp)
             except OSError:
                 pass
+        return
+
+    # Mirror the refreshed lease into the claim (BOU-2223 dual-write). Coalescing
+    # is inherited: this runs only when the marker was actually rewritten, so the
+    # claim heartbeats on exactly the same cadence. ``work_found`` selects the same
+    # long fix-lease tier the marker just wrote.
+    pr_raw = fields.get("pr", "")
+    pid_raw = fields.get("pid", "")
+    if str(pr_raw).isdigit():
+        _dual_write_ownership_claim(
+            cwd,
+            self_session_id,
+            int(pid_raw) if pid_raw.isascii() and pid_raw.isdigit() else None,
+            int(pr_raw),
+            fields.get("provenance", "") or "armed",
+            work_found=work_found,
+            # No branch probe: a same-session claim_task on an active claim is a
+            # heartbeat and keeps the ORIGINAL owner record, so metadata passed
+            # here would be discarded anyway. The heartbeat runs on the Stop-hook
+            # path, where a needless `git rev-parse` is pure deadline cost.
+            branch="",
+        )
 
 
 def _write_arm_marker(
@@ -317,6 +377,11 @@ def _write_arm_marker(
     except OSError:
         pass
 
+    # Probed once and shared with the ownership dual-write below: both are `git`
+    # subprocesses on the Stop-hook path, which has a hard deadline.
+    branch = _current_branch(cwd)
+    repo = _repo_slug(cwd)
+
     try:
         import subprocess  # noqa: PLC0415
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
@@ -328,12 +393,59 @@ def _write_arm_marker(
                 baseline = rev.stdout.strip() or None
         except (OSError, subprocess.TimeoutExpired):
             baseline = None
-        branch = _current_branch(cwd)
         session_ledger.append(session_id, pr_number, branch, cwd, baseline,
-                              repo=_repo_slug(cwd))
+                              repo=repo)
     except Exception:  # noqa: BLE001
         pass
+
+    _dual_write_ownership_claim(
+        cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch
+    )
     return True
+
+
+def _dual_write_ownership_claim(
+    cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
+    *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
+) -> None:
+    """Mirror an ownership-marker write into an agent-coordinator claim (BOU-2223).
+
+    Stage 1 of the ownership consolidation: markers stay authoritative and every
+    write is mirrored here so the parity harness can prove the claim-derived view
+    agrees before any reader is flipped. Best-effort by construction — a claim
+    store problem must never fail the marker write that callers depend on.
+
+    ``repo``/``branch`` let a caller that already probed git pass the values in;
+    ``None`` means "probe here".
+    """
+    try:
+        from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
+        if not ownership.dual_write_enabled():
+            return
+        outcome = ownership.record_ownership(
+            repo=_repo_slug(cwd) if repo is None else repo,
+            pr_number=pr_number,
+            session_id=session_id,
+            pid=pid,
+            worktree_path=cwd,
+            provenance=provenance,
+            branch=_current_branch(cwd) if branch is None else branch,
+            work_found=work_found,
+        )
+        if not outcome.ok:
+            ownership_parity.log_divergence(
+                cwd,
+                {
+                    "kind": "dual_write_failed",
+                    "pr": pr_number,
+                    "session_id": session_id,
+                    "provenance": provenance,
+                    "reason": outcome.reason,
+                    "conflict_session_id": outcome.conflict_session_id,
+                },
+            )
+    except Exception:  # noqa: BLE001 — never break the authoritative marker write
+        pass
 
 
 def _marker_provenance(worktree_path: str) -> str:
@@ -416,6 +528,21 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
         from agentic_pr_dash import maintenance  # noqa: PLC0415
         maintenance.prune_state(cwd, pr_number)
     except Exception:  # noqa: BLE001
+        pass
+
+    # The PR is authoritatively merged/closed and its marker is gone — release the
+    # mirrored claim too, or the claim-derived view would keep reporting an owner
+    # for a dead PR (BOU-2223 dual-write).
+    try:
+        from agentic_pr_dash import ownership  # noqa: PLC0415
+        if ownership.dual_write_enabled():
+            ownership.release_ownership(
+                repo=_repo_slug(cwd),
+                pr_number=pr_number,
+                session_id=session_id,
+                reason="pr_closed",
+            )
+    except Exception:  # noqa: BLE001 — never break marker pruning
         pass
 
 
