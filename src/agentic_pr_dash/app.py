@@ -46,6 +46,13 @@ from .worktrees import (
 
 BASE_DIR = Path(__file__).parent
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+# Pin the template set to the one this process booted with (BOU-2217). Jinja defaults
+# to auto_reload=True, but Python classes never reload — so an in-place snapshot
+# reinstall paired a NEW board.html against the OLD WorktreeCard and every render 500'd
+# with UndefinedError until someone restarted the daemon. Consistency beats freshness
+# here: install-agent-ops-tools.sh already bounces the pr-dashboard daemon after
+# installing, which is what makes new templates live.
+templates.env.auto_reload = False
 CONTEXT_CACHE_TTL_SECONDS = 3.0
 _dashboard_context_cache: dict[tuple[bool, str], tuple[float, dict[str, object]]] = {}
 _dashboard_context_tasks: dict[tuple[bool, str], asyncio.Task[dict[str, object]]] = {}
