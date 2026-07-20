@@ -13,3 +13,6 @@ venv/
 .ruff_cache/
 .mypy_cache/
 *.log
+
+# Local tooling state (serena MCP project cache)
+.serena/
