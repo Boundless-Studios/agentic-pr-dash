@@ -290,6 +290,25 @@ def _collect_owned_worktrees(
 
     candidates = list(_iter_worktrees_with_branch(cwd))
 
+    anchor_abs = os.path.abspath(os.path.expanduser(cwd))
+
+    def _provenance_for(worktree_path: str) -> str:
+        """Distinguish a missed-arm pickup from a cross-epic sibling claim (BOU-2221).
+
+        Adopting the session's OWN worktree is the BOU-1787 missed-arm case: the
+        session opened this PR and the arm hook simply did not fire, so it really
+        does own the work and the stop gate should keep blocking on it.
+
+        Adopting a DIFFERENT worktree is not that. ``@me`` PR lookups key on GitHub
+        identity, so every sibling worktree on this machine matches "open @me PR" —
+        which is how a bou-2193 session ended up responsible for bou-2195's PRs,
+        with the gate demanding it push fixes into a worktree another session was
+        actively editing.
+        """
+        if os.path.abspath(worktree_path) == anchor_abs:
+            return "armed"
+        return "adopted"
+
     independent = _live_independent_owner_paths(
         [path for path, _branch in candidates], session_id
     )
@@ -364,7 +383,11 @@ def _collect_owned_worktrees(
                 int(number), _slug(), session_id, worktree_path
             ) is not None:
                 continue
-            if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
+            # Dead-marker takeover: inherited, not armed by this session (BOU-2221).
+            if _write_arm_marker(
+                worktree_path, session_id, int(eff_pid), int(number),
+                provenance=_provenance_for(worktree_path),
+            ):
                 _emit(worktree_path)
             continue
         if not adopt_unmarked:
@@ -380,7 +403,12 @@ def _collect_owned_worktrees(
             continue
         if _live_foreign_owner(worktree_path, session_id):
             continue
-        if _write_arm_marker(worktree_path, session_id, int(eff_pid), int(number)):
+        # Missed-arm pickup: this session never armed this PR and may know nothing
+        # about the work in it, so mark it adopted (BOU-2221).
+        if _write_arm_marker(
+            worktree_path, session_id, int(eff_pid), int(number),
+            provenance=_provenance_for(worktree_path),
+        ):
             _emit(worktree_path)
     return result
 

@@ -8,7 +8,7 @@ import time as _time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _env_int
-from .markers import _read_marker, _prune_stale_marker, _read_session_marker
+from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance
 
 
 def _stop_state_path(cwd: str) -> str:
@@ -228,10 +228,20 @@ def _stop_gate_impl(args) -> int:
     check_unobservable = False
     check_warn_only = False
     from .worktree_check import WARN_ONLY_MARKER  # noqa: PLC0415
+    adopted_pending: list[tuple[str, str]] = []
     for worktree in owned:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
-            pending.append((worktree, text))
+            # An ADOPTED worktree is one auto-adoption handed us: this session
+            # never armed it and has no context on the work. Its blockers are
+            # reported, not enforced — the maintenance loop services them. Making
+            # them blocking wedges a session on another epic's PR, and the "fix +
+            # push to the existing branch" instruction can clobber a live sibling
+            # session mid-edit (BOU-2221; hit with #2650 and #2653).
+            if _marker_provenance(worktree) == "adopted":
+                adopted_pending.append((worktree, text))
+            else:
+                pending.append((worktree, text))
         elif code == 2:
             check_unobservable = True
         elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
@@ -276,6 +286,19 @@ def _stop_gate_impl(args) -> int:
                 if info is not None:
                     escalated_owned[pr] = info
                     break
+
+    # Adopted PRs never block, but they must not vanish either: say what was
+    # inherited and who is actually handling it (BOU-2221).
+    if adopted_pending:
+        summaries = ", ".join(
+            f"#{_extract_pr_number(text) or '?'}" for _wt, text in adopted_pending
+        )
+        print(
+            f"[pr-watch] FYI: adopted PR(s) {summaries} have pending work. These were "
+            f"auto-adopted, not armed by this session — the maintenance loop owns them "
+            f"and they are NOT blocking your stop.",
+            file=sys.stderr,
+        )
 
     if not pending:
         if (not getattr(args, "no_waiter", False)) and session_id:

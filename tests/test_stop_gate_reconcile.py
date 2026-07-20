@@ -73,7 +73,9 @@ def _wire_unmarked_open_pr_worktree(
     )
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda path, sid: None)
 
-    def _adopt(path: str, session_id: str, pid: int, pr_number: int) -> bool:
+    def _adopt(
+        path: str, session_id: str, pid: int, pr_number: int, provenance: str = "armed"
+    ) -> bool:
         adopted.append((str(Path(path)), session_id, int(pid), int(pr_number)))
         marker_state[str(Path(path))] = session_id
         return True
