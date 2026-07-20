@@ -105,9 +105,19 @@ worktrees on a hook with a hard ~108s deadline, so per-PR `status()` calls are n
 acceptable.
 
 `OwnershipSnapshot` reads the store **once**, indexes `task_id -> latest ClaimRecord`,
-and answers many queries. It carries an explicit `ok` flag: on read failure or budget
-exhaustion it returns a snapshot that answers `unknown` — never a false "unowned" —
-so every future reader can fail closed.
+and answers many queries. It carries an explicit `ok` flag: on read failure or lock
+timeout it returns a snapshot that answers `unknown` — never a false "unowned" — so
+every future reader can fail closed.
+
+The lock itself is the sharper hazard. `JsonlClaimStore` takes `fcntl.flock(LOCK_EX)`
+with **no timeout**, and marker writes were previously lock-free (`mkstemp` +
+`os.replace`) — so the dual-write would be the first blocking lock the stop gate ever
+takes, on a file shared with the `pr-maintenance-loop` daemon and every other
+session. The surrounding `time.monotonic()` budgets are cooperative and cannot
+interrupt a thread parked in a syscall. `BoundedLockClaimStore` therefore acquires
+with `LOCK_NB` against a deadline (`AGENTIC_PR_DASH_OWNERSHIP_LOCK_TIMEOUT_SECONDS`,
+default 2s) and raises `TimeoutError` rather than waiting; both callers already treat
+a store error as fail-closed.
 
 ### 5. Dual-write — exactly three points, all in `markers.py`
 

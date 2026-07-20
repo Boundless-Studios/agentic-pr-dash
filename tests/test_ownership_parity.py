@@ -13,6 +13,7 @@ same PR number in two repos; a released claim after a merged PR).
 
 from datetime import datetime, timedelta, timezone
 import os
+import time
 
 import pytest
 
@@ -106,9 +107,19 @@ def test_claim_task_id_is_repo_qualified(worktree, monkeypatch):
     """
     from agentic_pr_dash import config
 
+    # Two genuinely distinct worktrees, each resolving to a different repo — the
+    # real shape of a `maintenance_repo_roots` setup, not one directory whose slug
+    # is re-patched mid-test.
+    other_wt = os.path.join(os.path.dirname(worktree), "wt-other")
+    os.makedirs(other_wt, exist_ok=True)
+    monkeypatch.setattr(
+        config,
+        "_detect_repo",
+        lambda path: OTHER_REPO if str(path).endswith("wt-other") else REPO,
+    )
+
     assert _write_arm_marker(worktree, SID, LIVE_PID, 500)
-    monkeypatch.setattr(config, "_detect_repo", lambda path: OTHER_REPO)
-    assert _write_arm_marker(worktree, OTHER_SID, LIVE_PID, 500)
+    assert _write_arm_marker(other_wt, OTHER_SID, LIVE_PID, 500)
 
     snap = ownership.snapshot()
     assert snap.owner_for(REPO, 500).session_id == SID
@@ -146,6 +157,16 @@ def test_stale_heartbeat_with_live_pid_stays_owned_on_both_sides(worktree):
     machine-wide loop claim the PR out from under a live session.
     """
     assert _write_arm_marker(worktree, SID, LIVE_PID, 301)
+    # Heartbeat first, so the claim carries a real heartbeat-TTL lease that then
+    # expires — without this the arm's LEASE_PID_TIER_ONLY claim is already expired
+    # and the test would pass even if the heartbeat dual-write were broken entirely.
+    _touch_owner_heartbeat(worktree, SID, work_found=False)
+    from agentic_pr_dash._maintenance.markers import _heartbeat_ttl_seconds
+
+    assert ownership.snapshot().owner_for(REPO, 301).state == "active", (
+        "precondition: the heartbeat must have given the claim a live lease"
+    )
+
     stale = _iso(_now() - timedelta(hours=6))
     _set_marker_fields(worktree, heartbeat=stale, last_heartbeat=stale)
 
@@ -382,6 +403,51 @@ def test_unreadable_store_reports_unknown_not_unowned(worktree, monkeypatch):
     assert ownership_parity.compare_worktree(worktree, snap=snap).reason == (
         "claim_store_unreadable"
     )
+
+
+def test_lock_wait_is_bounded_and_fails_closed(worktree, monkeypatch):
+    """The stop gate must never park in ``flock``.
+
+    ``JsonlClaimStore`` takes ``LOCK_EX`` with no timeout, and the dual-write runs
+    on the Stop-hook path — a subprocess with a hard ~108s deadline that fails
+    closed. Marker writes were lock-free before this adapter, so an unbounded wait
+    here would be a new way to blow that deadline. A held lock must time out, and
+    the timeout must degrade to "unknown", never to "unowned".
+    """
+    import fcntl
+
+    from agentic_pr_dash import coordinator
+
+    monkeypatch.setenv("AGENTIC_PR_DASH_OWNERSHIP_LOCK_TIMEOUT_SECONDS", "0.2")
+
+    assert _write_arm_marker(worktree, SID, LIVE_PID, 900)
+
+    lock_path = str(coordinator.store_path()) + ".lock"
+    with open(lock_path, "a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        started = time.monotonic()
+        snap = ownership.snapshot()
+        elapsed = time.monotonic() - started
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    assert elapsed < 5, f"snapshot blocked {elapsed:.1f}s on a held lock"
+    assert snap.known() is False, "a lock timeout must report unknown, not unowned"
+    assert snap.owner_for(REPO, 900) is None
+
+    # And the write path degrades the same way, without failing the marker write.
+    with open(lock_path, "a+", encoding="utf-8") as holder:
+        fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+        outcome = ownership.record_ownership(
+            repo=REPO,
+            pr_number=901,
+            session_id=SID,
+            pid=LIVE_PID,
+            worktree_path=worktree,
+        )
+        fcntl.flock(holder.fileno(), fcntl.LOCK_UN)
+
+    assert outcome.ok is False
+    assert "TimeoutError" in outcome.reason
 
 
 def test_snapshot_answers_many_prs_from_one_store_read(worktree, monkeypatch):

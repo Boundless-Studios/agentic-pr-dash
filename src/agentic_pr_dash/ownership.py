@@ -29,9 +29,12 @@ Two properties matter for the readers that will arrive in Stage 2:
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import os
+from pathlib import Path
+import time
 
 from agent_coordinator.models import ClaimRecord, OwnerIdentity, TaskIdentity
 from agent_coordinator.service import (
@@ -72,8 +75,94 @@ def _store_path():
     return coordinator.store_path()
 
 
+#: How long an ownership store operation may wait for the claim-store lock.
+#: See :class:`BoundedLockClaimStore` for why this must be bounded.
+DEFAULT_LOCK_TIMEOUT_SECONDS = 2.0
+
+_LOCK_POLL_SECONDS = 0.01
+
+
+def lock_timeout_seconds() -> float:
+    raw = os.environ.get("AGENTIC_PR_DASH_OWNERSHIP_LOCK_TIMEOUT_SECONDS", "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_LOCK_TIMEOUT_SECONDS
+    except ValueError:
+        return DEFAULT_LOCK_TIMEOUT_SECONDS
+    return value if value > 0 else DEFAULT_LOCK_TIMEOUT_SECONDS
+
+
+class BoundedLockClaimStore(JsonlClaimStore):
+    """A claim store whose lock wait is bounded.
+
+    ``JsonlClaimStore`` takes ``fcntl.flock(LOCK_EX)`` with no timeout, so an
+    operation blocks in the syscall for as long as any other holder keeps the lock
+    — the long-running ``pr-maintenance-loop`` daemon, another session's waiter, or
+    a process wedged mid-``fsync`` on a slow filesystem.
+
+    That is fine for the daemon. It is NOT fine here: the ownership dual-write runs
+    inside ``_write_arm_marker``/``_touch_owner_heartbeat``, both reachable from the
+    stop gate — a Stop-hook subprocess with a hard ~108s deadline that fails CLOSED
+    when exceeded (BOU-1953). Before this adapter existed, marker writes were
+    lock-free (``mkstemp`` + ``os.replace``), so this would be the first blocking
+    lock on that path, and the surrounding ``time.monotonic()`` budgets are
+    cooperative — they cannot interrupt a thread parked in ``flock``.
+
+    So the lock is acquired non-blockingly with a deadline and raises
+    :class:`TimeoutError` instead of waiting. Every caller in this module already
+    treats a store error as "fail closed": :func:`snapshot` reports ``known() ==
+    False`` and :func:`record_ownership` returns a failed :class:`ClaimOutcome` that
+    the marker write logs as a divergence and otherwise ignores.
+    """
+
+    def __init__(self, path, *, timeout: float | None = None):
+        super().__init__(path)
+        self.timeout = lock_timeout_seconds() if timeout is None else timeout
+
+    @contextmanager
+    def _bounded_lock(self):
+        import fcntl  # noqa: PLC0415
+
+        lock_path = Path(self.lock_path)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            deadline = time.monotonic() + self.timeout
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"claim store lock held longer than {self.timeout}s: "
+                            f"{lock_path}"
+                        ) from None
+                    time.sleep(_LOCK_POLL_SECONDS)
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+
+    def append_event(self, event):
+        with self._bounded_lock():
+            self._append_event_unlocked(event)
+
+    def read_events(self):
+        with self._bounded_lock():
+            return self._read_events_unlocked()
+
+    def transact_event(self, build_event):
+        with self._bounded_lock():
+            events = self._read_events_unlocked()
+            event = build_event(events)
+            self._append_event_unlocked(event)
+            return event
+
+
 def _coordinator() -> TaskCoordinator:
-    return TaskCoordinator(JsonlClaimStore(_store_path()))
+    return TaskCoordinator(BoundedLockClaimStore(_store_path()))
 
 
 def ownership_task(repo: str, pr_number: int) -> TaskIdentity:
