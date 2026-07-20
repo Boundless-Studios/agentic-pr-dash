@@ -102,12 +102,94 @@ function restoreBoardScroll(boardEl) {
     });
 }
 
+// ─── Board freshness (BOU-2193) ──────────────────────────────────────────────
+// htmx skips the swap when a poll returns an error, so a failing /partials/board
+// leaves the last-good board on screen indefinitely. Previously the "Live" chip
+// stayed green throughout, so a dashboard that had been frozen for hours looked
+// current. Track poll outcomes here — in the browser, where the missing response
+// is actually observable — and degrade the chip accordingly.
+
+let lastGoodBoardSwap = Date.now();
+let lastBoardError = null;
+
+function formatStaleAge(ms) {
+    const seconds = Math.floor(ms / 1000);
+    if (seconds < 60) {
+        return seconds + 's';
+    }
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) {
+        return minutes + 'm';
+    }
+    return Math.floor(minutes / 60) + 'h' + (minutes % 60) + 'm';
+}
+
+function renderBoardFreshness() {
+    const dot = document.getElementById('live-dot');
+    const label = document.getElementById('live-label');
+    if (!dot || !label) {
+        return;
+    }
+
+    if (!lastBoardError) {
+        dot.classList.remove('live-dot-stale');
+        label.classList.remove('live-label-stale');
+        label.textContent = 'Live';
+        label.title = 'Board is polling normally';
+        return;
+    }
+
+    const age = formatStaleAge(Date.now() - lastGoodBoardSwap);
+    dot.classList.add('live-dot-stale');
+    label.classList.add('live-label-stale');
+    label.textContent = 'stale ' + age;
+    label.title =
+        'Board poll failing (' + lastBoardError + '). Showing the last successful render, ' +
+        age + ' old.';
+}
+
+// Re-render on an interval so the age keeps ticking while the board sits stale,
+// rather than freezing at whatever it read when the first poll failed.
+setInterval(renderBoardFreshness, 1000);
+
+function isBoardRequest(detail) {
+    const target = detail && detail.target;
+    if (target && target.classList && target.classList.contains('board')) {
+        return true;
+    }
+    // On an error htmx may not resolve the swap target, so fall back to the path.
+    const path = detail && detail.pathInfo && detail.pathInfo.requestPath;
+    return Boolean(path && path.indexOf('/partials/board') !== -1);
+}
+
+document.addEventListener('htmx:responseError', function(event) {
+    // Scoped to the board: a failing event-log or runner-fleet poll says nothing
+    // about whether the PR board itself is current.
+    if (!isBoardRequest(event.detail)) {
+        return;
+    }
+    const status = event.detail.xhr ? event.detail.xhr.status : 'error';
+    lastBoardError = 'HTTP ' + status;
+    renderBoardFreshness();
+});
+
+document.addEventListener('htmx:sendError', function(event) {
+    if (!isBoardRequest(event.detail)) {
+        return;
+    }
+    lastBoardError = 'network error';
+    renderBoardFreshness();
+});
+
 document.addEventListener('htmx:afterSwap', function(event) {
     const target = event.detail.target;
     if (!target) {
         return;
     }
     if (target.classList.contains('board')) {
+        lastGoodBoardSwap = Date.now();
+        lastBoardError = null;
+        renderBoardFreshness();
         applyCardFilter();
         restoreBoardScroll(target);
         target.querySelectorAll('.card').forEach(function(card) {

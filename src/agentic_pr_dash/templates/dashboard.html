@@ -64,8 +64,11 @@
                     <span>Show agent worktrees</span>
                 </label>
             </form>
-            <span class="live-dot"></span>
-            <span class="live-label">Live</span>
+            {# Freshness is driven by observed board-poll outcomes in app.js, not by a
+               server-rendered timestamp: the failure this reports (BOU-2193) is one where
+               the board response never arrives, so the server cannot report on it. #}
+            <span id="live-dot" class="live-dot"></span>
+            <span id="live-label" class="live-label" title="Board is polling normally">Live</span>
             <form method="post" action="/api/refresh" style="display:inline">
                 <button type="submit" class="btn btn-ghost">Refresh</button>
             </form>

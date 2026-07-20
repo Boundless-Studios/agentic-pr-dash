@@ -260,19 +260,23 @@ class Config:
         """Return ``owner/name``, auto-detecting from ``gh``/git remote if unset."""
         if self.repo:
             return self.repo
-        # ``_safe_cwd()`` (not ``Path.cwd()``) so an ambient caller
+        # ``safe_cwd()`` (not ``Path.cwd()``) so an ambient caller
         # (coordinator._repo_slug_for_pr, maintenance.pr_url(cwd=None)) does not
         # re-raise the deleted-cwd FileNotFoundError that ``load()`` already
         # guards against (BOU-1905 / PR #62 review).
-        return _detect_repo(cwd or _safe_cwd())
+        return _detect_repo(cwd or safe_cwd())
 
 
-def _safe_cwd() -> Path:
+def safe_cwd() -> Path:
     """``Path.cwd()`` that tolerates a deleted working directory.
 
-    A long-lived detached process (the waiter) can outlive its cwd when
-    stale-worktree reaping removes the directory, so ``os.getcwd()`` raises
-    FileNotFoundError. Fall back to $HOME rather than crashing (BOU-1905)."""
+    A long-lived detached process can outlive its cwd when stale-worktree reaping
+    removes the directory, so ``os.getcwd()`` raises FileNotFoundError. Fall back
+    to $HOME rather than crashing (BOU-1905).
+
+    Public because the dashboard server hits the same failure: it inherits an
+    ephemeral worktree as its cwd, and every ``/partials/board`` render raised
+    FileNotFoundError once that worktree was reaped (BOU-2193)."""
     try:
         return Path.cwd()
     except (FileNotFoundError, OSError):
@@ -328,11 +332,11 @@ def _resolve_state_dir(file_cfg: dict, base: Path) -> Path:
 @lru_cache(maxsize=8)
 def load(cwd: str | None = None) -> Config:
     """Load and cache the resolved config for ``cwd`` (defaults to the process cwd)."""
-    # ``_safe_cwd()`` tolerates a deleted ambient cwd (a long-lived detached
+    # ``safe_cwd()`` tolerates a deleted ambient cwd (a long-lived detached
     # waiter can outlive its worktree via stale-worktree reaping), so every
     # ambient-cwd ``load()`` site — agents.py's discovery/cpu helpers among
     # them — inherits the safety net rather than a raw traceback (BOU-1905).
-    base = Path(cwd) if cwd else _safe_cwd()
+    base = Path(cwd) if cwd else safe_cwd()
     cfg_path = _find_config_file(base)
     root = cfg_path.parent if cfg_path else base
     data = _load_toml(cfg_path)
