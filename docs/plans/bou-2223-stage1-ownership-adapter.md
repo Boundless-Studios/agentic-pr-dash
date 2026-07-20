@@ -65,12 +65,37 @@ under it.
 So the façade defines liveness as:
 
 ```
-live  ==  state is ACTIVE
-      or (state is EXPIRED and pid_is_live(owner.pid))
+live  ==  lease not expired                       # tiers 1 & 2, unconditionally
+      or  pid positively probes as alive          # tier 3
 ```
 
-Lease seconds map to the marker's two tiers: `heartbeat_ttl_seconds` normally,
-`_fix_lease_seconds()` when a fix is in flight (`work_found=True`).
+Two details the first cut got wrong, both pinned by existing tests that are the
+specification:
+
+* **Within the lease, the pid is never consulted.** `test_dead_pid_with_fresh_heartbeat_still_defers`
+  requires a fresh heartbeat to grant ownership even with a dead recorded pid — the
+  marker's `pid` is stamped once at arm time by `_resolve_owner_pid` and never
+  rewritten, while a detached waiter or the maintenance loop keeps heartbeating
+  under the same session id. `TaskCoordinator.status()` would answer `OWNER_DEAD`
+  here; the façade must not.
+* **A bare arm gets no time-based tier at all.** `_write_arm_marker` writes
+  `armed_at` but neither `heartbeat` nor `fix_lease_until`, so a freshly-armed
+  marker satisfies neither tier 1 nor 2 and rests entirely on the owner pid. The
+  arm's mirrored claim therefore uses `LEASE_PID_TIER_ONLY` (a zero lease) rather
+  than a full TTL — otherwise a session that arms and then dies before its first
+  heartbeat would read as owned on the claim side and reclaimable on the marker
+  side.
+
+Lease seconds otherwise map to the marker's two time tiers, written by
+`_touch_owner_heartbeat`: `heartbeat_ttl_seconds` normally, `_fix_lease_seconds()`
+when a fix is in flight (`work_found=True`).
+
+One further asymmetry the parity harness has to respect: `_fix_lease_active` treats
+an **unparseable** `fix_lease_until` as ACTIVE (it guards a dispatch race, where
+deferring is the safe error), but the ownership reader `_live_foreign_owner` falls
+through to the pid tier instead — pinned by
+`test_corrupt_fix_lease_without_fresh_heartbeat_does_not_defer_forever`. The
+marker-side view mirrors the ownership reader, not the helper.
 
 ### 4. Bounded, fail-closed reads
 

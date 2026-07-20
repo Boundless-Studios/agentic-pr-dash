@@ -112,12 +112,20 @@ def _heartbeat_ttl_seconds(cwd: str | None = None) -> int:
     return ttl(cwd)
 
 
+#: Lease for a claim that mirrors a marker carrying NO time-based tier — i.e. a
+#: freshly-armed marker. ``_write_arm_marker`` writes ``armed_at`` but no
+#: ``heartbeat`` and no ``fix_lease_until``, so such a marker satisfies neither of
+#: the first two liveness tiers and its ownership rests entirely on the owner pid.
+#: A zero lease reproduces that: the claim goes straight to the pid tier.
+LEASE_PID_TIER_ONLY = 0
+
+
 def _lease_seconds_for(cwd: str | None, work_found: bool) -> int:
     """Marker lease tiers, reused verbatim.
 
-    The marker scheme grants a short alive-and-ticking window normally and a much
-    longer window while a fix is in flight. Mapping both onto the claim lease keeps
-    ``EXPIRED`` meaning the same thing on both sides of the parity check.
+    The marker scheme grants a short alive-and-ticking window on a heartbeat and a
+    much longer one while a fix is in flight. Mapping both onto the claim lease
+    keeps lease expiry meaning the same thing on both sides of the parity check.
     """
     return _fix_lease_seconds() if work_found else _heartbeat_ttl_seconds(cwd)
 
@@ -158,10 +166,6 @@ class OwnershipSnapshot:
         """
         return pid is not None and pid > 0 and bool(self._pid_is_live(pid))
 
-    def _pid_known_dead(self, pid: int | None) -> bool:
-        """True only for a pid we can positively probe as gone."""
-        return pid is not None and pid > 0 and not self._pid_is_live(pid)
-
     def claim_for(self, repo: str, pr_number: int) -> ClaimRecord | None:
         if not self.ok:
             return None
@@ -181,10 +185,18 @@ class OwnershipSnapshot:
             state, live = claim.status, False
         elif self._now < claim.lease_expires_at:
             # Within the lease — the marker equivalent of a fresh heartbeat or an
-            # active fix-lease, which grant ownership on their own. Only a
-            # positively-dead owner pid overrides that (coordinator's OWNER_DEAD).
-            dead = self._pid_known_dead(claim.owner.pid)
-            live, state = not dead, ("owner_dead" if dead else "active")
+            # active fix-lease. Those tiers grant ownership UNCONDITIONALLY: the
+            # marker never consults the pid while the heartbeat is fresh, which
+            # ``test_dead_pid_with_fresh_heartbeat_still_defers`` pins. That is not
+            # an oversight — the marker's ``pid`` is stamped once at arm time by
+            # ``_resolve_owner_pid`` and never rewritten, while a detached waiter or
+            # the maintenance loop keeps heartbeating under the same session id, so
+            # the recorded pid can die under a session that is still working.
+            #
+            # ``TaskCoordinator.status()`` would answer OWNER_DEAD here. Applying
+            # that would make the parity harness log divergences for an ordinary
+            # loop-covered PR, muddying the very signal Stage 2 has to trust.
+            live, state = True, "active"
         else:
             # Lease expired. The marker scheme's third liveness tier keeps
             # ownership for a still-alive owner pid: a session with no waiter
@@ -194,7 +206,7 @@ class OwnershipSnapshot:
             # reclaimable, so the rule is applied here instead — and, like the
             # marker's ``_pid_alive``, an absent pid does NOT satisfy it.
             live = self._pid_known_alive(claim.owner.pid)
-            state = "expired_owner_live" if live else "expired"
+            state = "owner_pid_live" if live else "expired"
         return OwnerView(
             session_id=claim.owner.session_id,
             pid=claim.owner.pid,
@@ -272,6 +284,7 @@ def record_ownership(
     provenance: str = PROVENANCE_ARMED,
     branch: str = "",
     work_found: bool = False,
+    lease_seconds: int | None = None,
     now: datetime | None = None,
 ) -> ClaimOutcome:
     """Record (or refresh) this session's ownership claim on ``(repo, pr)``.
@@ -309,7 +322,11 @@ def record_ownership(
         record = _coordinator().claim_task(
             ownership_task(repo, pr_number),
             owner,
-            lease_seconds=_lease_seconds_for(worktree_path, work_found),
+            lease_seconds=(
+                _lease_seconds_for(worktree_path, work_found)
+                if lease_seconds is None
+                else lease_seconds
+            ),
             now=now,
         )
     except ClaimConflictError as exc:

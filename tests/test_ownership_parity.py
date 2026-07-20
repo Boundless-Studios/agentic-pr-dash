@@ -155,7 +155,7 @@ def test_stale_heartbeat_with_live_pid_stays_owned_on_both_sides(worktree):
     # Age the claim past its lease the same way.
     future = _now() + timedelta(hours=6)
     view = ownership.snapshot(now=future).owner_for(REPO, 301)
-    assert view.state == "expired_owner_live"
+    assert view.state == "owner_pid_live"
     assert view.live is True, (
         "an expired lease with a live owner pid must stay owned, matching the "
         "marker's third liveness tier"
@@ -177,17 +177,87 @@ def test_stale_heartbeat_with_dead_pid_is_reclaimable_on_both_sides(worktree):
     assert ownership_parity.compare_worktree(worktree, now=future).agrees
 
 
-def test_dead_pid_within_lease_is_owner_dead_on_both_sides(worktree):
-    """A dead owner is reclaimable even with lease left — and the marker agrees,
-    because a dead pid also fails its heartbeat and fix-lease tiers once stale."""
+def test_fresh_heartbeat_with_dead_pid_stays_owned_on_both_sides(worktree):
+    """A fresh heartbeat grants ownership even when the recorded pid is dead.
+
+    ``test_dead_pid_with_fresh_heartbeat_still_defers`` in test_foreign_owner.py is
+    the specification: the marker's ``pid`` is stamped once at arm time and never
+    rewritten, while a detached waiter or the maintenance loop keeps heartbeating
+    under the same session id — so a dead recorded pid does NOT mean the owner is
+    gone. ``TaskCoordinator.status()`` would call this OWNER_DEAD; the façade must
+    not.
+    """
     assert _write_arm_marker(worktree, SID, DEAD_PID, 303)
-    stale = _iso(_now() - timedelta(hours=6))
-    _set_marker_fields(worktree, heartbeat=stale, last_heartbeat=stale)
+    _touch_owner_heartbeat(worktree, SID, work_found=False)
+
+    assert marker_owner_view(worktree)["live"] is True
 
     view = ownership.snapshot().owner_for(REPO, 303)
-    assert view.state == "owner_dead"
-    assert view.live is False
+    assert view.state == "active"
+    assert view.live is True, (
+        "an unexpired lease must not be overridden by a dead recorded pid — the "
+        "marker's heartbeat tier never consults it"
+    )
     assert ownership_parity.compare_worktree(worktree).agrees
+
+
+def test_a_bare_arm_rests_on_the_pid_tier_on_both_sides(worktree):
+    """``_write_arm_marker`` writes no heartbeat and no fix-lease.
+
+    Such a marker satisfies neither time-based liveness tier, so its ownership
+    rests entirely on the owner pid — and the mirrored claim must start in the same
+    state. Giving the arm a full heartbeat-TTL lease instead would make a session
+    that arms and then dies before its first heartbeat look owned on the claim side
+    while the marker reports it reclaimable.
+    """
+    assert _write_arm_marker(worktree, SID, DEAD_PID, 308)
+
+    assert marker_owner_view(worktree)["live"] is False
+    view = ownership.snapshot().owner_for(REPO, 308)
+    assert view.live is False, "a bare arm with a dead pid must not look owned"
+    assert ownership_parity.compare_worktree(worktree).agrees
+
+    # ...and the same arm with a LIVE pid is owned on both sides, via that tier.
+    assert _write_arm_marker(worktree, SID, LIVE_PID, 309)
+    assert marker_owner_view(worktree)["live"] is True
+    live_view = ownership.snapshot().owner_for(REPO, 309)
+    assert live_view.state == "owner_pid_live"
+    assert live_view.live is True
+    assert ownership_parity.compare_worktree(worktree).agrees
+
+
+def test_corrupt_fix_lease_does_not_grant_ownership_forever(worktree):
+    """Mirrors ``test_corrupt_fix_lease_without_fresh_heartbeat_does_not_defer_forever``.
+
+    ``_fix_lease_active`` treats an unparseable lease as ACTIVE — correct where it
+    guards a dispatch race, wrong for ownership, where ``_live_foreign_owner`` falls
+    through to the pid tier instead. The parity harness must mirror the ownership
+    reader, or it would report agreement on a marker the real reader disowns.
+    """
+    assert _write_arm_marker(worktree, SID, DEAD_PID, 306)
+    _set_marker_fields(
+        worktree,
+        heartbeat=_iso(_now() - timedelta(hours=6)),
+        last_heartbeat=_iso(_now() - timedelta(hours=6)),
+        fix_lease_until="not-a-timestamp",
+    )
+
+    assert marker_owner_view(worktree)["live"] is False, (
+        "a corrupt fix-lease must not confer ownership on a dead owner"
+    )
+
+
+def test_oversized_marker_pid_is_rejected_not_smuggled_into_the_claim(worktree):
+    """A corrupt marker pid must not reach ``OwnerIdentity``.
+
+    ``_pid_alive`` rejects >10-digit pids explicitly (they overflow ``os.kill``'s
+    pid_t); the ownership view applies the same guard rather than relying on
+    ``os.kill`` to fail incidentally.
+    """
+    assert _write_arm_marker(worktree, SID, LIVE_PID, 307)
+    _set_marker_fields(worktree, pid="1" * 40)
+
+    assert marker_owner_view(worktree)["pid"] is None
 
 
 def test_fix_lease_extends_the_claim_lease(worktree):
