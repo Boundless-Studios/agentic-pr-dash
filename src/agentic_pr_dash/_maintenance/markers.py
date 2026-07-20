@@ -5,7 +5,15 @@ import os
 import sys
 
 from agentic_pr_dash.config import load as load_config
-from ._common import _parse_iso, _pid_alive, _fix_lease_seconds, _resolve_owner_pid, _current_branch, _repo_slug
+from ._common import (
+    _PID_MAX_DIGITS,
+    _parse_iso,
+    _pid_alive,
+    _fix_lease_seconds,
+    _resolve_owner_pid,
+    _current_branch,
+    _repo_slug,
+)
 
 # How long an owner's loop heartbeat stays "fresh" (the ownership lease).
 _HEARTBEAT_TTL_SECONDS = 600       # 10 min — alive-and-ticking window (3m loop + slack)
@@ -122,6 +130,72 @@ def _live_foreign_owner(cwd: str, self_session_id: str) -> str | None:
     if _pid_alive(fields.get("pid", "")):
         return owner
     return None
+
+
+def marker_owner_view(cwd: str) -> dict | None:
+    """Read-only marker-derived ownership of the worktree at ``cwd`` (BOU-2223).
+
+    Returns ``None`` when no marker exists. Otherwise a dict with the marker's
+    ``session_id`` / ``pid`` / ``pr`` / ``provenance`` plus ``live``, computed with
+    the SAME three-tier rule ``_live_foreign_owner`` applies — fresh heartbeat, or
+    an unexpired fix-lease, or (the robust fallback) a still-alive owner pid.
+
+    This is an extraction for the ownership parity harness, not a behaviour change:
+    ``_live_foreign_owner`` keeps its own inlined logic because it additionally
+    filters to a *different* session and emits the unparseable-lease warnings that
+    its callers depend on. This view answers "who does the marker name, and is that
+    owner live?" for any session, including ourselves.
+
+    The lease tier deliberately reproduces ``_live_foreign_owner``'s inline
+    handling rather than calling ``_fix_lease_active``: the two disagree on an
+    UNPARSEABLE ``fix_lease_until``. ``_fix_lease_active`` treats it as active (it
+    guards a dispatch race, where deferring is the safe error), while the ownership
+    reader falls through to the pid tier — which is what
+    ``test_corrupt_fix_lease_without_fresh_heartbeat_does_not_defer_forever``
+    pins. Mirroring the wrong one would corrupt the parity signal Stage 2 depends
+    on for exactly the edge case both call sites went out of their way to handle.
+    """
+    fields = _read_marker(cwd)
+    if fields is None:
+        return None
+    owner = fields.get("session_id", "")
+    live = any(
+        _heartbeat_fresh(value, cwd)
+        for value in (fields.get("last_heartbeat", ""), fields.get("heartbeat", ""))
+        if value
+    )
+    if not live:
+        lease_ts = _parse_iso(fields.get("fix_lease_until", ""))
+        if lease_ts is not None:
+            from datetime import datetime, timezone  # noqa: PLC0415
+
+            live = datetime.now(timezone.utc) < lease_ts
+    if not live:
+        live = _pid_alive(fields.get("pid", ""))
+    pr_raw = fields.get("pr", "")
+    return {
+        "session_id": owner,
+        "pid": _marker_pid_value(fields.get("pid", "")),
+        "pr": int(pr_raw) if str(pr_raw).isdigit() else None,
+        "provenance": fields.get("provenance", "") or "armed",
+        "live": bool(owner) and live,
+    }
+
+
+def _marker_pid_value(pid_raw: str) -> int | None:
+    """A marker ``pid=`` value as an int, or ``None`` when unusable.
+
+    Applies the same guards ``_pid_alive`` does — ASCII digits only and at most
+    ``_PID_MAX_DIGITS`` — so a corrupt marker cannot smuggle an oversized pid into
+    an ownership claim, where it would only be rejected incidentally by
+    ``os.kill``'s pid_t overflow.
+    """
+    if not (pid_raw.isascii() and pid_raw.isdigit()):
+        return None
+    if len(pid_raw) > _PID_MAX_DIGITS:
+        return None
+    value = int(pid_raw)
+    return value if value > 0 else None
 
 
 def _live_pr_owner_record(
@@ -258,6 +332,27 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
                 os.remove(tmp)
             except OSError:
                 pass
+        return
+
+    # Mirror the refreshed lease into the claim (BOU-2223 dual-write). Coalescing
+    # is inherited: this runs only when the marker was actually rewritten, so the
+    # claim heartbeats on exactly the same cadence. ``work_found`` selects the same
+    # long fix-lease tier the marker just wrote.
+    pr_raw = fields.get("pr", "")
+    if str(pr_raw).isdigit():
+        _dual_write_ownership_claim(
+            cwd,
+            self_session_id,
+            _marker_pid_value(fields.get("pid", "")),
+            int(pr_raw),
+            fields.get("provenance", "") or "armed",
+            work_found=work_found,
+            # No branch probe: a same-session claim_task on an active claim is a
+            # heartbeat and keeps the ORIGINAL owner record, so metadata passed
+            # here would be discarded anyway. The heartbeat runs on the Stop-hook
+            # path, where a needless `git rev-parse` is pure deadline cost.
+            branch="",
+        )
 
 
 def _write_arm_marker(
@@ -317,6 +412,24 @@ def _write_arm_marker(
     except OSError:
         pass
 
+    # Probed once and shared with the ownership dual-write below: both are `git`
+    # subprocesses on the Stop-hook path, which has a hard deadline.
+    #
+    # Guarded because hoisting them OUT of the ledger-append try/except below
+    # would otherwise let a probe failure escape ``_write_arm_marker`` — none of
+    # its callers wrap it, so on the Stop-hook path that would crash the hook
+    # instead of degrading. ``_current_branch`` catches only OSError/Timeout, and
+    # ``subprocess.run(text=True)`` can also raise UnicodeDecodeError on a
+    # non-UTF-8 ref name or git warning.
+    try:
+        branch = _current_branch(cwd)
+    except Exception:  # noqa: BLE001
+        branch = ""
+    try:
+        repo = _repo_slug(cwd)
+    except Exception:  # noqa: BLE001
+        repo = ""
+
     try:
         import subprocess  # noqa: PLC0415
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
@@ -328,12 +441,68 @@ def _write_arm_marker(
                 baseline = rev.stdout.strip() or None
         except (OSError, subprocess.TimeoutExpired):
             baseline = None
-        branch = _current_branch(cwd)
         session_ledger.append(session_id, pr_number, branch, cwd, baseline,
-                              repo=_repo_slug(cwd))
+                              repo=repo)
     except Exception:  # noqa: BLE001
         pass
+
+    # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
+    # ``fix_lease_until``, so it satisfies neither time-based liveness tier and its
+    # ownership rests entirely on the owner pid. The mirrored claim must start in
+    # the same state, or a session that arms and then dies before its first
+    # heartbeat would look owned on the claim side and unowned on the marker side.
+    _dual_write_ownership_claim(
+        cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
+        pid_tier_only=True,
+    )
     return True
+
+
+def _dual_write_ownership_claim(
+    cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
+    *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
+    pid_tier_only: bool = False,
+) -> None:
+    """Mirror an ownership-marker write into an agent-coordinator claim (BOU-2223).
+
+    Stage 1 of the ownership consolidation: markers stay authoritative and every
+    write is mirrored here so the parity harness can prove the claim-derived view
+    agrees before any reader is flipped. Best-effort by construction — a claim
+    store problem must never fail the marker write that callers depend on.
+
+    ``repo``/``branch`` let a caller that already probed git pass the values in;
+    ``None`` means "probe here". ``pid_tier_only`` mirrors a marker that carries no
+    heartbeat and no fix-lease, so the claim's liveness rests on the owner pid.
+    """
+    try:
+        from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
+        if not ownership.dual_write_enabled():
+            return
+        outcome = ownership.record_ownership(
+            lease_seconds=ownership.LEASE_PID_TIER_ONLY if pid_tier_only else None,
+            repo=_repo_slug(cwd) if repo is None else repo,
+            pr_number=pr_number,
+            session_id=session_id,
+            pid=pid,
+            worktree_path=cwd,
+            provenance=provenance,
+            branch=_current_branch(cwd) if branch is None else branch,
+            work_found=work_found,
+        )
+        if not outcome.ok:
+            ownership_parity.log_divergence(
+                cwd,
+                {
+                    "kind": "dual_write_failed",
+                    "pr": pr_number,
+                    "session_id": session_id,
+                    "provenance": provenance,
+                    "reason": outcome.reason,
+                    "conflict_session_id": outcome.conflict_session_id,
+                },
+            )
+    except Exception:  # noqa: BLE001 — never break the authoritative marker write
+        pass
 
 
 def _marker_provenance(worktree_path: str) -> str:
@@ -416,6 +585,21 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
         from agentic_pr_dash import maintenance  # noqa: PLC0415
         maintenance.prune_state(cwd, pr_number)
     except Exception:  # noqa: BLE001
+        pass
+
+    # The PR is authoritatively merged/closed and its marker is gone — release the
+    # mirrored claim too, or the claim-derived view would keep reporting an owner
+    # for a dead PR (BOU-2223 dual-write).
+    try:
+        from agentic_pr_dash import ownership  # noqa: PLC0415
+        if ownership.dual_write_enabled():
+            ownership.release_ownership(
+                repo=_repo_slug(cwd),
+                pr_number=pr_number,
+                session_id=session_id,
+                reason="pr_closed",
+            )
+    except Exception:  # noqa: BLE001 — never break marker pruning
         pass
 
 
