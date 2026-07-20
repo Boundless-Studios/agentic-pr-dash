@@ -84,6 +84,12 @@ _DEFAULT_COMPACT_THRESHOLD = 5000
 _MAX_STATUS_REPORT_BYTES = 1_048_576
 _STATUS_DEDUPE_TOMBSTONES_PER_SESSION = 256
 
+# Events written by the harness status-report path (`record_status_report`),
+# which keys sessions by conversation id rather than the launcher's session id.
+# A session made up of ONLY these is "harness-only" and can never reach a
+# terminal event, so compaction ages it out instead (BOU-2210).
+_HARNESS_EVENTS = {"harness_status", "harness_status_seen"}
+
 _PRIVATE_REPORT_FIELDS = {
     "api_key",
     "api_keys",
@@ -612,6 +618,29 @@ def read_events(path: Path | None = None, limit: int | None = None) -> list[dict
     return events
 
 
+def _coerce_int(value: Any) -> int | None:
+    """``int(value)`` or None — never raises (BOU-2210).
+
+    ``read_events`` deliberately tolerates a malformed *line*; the merge step
+    must tolerate a malformed *field* the same way. An unguarded ``int()`` here
+    raised straight out of ``summarize_sessions`` into the dashboard's card
+    builder, so one bad value took the WHOLE board down permanently (every
+    request re-read the same poisoned line) until someone hand-edited the JSONL.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> float | None:
+    """``float(value)`` or None — never raises. See ``_coerce_int``."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> RuntimeSessionState:
     incoming_event = str(event.get("event") or "unknown")
     if (
@@ -654,11 +683,13 @@ def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> Ru
         str(event.get("event")) == "started"
         or (str(event.get("event")) == "harness_status" and state.pid is None)
     ) and event.get("pid") is not None:
-        state.pid = int(event["pid"])
+        pid_value = _coerce_int(event["pid"])
+        if pid_value is not None:
+            state.pid = pid_value
     for field_name in ("ppid", "pr_number", "exit_code"):
-        value = event.get(field_name)
-        if value is not None:
-            setattr(state, field_name, int(value))
+        coerced = _coerce_int(event.get(field_name))
+        if coerced is not None:
+            setattr(state, field_name, coerced)
     if event.get("feature_pipeline"):
         # Sticky: once a session is known to be a feature-pipeline run, later
         # events that omit the marker don't clear it.
@@ -692,11 +723,12 @@ def _merge_event(state: RuntimeSessionState | None, event: dict[str, Any]) -> Ru
             "active_critical_sections",
             "outbox_depth",
         ):
-            value = event.get(field_name)
-            if value is not None:
-                setattr(state, field_name, int(value))
-        if event.get("context_percent") is not None:
-            state.context_percent = float(event["context_percent"])
+            coerced = _coerce_int(event.get(field_name))
+            if coerced is not None:
+                setattr(state, field_name, coerced)
+        context_percent = _coerce_float(event.get("context_percent"))
+        if context_percent is not None:
+            state.context_percent = context_percent
     return state
 
 
@@ -844,11 +876,21 @@ def _compact_registry_locked(
     latest_status_index_by_session: dict[str, int] = {}
     status_before_terminal_by_session: dict[str, int] = {}
     keyed_history_indices_by_session: dict[str, list[int]] = {}
+    harness_only_sessions: set[str] = set()
+    lifecycle_sessions: set[str] = set()
+    latest_pid_by_session: dict[str, int | None] = {}
     for index, (_line, event) in enumerate(parsed):
         sid = str(event.get("session_id") or "")
         if not sid:
             continue
         event_name = str(event.get("event") or "")
+        if event_name in _HARNESS_EVENTS:
+            harness_only_sessions.add(sid)
+            pid_value = _coerce_int(event.get("pid"))
+            if pid_value is not None:
+                latest_pid_by_session[sid] = pid_value
+        else:
+            lifecycle_sessions.add(sid)
         if event_name == "harness_status_seen" or (
             event_name == "harness_status"
             and event.get("idempotency_keyed") is not False
@@ -873,6 +915,31 @@ def _compact_registry_locked(
             continue
         if latest_ts_by_session.get(sid, "") < cutoff_iso:
             drop_sessions.add(sid)
+
+    # Max-age rule for HARNESS-ONLY sessions (BOU-2210).
+    #
+    # `record_status_report` keys a session by `report.conversation_id` — a
+    # different id space from the launcher's `WTD_SESSION_ID`. Nothing ever
+    # writes a `completed`/`failed`/`cleanup_completed` event under a
+    # conversation id, so the terminal-state rule above can never fire for one:
+    # every rotated conversation left one permanently-unreclaimable
+    # `harness_status` line (context rotation every ~30 min across 5 worktrees
+    # ≈ 240 ids/day ≈ 87k lines/year). The per-session tombstone cap bounds each
+    # session's HISTORY but not the per-session FLOOR.
+    #
+    # So: a session that has only ever produced harness events (no `started`,
+    # no terminal, no other lifecycle event), whose newest event is older than
+    # the retention cutoff, and whose last reported pid is not live, is dead by
+    # age and reclaimable. A live pid always wins — a long-idle but genuinely
+    # running harness session is never dropped.
+    for sid in harness_only_sessions - lifecycle_sessions:
+        if sid in drop_sessions:
+            continue
+        if latest_ts_by_session.get(sid, "") >= cutoff_iso:
+            continue
+        if pid_is_live(latest_pid_by_session.get(sid)):
+            continue
+        drop_sessions.add(sid)
 
     keep_status_indices = set(latest_status_index_by_session.values())
     keep_status_indices.update(status_before_terminal_by_session.values())

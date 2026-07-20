@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 from functools import lru_cache
 from pathlib import Path
 
@@ -1025,96 +1026,142 @@ def _tick(args, executor: str) -> None:
     for cwd in _discover_cwds(args):
         if not Path(cwd).is_dir():
             continue
+        # BOU-2210: one worktree's bad luck must never abort the tick (or, in
+        # the daemon, the whole process). The coordinator facade can raise a
+        # whole family of exceptions beyond StaleClaimError — PermissionError
+        # (owner_session_id mismatch: the `check` subprocess claims as
+        # `pid:<ancestor-agent-pid>` when the loop runs without --session-id,
+        # while the loop heartbeats as `pid:<os.getpid()>`), KeyError (claims
+        # .jsonl rotated between check and heartbeat), ValueError (the claim was
+        # released when the PR went clean), OSError (fsync on a full disk) — and
+        # git/gh/subprocess/IO can fail for their own reasons. Log and continue.
         try:
-            hf = _health_file(cwd)
-        except Exception:  # noqa: BLE001 — heartbeat is best-effort
-            hf = None
-        if hf is not None and hf not in stamped_health_files:
-            stamped_health_files.add(hf)
+            _service_cwd(
+                args,
+                executor,
+                fallback,
+                cwd,
+                interval=interval,
+                tick_viable=tick_viable,
+                tick_errors=tick_errors,
+                stamped_health_files=stamped_health_files,
+            )
+        except Exception as exc:  # noqa: BLE001 — a daemon must survive one PR
+            print(
+                f"[agentic-pr-dash] tick for {cwd} failed: "
+                f"{type(exc).__name__}: {exc} — continuing",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+
+
+def _service_cwd(
+    args,
+    executor: str,
+    fallback: str,
+    cwd: str,
+    *,
+    interval: int | None,
+    tick_viable: bool,
+    tick_errors: dict[str, str],
+    stamped_health_files: set[Path],
+) -> None:
+    """Service exactly one worktree. Raising is fine — ``_tick`` isolates it."""
+    try:
+        hf = _health_file(cwd)
+    except Exception:  # noqa: BLE001 — heartbeat is best-effort
+        hf = None
+    if hf is not None and hf not in stamped_health_files:
+        stamped_health_files.add(hf)
+        record_loop_health(
+            cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
+            session_id=args.session_id or "",
+            no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
+            once=bool(getattr(args, "once", False)),
+        )
+    if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
+        return
+    check = subprocess.run(
+        [sys.executable, "-m", "agentic_pr_dash", "check",
+         "--cwd", cwd, "--session-id", args.session_id or ""],
+        capture_output=True, text=True,
+    )
+    if check.returncode != CHECK_WORK_FOUND:
+        # 0 = clean/deferred, 2 = gh unavailable. A warn-only defer (a blocked
+        # owned PR we deferred to its live owner without dispatching) is exit 0
+        # by design, but must still be VISIBLE in loop output — otherwise the
+        # detached loop's coverage looks clean while the PR is red (BOU-1788,
+        # codex PR #48 review).
+        notice = check.stdout.strip()
+        is_warn_only = bool(notice and worktree_check.WARN_ONLY_MARKER in notice)
+        if is_warn_only:
+            print(f"[agentic-pr-dash] {notice}", file=sys.stderr)
+        # On a genuinely clean result, drop any stale streak/escalation marker
+        # for this PR (it recovered without an executor dispatch). Skip rc 2
+        # (gh failure is not evidence of recovery) AND skip warn-only defers —
+        # those are a KNOWN-blocked PR deferred to its live owner, not a
+        # recovery, so clearing would hide a still-red PR (BOU-1789/BOU-1788).
+        if check.returncode == 0 and not is_warn_only:
+            _clear_recovered_streak(cwd)
+        return
+    pr = _parse_pr_number(check.stdout)
+    claim_handle = _parse_coordinator_claim_handle(check.stdout)
+    prompt = check.stdout
+    baseline = _baseline_sha(cwd, pr)
+    print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
+    session = args.session_id or f"pid:{_loop_pid()}"
+    if claim_handle:
+        try:
+            coordinator.heartbeat_claim(claim_handle, session)
+        except StaleClaimError:
+            return
+    serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
+    if not serviced:
+        # Primary (and fallback, if any) failed. Record the failure streak,
+        # then release the claim so the PR is not left wrongly owned until
+        # the lease expires, then move on. Retain the CONCRETE per-executor
+        # errors in the streak record (BOU-2086) instead of a generic line.
+        detail = "; ".join(f"{k}: {v}" for k, v in exec_errors.items())
+        err_summary = (
+            f"executor dispatch failed for PR #{pr}: {detail}"
+            if detail else f"executor exit non-zero or spawn-failed for PR #{pr}"
+        )
+        # Every attempted executor failed to even SPAWN → the loop cannot
+        # currently dispatch anything: downgrade this repo's viability record
+        # immediately rather than waiting for the next tick's validation.
+        if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
             record_loop_health(
-                cwd, executors_viable=tick_viable, errors=tick_errors, interval=interval,
+                cwd, executors_viable=False, errors=exec_errors, interval=interval,
                 session_id=args.session_id or "",
                 no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
                 once=bool(getattr(args, "once", False)),
             )
-        if _cleanup_stale_no_pr_worktree(cwd, args.session_id or ""):
-            continue
-        check = subprocess.run(
-            [sys.executable, "-m", "agentic_pr_dash", "check",
-             "--cwd", cwd, "--session-id", args.session_id or ""],
-            capture_output=True, text=True,
-        )
-        if check.returncode != CHECK_WORK_FOUND:
-            # 0 = clean/deferred, 2 = gh unavailable. A warn-only defer (a blocked
-            # owned PR we deferred to its live owner without dispatching) is exit 0
-            # by design, but must still be VISIBLE in loop output — otherwise the
-            # detached loop's coverage looks clean while the PR is red (BOU-1788,
-            # codex PR #48 review).
-            notice = check.stdout.strip()
-            is_warn_only = bool(notice and worktree_check.WARN_ONLY_MARKER in notice)
-            if is_warn_only:
-                print(f"[agentic-pr-dash] {notice}", file=sys.stderr)
-            # On a genuinely clean result, drop any stale streak/escalation marker
-            # for this PR (it recovered without an executor dispatch). Skip rc 2
-            # (gh failure is not evidence of recovery) AND skip warn-only defers —
-            # those are a KNOWN-blocked PR deferred to its live owner, not a
-            # recovery, so clearing would hide a still-red PR (BOU-1789/BOU-1788).
-            if check.returncode == 0 and not is_warn_only:
-                _clear_recovered_streak(cwd)
-            continue
-        pr = _parse_pr_number(check.stdout)
-        claim_handle = _parse_coordinator_claim_handle(check.stdout)
-        prompt = check.stdout
-        baseline = _baseline_sha(cwd, pr)
-        print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
-        session = args.session_id or f"pid:{_loop_pid()}"
+        new_streak = record_executor_failure(cwd, pr, err_summary)
+        _maybe_escalate(cwd, pr, err_summary, new_streak)
         if claim_handle:
-            try:
-                coordinator.heartbeat_claim(claim_handle, session)
-            except StaleClaimError:
-                continue
-        serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
-        if not serviced:
-            # Primary (and fallback, if any) failed. Record the failure streak,
-            # then release the claim so the PR is not left wrongly owned until
-            # the lease expires, then move on. Retain the CONCRETE per-executor
-            # errors in the streak record (BOU-2086) instead of a generic line.
-            detail = "; ".join(f"{k}: {v}" for k, v in exec_errors.items())
-            err_summary = (
-                f"executor dispatch failed for PR #{pr}: {detail}"
-                if detail else f"executor exit non-zero or spawn-failed for PR #{pr}"
-            )
-            # Every attempted executor failed to even SPAWN → the loop cannot
-            # currently dispatch anything: downgrade this repo's viability record
-            # immediately rather than waiting for the next tick's validation.
-            if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
-                record_loop_health(
-                    cwd, executors_viable=False, errors=exec_errors, interval=interval,
-                    session_id=args.session_id or "",
-                    no_discover_worktrees=bool(getattr(args, "no_discover_worktrees", False)),
-                    once=bool(getattr(args, "once", False)),
-                )
-            new_streak = record_executor_failure(cwd, pr, err_summary)
-            _maybe_escalate(cwd, pr, err_summary, new_streak)
-            if claim_handle:
-                reason = "all_executors_failed" if fallback else "executor_failed"
-                try:
-                    coordinator.release_claim(claim_handle, session, reason)
-                except StaleClaimError:
-                    pass
-            continue
-        complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
-        if pr is not None:
-            complete_args += ["--pr", str(pr)]
-        complete = subprocess.run(complete_args)
-        if claim_handle:
-            reason = "completed" if complete.returncode == 0 else "complete_failed"
+            reason = "all_executors_failed" if fallback else "executor_failed"
             try:
                 coordinator.release_claim(claim_handle, session, reason)
             except StaleClaimError:
-                continue
-        # Reset the failure streak on a successful dispatch + complete.
-        reset_executor_failure(cwd, pr)
+                pass
+        return
+    complete_args = [sys.executable, "-m", "agentic_pr_dash", "complete", "--cwd", cwd, "--baseline", baseline]
+    if pr is not None:
+        complete_args += ["--pr", str(pr)]
+    complete = subprocess.run(complete_args)
+    if claim_handle:
+        reason = "completed" if complete.returncode == 0 else "complete_failed"
+        try:
+            coordinator.release_claim(claim_handle, session, reason)
+        except StaleClaimError:
+            # Someone fenced the claim out from under us mid-flight. The
+            # dispatch + complete still SUCCEEDED, so the failure streak must
+            # still be reset (BOU-2210): the old `continue` skipped the reset
+            # below, leaving a stale streak that could trip a 3-strike
+            # escalation on only 2 genuinely-earned failures.
+            pass
+    # Reset the failure streak on a successful dispatch + complete.
+    reset_executor_failure(cwd, pr)
 
 
 def _write_loop_pidfile(pidfile: Path | None) -> None:
@@ -1211,7 +1258,20 @@ def main(argv: list[str] | None = None) -> int:
     _write_loop_pidfile(cfg.maintenance_loop_pidfile)
     try:
         while True:
-            _tick(args, executor)
+            # Belt-and-braces over the per-cwd guard in `_tick` (BOU-2210): a
+            # fault OUTSIDE the per-cwd body — worktree discovery, executor
+            # viability probing — must not kill the daemon either. Only
+            # `Exception` is caught, so KeyboardInterrupt/SystemExit still stop
+            # the loop as a supervisor expects.
+            try:
+                _tick(args, executor)
+            except Exception as exc:  # noqa: BLE001 — the daemon must survive
+                print(
+                    f"[agentic-pr-dash] loop tick failed: "
+                    f"{type(exc).__name__}: {exc} — retrying next interval",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
             time.sleep(max(5, args.interval))
     finally:
         _remove_loop_pidfile(cfg.maintenance_loop_pidfile)
