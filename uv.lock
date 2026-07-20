@@ -4,8 +4,8 @@ requires-python = ">=3.11"
 
 [[package]]
 name = "agent-coordinator"
-version = "0.2.0"
-source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=d558062de240937295c120c4f9ef0d1b1d7cb229#d558062de240937295c120c4f9ef0d1b1d7cb229" }
+version = "0.3.0"
+source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=7576e2a4e7e8aa9a0d262b744a1b84fcc49f7767#7576e2a4e7e8aa9a0d262b744a1b84fcc49f7767" }
 
 [[package]]
 name = "agentic-pr-dash"
@@ -35,7 +35,7 @@ serve = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-coordinator", git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=d558062de240937295c120c4f9ef0d1b1d7cb229" },
+    { name = "agent-coordinator", git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=7576e2a4e7e8aa9a0d262b744a1b84fcc49f7767" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },

@@ -160,6 +160,41 @@ def test_stale_claim_handle_epoch_is_rejected(tmp_path, monkeypatch):
         coordinator.release_claim(stale, "owner-1", "completed")
 
 
+def test_deposed_owner_cannot_re_arm_its_dead_lease(tmp_path, monkeypatch):
+    """BOU-2209: a stalled owner that resumes must not extend a lease it lost.
+
+    Under agent-coordinator 0.2.0 this heartbeat SUCCEEDED — heartbeat compared
+    the request's epoch against *that claim's own* lease_epoch, and claim_task
+    left the superseded record ``status="active"``. Owner 1 could stall past its
+    lease (swap, SIGSTOP, a long adapter call), watch owner 2 take over, then
+    resume and keep its runtime alive alongside the new owner's. 0.3.0 compares
+    against the TASK's current epoch and retires predecessors in the same
+    transaction, so the deposed owner learns it lost.
+    """
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+    pr = _pr()
+
+    # Owner 1 claims, with a lease that is already expired.
+    deposed = coordinator.claim_pr(
+        pr, session_id="owner-1", pid=os.getpid(), agent="codex", lease_seconds=0
+    )
+    # Owner 2 sees the expired lease and takes the task at a higher epoch.
+    successor = coordinator.claim_pr(
+        pr, session_id="owner-2", pid=os.getpid(), agent="codex", lease_seconds=300
+    )
+    assert successor.lease_epoch > deposed.lease_epoch
+
+    # Owner 1 resumes and tries to extend the lease it no longer holds.
+    with pytest.raises(StaleClaimError):
+        coordinator.heartbeat_claim(deposed, "owner-1")
+    with pytest.raises(StaleClaimError):
+        coordinator.release_claim(deposed, "owner-1", "completed")
+
+    # The successor is unaffected by the deposed owner's attempts.
+    coordinator.heartbeat_claim(successor, "owner-2")
+
+
 def test_active_claim_suppresses_duplicate_dispatch(tmp_path, monkeypatch):
     store = tmp_path / "claims.jsonl"
     monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))

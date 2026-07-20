@@ -20,13 +20,21 @@ dependencies = [
     # makes CI non-reproducible and can silently adopt a breaking change. Bump
     # this sha deliberately, together with the call sites.
     #
-    # ``d558062`` is agent-coordinator 0.2.0, which made ``lease_epoch`` a
-    # REQUIRED kwarg on ``TaskCoordinator.heartbeat_claim`` / ``release_claim``
-    # (fenced claims). Main briefly pinned back to ``8fa2034`` (0.1.0) because
-    # our facade still called the old signature; this branch (BOU-2195) is that
-    # deliberate adoption — ``coordinator.py`` now threads the lease epoch and
-    # ``loop.py`` treats ``StaleClaimError`` as a per-PR handoff.
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@d558062de240937295c120c4f9ef0d1b1d7cb229",
+    # ``7576e2a`` is agent-coordinator 0.3.0 (BOU-2209). 0.2.0 made ``lease_epoch``
+    # a REQUIRED kwarg on ``TaskCoordinator.heartbeat_claim`` / ``release_claim``
+    # (fenced claims), which ``coordinator.py`` threads and ``loop.py`` treats as a
+    # per-PR handoff via ``StaleClaimError``. 0.3.0 makes that fence actually bite:
+    # heartbeat/release now compare against the TASK's current epoch rather than
+    # the claim's own, and ``claim_task`` retires superseded claims in the same
+    # transaction — so a stalled owner that resumes cannot re-arm its dead lease.
+    #
+    # Additive for us: ``StaleClaimError`` gains ``current_claim_id`` and the
+    # claimed event gains ``superseded_claim_ids``; no signature we call changed.
+    #
+    # Gaia pins this same package (BOU-2228). uv cannot resolve two different git
+    # revs for one package, so gaia's harness pin cannot move past the v0.3.0-based
+    # harness until this bump lands and APD_REF follows it.
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@7576e2a4e7e8aa9a0d262b744a1b84fcc49f7767",
 ]
 
 [project.optional-dependencies]
