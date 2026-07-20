@@ -260,8 +260,24 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
                 pass
 
 
-def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bool:
-    """Write the pr-watch.armed ownership marker (the single writer)."""
+def _write_arm_marker(
+    cwd: str,
+    session_id: str,
+    pid: int,
+    pr_number: int,
+    provenance: str = "armed",
+) -> bool:
+    """Write the pr-watch.armed ownership marker (the single writer).
+
+    ``provenance`` distinguishes how ownership was acquired (BOU-2221):
+
+    * ``armed`` — the session explicitly armed this PR (it opened it, or a hook
+      armed it on its behalf). Full ownership; the stop gate blocks on it.
+    * ``adopted`` — auto-adoption claimed an unmarkered or dead-markered sibling
+      worktree whose branch happened to have an open ``@me`` PR. The session has
+      no context on that work, so the stop gate must not hold it hostage to that
+      PR's CI; the maintenance loop services it instead.
+    """
     import tempfile  # noqa: PLC0415
     from datetime import datetime, timezone  # noqa: PLC0415
 
@@ -277,6 +293,7 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
         "armed_at": now,
         "session_id": session_id,
         "pid": str(pid),
+        "provenance": provenance,
     }
     content = "".join(f"{k}={v}\n" for k, v in fields.items())
     target = os.path.join(state_dir, "pr-watch.armed")
@@ -317,6 +334,26 @@ def _write_arm_marker(cwd: str, session_id: str, pid: int, pr_number: int) -> bo
     except Exception:  # noqa: BLE001
         pass
     return True
+
+
+def _marker_provenance(worktree_path: str) -> str:
+    """Return how this worktree's ownership was acquired (BOU-2221).
+
+    ``armed`` (the default) when the field is absent: markers written before
+    provenance existed represent real arms, and must keep blocking exactly as
+    they did. Only an explicit ``adopted`` stamp relaxes the stop gate.
+    """
+    marker = _marker_path(worktree_path)
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if line.startswith("provenance="):
+                    value = line[len("provenance="):].strip()
+                    return value or "armed"
+    except OSError:
+        return "armed"
+    return "armed"
 
 
 def _marker_session_id(worktree_path: str) -> str | None:

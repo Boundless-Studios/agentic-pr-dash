@@ -59,7 +59,9 @@ def test_stop_gate_adopts_and_inspects_unmarked_open_pr_worktree(
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda path, sid: None)
     adopted: list[str] = []
 
-    def _adopt(path: str, session_id: str, pid: int, pr_number: int) -> bool:
+    def _adopt(
+        path: str, session_id: str, pid: int, pr_number: int, provenance: str = "armed"
+    ) -> bool:
         adopted.append(str(Path(path)))
         marker_state[str(Path(path))] = session_id
         return True
