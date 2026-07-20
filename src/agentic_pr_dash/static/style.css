@@ -73,9 +73,18 @@ code, pre {
     flex-shrink: 0;
 }
 
+/* Board polls are failing — the board on screen is frozen, not current (BOU-2193). */
+.live-dot-stale {
+    background: var(--danger);
+}
+
 @media (prefers-reduced-motion: no-preference) {
     .live-dot {
         animation: live-pulse 2.4s ease-in-out infinite;
+    }
+    /* Stop pulsing when stale: the pulse reads as "updating". */
+    .live-dot-stale {
+        animation: none;
     }
 }
 
@@ -202,6 +211,11 @@ header h1 {
 .live-label {
     font-size: 12px;
     color: var(--text-muted);
+}
+
+.live-label-stale {
+    color: var(--danger);
+    font-weight: 600;
 }
 
 /* ─── Buttons ────────────────────────────────────────────────────────────── */

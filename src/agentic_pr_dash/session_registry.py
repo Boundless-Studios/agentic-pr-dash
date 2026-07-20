@@ -25,6 +25,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from agentic_pr_dash.config import safe_cwd
+
 from .config import load as load_config
 
 
@@ -356,7 +358,9 @@ def record_event(
     """Append a session event to the registry and return the serialized event."""
     target = path or registry_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    resolved_worktree = worktree_path or _env("PROJECT_DIR") or os.getcwd()
+    # ``str(safe_cwd())`` not ``os.getcwd()``: this value is serialized into the
+    # JSONL event log, so it must survive a reaped cwd AND stay a str (BOU-2193).
+    resolved_worktree = worktree_path or _env("PROJECT_DIR") or str(safe_cwd())
     resolved_branch = branch or _git_branch(resolved_worktree)
     payload = _clean_payload(
         {
@@ -483,7 +487,7 @@ def record_status_report(
     """Validate and append one canonical harness ``StatusReport`` projection."""
     report = _parse_status_report(payload)
     resolved_worktree = str(
-        Path(worktree_path or _env("PROJECT_DIR") or os.getcwd())
+        Path(worktree_path or _env("PROJECT_DIR") or safe_cwd())
         .expanduser()
         .resolve()
     )
@@ -580,7 +584,7 @@ def record_event_from_env(event: str, **kwargs: Any) -> dict[str, Any]:
         launch_source=_env("SESSION_LAUNCH_SOURCE") or None,
         pid=int(pid or os.getpid()),
         ppid=int(ppid or os.getppid()),
-        worktree_path=_env("PROJECT_DIR") or os.getcwd(),
+        worktree_path=_env("PROJECT_DIR") or str(safe_cwd()),
         **kwargs,
     )
 

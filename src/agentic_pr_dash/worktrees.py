@@ -15,6 +15,8 @@ import platform
 import subprocess
 from pathlib import Path
 
+from agentic_pr_dash.config import safe_cwd
+
 ZERO_COMMIT_STALE_SECS = 86400
 AGENT_STALE_SECS = 3 * 86400
 OTHER_STALE_SECS = 7 * 86400
@@ -46,7 +48,12 @@ def _now_epoch() -> int:
 
 def get_main_repo_root(root: str | None = None) -> str:
     """Get the root of the main (non-worktree) git repo."""
-    scan_root = root or os.getcwd()
+    # ``str(safe_cwd())`` — the dashboard server outlives the ephemeral worktree it
+    # was launched from, and a raw ``os.getcwd()`` then raises FileNotFoundError on
+    # every board render for the rest of the process's life (BOU-2193). ``str(...)``
+    # keeps the declared -> str contract: orchestrator._maintenance_roots compares
+    # this value against a list of str, where a bare Path would never match.
+    scan_root = root or str(safe_cwd())
     r = _run(["git", "worktree", "list", "--porcelain"], cwd=scan_root)
     if r.returncode != 0:
         return scan_root
