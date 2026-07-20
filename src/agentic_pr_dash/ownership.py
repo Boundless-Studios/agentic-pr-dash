@@ -180,6 +180,23 @@ def ownership_task(repo: str, pr_number: int) -> TaskIdentity:
     )
 
 
+def _parse_task_id(task_id: str) -> tuple[str, int | None]:
+    """Parse an ownership ``task_id`` (``github:{repo}#{pr}``) defensively.
+
+    Returns ``("", None)`` on anything that doesn't match the expected shape —
+    a malformed or foreign task_id must never raise here; the caller (Stage 2's
+    reverse worktree->claim index) has no better fallback than "unknown".
+    """
+    prefix = "github:"
+    if not task_id.startswith(prefix):
+        return "", None
+    rest = task_id[len(prefix):]
+    repo, sep, pr_raw = rest.rpartition("#")
+    if not sep or not pr_raw.isdigit():
+        return "", None
+    return repo, int(pr_raw)
+
+
 @dataclass(frozen=True)
 class OwnerView:
     """Claim-derived ownership of one PR."""
@@ -192,6 +209,10 @@ class OwnerView:
     state: str
     claim_id: str
     lease_epoch: int
+    #: Parsed from the claim's ``task.task_id`` (``github:{repo}#{pr}``).
+    #: ``""``/``None`` when the task_id doesn't parse — never raises.
+    repo: str = ""
+    pr_number: int | None = None
     metadata: dict[str, str] = field(default_factory=dict)
 
 
@@ -260,16 +281,11 @@ class OwnershipSnapshot:
             return None
         return self._claims.get(ownership_task(repo, pr_number).task_id)
 
-    def owner_for(self, repo: str, pr_number: int) -> OwnerView | None:
-        """The claim-derived owner of ``(repo, pr)``, live or not.
-
-        ``None`` means no claim was ever recorded (or the snapshot is unusable —
-        check :meth:`known`). A released claim resolves to a view with
-        ``live=False`` so a caller can distinguish "released" from "never claimed".
+    def _view_for_claim(self, claim: ClaimRecord) -> OwnerView:
+        """Build the :class:`OwnerView` for one claim, applying the marker-parity
+        liveness rule. Shared by :meth:`owner_for` and
+        :meth:`live_claims_for_session` so the rule lives in exactly one place.
         """
-        claim = self.claim_for(repo, pr_number)
-        if claim is None:
-            return None
         if claim.status != "active":
             state, live = claim.status, False
         elif self._now < claim.lease_expires_at:
@@ -296,6 +312,7 @@ class OwnershipSnapshot:
             # marker's ``_pid_alive``, an absent pid does NOT satisfy it.
             live = self._pid_known_alive(claim.owner.pid)
             state = "owner_pid_live" if live else "expired"
+        repo, pr_number = _parse_task_id(claim.task.task_id)
         return OwnerView(
             session_id=claim.owner.session_id,
             pid=claim.owner.pid,
@@ -305,13 +322,53 @@ class OwnershipSnapshot:
             state=state,
             claim_id=claim.claim_id,
             lease_epoch=claim.lease_epoch,
+            repo=repo,
+            pr_number=pr_number,
             metadata=dict(claim.owner.metadata),
         )
+
+    def owner_for(self, repo: str, pr_number: int) -> OwnerView | None:
+        """The claim-derived owner of ``(repo, pr)``, live or not.
+
+        ``None`` means no claim was ever recorded (or the snapshot is unusable —
+        check :meth:`known`). A released claim resolves to a view with
+        ``live=False`` so a caller can distinguish "released" from "never claimed".
+        """
+        claim = self.claim_for(repo, pr_number)
+        if claim is None:
+            return None
+        return self._view_for_claim(claim)
 
     def live_owner_for(self, repo: str, pr_number: int) -> OwnerView | None:
         """The owner only when it is still live; ``None`` otherwise."""
         view = self.owner_for(repo, pr_number)
         return view if view is not None and view.live else None
+
+    def live_claims_for_session(self, session_id: str) -> list[OwnerView]:
+        """Every LIVE ownership claim this session holds (BOU-2223 Stage 2).
+
+        The claim store is keyed by ``(repo, pr)``, not by worktree, so a
+        stop-gate reader that enumerates worktrees cannot look up "does my
+        worktree have a claim" without already knowing the PR — which would be
+        circular. ``OwnerIdentity.worktree_path`` (stamped by every dual-write in
+        :mod:`agentic_pr_dash._maintenance.markers`) closes the loop: this scans
+        every claim once and returns the ones ``session_id`` still holds live,
+        each carrying its own ``worktree_path``/``repo``/``pr_number`` so a caller
+        can build the worktree->claim reverse index in one pass.
+
+        Reuses :meth:`owner_for`'s liveness rule via the shared
+        :meth:`_view_for_claim` helper — it does not reimplement it.
+        """
+        if not self.ok or not session_id:
+            return []
+        views: list[OwnerView] = []
+        for claim in self._claims.values():
+            if claim.owner.session_id != session_id:
+                continue
+            view = self._view_for_claim(claim)
+            if view.live:
+                views.append(view)
+        return views
 
 
 def _unknown_snapshot(now: datetime) -> OwnershipSnapshot:
