@@ -130,6 +130,18 @@ def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
     repo's health/escalation file — owned worktrees can span several repos
     (``maintenance_repo_roots``), and the repo-scoped state files would
     otherwise be read against the stop-gate anchor's repo (codex PR #50 review).
+
+    Kept marker-only and single-argument on purpose (BOU-2223 Stage 2): several
+    existing tests monkeypatch this function directly with a one-argument
+    stub, and it is the specification. The claim-preferred merge lives one
+    layer up, in :func:`_effective_pr_pairs`, which calls this function rather
+    than replace it. ``_owned_open_pr_numbers`` itself is also left untouched
+    at its one call site (the waiter-demand block) — several existing tests
+    monkeypatch IT directly, decoupled from any real marker on disk, to force
+    "no owned open PRs"/"exactly PR N" independent of ``pr_to_wts``; that
+    decoupling predates Stage 2 (``pr_to_wts`` was already built from this same
+    marker-only function while the waiter block used its own call), so it is
+    left exactly as it was rather than folded into the claim-preferred flip.
     """
     pairs: list[tuple[str, int]] = []
     for wt in owned:
@@ -137,6 +149,24 @@ def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
         pr_raw = marker.get("pr", "")
         if str(pr_raw).isdigit():
             pairs.append((wt, int(pr_raw)))
+    return pairs
+
+
+def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[str, int]]:
+    """``(worktree, pr)`` pairs, preferring the claim-derived ``pr_for`` map
+    (``ownership_resolution.resolve_owned``, BOU-2223 Stage 2) per worktree and
+    falling back to the marker-derived :func:`_owned_open_pr_pairs` otherwise.
+
+    A thin layer over the unmodified marker-only helper so its call signature
+    — and every existing test that monkeypatches it with a single argument —
+    stays exactly as it was before this flip.
+    """
+    marker_by_wt = dict(_owned_open_pr_pairs(owned))
+    pairs: list[tuple[str, int]] = []
+    for wt in owned:
+        pr = pr_for.get(wt, marker_by_wt.get(wt))
+        if pr is not None:
+            pairs.append((wt, pr))
     return pairs
 
 
@@ -214,10 +244,23 @@ def _stop_gate_impl(args) -> int:
         return 0
     _save_stop_state(cwd, {**state, "ts": now})
 
+    # BOU-2223 Stage 2: flip ownership reads onto the claim store, with the
+    # marker as fallback whenever the two disagree. `resolve_owned` takes (or
+    # is given) exactly ONE `ownership.snapshot()` for this whole call — the
+    # store read is a full-file read under a bounded lock, and this path shares
+    # the stop gate's ~108s fail-closed deadline (BOU-1953), so a per-worktree
+    # read is not an option.
+    from .ownership_resolution import resolve_owned  # noqa: PLC0415
+
+    resolution = None
     if session_id:
-        owned = _owned_worktrees_across_roots(session_id, cwd)
+        marker_owned = _owned_worktrees_across_roots(session_id, cwd)
+        resolution = resolve_owned(session_id, cwd, marker_owned)
+        owned = resolution.worktrees
     else:
         owned = [cwd]
+    pr_for = resolution.pr_for if resolution is not None else {}
+    provenance_for = resolution.provenance_for if resolution is not None else {}
 
     pending: list[tuple[str, str]] = []
     # An owned PR whose check was UNOBSERVABLE (code 2: gh could not resolve
@@ -238,7 +281,7 @@ def _stop_gate_impl(args) -> int:
             # them blocking wedges a session on another epic's PR, and the "fix +
             # push to the existing branch" instruction can clobber a live sibling
             # session mid-edit (BOU-2221; hit with #2650 and #2653).
-            if _marker_provenance(worktree) == "adopted":
+            if provenance_for.get(worktree, _marker_provenance(worktree)) == "adopted":
                 adopted_pending.append((worktree, text))
             else:
                 pending.append((worktree, text))
@@ -267,7 +310,7 @@ def _stop_gate_impl(args) -> int:
     # (codex PR #50 review). Falls back to the anchor cwd for PRs with no
     # resolvable worktree (e.g. mocked/detached).
     pr_to_wts: dict[int, list[str]] = {}
-    for wt, pr in _owned_open_pr_pairs(owned):
+    for wt, pr in _effective_pr_pairs(owned, pr_for):
         pr_to_wts.setdefault(pr, []).append(wt)
 
     def _wts_for(pr: int) -> list[str]:
