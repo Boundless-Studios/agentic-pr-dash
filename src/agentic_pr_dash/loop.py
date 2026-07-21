@@ -640,6 +640,14 @@ def _loop_covers_pr(cwd: str, pr: int | None) -> bool:
     from ._maintenance import markers  # noqa: PLC0415
     if markers._marker_live_foreign_pid(cwd, ""):
         return False
+    # ...and the claim-side half of the same question. Unioned, not a
+    # replacement: from Stage 4 the marker is no longer written, so the check
+    # above degrades to "nobody owns this" and the loop would report itself as
+    # coverage for a PR a live session is actively holding — which also
+    # suppresses that session's own waiter (BOU-2223 Stage 4).
+    from ._maintenance.ownership_resolution import live_foreign_claim  # noqa: PLC0415
+    if live_foreign_claim(cwd, "", kind="loop_coverage_divergence"):
+        return False
     # BOU-1924: also defer to a live owner resolved from the durable
     # ledger/registry — the marker at THIS cwd is stale/absent when the owning
     # session repointed its worktree away, so marker-only resolution would miss

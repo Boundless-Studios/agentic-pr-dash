@@ -469,3 +469,64 @@ def resolve_worktree(
         marker_session_id=marker_session,
         divergences=divergences,
     )
+
+
+def live_foreign_claim(
+    worktree_path: str,
+    self_session_id: str,
+    *,
+    kind: str,
+    snap=None,
+) -> bool:
+    """True when a LIVE claim on ``worktree_path`` is held by another session.
+
+    The claim-side half of the "is someone else working here?" question. Every
+    caller unions this with its existing marker check
+    (``_marker_live_foreign_pid`` / ``_live_foreign_owner``) rather than replacing
+    it: either source reporting a live foreign owner is enough to keep hands off,
+    which is the precedent Stage 3 set in
+    ``worktrees._collect_owned_worktrees`` (BOU-2223).
+
+    Retiring the marker writer in Stage 4 is what makes this necessary — the
+    marker-only checks silently degrade to "nobody owns this" once the file stops
+    being written, which would let the detached loop, the headless dashboard and a
+    live in-session owner all dispatch against the same PR.
+
+    ``self_session_id`` may be ``""`` for a caller with no session of its own (the
+    detached loop); every live claim is then foreign, which is the intent.
+
+    Fail-open on error is deliberate and matches the marker helpers: a claim-store
+    problem must not wedge maintenance, and the caller's marker check stays in
+    force.
+    """
+    return live_foreign_claim_owner(
+        worktree_path, self_session_id, kind=kind, snap=snap
+    ) is not None
+
+
+def live_foreign_claim_owner(
+    worktree_path: str,
+    self_session_id: str,
+    *,
+    kind: str,
+    snap=None,
+) -> str | None:
+    """The session id of a LIVE foreign claim on ``worktree_path``, or ``None``.
+
+    Same question as :func:`live_foreign_claim`, but for the callers that need to
+    name the owner rather than just know one exists — ``_live_foreign_owner``'s
+    return shape, so a caller can union the two sources with a plain
+    ``marker_owner or claim_owner``.
+
+    Deterministic when several claims are live on one worktree: the ids are
+    returned in ``claim_session_ids`` order, which
+    :func:`resolve_worktree` de-duplicates while preserving first-seen order.
+    """
+    try:
+        owned = resolve_worktree(worktree_path, kind=kind, snap=snap)
+    except Exception:  # noqa: BLE001 — never break a coordination check
+        return None
+    for sid in owned.claim_session_ids:
+        if sid != self_session_id:
+            return sid
+    return None

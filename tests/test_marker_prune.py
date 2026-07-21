@@ -34,13 +34,17 @@ def _isolate_ledger(tmp_path, monkeypatch):
 
 
 def _make_worktree(tmp_path: Path, session_id: str, pr_number: int) -> Path:
+    """Arm a worktree AS A PRE-STAGE-4 INSTALL WOULD: this whole module pins the
+    marker-pruning writer (removing the on-disk file/state on a merged PR), which
+    is meaningless to exercise unless the file actually exists — callers must
+    supply the ``legacy_marker_writes`` fixture."""
     wt = tmp_path / "worktree"
     wt.mkdir(exist_ok=True)
     mc._write_arm_marker(str(wt), session_id, os.getpid(), pr_number)
     return wt
 
 
-def test_prune_stale_marker_on_merged_pr(tmp_path, monkeypatch):
+def test_prune_stale_marker_on_merged_pr(tmp_path, monkeypatch, legacy_marker_writes):
     """Merged PR → armed marker + stop-loop state + ledger entry are all pruned."""
     wt = _make_worktree(tmp_path, SID, 42)
     # Write a stop-loop state file to verify it gets removed
@@ -84,7 +88,7 @@ def test_prune_stale_marker_on_closed_pr(tmp_path, monkeypatch):
     assert not any(e.pr == 55 for e in sl.read(SID))
 
 
-def test_prune_does_not_fire_when_gh_unavailable(tmp_path, monkeypatch):
+def test_prune_does_not_fire_when_gh_unavailable(tmp_path, monkeypatch, legacy_marker_writes):
     """When gh is unavailable (state='unknown'), do NOT prune."""
     wt = _make_worktree(tmp_path, SID, 77)
     sl.append(SID, pr=77, branch="bou-77", worktree=str(wt))
@@ -98,7 +102,7 @@ def test_prune_does_not_fire_when_gh_unavailable(tmp_path, monkeypatch):
     assert any(e.pr == 77 for e in sl.read(SID)), "Ledger entry must NOT be pruned when gh unavailable"
 
 
-def test_prune_does_not_fire_for_open_pr(tmp_path, monkeypatch):
+def test_prune_does_not_fire_for_open_pr(tmp_path, monkeypatch, legacy_marker_writes):
     """An open PR should not trigger pruning."""
     wt = _make_worktree(tmp_path, SID, 88)
     sl.append(SID, pr=88, branch="bou-88", worktree=str(wt))
@@ -134,7 +138,7 @@ def test_check_subcommand_prunes_stale_marker_via_stop_gate(tmp_path, monkeypatc
 
 
 def test_stop_gate_prunes_stale_marker_for_merged_pr_and_exits_0(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, legacy_marker_writes
 ):
     """stop-gate: armed marker for a merged PR → marker pruned → gate exits 0
     without demanding a waiter (regression for BOU-1632 Codex P2 finding 1).

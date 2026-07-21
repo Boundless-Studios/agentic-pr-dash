@@ -276,8 +276,19 @@ def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):
 
 
 def test_stop_gate_no_open_prs_exits_cleanly(tmp_path, monkeypatch, capsys):
-    """No pending work and no owned open PRs → exit 0 (no waiter needed)."""
-    wt = _make_armed_worktree(tmp_path, SID, 42)
+    """No pending work and no owned open PRs → exit 0 (no waiter needed).
+
+    Deliberately a BARE worktree, not `_make_armed_worktree`: that helper's
+    `_write_arm_marker` dual-writes a real ownership CLAIM by default (BOU-2223),
+    and the stop gate's waiter-demand branch unions the claim-derived
+    `pr_for.values()` on top of the `_owned_open_pr_numbers` stub below — an armed
+    worktree would leak PR 42's claim back in through that union even though the
+    marker-only stub says "no open PRs", making the "no owned open PRs" premise
+    dishonest. A worktree with neither a marker nor a claim is the honest way to
+    express it.
+    """
+    wt = tmp_path / "worktree"
+    wt.mkdir()
 
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))

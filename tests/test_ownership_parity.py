@@ -34,6 +34,15 @@ REPO = "Boundless-Studios/agentic-pr-dash"
 OTHER_REPO = "Boundless-Studios/gaia-free"
 
 
+@pytest.fixture(autouse=True)
+def _dual_writer_era(legacy_marker_writes):
+    """Every test here compares the marker-derived view against the
+    claim-derived one, so the whole file needs the pre-Stage-4 dual-write
+    (BOU-2223 Stage 4 turned the marker writer off by default) — there is no
+    marker to compare against otherwise."""
+    yield
+
+
 @pytest.fixture
 def worktree(tmp_path, monkeypatch):
     """A worktree whose state dir and repo slug are hermetic.

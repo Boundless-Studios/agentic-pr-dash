@@ -274,12 +274,16 @@ def test_stop_gate_aggregates_detached_across_roots_p1_first(tmp_path, monkeypat
 # --------------------------------------------------------------------------
 
 def test_reconcile_prs_does_not_arm_unmarked_sibling_root_pr(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, legacy_marker_writes
 ):
     """BOU-1814 (PR #58 review): ``_owned_pr_records_all_roots`` scans sibling
     roots read-only. An unmarked open ``@me`` PR in a maintenance_repo_root must
     NOT get a ``pr-watch.armed`` marker written (cross-root wrong-session
     ownership), while the anchor root keeps adopting its own unmarked PR.
+
+    This pins the legacy marker WRITER's scoping, so it needs the pre-Stage-4
+    dual-write (BOU-2223 Stage 4) — otherwise ``anchor_marker.exists()`` below
+    would be false regardless of whether the scoping guard works.
     """
     sib = _make_repo(tmp_path / "sibling", slug="o/sib")
     anchor = _make_repo(tmp_path / "anchor", roots_cfg=[str(sib)], slug="o/anchor")

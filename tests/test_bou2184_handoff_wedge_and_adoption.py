@@ -252,8 +252,11 @@ def _sibling_fixture(tmp_path, monkeypatch, *, marker_pid=DEAD_PID):
 
 
 def test_reconcile_prs_surfaces_sibling_worktree_pr_with_dead_owner(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, legacy_marker_writes
 ):
+    """Adoption re-stamps the on-disk marker with the new owner; that re-stamp is
+    the legacy WRITER (BOU-2223 Stage 4 turned it off by default), so this needs
+    the pre-Stage-4 dual-write or the final assertion sees the old owner untouched."""
     anchor, sib, sib_wt = _sibling_fixture(tmp_path, monkeypatch)
 
     rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(anchor)])
@@ -271,8 +274,9 @@ def test_reconcile_prs_surfaces_sibling_worktree_pr_with_dead_owner(
 
 
 def test_list_owned_surfaces_dead_markered_sibling_worktree(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, legacy_marker_writes
 ):
+    """Same re-stamp dependency as the reconcile-prs sibling test above."""
     anchor, sib, sib_wt = _sibling_fixture(tmp_path, monkeypatch)
 
     args = argparse.Namespace(session_id="sess-X", cwd=str(anchor), pid=os.getpid())
@@ -304,8 +308,9 @@ def test_live_foreign_marker_in_sibling_root_is_not_taken_over(
 # ---------------------------------------------------------------------------
 
 def test_adopt_orphan_prs_adopts_present_worktree_with_dead_owner(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, legacy_marker_writes
 ):
+    """Same re-stamp dependency: adoption's marker re-write is the legacy writer."""
     anchor = _make_repo(tmp_path / "anchor", slug="o/anchor")
     wt = _add_worktree(anchor, tmp_path / "anchor-wt-7", "b-7")
     _arm(wt, "dead-sess", 7, DEAD_PID)
@@ -386,8 +391,9 @@ def test_dead_marker_takeover_defers_to_live_durable_ledger_owner(
 
 
 def test_dead_marker_takeover_proceeds_when_durable_owner_dead(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, legacy_marker_writes
 ):
+    """Same re-stamp dependency: takeover's marker re-write is the legacy writer."""
     anchor, sib, sib_wt = _sibling_fixture(tmp_path, monkeypatch)
     # A stale ledger row from a DEAD session must not block takeover.
     sl.append("stale-dead-owner", pr=79, branch="bou-2155", worktree="", repo="o/sib")

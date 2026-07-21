@@ -187,7 +187,10 @@ def _marker_key(wt, pr: int) -> str:
     return _waiter_mod._clean_exit_key(_repo_slug(str(wt)), pr)
 
 
-def test_await_clean_exit_writes_marker(tmp_path, monkeypatch):
+def test_await_clean_exit_writes_marker(tmp_path, monkeypatch, legacy_marker_writes):
+    """``_owned_open_pr_pairs`` (the clean-exit verified-set source) is
+    deliberately kept marker-only (BOU-2223 Stage 2/4 doc), so this needs an
+    actual on-disk marker — the pre-Stage-4 dual-write."""
     wt = _arm(tmp_path, 42)
     _wire_await(tmp_path, monkeypatch, wt)
     monkeypatch.setattr(mc, "_check_worktree",
