@@ -22,7 +22,9 @@ def _clear_cache():
     config.load.cache_clear()
 
 
-def test_arm_marker_roundtrip(tmp_path):
+def test_arm_marker_roundtrip(tmp_path, legacy_marker_writes):
+    """Marker writes are off by default from Stage 4; this pins the on-disk
+    shape a pre-Stage-4 install still produces (the read-only shim's contract)."""
     assert mc._write_arm_marker(str(tmp_path), "sess-1", 4242, 7) is True
 
     marker = tmp_path / ".agentic-pr-dash" / "pr-watch.armed"
@@ -40,7 +42,7 @@ def test_arm_marker_roundtrip(tmp_path):
     assert session.read_text(encoding="utf-8").strip() == "sess-1"
 
 
-def test_marker_honors_legacy_state_dir(tmp_path):
+def test_marker_honors_legacy_state_dir(tmp_path, legacy_marker_writes):
     # An existing .gaia dir is adopted, so an existing install's markers keep
     # landing in the same place after the rename.
     (tmp_path / ".gaia").mkdir()
@@ -56,7 +58,7 @@ def test_marker_path_uses_configured_dir(tmp_path, monkeypatch):
     assert mc._marker_path(str(tmp_path)).endswith(os.path.join(".markers", "pr-watch.armed"))
 
 
-def test_marker_session_id_read(tmp_path):
+def test_marker_session_id_read(tmp_path, legacy_marker_writes):
     mc._write_arm_marker(str(tmp_path), "owner-xyz", 99, 3)
     assert mc._marker_session_id(str(tmp_path)) == "owner-xyz"
 
@@ -385,7 +387,7 @@ def test_live_independent_owner_paths_ignores_marker_only(tmp_path, monkeypatch)
     assert mc._live_independent_owner_paths([str(armed)], "sess-self") == set()
 
 
-def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
+def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch, legacy_marker_writes):
     """Reconciliation does not adopt an independently-owned sibling, AND an
     already-stolen worktree (our marker on it) is not re-emitted — it is healed
     because the live-independent-owner gate runs before the 'already ours' emit
@@ -419,7 +421,7 @@ def test_collect_owned_skips_and_heals_independent_owner(tmp_path, monkeypatch):
     assert str(stolen) not in result      # contested/stolen → not serviced (healed)
 
 
-def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeypatch):
+def test_collect_owned_adopts_orphan_when_no_independent_owner(tmp_path, monkeypatch, legacy_marker_writes):
     """No independent owner → a genuinely-orphaned PR worktree is still adopted,
     preserving BOU-1442 sub-agent pickup / crash recovery."""
     orphan = tmp_path / "orphan"
@@ -521,7 +523,7 @@ def test_collect_owned_never_adopts_dead_foreign_marker(tmp_path, monkeypatch):
     assert mc._marker_session_id(str(foreign)) == "old-finished-session"
 
 
-def test_collect_owned_still_refreshes_worktree_this_session_armed(tmp_path, monkeypatch):
+def test_collect_owned_still_refreshes_worktree_this_session_armed(tmp_path, monkeypatch, legacy_marker_writes):
     """A worktree THIS session actually armed stays owned and its heartbeat/pr
     stays refreshable — the new foreign-marker guard must not touch the
     already-ours path (regression companion to the adoption-blocking fix)."""

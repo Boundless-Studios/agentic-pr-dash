@@ -14,6 +14,7 @@ from .markers import (
     _read_marker,
     _session_is_live,
     _write_arm_marker,
+    release_ownership_claims as _release_ownership_claims,
 )
 from .ownership_resolution import resolve_worktree
 from .worktrees import (
@@ -185,6 +186,13 @@ def _detached_pr_records(session_id: str, cwd: str,
     if prune:
         session_ledger.prune(session_id, prune, repo=target_repo,
                              include_legacy=(include_legacy and prune_legacy))
+        # Release the ownership claims too. This path retires merged/closed PRs
+        # that have NO live worktree, so `_prune_stale_marker` — the only other
+        # release site — never sees them: it is driven by a marker in a worktree
+        # this one has already established is gone. Without this, a PR that merged
+        # after its worktree was removed leaves a live claim that nothing ever
+        # clears (BOU-2223 Stage 4).
+        _release_ownership_claims(cwd, prune, session_id)
     return records
 
 

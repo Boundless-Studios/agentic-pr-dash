@@ -695,10 +695,25 @@ class Orchestrator:
             # let the dashboard grab the claim out from under it.
             from ._maintenance import markers  # noqa: PLC0415
 
-            if markers._marker_live_foreign_pid(pr.worktree_path, DASHBOARD_OWNER_SESSION_ID):
+            # Unioned with the claim side: from Stage 4 the marker is no longer
+            # written, so a marker-only check degrades to "nobody owns this" and
+            # the dashboard would dispatch into a worktree a live session is
+            # editing — exactly what this gate exists to prevent. There is no
+            # other guard on this path (BOU-2223 Stage 4).
+            from ._maintenance.ownership_resolution import (  # noqa: PLC0415
+                live_foreign_claim,
+            )
+
+            if markers._marker_live_foreign_pid(
+                pr.worktree_path, DASHBOARD_OWNER_SESSION_ID
+            ) or live_foreign_claim(
+                pr.worktree_path,
+                DASHBOARD_OWNER_SESSION_ID,
+                kind="dashboard_dispatch_divergence",
+            ):
                 self.log(
                     f"Skipping headless maintenance for #{pr.number} — a live "
-                    f"in-session owner holds the worktree marker",
+                    f"in-session owner holds the worktree",
                     pr_number=pr.number,
                 )
                 return

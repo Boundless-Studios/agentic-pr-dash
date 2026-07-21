@@ -95,11 +95,15 @@ def test_claim_only_worktree_is_still_owned_with_divergence_logged(isolated_stor
 # ── 3. Marker-only worktree (union, fail-closed) ────────────────────────────
 
 
-def test_marker_only_worktree_is_still_owned_with_divergence_logged(isolated_store, monkeypatch):
+def test_marker_only_worktree_is_still_owned_with_divergence_logged(
+    isolated_store, monkeypatch, legacy_marker_writes
+):
     wt = _mk(isolated_store, "marker-only")
     abspath = os.path.abspath(wt)
     # Disable dual-write for this one arm so a marker exists with NO mirrored
-    # claim — the "claim never learned about this PR" case.
+    # claim — the "claim never learned about this PR" case. `legacy_marker_writes`
+    # is still needed so the marker write itself actually happens (Stage 4 turned
+    # that off independently of dual-write).
     monkeypatch.setenv("AGENTIC_PR_DASH_OWNERSHIP_DUAL_WRITE", "0")
     assert _write_arm_marker(wt, SID, LIVE_PID, 300)
     monkeypatch.delenv("AGENTIC_PR_DASH_OWNERSHIP_DUAL_WRITE")
@@ -177,7 +181,9 @@ def test_claim_naming_a_worktree_git_no_longer_lists_is_not_resurrected(isolated
 # ── 6. Provenance disagreement resolves toward "armed" ──────────────────────
 
 
-def test_provenance_disagreement_resolves_to_armed_and_logs_divergence(isolated_store):
+def test_provenance_disagreement_resolves_to_armed_and_logs_divergence(
+    isolated_store, legacy_marker_writes
+):
     wt = _mk(isolated_store, "wt")
     assert _write_arm_marker(wt, SID, LIVE_PID, 500, provenance="armed")
     # Diverge the marker's provenance in place, independent of the claim,

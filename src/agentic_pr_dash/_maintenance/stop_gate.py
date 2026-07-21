@@ -250,12 +250,25 @@ def _stop_gate_impl(args) -> int:
     # store read is a full-file read under a bounded lock, and this path shares
     # the stop gate's ~108s fail-closed deadline (BOU-1953), so a per-worktree
     # read is not an option.
-    from .ownership_resolution import resolve_owned  # noqa: PLC0415
+    from .ownership_resolution import (  # noqa: PLC0415
+        claim_reads_enabled, resolve_owned, resolve_worktree,
+    )
+
+    # ONE snapshot for the whole tick: `resolve_owned` below and the per-worktree
+    # `resolve_worktree` prune inside the loop both need one, and the store read is
+    # a full-file read under a bounded lock. Taken only when claim reads are on, so
+    # the kill-switch path keeps costing exactly zero store reads.
+    resolution_snapshot = None
+    if claim_reads_enabled():
+        from agentic_pr_dash import ownership  # noqa: PLC0415
+        resolution_snapshot = ownership.snapshot()
 
     resolution = None
     if session_id:
         marker_owned = _owned_worktrees_across_roots(session_id, cwd)
-        resolution = resolve_owned(session_id, cwd, marker_owned)
+        resolution = resolve_owned(
+            session_id, cwd, marker_owned, snap=resolution_snapshot
+        )
         owned = resolution.worktrees
     else:
         owned = [cwd]
@@ -290,9 +303,21 @@ def _stop_gate_impl(args) -> int:
         elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
             check_warn_only = True
         elif code == 0 and session_id:
-            marker = _read_marker(worktree) or {}
-            if str(marker.get("pr", "")).isdigit():
-                _prune_stale_marker(worktree, marker, session_id)
+            # Claim-first (BOU-2223 Stage 4). This used to key off a raw marker
+            # read, which silently stopped firing once marker writes were retired:
+            # a claim-only worktree has no marker, so a merged/closed PR would
+            # never release its claim and the claim-derived view would keep
+            # reporting an owner for a dead PR forever.
+            # NB: never rebind `owned` here — it is the list this loop iterates
+            # and is still needed by _effective_pr_pairs / _owned_open_pr_numbers
+            # below.
+            pruned = resolve_worktree(
+                worktree, kind="prune_divergence", snap=resolution_snapshot
+            )
+            if pruned.pr_number is not None:
+                _prune_stale_marker(
+                    worktree, {"pr": str(pruned.pr_number)}, session_id
+                )
 
     if session_id:
         detached = [r for r in _detached_records_across_roots(session_id, cwd)
@@ -348,8 +373,18 @@ def _stop_gate_impl(args) -> int:
             from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
             # A PR is loop-covered only if covered in EVERY repo that owns it; if
             # any repo's instance is uncovered/escalated, force the waiter.
+            # Marker-derived numbers UNIONed with the claim-derived ones. The
+            # marker half stays a direct call so the several existing tests that
+            # monkeypatch `_owned_open_pr_numbers` with a one-argument stub keep
+            # controlling it (BOU-2223 Stage 2 left it deliberately marker-only).
+            # The union is what Stage 4 needs: once the marker stops being
+            # written this set would otherwise collapse to the detached PRs
+            # alone, and a session owning a live open PR would never be told to
+            # start a waiter — arriving review comments and red CI would stop
+            # waking it. That is a fail-OPEN regression on a fail-closed path.
+            owned_pr_numbers = _owned_open_pr_numbers(owned) | set(pr_for.values())
             worktree_prs = {
-                n for n in _owned_open_pr_numbers(owned)
+                n for n in owned_pr_numbers
                 if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))
             }
             detached_prs = set()

@@ -353,7 +353,10 @@ def test_heartbeat_not_rewritten_when_fresh(tmp_path, monkeypatch):
     assert marker.stat().st_mtime_ns == before, "fresh heartbeat must not be rewritten"
 
 
-def test_heartbeat_rewritten_when_stale(tmp_path, monkeypatch):
+def test_heartbeat_rewritten_when_stale(tmp_path, monkeypatch, legacy_marker_writes):
+    """``_touch_owner_heartbeat`` only rewrites the on-disk marker while the
+    legacy writer is enabled (BOU-2223 Stage 4 turned it off by default), so this
+    coalescing behaviour needs the pre-Stage-4 dual-write to observe."""
     from agentic_pr_dash import maintenance_check as mc
 
     marker = tmp_path / "pr-watch.armed"
@@ -367,7 +370,8 @@ def test_heartbeat_rewritten_when_stale(tmp_path, monkeypatch):
     assert fields["heartbeat"] != stale, "a stale heartbeat must be refreshed"
 
 
-def test_heartbeat_work_found_always_writes_lease(tmp_path, monkeypatch):
+def test_heartbeat_work_found_always_writes_lease(tmp_path, monkeypatch, legacy_marker_writes):
+    """Same on-disk-rewrite dependency as the staleness test above."""
     from agentic_pr_dash import maintenance_check as mc
 
     marker = tmp_path / "pr-watch.armed"

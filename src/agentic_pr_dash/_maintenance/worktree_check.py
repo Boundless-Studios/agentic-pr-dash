@@ -369,6 +369,18 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # a blocked owned PR as a clean no-op (BOU-1788): the owner is responsible for
     # the fix, but every checker must still SURFACE that the PR is blocked.
     owner = markers._live_foreign_owner(cwd, self_session_id)
+    if owner is None:
+        # Claim-side half of the same gate. Unioned, not a replacement: from
+        # Stage 4 the marker is no longer written, so the marker-only check
+        # degrades to "nobody owns this" and this — the primary cross-session
+        # ownership gate — would stop firing entirely, letting two sessions (or
+        # the detached loop and a live session) both dispatch on one PR. The
+        # coordinator claim below is a different store with its own lease and
+        # does NOT implement "live in-session owner wins" (BOU-2223 Stage 4).
+        from .ownership_resolution import live_foreign_claim_owner  # noqa: PLC0415
+        owner = live_foreign_claim_owner(
+            cwd, self_session_id, kind="worktree_check_divergence"
+        )
     if owner is not None:
         # BOU-1879: a wake-capable owner (live feedback waiter) keeps ownership; a
         # WAKE-LESS owner gets exactly one grace tick, then we take over (fall through

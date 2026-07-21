@@ -54,7 +54,14 @@ def _mk(tmp_path: Path, name: str) -> str:
 
 def _arm_marker_only(monkeypatch, wt: str, session_id: str, pr: int) -> None:
     """Write a marker with NO mirrored claim — the pre-Stage-1 install case that
-    dominated the Stage 2 bake."""
+    dominated the Stage 2 bake.
+
+    Marker writes are also off by default from Stage 4 (BOU-2223), so this must
+    additionally opt back into the legacy writer or ``_write_arm_marker`` would
+    leave no on-disk marker either (with dual-write off, its return value would
+    just be the claim outcome — False here — rather than an actual write).
+    """
+    monkeypatch.setenv("AGENTIC_PR_DASH_MARKER_WRITES", "1")
     monkeypatch.setenv("AGENTIC_PR_DASH_OWNERSHIP_DUAL_WRITE", "0")
     assert _write_arm_marker(wt, session_id, LIVE_PID, pr)
     monkeypatch.delenv("AGENTIC_PR_DASH_OWNERSHIP_DUAL_WRITE")
@@ -67,7 +74,7 @@ def _unknown_snap():
 # ── resolve_worktree: agreement ──────────────────────────────────────────────
 
 
-def test_claim_and_marker_agree_source_both_no_divergence(isolated_store):
+def test_claim_and_marker_agree_source_both_no_divergence(isolated_store, legacy_marker_writes):
     wt = _mk(isolated_store, "wt")
     assert _write_arm_marker(wt, SID, LIVE_PID, 100)
 
@@ -164,7 +171,7 @@ def test_marker_pr_wins_when_the_claim_names_a_superseded_pr(isolated_store):
 # ── resolve_worktree: "could not look" ≠ "no claims" ─────────────────────────
 
 
-def test_unreadable_store_falls_back_entirely_to_the_marker(isolated_store):
+def test_unreadable_store_falls_back_entirely_to_the_marker(isolated_store, legacy_marker_writes):
     wt = _mk(isolated_store, "unreadable")
     assert _write_arm_marker(wt, SID, LIVE_PID, 700)
 

@@ -279,6 +279,28 @@ def _marker_live_foreign_pid(cwd: str, self_session_id: str) -> bool:
     return _pid_alive(fields.get("pid", ""))
 
 
+def marker_writes_enabled() -> bool:
+    """Whether ``pr-watch.armed`` is still WRITTEN (BOU-2223 Stage 4).
+
+    Off by default from Stage 4 on: the claim is the sole ownership authority and
+    the marker file is a READ-ONLY compatibility shim, kept for one release so a
+    worktree armed by a pre-Stage-4 install does not lose ownership mid-migration.
+    Stage 5 deletes the shim and this switch with it.
+
+    ``AGENTIC_PR_DASH_MARKER_WRITES=1`` restores the Stage 1-3 dual-write without a
+    package rollback, mirroring ``dual_write_enabled`` /
+    ``ownership_resolution.claim_reads_enabled``. Parsing is deliberately the
+    inverse of those two — they default ON and accept off-values, this defaults OFF
+    and accepts on-values — because re-enabling a retired writer must be explicit.
+
+    Note this gates the *ownership* marker only. ``pr-watch.session`` keeps being
+    written: it records WHICH session owns a worktree's terminal, which is session
+    identity rather than PR ownership and has no claim equivalent.
+    """
+    raw = os.environ.get("AGENTIC_PR_DASH_MARKER_WRITES", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _heartbeat_min_interval_seconds() -> int:
     raw = os.environ.get("AGENTIC_PR_DASH_HEARTBEAT_MIN_INTERVAL_SECONDS", "")
     if raw.isdigit() and int(raw) >= 0:
@@ -286,12 +308,69 @@ def _heartbeat_min_interval_seconds() -> int:
     return _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS
 
 
+def _heartbeat_fields_from_claim(cwd: str, self_session_id: str) -> dict[str, str] | None:
+    """Marker-shaped fields rebuilt from this session's live claim (Stage 4).
+
+    Once ``pr-watch.armed`` is no longer written there is nothing on disk for
+    :func:`_touch_owner_heartbeat` to read, so the claim supplies the same fields.
+    Returning the marker's exact shape keeps the coalescing and lease-tier logic
+    below untouched rather than forking it per source.
+
+    ``fix_lease_until`` is synthesised only when the claim's remaining lease is
+    longer than a heartbeat TTL, which is what distinguishes the long fix-lease
+    tier from an ordinary heartbeat — the same distinction the marker encoded by
+    the field's presence. None when this session holds no live claim here.
+    """
+    try:
+        from agentic_pr_dash import ownership  # noqa: PLC0415
+
+        snap = ownership.snapshot()
+        if not snap.known():
+            return None
+        views = [
+            v for v in snap.live_claims_for_worktree(cwd)
+            if v.session_id == self_session_id and v.pr_number is not None
+        ]
+        if not views:
+            return None
+        view = max(views, key=lambda v: v.lease_epoch)
+        claim = snap.claim_for(view.repo, view.pr_number)
+        if claim is None:
+            return None
+        fields = {
+            "pr": str(view.pr_number),
+            "session_id": view.session_id,
+            "pid": "" if view.pid is None else str(view.pid),
+            "provenance": view.provenance,
+        }
+        stamp = claim.heartbeat_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        fields["last_heartbeat"] = stamp
+        fields["heartbeat"] = stamp
+        remaining = (claim.lease_expires_at - claim.heartbeat_at).total_seconds()
+        if remaining > _heartbeat_ttl_seconds(cwd):
+            fields["fix_lease_until"] = claim.lease_expires_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return fields
+    except Exception:  # noqa: BLE001 — heartbeating must never break the caller
+        return None
+
+
 def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> None:
-    """Refresh this owner's coordination stamps in the marker (owner-only write)."""
+    """Refresh this owner's coordination stamps (owner-only write).
+
+    From Stage 4 the claim is what gets refreshed; the marker file is only
+    rewritten while ``marker_writes_enabled()``. Ownership and the PR number are
+    still resolved from the marker when one exists — during the shim window a
+    legacy marker is the only record for a worktree armed by an older install —
+    falling back to the live claim otherwise.
+    """
     if not self_session_id:
         return
     fields = _read_marker(cwd)
-    if fields is None or fields.get("session_id", "") != self_session_id:
+    if fields is None:
+        fields = _heartbeat_fields_from_claim(cwd, self_session_id)
+        if fields is None:
+            return
+    elif fields.get("session_id", "") != self_session_id:
         return
     from datetime import datetime, timedelta, timezone  # noqa: PLC0415
 
@@ -316,23 +395,24 @@ def _touch_owner_heartbeat(cwd: str, self_session_id: str, work_found: bool) -> 
         )
     else:
         fields.pop("fix_lease_until", None)
-    import tempfile  # noqa: PLC0415
+    if marker_writes_enabled():
+        import tempfile  # noqa: PLC0415
 
-    content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = _marker_path(cwd)
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".pr-watch.armed.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp, target)
-    except OSError:
-        if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        return
+        content = "".join(f"{k}={v}\n" for k, v in fields.items())
+        target = _marker_path(cwd)
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target), prefix=".pr-watch.armed.")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(tmp, target)
+        except OSError:
+            if tmp is not None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return
 
     # Mirror the refreshed lease into the claim (BOU-2223 dual-write). Coalescing
     # is inherited: this runs only when the marker was actually rewritten, so the
@@ -390,21 +470,22 @@ def _write_arm_marker(
         "pid": str(pid),
         "provenance": provenance,
     }
-    content = "".join(f"{k}={v}\n" for k, v in fields.items())
-    target = os.path.join(state_dir, "pr-watch.armed")
-    tmp = None
-    try:
-        fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
-        os.replace(tmp, target)
-    except OSError:
-        if tmp is not None:
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        return False
+    if marker_writes_enabled():
+        content = "".join(f"{k}={v}\n" for k, v in fields.items())
+        target = os.path.join(state_dir, "pr-watch.armed")
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(content)
+            os.replace(tmp, target)
+        except OSError:
+            if tmp is not None:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            return False
 
     try:
         with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
@@ -451,33 +532,53 @@ def _write_arm_marker(
     # ownership rests entirely on the owner pid. The mirrored claim must start in
     # the same state, or a session that arms and then dies before its first
     # heartbeat would look owned on the claim side and unowned on the marker side.
-    _dual_write_ownership_claim(
+    claimed = _dual_write_ownership_claim(
         cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
         pid_tier_only=True,
     )
-    return True
+    # From Stage 4 the claim IS the ownership write, so its outcome is this
+    # function's outcome. That makes arming genuinely fenced: when another LIVE
+    # session already holds (repo, pr), `record_ownership` refuses and adoption
+    # now declines instead of stamping a marker over the top of it. Under the
+    # Stage 1-3 dual-write the marker write always "succeeded" and the losing
+    # session went on believing it owned the PR — the BOU-2221 class of bug.
+    #
+    # With marker writes still enabled the marker remains authoritative, so a
+    # claim-store hiccup must not turn a successful arm into a failure.
+    if marker_writes_enabled():
+        return True
+    return claimed
 
 
 def _dual_write_ownership_claim(
     cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
     *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
     pid_tier_only: bool = False,
-) -> None:
-    """Mirror an ownership-marker write into an agent-coordinator claim (BOU-2223).
+) -> bool:
+    """Record ownership as an agent-coordinator claim (BOU-2223).
 
-    Stage 1 of the ownership consolidation: markers stay authoritative and every
-    write is mirrored here so the parity harness can prove the claim-derived view
-    agrees before any reader is flipped. Best-effort by construction — a claim
-    store problem must never fail the marker write that callers depend on.
+    Stage 1 introduced this as a MIRROR of the authoritative marker write, so the
+    parity harness could prove the claim-derived view agreed before any reader was
+    flipped. From Stage 4 the relationship is inverted: this is the ownership
+    write, and the marker is a read-only compatibility shim.
+
+    Returns True when the claim was recorded. Callers use that as the arm's
+    outcome once marker writes are retired, so a refusal (another live session
+    holds this ``(repo, pr)``) correctly declines the arm rather than silently
+    stamping over the top of it.
+
+    Still never raises: a claim-store problem degrades to False rather than
+    breaking the caller, and while marker writes are enabled the marker remains
+    authoritative so False is not fatal.
 
     ``repo``/``branch`` let a caller that already probed git pass the values in;
-    ``None`` means "probe here". ``pid_tier_only`` mirrors a marker that carries no
+    ``None`` means "probe here". ``pid_tier_only`` mirrors an arm that carries no
     heartbeat and no fix-lease, so the claim's liveness rests on the owner pid.
     """
     try:
         from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
         if not ownership.dual_write_enabled():
-            return
+            return False
         outcome = ownership.record_ownership(
             lease_seconds=ownership.LEASE_PID_TIER_ONLY if pid_tier_only else None,
             repo=_repo_slug(cwd) if repo is None else repo,
@@ -501,8 +602,9 @@ def _dual_write_ownership_claim(
                     "conflict_session_id": outcome.conflict_session_id,
                 },
             )
-    except Exception:  # noqa: BLE001 — never break the authoritative marker write
-        pass
+        return bool(outcome.ok)
+    except Exception:  # noqa: BLE001 — never break the caller
+        return False
 
 
 def _marker_provenance(worktree_path: str) -> str:
@@ -587,19 +689,41 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
     except Exception:  # noqa: BLE001
         pass
 
-    # The PR is authoritatively merged/closed and its marker is gone — release the
-    # mirrored claim too, or the claim-derived view would keep reporting an owner
-    # for a dead PR (BOU-2223 dual-write).
+    release_ownership_claims(cwd, {pr_number}, session_id)
+
+
+def release_ownership_claims(
+    cwd: str, pr_numbers: set[int], session_id: str, *, reason: str = "pr_closed"
+) -> None:
+    """Release this session's ownership claims on PRs that are authoritatively dead.
+
+    Every path that retires a PR's ownership must call this, not just the marker
+    prune. From Stage 4 the claim IS ownership, so a claim left behind by a
+    merged/closed PR is not cosmetic residue — it is a live ownership record for a
+    dead PR that nothing else will ever clear, and the claim-derived readers will
+    keep reporting an owner forever (BOU-2223 Stage 4).
+
+    Deliberately NOT gated on ``dual_write_enabled()``: that switch governs whether
+    we still MIRROR marker writes into claims, and turning the mirror off must not
+    strand claims written while it was on. Releasing a claim that does not exist is
+    a no-op, so the unconditional call is safe.
+
+    Best-effort by construction — cleanup must never break the caller that was
+    retiring the PR.
+    """
+    if not pr_numbers:
+        return
     try:
         from agentic_pr_dash import ownership  # noqa: PLC0415
-        if ownership.dual_write_enabled():
+        repo = _repo_slug(cwd)
+        for pr_number in pr_numbers:
             ownership.release_ownership(
-                repo=_repo_slug(cwd),
+                repo=repo,
                 pr_number=pr_number,
                 session_id=session_id,
-                reason="pr_closed",
+                reason=reason,
             )
-    except Exception:  # noqa: BLE001 — never break marker pruning
+    except Exception:  # noqa: BLE001 — never break the caller
         pass
 
 

@@ -70,6 +70,21 @@ def _isolate_mutation_pacing():
     github_api.reset_mutation_pacing()
 
 
+@pytest.fixture
+def legacy_marker_writes(monkeypatch):
+    """Simulate a pre-Stage-4 install: ``pr-watch.armed`` marker writes enabled.
+
+    BOU-2223 Stage 4 flipped ``markers.marker_writes_enabled()`` OFF by default —
+    the claim is now the sole ownership authority and the marker is a read-only
+    compatibility shim. A test whose subject IS that legacy marker (its on-disk
+    shape, the writer's re-stamp/takeover behaviour, or a marker-vs-claim parity
+    comparison) opts back into the old dual-write with this fixture so it keeps
+    exercising a real pre-Stage-4 arm rather than the retired writer's absence.
+    """
+    monkeypatch.setenv("AGENTIC_PR_DASH_MARKER_WRITES", "1")
+    yield
+
+
 @pytest.fixture(autouse=True)
 def _isolate_resolve_fallback_logged():
     """Reset github_api's once-per-process resolve-fallback log flag (BOU-1974).

@@ -26,7 +26,10 @@ from agentic_pr_dash._maintenance.markers import _read_marker, _write_arm_marker
 
 
 @pytest.fixture
-def worktree(tmp_path, monkeypatch):
+def worktree(tmp_path, monkeypatch, legacy_marker_writes):
+    """The provenance tests below round-trip through the on-disk marker file, so
+    this needs the pre-Stage-4 dual-write (BOU-2223 Stage 4 turned the marker
+    writer off by default) or ``_write_arm_marker`` would leave nothing to read."""
     monkeypatch.setenv("AGENTIC_PR_DASH_STATE_DIR", str(tmp_path / ".gaia"))
     wt = tmp_path / "wt"
     wt.mkdir()
