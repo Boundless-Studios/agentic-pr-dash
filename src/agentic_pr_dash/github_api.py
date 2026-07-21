@@ -1962,14 +1962,21 @@ _REQUIRED_ROLLUP_QUERY = (
 _ROLLUP_MAX_PAGES = 20
 
 
-def _ctx_is_pending(ctx: dict) -> bool:
-    if not isinstance(ctx, dict) or not ctx.get("isRequired"):
+def _ctx_is_nonterminal(ctx: dict) -> bool:
+    """True when this context has not reached a terminal state, required or not."""
+    if not isinstance(ctx, dict):
         return False
     if ctx.get("__typename") == "CheckRun":
         return ctx.get("status") != "COMPLETED"
     if ctx.get("__typename") == "StatusContext":
         return ctx.get("state") in ("EXPECTED", "PENDING")
     return False
+
+
+def _ctx_is_pending(ctx: dict) -> bool:
+    if not isinstance(ctx, dict) or not ctx.get("isRequired"):
+        return False
+    return _ctx_is_nonterminal(ctx)
 
 
 def _repo_for_cwd(cwd: str | None) -> str | None:
@@ -1996,8 +2003,23 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     ``COMPLETED`` (queued/in_progress/waiting/requested) or a ``StatusContext``
     is ``EXPECTED``/``PENDING`` — the ``EXPECTED`` state covers required checks
     configured by branch protection that have not reported yet (the cli/cli#8855
-    gap that ``gh pr checks`` misses). Paginates the contexts so a required
-    pending context past the first 100 isn't missed. Returns ``False`` on any
+    gap that ``gh pr checks`` misses).
+
+    When the rollup declares NO required context at all, every non-terminal check
+    counts instead (BOU-2294). ``isRequired`` reflects branch protection, and a
+    repo that gates merges by convention rather than by a protection rule reports
+    ``isRequired: false`` for every check — so the strict reading made this
+    function answer "CI is terminal" while the whole suite was still running, and
+    the waiter clean-exited seconds after a push. That answer was already
+    asymmetric with failure detection, which counts ANY failing check
+    (``_pr_open_state`` → ``get_ci_checks``) with no ``isRequired`` filter: CI
+    could only ever be found red, never found running. The fallback is scoped to
+    "no required contexts exist" so a repo that DOES declare required checks keeps
+    the narrow semantics and its waiters are not held open by optional jobs.
+
+    Paginates the contexts so a required pending context past the first 100
+    isn't missed — and so the "no required contexts" question is answered over
+    the WHOLE rollup, not just its first page. Returns ``False`` on any
     error or when no required check is pending (fail-safe) — but a gh/parse
     failure additionally records ``checks_probe_failure_seen()`` so tick-based
     consumers (the await waiter's clean exit) can tell "observed terminal" from
@@ -2009,6 +2031,10 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
         return False
     owner, name = repo.split("/", 1)
     after: str | None = None
+    # Accumulated across pages: the "no required contexts anywhere" fallback can
+    # only be decided once every page has been seen.
+    saw_required = False
+    unrequired_pending = False
     for _ in range(_ROLLUP_MAX_PAGES):
         cmd = ["gh", "api", "graphql",
                "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
@@ -2033,11 +2059,18 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
         except (KeyError, TypeError):
             _note_checks_probe_failure()
             return False
-        if any(_ctx_is_pending(ctx) for ctx in contexts.get("nodes", [])):
-            return True
+        for ctx in contexts.get("nodes", []):
+            if not isinstance(ctx, dict):
+                continue
+            if ctx.get("isRequired"):
+                saw_required = True
+                if _ctx_is_pending(ctx):
+                    return True
+            elif _ctx_is_nonterminal(ctx):
+                unrequired_pending = True
         page = contexts.get("pageInfo") or {}
         if not page.get("hasNextPage") or not page.get("endCursor"):
-            return False
+            return unrequired_pending and not saw_required
         after = page["endCursor"]
     # Fell out of the page loop with hasNextPage still true: the rollup was
     # TRUNCATED at _ROLLUP_MAX_PAGES, so a required pending context on a later

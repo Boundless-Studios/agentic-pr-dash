@@ -41,6 +41,17 @@ def _await_pidfile_path(cwd: str, session_id: str = SID) -> Path:
     return Path(mc._await_pidfile(cwd, session_id))
 
 
+def _bind_pr(monkeypatch, pr: int = 42) -> None:
+    """Make every owned worktree resolve to open PR ``pr``.
+
+    The clean verdict is reachable only when the waiter actually watched a PR
+    (BOU-2294), so a test whose subject is NOT the empty watch set has to bind
+    one. ``_owned_open_pr_pairs`` is the documented seam for this.
+    """
+    monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
+    monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+
+
 def _write_pidfile(cwd: str, pid: int, session_id: str) -> None:
     path = _await_pidfile_path(cwd, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -97,8 +108,13 @@ def test_await_exits_10_with_prompt_when_work_found(tmp_path, monkeypatch, capsy
     assert not _await_pidfile_path(str(tmp_path)).exists()
 
 
-def test_await_exits_0_when_no_owned_open_prs(tmp_path, monkeypatch, capsys):
-    """When there are no owned worktrees and no detached PR records, exits 0."""
+def test_await_exits_unbound_when_no_owned_open_prs(tmp_path, monkeypatch, capsys):
+    """No owned worktrees and no detached PR records: the waiter bound to NOTHING.
+
+    That is not a clean bill of health — it used to exit 0 next to a "all watched
+    PRs are clean" message, which is a wrong answer that looks like a right one
+    (BOU-2294). It must be loud and non-zero instead.
+    """
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
@@ -110,7 +126,11 @@ def test_await_exits_0_when_no_owned_open_prs(tmp_path, monkeypatch, capsys):
         "--owner-pid", "12345",
         "--max-wait", "1",
     ])
-    assert rc == 0
+    captured = capsys.readouterr()
+    assert rc == mc._AWAIT_UNBOUND
+    assert rc != 0 and rc != 10
+    assert "clean" not in captured.out.lower()
+    assert '"outcome":"unbound"' in captured.err
     assert not _await_pidfile_path(str(tmp_path)).exists()
 
 
@@ -161,8 +181,10 @@ def test_await_stale_pidfile_not_exit_3(tmp_path, monkeypatch, capsys):
         "--owner-pid", "12345",
         "--max-wait", "1",
     ])
-    # Should NOT be 3 (stale pidfile is ignored)
-    assert rc == 0
+    # Should NOT be 3 (stale pidfile is ignored). Nothing is owned here, so the
+    # run ends unbound rather than clean (BOU-2294).
+    assert rc != 3
+    assert rc == mc._AWAIT_UNBOUND
 
 
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
@@ -176,6 +198,7 @@ def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(mc, "_check_worktree", _clean_check)
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",
@@ -227,6 +250,7 @@ def test_await_exits_0_promptly_when_owned_pr_clean_infinite_max_wait(
     # Required CI terminal — nothing watch-pending.
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr("time.sleep", lambda s: None)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",
@@ -262,6 +286,7 @@ def test_await_stamps_heartbeat_each_tick(tmp_path, monkeypatch):
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "clean"))
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", _fake_heartbeat)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",
@@ -301,6 +326,8 @@ def test_await_pidfile_written_and_removed(tmp_path, monkeypatch):
         "--max-wait", "0",
         "--interval", "1",
     ])
-    assert rc == 0
+    # Nothing owned this run, so the verdict is "unbound" (BOU-2294) — the
+    # pidfile lifecycle under test is the same on every exit path.
+    assert rc == mc._AWAIT_UNBOUND
     assert written_pids  # pidfile was present during the tick
     assert not pidfile_path.exists()  # cleaned up on exit

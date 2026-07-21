@@ -57,6 +57,18 @@ def _await_args(tmp_path):
     ]
 
 
+def _bind_pr(monkeypatch, pr: int = 42) -> None:
+    """Make every owned worktree resolve to open PR ``pr`` (BOU-2294).
+
+    A clean verdict is only reachable for a waiter that actually watched a PR;
+    one that resolved none reports ``unbound`` instead. Tests whose subject is a
+    suppression rule (not the empty watch set) bind one so the tick AFTER the
+    suppression can still reach the clean exit.
+    """
+    monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
+    monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+
+
 def _wire_await(tmp_path, monkeypatch, wt):
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
@@ -99,6 +111,7 @@ def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
+    _bind_pr(monkeypatch)
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
@@ -164,6 +177,7 @@ def test_await_warn_only_deferral_suppresses_clean_exit(tmp_path, monkeypatch):
 
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    _bind_pr(monkeypatch)
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
@@ -537,7 +551,9 @@ def test_await_clean_exit_excludes_stale_marker_pr(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: None)
 
     rc = mc.main(_await_args(tmp_path))
-    assert rc == 0
+    # Nothing was verified, so there is no verdict to report — the waiter exits
+    # `unbound` rather than claiming the PRs it owns are clean (BOU-2294).
+    assert rc == mc._AWAIT_UNBOUND
     assert _waiter_mod._read_clean_exit_keys(SID) == set()
 
 
@@ -553,7 +569,9 @@ def test_await_clean_exit_excludes_marker_pr_when_branch_resolves_elsewhere(tmp_
     monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: (43, False))
 
     rc = mc.main(_await_args(tmp_path))
-    assert rc == 0
+    # #42 is the only PR this worktree resolved to, and it was NOT verified — so
+    # the tick verified nothing and exits unbound (BOU-2294).
+    assert rc == mc._AWAIT_UNBOUND
     assert _marker_key(wt, 42) not in _waiter_mod._read_clean_exit_keys(SID)
 
 
@@ -582,6 +600,7 @@ def test_await_unknown_detached_state_suppresses_clean_exit(tmp_path, monkeypatc
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", fake_detached)
+    _bind_pr(monkeypatch)
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0

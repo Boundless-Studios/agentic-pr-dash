@@ -211,6 +211,35 @@ def _await_watch_pending_this_tick(
     )
 
 
+def _owned_pr_pairs_for_await(owned: list[str]) -> list[tuple[str, int]]:
+    """``(worktree, pr)`` pairs for the waiter, claim-first with marker fallback.
+
+    ``_owned_open_pr_pairs`` reads ``pr-watch.armed`` and nothing else. Stage 4 of
+    BOU-2223 retired that file's WRITER, so on a current install it answers "this
+    session owns no PR anywhere" — and a marker-only reader does not fail, it
+    silently returns an empty set (BOU-2294). Here that emptiness fed the
+    clean-exit verified set, which is what tells the stop gate which PRs a waiter
+    already vouched for.
+
+    Union, never intersection, per the Stage-2/3 precedent: the marker seam is
+    left exactly as it is (several tests monkeypatch it directly and it is the
+    specification) and the live claim is added alongside it.
+    """
+    from ._maintenance.ownership_resolution import resolve_worktree  # noqa: PLC0415
+    from agentic_pr_dash import ownership  # noqa: PLC0415
+
+    pairs = dict(_owned_open_pr_pairs(owned))
+    missing = [wt for wt in owned if wt not in pairs]
+    if missing:
+        # ONE store read for every worktree still unresolved, never one each.
+        snap = ownership.snapshot()
+        for wt in missing:
+            pr = resolve_worktree(wt, kind="waiter_divergence", snap=snap).pr_number
+            if pr is not None:
+                pairs[wt] = pr
+    return list(pairs.items())
+
+
 def _marker_pr_still_current(worktree: str, pr_number: int) -> bool:
     """True iff ``worktree``'s CURRENT branch still resolves to open PR
     ``pr_number``.
@@ -584,9 +613,24 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
 # (3) from "idle: nothing pending, nothing to watch" (0) — so supervising
 # sessions parse the outcome. These are DISTINCT outcomes: `deferred_to_loop`
 # means real coverage handed off; `idle` means no coverage was needed (#62).
+#
+# 4 (`unbound`) is the loud version of "we watched nothing" (BOU-2294). An empty
+# watch set used to exit 0 and read as a verdict — the waiter reported the PRs it
+# owns as clean while it had in fact bound to no PR at all, so a check that went
+# red afterwards woke nobody. A wrong answer that looks right is worse than no
+# answer, so this exits NON-ZERO and says it reached no verdict.
+#
+# 4 was chosen against the callers rather than picked freely: 10 is the harness's
+# wake signal, 0 means clean/idle, 3 means deferred, and 1 is the crash path in
+# `_cmd_await`. Nothing keys coverage off the exit code — the stop gate's
+# coverage logic and `run_post_push_watch` both go through `_await_alive`'s
+# pidfile — so a new non-zero code cannot silence a wake or fake coverage.
+_AWAIT_UNBOUND = 4
+
 _AWAIT_OUTCOMES: dict[int, tuple[str, str]] = {
     10: ("woke", "feedback arrived on an owned PR"),
     3: ("deferred_to_loop", "another waiter already covers this session"),
+    _AWAIT_UNBOUND: ("unbound", "watched nothing — no verdict on any PR"),
     0: ("idle", "no pending feedback and nothing to watch (idle / max-wait elapsed)"),
 }
 
@@ -606,6 +650,24 @@ def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = ""
         print(line, file=sys.stderr, flush=True)
     except Exception:  # noqa: BLE001 — outcome reporting must never mask the real exit
         pass
+
+
+def _unbound_exit(session_id: str, why: str) -> int:
+    """Leave the waiter with NO verdict, loudly (BOU-2294).
+
+    Also drops any clean-exit marker this session left behind: that marker is what
+    tells the stop gate "a waiter already verified these PRs, don't demand another
+    one". Keeping it while we cannot even resolve what we own would let a stale
+    verdict keep suppressing coverage.
+    """
+    _clear_clean_exit_marker(session_id)
+    print(
+        f"[pr-watch] waiter watched NOTHING ({why}) — exiting with NO verdict. "
+        f"This is not a clean bill of health: no PR was observed, so nothing here "
+        f"will wake the session.",
+        file=sys.stderr,
+    )
+    return _AWAIT_UNBOUND
 
 
 def _cmd_await(args: argparse.Namespace) -> int:
@@ -738,7 +800,12 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 and not github_api.rate_limit_seen()
                 and not getattr(args, "keep_alive_without_prs", False)
             ):
-                return 0
+                # Nothing resolved to watch. That is NOT "everything is clean" —
+                # ownership resolution may simply have come up empty for a session
+                # that does own an open PR (BOU-2294). Say so loudly instead of
+                # exiting 0 next to a clean-looking message.
+                return _unbound_exit(session_id, "no owned worktree and no "
+                                     "detached PR resolved for this session")
 
             # BOU-1962: clean-state early exit. `pending` is empty here (the
             # return-10 above fired otherwise), so no owned or detached PR has
@@ -784,13 +851,22 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # verified (round 5).
                     verified = {
                         _clean_exit_key(_repo_slug(wt), n)
-                        for wt, n in _owned_open_pr_pairs(owned)
+                        for wt, n in _owned_pr_pairs_for_await(owned)
                         if _marker_pr_still_current(wt, n)
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick
                         if r.get("state") not in ("merged", "closed", "draft", "unknown")
                     }
+                    if not verified:
+                        # Owned worktrees exist but none of them resolved to an
+                        # open PR this tick, so "clean" would be a verdict on the
+                        # empty set — the exact false green BOU-2294 is about.
+                        # Refuse to record or announce one.
+                        return _unbound_exit(
+                            session_id,
+                            "no owned worktree resolved to an open PR",
+                        )
                     _write_clean_exit_marker(session_id, verified)
                     print(
                         "[pr-watch] all watched PRs are clean (no pending "
