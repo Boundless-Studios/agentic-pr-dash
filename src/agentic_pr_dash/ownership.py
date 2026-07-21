@@ -370,6 +370,38 @@ class OwnershipSnapshot:
                 views.append(view)
         return views
 
+    def live_claims_for_worktree(self, worktree_path: str) -> list[OwnerView]:
+        """Every LIVE ownership claim naming ``worktree_path`` (BOU-2223 Stage 3).
+
+        The session-scoped :meth:`live_claims_for_session` answers "which
+        worktrees do I own", which is the stop gate's question. Stage 3's readers
+        ask the transpose — "who owns THIS worktree" — for a path they already
+        hold, and several of them (the dashboard card, the post-push hook) have no
+        session id to scope by at all. Both directions are the same one-pass scan
+        over ``OwnerIdentity.worktree_path``; neither can be a store lookup,
+        because the store is keyed by ``(repo, pr)``.
+
+        More than one live claim can legitimately name one worktree — a branch
+        reassigned to a new PR leaves the old PR's claim unreleased, since
+        dual-write only releases on merge/close. Disambiguating is the caller's
+        job (it has the marker's current PR to compare against); this returns all
+        of them, in no guaranteed order.
+
+        Reuses :meth:`_view_for_claim`'s liveness rule — it does not reimplement it.
+        """
+        if not self.ok or not worktree_path:
+            return []
+        target = os.path.abspath(worktree_path)
+        views: list[OwnerView] = []
+        for claim in self._claims.values():
+            claim_path = claim.owner.worktree_path
+            if not claim_path or os.path.abspath(claim_path) != target:
+                continue
+            view = self._view_for_claim(claim)
+            if view.live:
+                views.append(view)
+        return views
+
 
 def _unknown_snapshot(now: datetime) -> OwnershipSnapshot:
     return OwnershipSnapshot({}, now=now, ok=False)

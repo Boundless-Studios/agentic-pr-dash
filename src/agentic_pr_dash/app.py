@@ -631,16 +631,27 @@ def _ownership_for_card(
         try:
             from ._maintenance.markers import _read_marker  # noqa: PLC0415
             from ._maintenance._common import _pid_alive, _parse_iso  # noqa: PLC0415
+            from ._maintenance.ownership_resolution import resolve_worktree  # noqa: PLC0415
+
+            # Claim-first for identity (BOU-2223 Stage 3); the marker still
+            # supplies armed_at/heartbeat, which have no claim equivalent — the
+            # claim's lease is a different quantity and must not be shown as one.
+            owned = resolve_worktree(worktree_path, kind="card_divergence")
+            if owned.session_id:
+                result["owner_session_id"] = owned.session_id
+            if owned.owner_pid is not None:
+                result["owner_pid"] = owned.owner_pid
+                result["owner_pid_alive"] = _pid_alive(str(owned.owner_pid))
 
             marker = _read_marker(worktree_path)
             if marker:
                 session_id = marker.get("session_id") or None
                 if session_id:
-                    result["owner_session_id"] = session_id
+                    result.setdefault("owner_session_id", session_id)
                 pid_str = marker.get("pid", "")
                 if pid_str.isdigit():
-                    result["owner_pid"] = int(pid_str)
-                    result["owner_pid_alive"] = _pid_alive(pid_str)
+                    result.setdefault("owner_pid", int(pid_str))
+                    result.setdefault("owner_pid_alive", _pid_alive(pid_str))
                 raw_armed = marker.get("armed_at")
                 if raw_armed:
                     dt = _parse_iso(raw_armed)

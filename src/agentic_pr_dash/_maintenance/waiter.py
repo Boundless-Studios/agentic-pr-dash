@@ -162,8 +162,12 @@ def _covered_or_requested(data: dict, cwd: str) -> bool:
 def _request_waiter_coverage(cwd: str, session_id: str) -> bool:
     """Ask the live session waiter to add this marker-owned worktree."""
     try:
-        from . import markers  # noqa: PLC0415
-        if markers._marker_session_id(cwd) != session_id:
+        from .ownership_resolution import resolve_worktree  # noqa: PLC0415
+        # Claim-first (BOU-2223 Stage 3). Union rule: a claim this session holds
+        # is enough even if the marker hasn't caught up, and vice versa — asking
+        # for coverage we don't need is harmless, dropping coverage we do need
+        # strands an owned PR.
+        if not resolve_worktree(cwd, kind="waiter_divergence").owned_by(session_id):
             return False
         path = _await_pidfile("", session_id)
         with open(path, encoding="utf-8") as fh:
