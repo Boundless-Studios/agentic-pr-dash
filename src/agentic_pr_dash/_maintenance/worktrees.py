@@ -205,10 +205,17 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
     return owned
 
 
-def _marker_pr(worktree_path: str) -> str:
-    """The PR number recorded in a worktree's pr-watch.armed marker ('' if none)."""
-    from .markers import _read_marker  # noqa: PLC0415
-    return str((_read_marker(worktree_path) or {}).get("pr", ""))
+def _marker_pr(worktree_path: str, *, snap=None) -> str:
+    """The PR this worktree is for, claim-first ('' if neither source knows).
+
+    Claim-derived since BOU-2223 Stage 3; the marker remains the fallback and is
+    still what decides the answer when the two disagree about which PR a
+    worktree currently belongs to (the marker is rewritten on supersede, an
+    unreleased claim is not).
+    """
+    from .ownership_resolution import resolve_worktree  # noqa: PLC0415
+    pr = resolve_worktree(worktree_path, kind="worktree_divergence", snap=snap).pr_number
+    return "" if pr is None else str(pr)
 
 
 def _collect_owned_worktrees(
@@ -270,11 +277,11 @@ def _collect_owned_worktrees(
     from .markers import (  # noqa: PLC0415
         _live_foreign_owner,
         _live_pr_owner_record,
-        _marker_session_id,
-        _read_marker,
         _session_is_live,
         _write_arm_marker,
     )
+    from .ownership_resolution import resolve_worktree  # noqa: PLC0415
+    from agentic_pr_dash import ownership  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
@@ -334,36 +341,49 @@ def _collect_owned_worktrees(
                 ) or {}
         return pr_map
 
+    # ONE store read for every candidate below (BOU-2223 Stage 3). This path is
+    # reachable from the Stop hook's ~108s fail-closed budget (BOU-1953), so a
+    # snapshot per worktree is not an option.
+    snap = ownership.snapshot()
+
+    def _own(worktree_path: str):
+        return resolve_worktree(worktree_path, kind="collect_owned_divergence", snap=snap)
+
     for worktree_path, branch in candidates:
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
             continue
-        if _marker_session_id(worktree_path) == session_id:
-            # Already ours — but if the marker's PR is stale (the branch's open
-            # PR changed since we armed), rewrite it so the Stop-gate re-checks
-            # the CURRENT PR even inside the clean-stop window.
+        owned = _own(worktree_path)
+        if owned.owned_by(session_id):
+            # Already ours — but if the recorded PR is stale (the branch's open
+            # PR changed since we armed), rewrite the marker so the Stop-gate
+            # re-checks the CURRENT PR even inside the clean-stop window.
             cur = _branch_prs().get(branch)
-            if cur is not None and not cur[1] and _marker_pr(worktree_path) != str(cur[0]):
+            if cur is not None and not cur[1] and str(owned.pr_number or "") != str(cur[0]):
                 _write_arm_marker(worktree_path, session_id, int(eff_pid), int(cur[0]))
             _emit(worktree_path)
             continue
-        marker = _read_marker(worktree_path)
-        if marker:
-            # Already carries SOME session's marker (foreign, live or dead —
-            # ``_marker_session_id`` above already excluded the "already ours"
-            # case). Only an explicit `arm` may claim an already-markered
-            # worktree; a shared-repo `git worktree list` scan surfacing one of
-            # "my" open GitHub PRs here is not evidence THIS session ever armed
-            # it (BOU-1953 root cause #3 — no cross-epic adoption)...
+        if owned.source != "none":
+            # Already owned by SOME other session, by marker or by claim (the
+            # ``owned_by`` union check above already excluded the "already ours"
+            # case). Only an explicit `arm` may claim an already-owned worktree;
+            # a shared-repo `git worktree list` scan surfacing one of "my" open
+            # GitHub PRs here is not evidence THIS session ever armed it
+            # (BOU-1953 root cause #3 — no cross-epic adoption)...
             if not adopt_dead_markered:
                 continue
             # ...EXCEPT when the caller opted into dead-owner takeover
-            # (cross-root scans, BOU-2184): a marker whose owning session is
-            # conclusively dead would otherwise hide this worktree's open
-            # non-draft ``@me`` PR from every session forever.
+            # (cross-root scans, BOU-2184): an owner that is conclusively dead
+            # would otherwise hide this worktree's open non-draft ``@me`` PR
+            # from every session forever.
             if _live_foreign_owner(worktree_path, session_id):
                 continue
-            owner_sid = marker.get("session_id", "")
+            # A live foreign CLAIM blocks takeover too. Union with the marker
+            # check above, never a replacement for it: either source reporting a
+            # live foreign owner is enough to keep hands off.
+            if any(sid != session_id for sid in owned.claim_session_ids):
+                continue
+            owner_sid = owned.session_id or ""
             if owner_sid and _session_is_live(owner_sid, worktree_path):
                 continue
             cur = _branch_prs().get(branch)
@@ -433,6 +453,8 @@ def _reconcile_owned_across_roots(
     remaining roots are skipped so a slow ``gh``/worktree probe can't blow the
     Stop-hook deadline. The anchor root is serviced first.
     """
+    from agentic_pr_dash import ownership  # noqa: PLC0415
+
     owned: list[str] = []
     newly_adopted: list[str] = []
     seen: set[str] = set()
@@ -441,7 +463,18 @@ def _reconcile_owned_across_roots(
         if deadline is not None and time.monotonic() > deadline:
             break
         before = set(_collect_stop_gate_worktrees(session_id, root))
-        before_prs = {wt: _marker_pr(wt) for wt in before}
+        # TWO store reads per root, not two per worktree (BOU-2223 Stage 3).
+        # `_marker_pr` is now claim-aware, so leaving these unbatched meant a
+        # full claims.jsonl replay for every worktree in `before` and again for
+        # every worktree in `root_owned` — an unbounded log (BOU-2239) re-read
+        # O(worktrees) times on the Stop hook's fail-closed budget (BOU-1953).
+        #
+        # The snapshots must stay DISTINCT: `before_prs` is captured before
+        # `_collect_owned_worktrees` runs, which may rewrite ownership, and the
+        # comparison below is what detects that rewrite. Reusing one snapshot
+        # would compare it against itself and never see a claim-side change.
+        snap_before = ownership.snapshot()
+        before_prs = {wt: _marker_pr(wt, snap=snap_before) for wt in before}
         if os.path.abspath(root) == anchor:
             root_owned = _collect_owned_worktrees(session_id, root, pid, deadline)
         else:
@@ -453,19 +486,27 @@ def _reconcile_owned_across_roots(
                 adopt_unmarked=False,
                 adopt_dead_markered=True,
             )
+        snap_after = ownership.snapshot()
         for wt in root_owned:
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)
-            adopted = wt not in before or before_prs.get(wt) != _marker_pr(wt)
+            adopted = (
+                wt not in before
+                or before_prs.get(wt) != _marker_pr(wt, snap=snap_after)
+            )
             if adopted and wt not in newly_adopted:
                 newly_adopted.append(wt)
     return owned, newly_adopted
 
 
 def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
-    """Return marker-owned worktrees for passive Stop-hook gating."""
-    from .markers import _marker_session_id  # noqa: PLC0415
+    """Return the worktrees this session owns, for passive Stop-hook gating.
+
+    Claim-first since BOU-2223 Stage 3, marker as fallback, union rule.
+    """
+    from .ownership_resolution import resolve_worktree  # noqa: PLC0415
+    from agentic_pr_dash import ownership  # noqa: PLC0415
     cwd = os.path.abspath(cwd)
     if not session_id:
         return []
@@ -475,13 +516,19 @@ def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
         [path for path, _branch in candidates], session_id
     )
 
+    # ONE store read for every candidate. This runs on the Stop hook's ~108s
+    # fail-closed budget (BOU-1953); a snapshot per worktree would blow it.
+    snap = ownership.snapshot()
+
     result: list[str] = []
     seen: set[str] = set()
     for worktree_path, _branch in candidates:
         abs_path = os.path.abspath(worktree_path)
         if abs_path in independent:
             continue
-        if _marker_session_id(worktree_path) != session_id:
+        if not resolve_worktree(
+            worktree_path, kind="stop_gate_worktree_divergence", snap=snap
+        ).owned_by(session_id):
             continue
         if worktree_path not in seen:
             seen.add(worktree_path)
@@ -489,13 +536,18 @@ def _collect_stop_gate_worktrees(session_id: str, cwd: str) -> list[str]:
     return result
 
 
-def _worktree_is_for_entry(path: str, entry) -> bool:
-    """True if the worktree at `path` still belongs to this ledger entry's PR."""
-    from .markers import _read_marker  # noqa: PLC0415
-    marker = _read_marker(path) or {}
-    if str(marker.get("pr", "")) == str(entry.pr):
+def _worktree_is_for_entry(path: str, entry, *, snap=None) -> bool:
+    """True if the worktree at `path` still belongs to this ledger entry's PR.
+
+    Claim-first since BOU-2223 Stage 3. ``source == "none"`` (neither a marker
+    nor a claim) keeps the marker-era answer: an unowned worktree belongs to no
+    ledger entry, so the branch check below is not reached.
+    """
+    from .ownership_resolution import resolve_worktree  # noqa: PLC0415
+    owned = resolve_worktree(path, kind="ledger_entry_divergence", snap=snap)
+    if owned.pr_number is not None and str(owned.pr_number) == str(entry.pr):
         return True
-    if not marker:
+    if owned.source == "none":
         return False
     branch = _current_branch(path)
     return bool(branch) and entry.branch and branch == entry.branch

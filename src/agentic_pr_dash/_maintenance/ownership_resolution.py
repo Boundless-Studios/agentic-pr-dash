@@ -118,6 +118,12 @@ def _marker_pr_and_provenance(worktree: str) -> tuple[int | None, str | None]:
     return pr, _marker_provenance(worktree)
 
 
+def _marker_session_id(worktree: str) -> str | None:
+    from .markers import _marker_session_id as read  # noqa: PLC0415
+
+    return read(worktree) or None
+
+
 def _valid_claim_worktrees(anchor_cwd: str) -> set[str]:
     """Worktree paths a claim is allowed to resurrect: still a directory AND
     still enumerated by ``git worktree list`` from one of the stop gate's
@@ -298,5 +304,168 @@ def resolve_owned(
         pr_for=pr_for,
         provenance_for=provenance_for,
         source_for=source_for,
+        divergences=divergences,
+    )
+
+
+@dataclass(frozen=True)
+class WorktreeOwnership:
+    """Who owns ONE worktree, resolved claim-first (BOU-2223 Stage 3).
+
+    :func:`resolve_owned` answers the stop gate's set question ("which worktrees
+    do I own"). Every other reader asks the transpose about a path it already
+    holds, so this is the shape they share.
+
+    ``session_id``/``pr_number``/``provenance`` are the merged best answer, for
+    display and for "which PR is this". Do NOT open-code an ownership test
+    against ``session_id`` — use :meth:`owned_by`, which applies the union rule.
+    """
+
+    worktree: str
+    session_id: str | None
+    pr_number: int | None
+    provenance: str | None
+    #: "claim" | "marker" | "both" | "none"
+    source: str
+    owner_pid: int | None = None
+    lease_epoch: int | None = None
+    state: str | None = None
+    #: Session ids that any live claim on this worktree is held by.
+    claim_session_ids: tuple[str, ...] = ()
+    marker_session_id: str | None = None
+    divergences: list[dict] = field(default_factory=list)
+
+    def owned_by(self, session_id: str) -> bool:
+        """Union rule: ``session_id`` owns this worktree if EITHER source says so.
+
+        Never an intersection. Both call sites that ask this — the stop gate's
+        passive worktree collection and the waiter's coverage request — decide
+        whether a session may stop or stay covered, and both fail CLOSED
+        (BOU-1953): dropping a worktree means a session walks away from work it
+        still owns. A claim the marker hasn't caught up to, or a marker whose
+        dual-write predates Stage 1, must each be enough on its own.
+        """
+        if not session_id:
+            return False
+        return session_id == self.marker_session_id or session_id in self.claim_session_ids
+
+
+def resolve_worktree(
+    worktree_path: str,
+    *,
+    kind: str,
+    snap=None,
+) -> WorktreeOwnership:
+    """Resolve one worktree's ownership, claim-first with a marker fallback.
+
+    ``kind`` names the calling reader in the divergence log
+    (``reconcile_divergence``, ``waiter_divergence``, ...) so a Stage 4 bake can
+    attribute a disagreement to the call path that saw it, rather than to one
+    undifferentiated pile.
+
+    ``snap`` MUST be passed by any caller resolving more than one worktree: the
+    snapshot is a full store read, and the Stop hook's ~108s deadline is a
+    fail-closed budget that one-read-per-worktree would blow.
+    """
+    path = os.path.abspath(worktree_path)
+    marker_pr, marker_prov = _marker_pr_and_provenance(path)
+    marker_session = _marker_session_id(path)
+
+    def _marker_only(source: str, divergences: list[dict] | None = None) -> WorktreeOwnership:
+        return WorktreeOwnership(
+            worktree=path,
+            session_id=marker_session,
+            pr_number=marker_pr,
+            provenance=marker_prov,
+            source=source,
+            marker_session_id=marker_session,
+            divergences=divergences or [],
+        )
+
+    if not claim_reads_enabled():
+        return _marker_only("marker" if marker_session or marker_pr else "none")
+
+    from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
+
+    snapshot = snap if snap is not None else ownership.snapshot()
+
+    def _log(payload: dict) -> dict:
+        record = {"kind": kind, "worktree": path, **payload}
+        ownership_parity.log_divergence(path, record)
+        return record
+
+    if not snapshot.known():
+        # "Could not look", NOT "no claims" — fall back entirely to the marker,
+        # exactly as the kill-switch-off shape, and say why once.
+        return _marker_only(
+            "marker" if marker_session or marker_pr else "none",
+            [_log({"reason": "claim_store_unreadable", "marker_pr": marker_pr})],
+        )
+
+    views = snapshot.live_claims_for_worktree(path)
+    # A claim must never resurrect a worktree that is gone. A path with a marker
+    # was established as real by whoever enumerated it; a claim-only path has no
+    # such witness, so it has to still be a directory.
+    if views and marker_session is None and marker_pr is None and not os.path.isdir(path):
+        views = []
+
+    if not views:
+        divergences = []
+        if marker_session or marker_pr is not None:
+            divergences.append(_log({
+                "reason": "marker_only_worktree",
+                "marker_pr": marker_pr,
+                "marker_provenance": marker_prov,
+                "marker_session_id": marker_session,
+            }))
+        return _marker_only("marker" if (marker_session or marker_pr is not None) else "none",
+                            divergences)
+
+    # Same tiebreak as resolve_owned: the marker is the freshest signal of which
+    # PR this worktree is for right now; failing that, the highest lease epoch is
+    # the best proxy for "most recently (re)claimed".
+    match = next((v for v in views if v.pr_number == marker_pr), None) if marker_pr is not None else None
+    view = match or max(views, key=lambda v: v.lease_epoch)
+
+    divergences = []
+    if marker_session is None and marker_pr is None:
+        divergences.append(_log({
+            "reason": "claim_only_worktree",
+            "claim_pr": view.pr_number,
+            "claim_provenance": view.provenance,
+            "claim_session_id": view.session_id,
+        }))
+    else:
+        if marker_pr is not None and view.pr_number is not None and marker_pr != view.pr_number:
+            divergences.append(_log({
+                "reason": "different_pr_number",
+                "marker_pr": marker_pr,
+                "claim_pr": view.pr_number,
+            }))
+        if marker_session and view.session_id and marker_session != view.session_id:
+            divergences.append(_log({
+                "reason": "different_session_id",
+                "marker_session_id": marker_session,
+                "claim_session_id": view.session_id,
+            }))
+        if marker_prov and view.provenance and marker_prov != view.provenance:
+            divergences.append(_log({
+                "reason": "different_provenance",
+                "marker_provenance": marker_prov,
+                "claim_provenance": view.provenance,
+            }))
+
+    has_marker = marker_session is not None or marker_pr is not None
+    return WorktreeOwnership(
+        worktree=path,
+        session_id=view.session_id or marker_session,
+        pr_number=view.pr_number if view.pr_number is not None else marker_pr,
+        provenance=_resolve_provenance(marker_prov, view.provenance),
+        source="both" if has_marker else "claim",
+        owner_pid=view.pid,
+        lease_epoch=view.lease_epoch,
+        state=view.state,
+        claim_session_ids=tuple(dict.fromkeys(v.session_id for v in views if v.session_id)),
+        marker_session_id=marker_session,
         divergences=divergences,
     )

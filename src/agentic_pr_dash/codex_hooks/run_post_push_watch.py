@@ -35,6 +35,7 @@ from agentic_pr_dash.codex_hooks.run_arm_pr_watch import (
     normalized_payload,
 )
 from agentic_pr_dash._maintenance.markers import _read_marker, _read_session_marker
+from agentic_pr_dash._maintenance.ownership_resolution import resolve_worktree
 from agentic_pr_dash._maintenance.waiter import _await_alive
 
 
@@ -240,8 +241,14 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     session_id = _read_session_marker(push_cwd)
     if not session_id:
         return None
+    # Ownership of the pushed worktree, union across both sources (BOU-2223
+    # Stage 3): a claim this session holds is enough even when the marker is
+    # missing or stale, and vice versa. The session marker read above names
+    # WHICH session pushed — session identity, not PR ownership.
     marker = _read_marker(push_cwd) or {}
-    if marker.get("session_id") != session_id:
+    if marker.get("session_id") != session_id and not resolve_worktree(
+        push_cwd, kind="post_push_divergence"
+    ).owned_by(session_id):
         return None
     pr_number = get_pr_number(branch, Path(push_cwd))
     if pr_number is None:

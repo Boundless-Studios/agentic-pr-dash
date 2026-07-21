@@ -5,6 +5,7 @@ import os
 
 from ._common import _resolve_owner_pid, _repo_slug, _current_branch
 from .pr_state import _pr_open_state, _unpack_pr_open_state, _thread_is_p1
+from agentic_pr_dash import ownership
 from .markers import (
     _claim_pr,
     _live_foreign_owner,
@@ -14,6 +15,7 @@ from .markers import (
     _session_is_live,
     _write_arm_marker,
 )
+from .ownership_resolution import resolve_worktree
 from .worktrees import (
     _iter_worktree_paths,
     _live_independent_owner_paths,
@@ -30,6 +32,8 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
     eff_pid = pid if pid is not None else _resolve_owner_pid()
     present = set(_iter_worktree_paths(cwd))
     target_repo = _repo_slug(cwd)
+    # One store read for the whole pass (BOU-2223 Stage 3).
+    snap = ownership.snapshot()
     adopted = []
     for other in session_ledger.list_session_ids():
         if other == session_id:
@@ -46,10 +50,18 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
                 # dead session's PR whose worktree still exists fell through
                 # every path and its blockers sat unserviced (BOU-2184). Skip
                 # only when a live owner (or this session) actually covers it.
+                owned = resolve_worktree(
+                    abs_wt, kind="reconcile_divergence", snap=snap
+                )
                 marker_sid = _marker_session_id(abs_wt)
-                if marker_sid == session_id:
+                # Union (BOU-2223 Stage 3): ours by EITHER source means covered.
+                if marker_sid == session_id or owned.owned_by(session_id):
                     continue
                 if _live_foreign_owner(abs_wt, session_id):
+                    continue
+                # A live foreign CLAIM covers it too — union with the marker
+                # checks, never a replacement.
+                if any(sid != session_id for sid in owned.claim_session_ids):
                     continue
                 if marker_sid and _session_is_live(marker_sid, abs_wt):
                     continue
@@ -112,6 +124,8 @@ def _detached_pr_records(session_id: str, cwd: str,
     present_worktrees = set(_iter_worktree_paths(cwd))
     independent_worktrees = _live_independent_owner_paths(present_worktrees, session_id)
     target_repo = _repo_slug(cwd)
+    # One store read for the whole pass (BOU-2223 Stage 3).
+    snap = ownership.snapshot()
     records: list[dict] = []
     prune: set[int] = set()
     for e in session_ledger.read(session_id, repo=target_repo, include_legacy=include_legacy):
@@ -119,11 +133,16 @@ def _detached_pr_records(session_id: str, cwd: str,
         if (
             abs_wt
             and abs_wt in independent_worktrees
+            # Unowned by EITHER source — a live claim alone is enough to keep
+            # this worktree out of the detached set (BOU-2223 Stage 3).
             and not _read_marker(abs_wt)
+            and not resolve_worktree(
+                abs_wt, kind="detached_divergence", snap=snap
+            ).claim_session_ids
             and _current_branch(abs_wt) == e.branch
         ):
             continue
-        if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e):
+        if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e, snap=snap):
             continue
         state, url, has_fail, failing, review_decision, merge_state, mergeable = (
             _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
@@ -195,12 +214,21 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
     collect_kwargs = (
         {} if adopt_unmarked else {"adopt_unmarked": False, "adopt_dead_markered": True}
     )
+    owned_snap = ownership.snapshot()
     for wt in _collect_owned_worktrees(session_id, cwd, pid, **collect_kwargs):
+        # Claim-first, marker fallback (BOU-2223 Stage 3). The marker read stays
+        # module-level: it is the freshest signal of which PR this worktree is
+        # for right now, and it is the seam the existing tests inject through.
         marker = _read_marker(wt) or {}
         pr_raw = marker.get("pr")
-        if not pr_raw or not str(pr_raw).isdigit():
+        if pr_raw and str(pr_raw).isdigit():
+            pr = int(pr_raw)
+        else:
+            pr = resolve_worktree(
+                wt, kind="owned_records_divergence", snap=owned_snap
+            ).pr_number
+        if pr is None:
             continue
-        pr = int(pr_raw)
         if pr in records:
             records[pr]["worktree_present"] = True
             continue
