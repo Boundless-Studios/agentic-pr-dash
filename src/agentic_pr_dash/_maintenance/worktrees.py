@@ -453,6 +453,8 @@ def _reconcile_owned_across_roots(
     remaining roots are skipped so a slow ``gh``/worktree probe can't blow the
     Stop-hook deadline. The anchor root is serviced first.
     """
+    from agentic_pr_dash import ownership  # noqa: PLC0415
+
     owned: list[str] = []
     newly_adopted: list[str] = []
     seen: set[str] = set()
@@ -461,7 +463,18 @@ def _reconcile_owned_across_roots(
         if deadline is not None and time.monotonic() > deadline:
             break
         before = set(_collect_stop_gate_worktrees(session_id, root))
-        before_prs = {wt: _marker_pr(wt) for wt in before}
+        # TWO store reads per root, not two per worktree (BOU-2223 Stage 3).
+        # `_marker_pr` is now claim-aware, so leaving these unbatched meant a
+        # full claims.jsonl replay for every worktree in `before` and again for
+        # every worktree in `root_owned` — an unbounded log (BOU-2239) re-read
+        # O(worktrees) times on the Stop hook's fail-closed budget (BOU-1953).
+        #
+        # The snapshots must stay DISTINCT: `before_prs` is captured before
+        # `_collect_owned_worktrees` runs, which may rewrite ownership, and the
+        # comparison below is what detects that rewrite. Reusing one snapshot
+        # would compare it against itself and never see a claim-side change.
+        snap_before = ownership.snapshot()
+        before_prs = {wt: _marker_pr(wt, snap=snap_before) for wt in before}
         if os.path.abspath(root) == anchor:
             root_owned = _collect_owned_worktrees(session_id, root, pid, deadline)
         else:
@@ -473,11 +486,15 @@ def _reconcile_owned_across_roots(
                 adopt_unmarked=False,
                 adopt_dead_markered=True,
             )
+        snap_after = ownership.snapshot()
         for wt in root_owned:
             if wt not in seen:
                 seen.add(wt)
                 owned.append(wt)
-            adopted = wt not in before or before_prs.get(wt) != _marker_pr(wt)
+            adopted = (
+                wt not in before
+                or before_prs.get(wt) != _marker_pr(wt, snap=snap_after)
+            )
             if adopted and wt not in newly_adopted:
                 newly_adopted.append(wt)
     return owned, newly_adopted

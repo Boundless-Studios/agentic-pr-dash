@@ -293,6 +293,41 @@ def test_ownership_card_prefers_the_claim_owner(isolated_store):
     assert result["owner_pid_alive"] is True
 
 
+def test_adoptions_scan_does_not_read_the_store_once_per_worktree(isolated_store, monkeypatch):
+    """The store read must be batched per root, never per worktree.
+
+    ``_marker_pr`` became claim-aware in Stage 3, and it is called once per
+    worktree in ``before`` and again per worktree in ``root_owned``. Left
+    unbatched that is a full ``claims.jsonl`` replay — an append-only log with
+    no compaction (BOU-2239) — for every worktree, on the Stop hook's ~108s
+    fail-closed budget (BOU-1953).
+    """
+    from agentic_pr_dash._maintenance import worktrees
+
+    wts = [_mk(isolated_store, f"wt{i}") for i in range(5)]
+    for i, wt in enumerate(wts):
+        assert _write_arm_marker(wt, SID, LIVE_PID, 2000 + i)
+
+    calls = {"n": 0}
+    real_snapshot = ownership.snapshot
+
+    def _counting_snapshot(*a, **kw):
+        calls["n"] += 1
+        return real_snapshot(*a, **kw)
+
+    monkeypatch.setattr(ownership, "snapshot", _counting_snapshot)
+    monkeypatch.setattr(worktrees, "_maint_roots_for", lambda cwd: [str(isolated_store)])
+    monkeypatch.setattr(worktrees, "_collect_stop_gate_worktrees", lambda sid, root: list(wts))
+    monkeypatch.setattr(worktrees, "_collect_owned_worktrees",
+                        lambda sid, root, pid, deadline=None, **kw: list(wts))
+
+    worktrees._reconcile_owned_across_roots(SID, str(isolated_store), LIVE_PID)
+
+    # Two per root (a before and an after snapshot, which must stay distinct so
+    # a mid-call ownership rewrite is still detected) — NOT two per worktree.
+    assert calls["n"] <= 2, f"{calls['n']} store reads for {len(wts)} worktrees"
+
+
 def test_ownership_card_never_raises_on_an_unreadable_store(isolated_store, monkeypatch):
     from agentic_pr_dash.app import _ownership_for_card
 
