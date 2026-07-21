@@ -23,6 +23,16 @@ def _isolation(monkeypatch):
     config.load.cache_clear()
 
 
+def _bind_pr(monkeypatch, pr: int = 42) -> None:
+    """Make every owned worktree resolve to open PR ``pr``.
+
+    A clean verdict is reachable only when the waiter actually watched a PR
+    (BOU-2294), so any test that expects one has to bind one.
+    """
+    monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
+    monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+
+
 def test_await_stays_alive_past_max_wait_while_watch_pending(tmp_path, monkeypatch, capsys):
     """When max-wait expires but a non-draft PR is still watch-pending, the waiter
     must NOT return 0 — it must stay alive and poll again.
@@ -93,6 +103,7 @@ def test_await_returns_0_when_max_wait_expires_and_no_watch_pending(tmp_path, mo
     # No watch-pending PRs
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr("time.sleep", lambda s: None)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",
@@ -140,6 +151,7 @@ def test_await_pending_ci_transition_to_clean_exits_0(tmp_path, monkeypatch, cap
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
     monkeypatch.setattr("time.sleep", lambda s: None)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",
@@ -180,6 +192,7 @@ def test_await_gh_unobservable_tick_suppresses_clean_exit(tmp_path, monkeypatch,
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr("time.sleep", lambda s: None)
+    _bind_pr(monkeypatch)
 
     rc = mc.main([
         "await",

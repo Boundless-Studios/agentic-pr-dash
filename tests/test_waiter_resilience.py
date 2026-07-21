@@ -36,6 +36,16 @@ def _force_rate_limit_seen(monkeypatch, value):
     monkeypatch.setattr(github_api, "rate_limit_seen", fn)
 
 
+def _bind_pr(monkeypatch, pr: int = 42) -> None:
+    """Make every owned worktree resolve to open PR ``pr`` (BOU-2294).
+
+    Only a BOUND waiter can reach a clean/idle verdict; one that watched nothing
+    reports ``unbound`` instead.
+    """
+    monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
+    monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+
+
 SID = "sess-waiter-resilience"
 
 
@@ -138,7 +148,15 @@ def test_await_emits_idle_outcome_on_exit_0(tmp_path, monkeypatch, capsys):
     another waiter actually covering the session) (#62)."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     _force_rate_limit_seen(monkeypatch, False)
-    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    # A waiter that watched a real PR and found it clean — `idle` is the verdict
+    # of a BOUND waiter; an unbound one reports `unbound` instead (BOU-2294).
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(tmp_path)])
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    _bind_pr(monkeypatch)
     monkeypatch.setattr(
         _reconcile_mod, "_detached_pr_records",
         lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
@@ -283,8 +301,13 @@ def test_await_observable_tick_exits_idle_no_stale_ratelimit(tmp_path, monkeypat
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(mc.time, "sleep", lambda *_: None)
     _force_rate_limit_seen(monkeypatch, False)  # this tick observed GitHub fine
-    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [])
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees",
+                        lambda sid, cwd: [str(tmp_path)])
+    monkeypatch.setattr(mc, "_check_worktree",
+                        lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    _bind_pr(monkeypatch)
     monkeypatch.setattr(
         _reconcile_mod, "_detached_pr_records",
         lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
