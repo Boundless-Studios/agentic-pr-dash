@@ -12,16 +12,20 @@ open non-draft PR and no live waiter exists, it exits 2 with a spawn prompt.
 from __future__ import annotations
 
 import os
+import types
 from pathlib import Path
 
 import pytest
 
 from agentic_pr_dash import config, maintenance_check as mc
-from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import (
+    ownership_resolution as _ownership_resolution_mod,
+)
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 
 SID = "sess-waiter-test"
@@ -89,6 +93,144 @@ def test_stop_gate_clean_exit_when_waiter_alive(tmp_path, monkeypatch, capsys):
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     assert rc == 0
+
+
+def test_stop_gate_does_not_demand_waiter_for_claim_owned_draft(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """Claim-derived ownership must retain `_check_worktree`'s draft verdict."""
+    wt = tmp_path / "worktree"
+    wt.mkdir()
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt)],
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_owned",
+        lambda session_id, cwd, marker_owned, *, snap=None: types.SimpleNamespace(
+            worktrees=[str(wt)],
+            pr_for={str(wt): 2704},
+            provenance_for={str(wt): "armed"},
+        ),
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_worktree",
+        lambda worktree, *, kind, snap=None: types.SimpleNamespace(pr_number=None),
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (0, "PR is a draft; nothing pending"),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: set())
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "await" not in err.lower()
+    assert "waiter" not in err.lower()
+
+
+def test_stop_gate_does_not_demand_waiter_for_marker_owned_draft(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """Marker-derived ownership must retain `_check_worktree`'s draft verdict."""
+    wt = _make_armed_worktree(tmp_path, SID, 2704)
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt)],
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (0, "PR is a draft; nothing pending"),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {2704})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "await" not in err.lower()
+    assert "waiter" not in err.lower()
+
+
+def test_stop_gate_keeps_same_number_non_draft_in_another_repo(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """A draft PR number must not hide a non-draft PR in another repository."""
+    draft_wt = tmp_path / "draft-worktree"
+    ready_wt = tmp_path / "ready-worktree"
+    draft_wt.mkdir()
+    ready_wt.mkdir()
+    worktrees = [str(draft_wt), str(ready_wt)]
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: worktrees,
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_owned",
+        lambda session_id, cwd, marker_owned, *, snap=None: types.SimpleNamespace(
+            worktrees=worktrees,
+            pr_for={str(draft_wt): 2704, str(ready_wt): 2704},
+            provenance_for={wt: "armed" for wt in worktrees},
+        ),
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_worktree",
+        lambda worktree, *, kind, snap=None: types.SimpleNamespace(pr_number=None),
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (
+            (0, "PR is a draft; nothing pending")
+            if path == str(draft_wt)
+            else (0, "nothing pending")
+        ),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {2704})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "2704" in err
 
 
 def test_stop_gate_no_waiter_flag_suppresses(tmp_path, monkeypatch, capsys):
