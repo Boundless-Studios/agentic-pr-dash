@@ -25,8 +25,8 @@ Concurrency & housekeeping:
   * The read-merge-write is serialized with an exclusive ``fcntl.flock`` on a
     sibling ``.agent-activity.lock`` and re-reads the snapshot *inside* the lock,
     so two sessions firing at once can't drop each other's record. Lock
-    acquisition is bounded-nonblocking with a best-effort unlocked fallback, so
-    the hook never hangs the agent.
+    acquisition is bounded; if it fails, the advisory event is skipped rather
+    than risking an unlocked read-modify-write that clobbers sibling sessions.
   * Orphan records — dead owner pid, or untouched past a TTL — are pruned on
     every write. The firing session's own record is never pruned.
 
@@ -55,7 +55,7 @@ from agentic_pr_dash.config import DEFAULT_STATE_DIRNAME, LEGACY_STATE_DIRNAME
 
 _TRACKED_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")
 _IDLE_TTL_SECONDS = 24 * 3600  # prune records untouched longer than this, regardless of pid
-_LOCK_ATTEMPTS = 50            # x _LOCK_SLEEP ~ 0.5s max wait before the unlocked fallback
+_LOCK_ATTEMPTS = 500           # x _LOCK_SLEEP ~ 5s max wait before skipping the event
 _LOCK_SLEEP = 0.01
 
 
@@ -167,8 +167,7 @@ def _write_atomic(activity_dir: str, path: str, sessions: dict) -> None:
 
 def _acquire(lock_fd: int) -> bool:
     """Bounded non-blocking exclusive lock. Returns True if acquired; False after
-    ~0.5s so the caller can fall back to a best-effort unlocked write rather than
-    hang the agent on a wedged holder."""
+    ~5s so a wedged holder cannot hang the agent indefinitely."""
     for _ in range(_LOCK_ATTEMPTS):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -242,18 +241,23 @@ def main() -> int:
     except OSError:
         lock_fd = None
 
-    acquired = _acquire(lock_fd) if lock_fd is not None else False
+    if lock_fd is None:
+        return 0
+
+    acquired = _acquire(lock_fd)
+    if not acquired:
+        os.close(lock_fd)
+        return 0
+
     try:
         _merge_and_write(activity_dir, path, session_id, record, now_dt)
     except OSError:
         pass
     finally:
-        if lock_fd is not None:
-            try:
-                if acquired:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
     return 0
 
 
