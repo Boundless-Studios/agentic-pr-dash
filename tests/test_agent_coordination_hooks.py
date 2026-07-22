@@ -7,14 +7,18 @@
   * agentflow               — shared hub client
 """
 
+import fcntl
 import io
 import json
 import os
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agentic_pr_dash import app
 from agentic_pr_dash.codex_hooks import (
     agentflow,
     run_agent_activity,
@@ -96,6 +100,162 @@ def test_activity_two_sessions_coexist(tmp_path, monkeypatch):
     sessions = json.loads(_activity_file(tmp_path).read_text())["sessions"]
     assert sessions["A"]["state"] == "idle"
     assert sessions["B"]["state"] == "busy"
+
+
+def test_activity_waits_for_contended_lock_instead_of_overwriting_newer_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    """A writer queued past the old 0.5s limit must never write unlocked."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    activity_file = _activity_file(tmp_path)
+    activity_file.parent.mkdir()
+    activity_file.write_text(json.dumps({"sessions": {}}))
+    lock_path = activity_file.parent / ".agent-activity.lock"
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+    stale_sessions = {}
+
+    def finish_first_writer():
+        time.sleep(0.65)
+        run_agent_activity._write_atomic(
+            str(activity_file.parent),
+            str(activity_file),
+            {
+                **stale_sessions,
+                "first": {
+                    "state": "busy",
+                    "busy_since": "2026-07-21T00:00:00Z",
+                    "updated": "2026-07-21T00:00:00Z",
+                    "pid": os.getpid(),
+                },
+            },
+        )
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+
+    holder = threading.Thread(target=finish_first_writer)
+    holder.start()
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "second",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["UserPromptSubmit"],
+    )
+    holder.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert set(json.loads(activity_file.read_text())["sessions"]) == {
+        "first",
+        "second",
+    }
+
+
+@pytest.mark.parametrize("failure_mode", ["open", "acquire"])
+def test_activity_lock_failure_preserves_existing_snapshot(
+    tmp_path,
+    monkeypatch,
+    failure_mode,
+):
+    """An advisory hook may skip its event, but must not mutate without a lock."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    activity_file = _activity_file(tmp_path)
+    activity_file.parent.mkdir()
+    original = {
+        "sessions": {
+            "existing": {
+                "state": "busy",
+                "busy_since": "2026-07-21T00:00:00Z",
+                "updated": "2026-07-21T00:00:00Z",
+                "pid": os.getpid(),
+            }
+        }
+    }
+    activity_file.write_text(json.dumps(original))
+
+    if failure_mode == "open":
+        real_open = run_agent_activity.os.open
+
+        def fail_lock_open(path, flags, mode=0o777):
+            if os.fspath(path).endswith(".agent-activity.lock"):
+                raise OSError("synthetic lock-open failure")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(run_agent_activity.os, "open", fail_lock_open)
+    else:
+        monkeypatch.setattr(run_agent_activity, "_acquire", lambda _fd: False)
+
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "new",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["UserPromptSubmit"],
+    )
+
+    assert json.loads(activity_file.read_text()) == original
+
+
+def test_activity_stop_timeout_still_makes_dashboard_idle(tmp_path, monkeypatch):
+    """A contended Stop must not leave a live session visibly busy forever."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    activity_file = _activity_file(tmp_path)
+    activity_file.parent.mkdir()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    activity_file.write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    "s1": {
+                        "state": "busy",
+                        "busy_since": old,
+                        "updated": old,
+                        "pid": os.getpid(),
+                    }
+                }
+            }
+        )
+    )
+    real_acquire = run_agent_activity._acquire
+    monkeypatch.setattr(run_agent_activity, "_acquire", lambda _fd: False)
+
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["Stop"],
+    )
+
+    assert app._legacy_agent_activity_state(str(tmp_path)) == "idle"
+
+    monkeypatch.setattr(run_agent_activity, "_acquire", real_acquire)
+    monkeypatch.setattr(app, "_ACTIVITY_DEBOUNCE_SECONDS", 0)
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["UserPromptSubmit"],
+    )
+
+    assert app._legacy_agent_activity_state(str(tmp_path)) == "working"
 
 
 def test_activity_prunes_dead_pid_sibling(tmp_path, monkeypatch):

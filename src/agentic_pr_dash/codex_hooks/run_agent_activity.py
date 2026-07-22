@@ -25,8 +25,10 @@ Concurrency & housekeeping:
   * The read-merge-write is serialized with an exclusive ``fcntl.flock`` on a
     sibling ``.agent-activity.lock`` and re-reads the snapshot *inside* the lock,
     so two sessions firing at once can't drop each other's record. Lock
-    acquisition is bounded-nonblocking with a best-effort unlocked fallback, so
-    the hook never hangs the agent.
+    acquisition is bounded; if a Stop cannot acquire it, a per-session atomic
+    marker preserves the idle transition without risking an unlocked
+    read-modify-write that clobbers sibling sessions. Other advisory events are
+    skipped on lock failure.
   * Orphan records — dead owner pid, or untouched past a TTL — are pruned on
     every write. The firing session's own record is never pruned.
 
@@ -44,6 +46,7 @@ that shape (and supplies the durable owner pid) before delegating here.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -55,8 +58,9 @@ from agentic_pr_dash.config import DEFAULT_STATE_DIRNAME, LEGACY_STATE_DIRNAME
 
 _TRACKED_EVENTS = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop")
 _IDLE_TTL_SECONDS = 24 * 3600  # prune records untouched longer than this, regardless of pid
-_LOCK_ATTEMPTS = 50            # x _LOCK_SLEEP ~ 0.5s max wait before the unlocked fallback
+_LOCK_ATTEMPTS = 500           # x _LOCK_SLEEP ~ 5s max wait before skipping the event
 _LOCK_SLEEP = 0.01
+_DEFERRED_STOP_DIR = ".agent-activity-deferred-stops"
 
 
 def _activity_subdir(root: str) -> str:
@@ -127,18 +131,33 @@ def _is_orphan(rec, now: datetime) -> bool:
     return updated is None or (now - updated).total_seconds() > _IDLE_TTL_SECONDS
 
 
-def _build_record(event: str, prev: dict, now: str, owner_pid: int) -> dict:
+def _build_record(
+    event: str, prev: dict, now: str, owner_pid: int, sequence: int
+) -> dict:
     if event == "UserPromptSubmit":
-        return {"state": "busy", "busy_since": now, "updated": now, "pid": owner_pid}
+        return {
+            "state": "busy",
+            "busy_since": now,
+            "updated": now,
+            "pid": owner_pid,
+            "sequence": sequence,
+        }
     if event in ("PreToolUse", "PostToolUse"):
         return {
             "state": "busy",
             "busy_since": prev.get("busy_since") or now,  # preserve turn start
             "updated": now,
             "pid": owner_pid,
+            "sequence": sequence,
         }
     # Stop
-    return {"state": "idle", "busy_since": "", "updated": now, "pid": owner_pid}
+    return {
+        "state": "idle",
+        "busy_since": "",
+        "updated": now,
+        "pid": owner_pid,
+        "sequence": sequence,
+    }
 
 
 def _read_sessions(path: str) -> dict:
@@ -165,10 +184,44 @@ def _write_atomic(activity_dir: str, path: str, sessions: dict) -> None:
         raise
 
 
+def _deferred_stop_path(activity_dir: str, session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()
+    return os.path.join(activity_dir, _DEFERRED_STOP_DIR, f"{digest}.json")
+
+
+def _write_deferred_stop(activity_dir: str, session_id: str, record: dict) -> None:
+    """Persist a Stop that could not take the shared snapshot lock.
+
+    Each session owns a distinct atomic file, so this fallback cannot clobber a
+    sibling writer. Dashboard readers overlay the marker until a later event
+    for this session successfully updates the main snapshot.
+    """
+    deferred_dir = os.path.join(activity_dir, _DEFERRED_STOP_DIR)
+    os.makedirs(deferred_dir, exist_ok=True)
+    path = _deferred_stop_path(activity_dir, session_id)
+    fd, tmp = tempfile.mkstemp(dir=deferred_dir, prefix=".stop.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump({"session_id": session_id, "record": record}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _clear_deferred_stop(activity_dir: str, session_id: str) -> None:
+    try:
+        os.unlink(_deferred_stop_path(activity_dir, session_id))
+    except FileNotFoundError:
+        pass
+
+
 def _acquire(lock_fd: int) -> bool:
     """Bounded non-blocking exclusive lock. Returns True if acquired; False after
-    ~0.5s so the caller can fall back to a best-effort unlocked write rather than
-    hang the agent on a wedged holder."""
+    ~5s so a wedged holder cannot hang the agent indefinitely."""
     for _ in range(_LOCK_ATTEMPTS):
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -234,7 +287,7 @@ def main() -> int:
         return 0
 
     prev = _read_sessions(path).get(session_id) or {}
-    record = _build_record(event, prev, now_str, owner_pid)
+    record = _build_record(event, prev, now_str, owner_pid, time.time_ns())
 
     lock_fd = None
     try:
@@ -242,18 +295,34 @@ def main() -> int:
     except OSError:
         lock_fd = None
 
-    acquired = _acquire(lock_fd) if lock_fd is not None else False
+    if lock_fd is None:
+        if event == "Stop":
+            try:
+                _write_deferred_stop(activity_dir, session_id, record)
+            except OSError:
+                pass
+        return 0
+
+    acquired = _acquire(lock_fd)
+    if not acquired:
+        os.close(lock_fd)
+        if event == "Stop":
+            try:
+                _write_deferred_stop(activity_dir, session_id, record)
+            except OSError:
+                pass
+        return 0
+
     try:
         _merge_and_write(activity_dir, path, session_id, record, now_dt)
+        _clear_deferred_stop(activity_dir, session_id)
     except OSError:
         pass
     finally:
-        if lock_fd is not None:
-            try:
-                if acquired:
-                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            finally:
-                os.close(lock_fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
     return 0
 
 

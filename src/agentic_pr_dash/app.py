@@ -202,6 +202,7 @@ _HARNESS_TRANSITION_STATES = {
     "launching",
     "awaiting_ack",
 }
+_DEFERRED_STOP_DIR = ".agent-activity-deferred-stops"
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -244,9 +245,35 @@ def _legacy_agent_activity_state(worktree_path: str | None) -> str:
     sessions = data.get("sessions")
     if not isinstance(sessions, dict) or not sessions:
         return "none"
+    deferred_sequences: dict[str, int] = {}
+    deferred_dir = state_dir / _DEFERRED_STOP_DIR
+    try:
+        deferred_paths = list(deferred_dir.glob("*.json"))
+    except OSError:
+        deferred_paths = []
+    for deferred_path in deferred_paths:
+        try:
+            deferred = json.loads(deferred_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        session_id = deferred.get("session_id")
+        record = deferred.get("record")
+        if not isinstance(session_id, str) or not isinstance(record, dict):
+            continue
+        sequence = record.get("sequence")
+        if record.get("state") == "idle" and isinstance(sequence, int):
+            deferred_sequences[session_id] = max(
+                sequence, deferred_sequences.get(session_id, 0)
+            )
     now = datetime.now(timezone.utc)
-    for rec in sessions.values():
+    for session_id, rec in sessions.items():
         if not isinstance(rec, dict) or rec.get("state") != "busy":
+            continue
+        sequence = rec.get("sequence")
+        deferred_sequence = deferred_sequences.get(session_id)
+        if deferred_sequence is not None and (
+            not isinstance(sequence, int) or deferred_sequence >= sequence
+        ):
             continue
         busy_since = _parse_iso(rec.get("busy_since"))
         if busy_since is None:
