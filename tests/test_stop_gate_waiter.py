@@ -144,6 +144,95 @@ def test_stop_gate_does_not_demand_waiter_for_claim_owned_draft(
     assert "waiter" not in err.lower()
 
 
+def test_stop_gate_does_not_demand_waiter_for_marker_owned_draft(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """Marker-derived ownership must retain `_check_worktree`'s draft verdict."""
+    wt = _make_armed_worktree(tmp_path, SID, 2704)
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt)],
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (0, "PR is a draft; nothing pending"),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {2704})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+
+    assert rc == 0
+    assert "await" not in err.lower()
+    assert "waiter" not in err.lower()
+
+
+def test_stop_gate_keeps_same_number_non_draft_in_another_repo(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """A draft PR number must not hide a non-draft PR in another repository."""
+    draft_wt = tmp_path / "draft-worktree"
+    ready_wt = tmp_path / "ready-worktree"
+    draft_wt.mkdir()
+    ready_wt.mkdir()
+    worktrees = [str(draft_wt), str(ready_wt)]
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: worktrees,
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_owned",
+        lambda session_id, cwd, marker_owned, *, snap=None: types.SimpleNamespace(
+            worktrees=worktrees,
+            pr_for={str(draft_wt): 2704, str(ready_wt): 2704},
+            provenance_for={wt: "armed" for wt in worktrees},
+        ),
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_worktree",
+        lambda worktree, *, kind, snap=None: types.SimpleNamespace(pr_number=None),
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (
+            (0, "PR is a draft; nothing pending")
+            if path == str(draft_wt)
+            else (0, "nothing pending")
+        ),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {2704})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "2704" in err
+
+
 def test_stop_gate_no_waiter_flag_suppresses(tmp_path, monkeypatch, capsys):
     """--no-waiter suppresses the waiter-enforcement branch → exit 0."""
     wt = _make_armed_worktree(tmp_path, SID, 42)
