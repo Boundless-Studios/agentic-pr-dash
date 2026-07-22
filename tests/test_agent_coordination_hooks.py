@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agentic_pr_dash import app
 from agentic_pr_dash.codex_hooks import (
     agentflow,
     run_agent_activity,
@@ -201,6 +202,60 @@ def test_activity_lock_failure_preserves_existing_snapshot(
     )
 
     assert json.loads(activity_file.read_text()) == original
+
+
+def test_activity_stop_timeout_still_makes_dashboard_idle(tmp_path, monkeypatch):
+    """A contended Stop must not leave a live session visibly busy forever."""
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    activity_file = _activity_file(tmp_path)
+    activity_file.parent.mkdir()
+    old = (datetime.now(timezone.utc) - timedelta(minutes=1)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    activity_file.write_text(
+        json.dumps(
+            {
+                "sessions": {
+                    "s1": {
+                        "state": "busy",
+                        "busy_since": old,
+                        "updated": old,
+                        "pid": os.getpid(),
+                    }
+                }
+            }
+        )
+    )
+    real_acquire = run_agent_activity._acquire
+    monkeypatch.setattr(run_agent_activity, "_acquire", lambda _fd: False)
+
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "Stop",
+            "session_id": "s1",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["Stop"],
+    )
+
+    assert app._legacy_agent_activity_state(str(tmp_path)) == "idle"
+
+    monkeypatch.setattr(run_agent_activity, "_acquire", real_acquire)
+    monkeypatch.setattr(app, "_ACTIVITY_DEBOUNCE_SECONDS", 0)
+    _run(
+        run_agent_activity,
+        {
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "s1",
+            "cwd": str(tmp_path),
+            "owner_pid": os.getpid(),
+        },
+        argv=["UserPromptSubmit"],
+    )
+
+    assert app._legacy_agent_activity_state(str(tmp_path)) == "working"
 
 
 def test_activity_prunes_dead_pid_sibling(tmp_path, monkeypatch):
