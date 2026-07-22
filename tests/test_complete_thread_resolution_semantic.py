@@ -208,6 +208,16 @@ def test_thread_points_elsewhere_helper():
         "do this, e.g. add a guard", ANCHOR, touched) is False
 
 
+def test_thread_points_elsewhere_ignores_badge_url_and_callable_mentions():
+    body = (
+        "<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange?style=flat)"
+        "</sub></sub>\n\n"
+        "Make sure `scheduler.stop()` runs before returning."
+    )
+
+    assert mc._thread_elsewhere_refs(body, ANCHOR, {ANCHOR}) == []
+
+
 # --- BOU-2095 supersedes BOU-1748: "outdated" never widens resolution ----------
 
 DECK_CONF = "worktree-deck.conf"
