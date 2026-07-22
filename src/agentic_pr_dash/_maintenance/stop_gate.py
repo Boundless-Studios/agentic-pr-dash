@@ -283,8 +283,9 @@ def _stop_gate_impl(args) -> int:
     # return below (codex PR #75 review, round 2).
     check_unobservable = False
     check_warn_only = False
-    from .worktree_check import WARN_ONLY_MARKER  # noqa: PLC0415
+    from .worktree_check import DRAFT_PR_MARKER, WARN_ONLY_MARKER  # noqa: PLC0415
     adopted_pending: list[tuple[str, str]] = []
+    draft_worktrees: set[str] = set()
     for worktree in owned:
         code, text = _check_worktree(worktree, session_id, claim=False)
         if code == 10:
@@ -302,6 +303,8 @@ def _stop_gate_impl(args) -> int:
             check_unobservable = True
         elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
             check_warn_only = True
+        elif code == 0 and text == DRAFT_PR_MARKER:
+            draft_worktrees.add(worktree)
         elif code == 0 and session_id:
             # Claim-first (BOU-2223 Stage 4). This used to key off a raw marker
             # read, which silently stopped firing once marker writes were retired:
@@ -336,6 +339,8 @@ def _stop_gate_impl(args) -> int:
     # resolvable worktree (e.g. mocked/detached).
     pr_to_wts: dict[int, list[str]] = {}
     for wt, pr in _effective_pr_pairs(owned, pr_for):
+        if wt in draft_worktrees:
+            continue
         pr_to_wts.setdefault(pr, []).append(wt)
 
     def _wts_for(pr: int) -> list[str]:
@@ -382,7 +387,10 @@ def _stop_gate_impl(args) -> int:
             # alone, and a session owning a live open PR would never be told to
             # start a waiter — arriving review comments and red CI would stop
             # waking it. That is a fail-OPEN regression on a fail-closed path.
-            owned_pr_numbers = _owned_open_pr_numbers(owned) | set(pr_for.values())
+            claim_open_pr_numbers = {
+                pr for wt, pr in pr_for.items() if wt not in draft_worktrees
+            }
+            owned_pr_numbers = _owned_open_pr_numbers(owned) | claim_open_pr_numbers
             worktree_prs = {
                 n for n in owned_pr_numbers
                 if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))

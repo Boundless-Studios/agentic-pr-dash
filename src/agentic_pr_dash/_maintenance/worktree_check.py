@@ -24,6 +24,7 @@ from . import _common, completion, markers, pr_state, waiter, worktrees
 # matches on it to LOG these exit-0 notices instead of dropping them, so a
 # blocked owned PR is visible in loop output too (BOU-1788, codex PR #48 review).
 WARN_ONLY_MARKER = "NOT clean (no fix dispatched)"
+DRAFT_PR_MARKER = "PR is a draft; nothing pending"
 
 
 # ── BOU-1879: never defer to a WAKE-LESS owner beyond one grace tick ────────────
@@ -423,7 +424,7 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
 
     # Never service a DRAFT — the author marked it not-ready.
     if pr.is_draft:
-        return 0, "PR is a draft; nothing pending"
+        return 0, DRAFT_PR_MARKER
 
     # ── BOU-1924: ledger/registry ownership gate ───────────────────────────────
     # The marker gate above only sees THIS worktree's marker. A PR owned by a
