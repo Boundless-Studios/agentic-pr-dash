@@ -12,7 +12,7 @@ _FILE_REF_RE = re.compile(
         (?P<path>[\w./-]+\.(?:py|pyi|ts|tsx|js|jsx|gd|go|rs|java|kt|rb|c|h|cpp|hpp|sql|sh))
       |
         # Dotted module path with >=2 segments, e.g. gaia.api.worker_app.
-        (?P<module>[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*){1,})
+        (?P<module>[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*){1,})(?![\w(])
     )
     """,
     re.VERBOSE,
@@ -170,7 +170,8 @@ def _review_comments_from_threads(threads) -> list:
 def _candidate_file_refs(body: str) -> list[str]:
     """Extract file/module references from a review-thread body."""
     refs: list[str] = []
-    for m in _FILE_REF_RE.finditer(body or ""):
+    body_without_urls = re.sub(r"(?:https?:)?//[^\s)>]+", "", body or "")
+    for m in _FILE_REF_RE.finditer(body_without_urls):
         path = m.group("path")
         if path:
             refs.append(path)
