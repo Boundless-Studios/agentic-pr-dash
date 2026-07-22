@@ -20,7 +20,7 @@ dependencies = [
     # makes CI non-reproducible and can silently adopt a breaking change. Bump
     # this sha deliberately, together with the call sites.
     #
-    # ``810d3f3`` is agent-coordinator 0.3.1 (BOU-2239). 0.2.0 made ``lease_epoch``
+    # ``9904b24`` is agent-coordinator 0.3.2 (BOU-2239). 0.2.0 made ``lease_epoch``
     # a REQUIRED kwarg on ``TaskCoordinator.heartbeat_claim`` / ``release_claim``
     # (fenced claims), which ``coordinator.py`` threads and ``loop.py`` treats as a
     # per-PR handoff via ``StaleClaimError``. 0.3.0 makes that fence actually bite:
@@ -32,9 +32,9 @@ dependencies = [
     # claimed event gains ``superseded_claim_ids``; no signature we call changed.
     #
     # Gaia pins this same package (BOU-2228). uv cannot resolve two different git
-    # revs for one package, so gaia's harness pin cannot move past the v0.3.1-based
+    # revs for one package, so gaia's harness pin cannot move past the v0.3.2-based
     # harness until this bump lands and APD_REF follows it.
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@810d3f3ca7e2d1d7bada36520d417d63bff8a9fe",
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@9904b242e54cb2c73ce2f78091a923c82b9ec284",
 ]
 
 [project.optional-dependencies]
