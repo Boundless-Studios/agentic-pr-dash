@@ -79,8 +79,12 @@ def _stub_gauntlet(
     monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda n, cwd: [])
     monkeypatch.setattr(
         _worktrees_mod,
-        "_live_independent_owner_paths",
-        lambda paths, sid: set(paths) if independent else set(),
+        "_live_independent_owner_sessions",
+        lambda paths, sid: (
+            {os.path.abspath(path): (FOREIGN_SID,) for path in paths}
+            if independent
+            else {}
+        ),
     )
     monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda cwd: None)

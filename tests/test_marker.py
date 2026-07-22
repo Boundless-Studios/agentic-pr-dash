@@ -130,9 +130,13 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     monkeypatch.setattr(session_registry, "pid_is_live", lambda pid: True)
     monkeypatch.setattr(session_registry, "summarize_sessions", lambda path=None: _summary(_state(999, str(owned))))
 
-    result = mc._live_independent_owner_paths([str(owned), str(free)], "sess-self")
-    assert str(owned) in result
-    assert str(free) not in result
+    owners = _worktrees_mod._live_independent_owner_sessions(
+        [str(owned), str(free)], "sess-self"
+    )
+    assert owners == {str(owned): ("gaia-other",)}
+    assert mc._live_independent_owner_paths(
+        [str(owned), str(free)], "sess-self"
+    ) == {str(owned)}
 
 
 def test_live_independent_owner_paths_real_registry_path_smoke(tmp_path, monkeypatch):
@@ -366,8 +370,10 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
     _no_registry(monkeypatch)
     monkeypatch.setattr(agents, "discover_primary_feature_pipeline_agents", fake_discover)
 
-    result = mc._live_independent_owner_paths([str(owned)], "sess-self")
-    assert str(owned) in result
+    result = _worktrees_mod._live_independent_owner_sessions(
+        [str(owned)], "sess-self"
+    )
+    assert result == {str(owned): ("pid:999",)}
     assert captured["min_cpu"] == 0.0  # liveness, not activity
 
 
@@ -568,7 +574,13 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
 
     # Foreign owner present → defer, and DO NOT refresh the heartbeat/lease (else a
     # stolen marker would pin the PR; PR #7 review, P2).
-    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: {os.path.abspath(str(tmp_path))})
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_live_independent_owner_sessions",
+        lambda paths, sid: {
+            os.path.abspath(str(tmp_path)): ("sess-independent",)
+        },
+    )
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
     assert code == 0
     assert "independent owner" in text

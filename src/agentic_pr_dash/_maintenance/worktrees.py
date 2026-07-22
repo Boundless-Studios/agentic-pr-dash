@@ -149,18 +149,25 @@ def _self_pid_chain(max_depth: int = 16) -> set[int]:
     return pids
 
 
-def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
-    """Subset of ``paths`` where a LIVE INDEPENDENT session is present."""
+def _live_independent_owner_sessions(
+    paths, self_session_id: str
+) -> dict[str, tuple[str, ...]]:
+    """Map paths with live independent owners to their session identities.
+
+    Registry-backed owners retain their real session id so callers can inspect
+    waiter coverage. Process-only owners use a stable pid identity and are
+    therefore treated as wake-less unless a richer registry record appears.
+    """
     from agentic_pr_dash import agents, session_registry  # noqa: PLC0415
 
     candidates = list(dict.fromkeys(os.path.abspath(p) for p in paths if p))
     if not candidates:
-        return set()
+        return {}
 
     self_pids = _self_pid_chain()
     reg_of = {c: session_registry.registry_path(c) for c in candidates}
     clis_of = {c: set(load_config(c).discovery_names) for c in candidates}
-    owned: set[str] = set()
+    owned: dict[str, tuple[str, ...]] = {}
 
     distinct_regs = {str(reg_of[c]): reg_of[c] for c in candidates}
     index_by_reg: dict[str, dict[str, list]] = {}
@@ -185,8 +192,12 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
         index_by_reg[reg_str] = idx
     for c in candidates:
         states = index_by_reg[str(reg_of[c])].get(c, [])
-        if any(s.cli in clis_of[c] for s in states):
-            owned.add(c)
+        matching_states = sorted(
+            (s for s in states if s.cli in clis_of[c]),
+            key=lambda state: state.session_id,
+        )
+        if matching_states:
+            owned[c] = tuple(state.session_id for state in matching_states)
 
     remaining = [p for p in candidates if p not in owned]
     if remaining:
@@ -199,10 +210,25 @@ def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
         for path, agent_list in by_path.items():
             abs_path = os.path.abspath(path)
             allow = clis_of.get(abs_path, union_clis)
-            if any(a.pid not in self_pids and a.cli_name in allow for a in agent_list):
-                owned.add(abs_path)
+            matching_agents = sorted(
+                (
+                    a
+                    for a in agent_list
+                    if a.pid not in self_pids and a.cli_name in allow
+                ),
+                key=lambda agent: agent.pid,
+            )
+            if matching_agents:
+                owned[abs_path] = tuple(
+                    f"pid:{agent.pid}" for agent in matching_agents
+                )
 
     return owned
+
+
+def _live_independent_owner_paths(paths, self_session_id: str) -> set[str]:
+    """Subset of ``paths`` where a live independent session is present."""
+    return set(_live_independent_owner_sessions(paths, self_session_id))
 
 
 def _marker_pr(worktree_path: str, *, snap=None) -> str:
