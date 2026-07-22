@@ -503,12 +503,32 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
     # heartbeat/lease (BOU-1540). Blockers are known here, so name them rather
     # than emitting a clean-looking no-op (BOU-1788 family).
-    if worktrees._live_independent_owner_paths([cwd], self_session_id):
-        return 0, _blocked_defer_text(
-            pr_number=pr.number,
-            blockers=blockers,
-            owner_desc="live independent owner of this worktree",
+    independent_owners = worktrees._live_independent_owner_sessions(
+        [cwd], self_session_id
+    ).get(cwd, ())
+    if independent_owners:
+        waiter_owner = next(
+            (
+                owner
+                for owner in independent_owners
+                if waiter._await_alive(cwd, owner)
+            ),
+            None,
         )
+        if waiter_owner is not None:
+            _clear_wakeless_defer(cwd)
+            take_over = False
+        else:
+            owner_key = "independent:" + "|".join(independent_owners)
+            take_over = _wakeless_grace_exhausted(cwd, owner_key)
+        if not take_over:
+            return 0, _blocked_defer_text(
+                pr_number=pr.number,
+                blockers=blockers,
+                owner_desc="live independent owner of this worktree",
+            )
+        _clear_wakeless_defer(cwd)
+        _clear_no_progress(cwd)
 
     owner_session_id = self_session_id or f"pid:{_common._resolve_owner_pid()}"
 
