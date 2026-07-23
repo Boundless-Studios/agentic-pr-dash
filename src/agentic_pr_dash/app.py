@@ -58,6 +58,11 @@ _dashboard_context_cache: dict[tuple[bool, str], tuple[float, dict[str, object]]
 _dashboard_context_tasks: dict[tuple[bool, str], asyncio.Task[dict[str, object]]] = {}
 
 
+def _invalidate_dashboard_context() -> None:
+    _dashboard_context_cache.clear()
+    _dashboard_context_tasks.clear()
+
+
 def _asset_version() -> str:
     """Short fingerprint of the static bundle so changed JS/CSS load under a
     fresh URL. Busts both the browser HTTP cache and the service-worker cache
@@ -1135,7 +1140,7 @@ async def _dashboard_context_async(
     context = await task
     if _dashboard_context_tasks.get(key) is task:
         _dashboard_context_tasks.pop(key, None)
-    _dashboard_context_cache[key] = (time.monotonic(), context)
+        _dashboard_context_cache[key] = (time.monotonic(), context)
     return context
 
 
@@ -1591,6 +1596,7 @@ async def retry_ci(pr_number: int, request: Request):
 @app.post("/api/refresh")
 async def force_refresh():
     await orchestrator.refresh_prs()
+    _invalidate_dashboard_context()
     return RedirectResponse(url="/", status_code=303)
 
 
