@@ -133,7 +133,13 @@ def test_live_independent_owner_paths_registry_idle_session(tmp_path, monkeypatc
     owners = _worktrees_mod._live_independent_owner_sessions(
         [str(owned), str(free)], "sess-self"
     )
-    assert owners == {str(owned): ("gaia-other",)}
+    assert owners == {
+        str(owned): (
+            _worktrees_mod.IndependentOwnerIdentity(
+                session_id="gaia-other", registry_backed=True
+            ),
+        )
+    }
     assert mc._live_independent_owner_paths(
         [str(owned), str(free)], "sess-self"
     ) == {str(owned)}
@@ -373,7 +379,13 @@ def test_live_independent_owner_paths_process_scan_idle(tmp_path, monkeypatch):
     result = _worktrees_mod._live_independent_owner_sessions(
         [str(owned)], "sess-self"
     )
-    assert result == {str(owned): ("pid:999",)}
+    assert result == {
+        str(owned): (
+            _worktrees_mod.IndependentOwnerIdentity(
+                session_id="pid:999", registry_backed=False
+            ),
+        )
+    }
     assert captured["min_cpu"] == 0.0  # liveness, not activity
 
 
@@ -578,7 +590,11 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
         _worktrees_mod,
         "_live_independent_owner_sessions",
         lambda paths, sid: {
-            os.path.abspath(str(tmp_path)): ("sess-independent",)
+            os.path.abspath(str(tmp_path)): (
+                _worktrees_mod.IndependentOwnerIdentity(
+                    session_id="sess-independent", registry_backed=True
+                ),
+            )
         },
     )
     code, text = mc._check_worktree(str(tmp_path), "sess-self")
@@ -587,7 +603,9 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     assert heartbeats == []  # no heartbeat/lease write while deferring
 
     # No foreign owner → work is surfaced AND the fix lease is stamped.
-    monkeypatch.setattr(_worktrees_mod, "_live_independent_owner_paths", lambda paths, sid, config_cwd=None: set())
+    monkeypatch.setattr(
+        _worktrees_mod, "_live_independent_owner_sessions", lambda paths, sid: {}
+    )
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
     monkeypatch.setattr(_maint, "build_maintenance_summary", lambda pr: "SUMMARY")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
