@@ -301,8 +301,9 @@ def test_stop_runner_first_nonzero_error_code_when_no_block(tmp_path):
     assert rc == 3
 
 
-def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_values(
+def test_stop_runner_failure_report_captures_timeout_and_emits_structured_error(
     monkeypatch,
+    capsys,
 ):
     payload_text = json.dumps(
         {
@@ -342,6 +343,11 @@ def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_value
     )
 
     assert rc == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "hook_event_name": "Stop",
+        "error": "run_stop_checks: stop hook 'stop_example' timed out after 30 seconds",
+    }
     failure = runner.last_report.failures[0]
     assert failure.hook_name == "stop_example"
     assert failure.hook_path == "/repo/.claude/hooks/stop-example.py"
@@ -357,6 +363,50 @@ def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_value
     assert "xy" not in failure.stderr
     assert "scalar-only-leak" not in failure.stderr
     assert payload_text not in failure.stderr
+
+
+def test_stop_runner_timeout_replaces_earlier_nonblocking_json(monkeypatch, capsys):
+    results = iter(
+        [
+            subprocess.CompletedProcess(
+                args=["python3", "approve.py"],
+                returncode=0,
+                stdout='{"hook_event_name":"Stop","decision":"approve"}',
+                stderr="",
+            ),
+            subprocess.TimeoutExpired(
+                cmd=["python3", "slow.py"],
+                timeout=30,
+            ),
+        ]
+    )
+
+    def fake_run(*args, **kwargs):
+        result = next(results)
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+    monkeypatch.setattr(runners_mod.subprocess, "run", fake_run)
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: path,
+        is_enabled=lambda _name: True,
+        python="python3",
+    )
+
+    rc = runner.run(
+        [("approve", "approve.py"), ("slow", "slow.py")],
+        payload_text="{}",
+        hook_env={},
+    )
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == {
+        "hook_event_name": "Stop",
+        "error": "run_stop_checks: stop hook 'slow' timed out after 30 seconds",
+    }
+    assert '"decision":"approve"' in captured.err
 
 
 def test_stop_runner_failure_report_classifies_invalid_json_and_unexpected_exit(

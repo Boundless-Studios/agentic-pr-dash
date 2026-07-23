@@ -321,6 +321,21 @@ class StopChecksRunner:
                 )
                 if final_rc == 0:
                     final_rc = 1
+                error_json = json.dumps(
+                    {
+                        "hook_event_name": "Stop",
+                        "error": (
+                            f"run_stop_checks: stop hook '{hook_name}' timed out "
+                            f"after {self._timeout_seconds} seconds"
+                        ),
+                    }
+                )
+                # A timeout is authoritative over an earlier non-blocking
+                # approval, but must not hide an earlier blocking response.
+                if chosen_json is None or not chosen_json_blocking:
+                    if chosen_json is not None:
+                        human_output.add(chosen_json)
+                    chosen_json = error_json
                 continue
             except OSError as exc:
                 failures.append(
