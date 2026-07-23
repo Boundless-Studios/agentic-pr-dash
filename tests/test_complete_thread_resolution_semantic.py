@@ -62,7 +62,9 @@ def _pr():
 
 
 def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
-          threads=None, resolve_result=True, reply_result=True, events=None):
+          threads=None, resolve_result=True, reply_result=True, events=None,
+          commits=None, files_by_commit=None, spans_by_range=None,
+          dates_by_commit=None):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -82,18 +84,31 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     # One post-baseline commit exists (a real fixing push landed) ...
     monkeypatch.setattr(
         github_api, "get_new_pr_commits",
-        lambda *a, **k: [("c0ffee", "fix: logging")],
+        lambda *a, **k: commits or [("c0ffee", "fix: logging")],
     )
     # ... and it touched exactly `touched_files`.
     monkeypatch.setattr(
         github_api, "get_commit_changed_files",
-        lambda sha, cwd=None: list(touched_files),
+        lambda sha, cwd=None: list(
+            files_by_commit[sha] if files_by_commit is not None
+            else touched_files
+        ),
     )
     # ... changing exactly `spans` (hunk line ranges) in each touched file.
     monkeypatch.setattr(
         github_api, "get_changed_line_spans",
-        lambda base, head, path, cwd=None: None if spans is None else list(spans),
+        lambda base, head, path, cwd=None: (
+            spans_by_range.get((base, head, path))
+            if spans_by_range is not None
+            else None if spans is None else list(spans)
+        ),
     )
+    if dates_by_commit is not None:
+        monkeypatch.setattr(
+            github_api, "get_commit_date",
+            lambda sha, cwd=None: dates_by_commit.get(sha),
+            raising=False,
+        )
     all_threads = threads if threads is not None else [thread]
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda n, cwd=None: list(all_threads))
@@ -540,6 +555,100 @@ def test_bou2320_reopened_thread_requires_fix_newer_than_reviewer_followup(
     captured = capsys.readouterr()
     assert "bead left open" in captured.out
     assert "review_comments" in captured.out
+
+
+def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
+        monkeypatch, capsys):
+    top = ReviewThreadComment(
+        database_id=42, path=ANCHOR, line=7,
+        body="Guard against a None campaign here.", author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7,
+                body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
+                author="bot", created_at="2026-01-15T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7,
+                body="The change in A is still wrong.", author="rev",
+                created_at="2026-01-20T00:00:00Z",
+            ),
+        ],
+    )
+    commits = [("aaaaaaa", "fix: change anchor"), ("bbbbbbb", "docs: unrelated")]
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=commits,
+        files_by_commit={"aaaaaaa": [ANCHOR], "bbbbbbb": ["README.md"]},
+        dates_by_commit={
+            "aaaaaaa": "2026-01-10T00:00:00Z",
+            "bbbbbbb": "2026-02-01T00:00:00Z",
+        },
+        spans_by_range={
+            ("basesha", "headsha", ANCHOR): SPANS_AT_ANCHOR,
+            ("aaaaaaa^", "aaaaaaa", ANCHOR): SPANS_AT_ANCHOR,
+        },
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+
+
+def test_bou2320_post_followup_anchor_change_resolves_reopened_thread(monkeypatch):
+    top = ReviewThreadComment(
+        database_id=42, path=ANCHOR, line=7,
+        body="Guard against a None campaign here.", author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7,
+                body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
+                author="bot", created_at="2026-01-15T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7,
+                body="The change in A is still wrong.", author="rev",
+                created_at="2026-01-20T00:00:00Z",
+            ),
+        ],
+    )
+    commits = [("aaaaaaa", "fix: first attempt"), ("ccccccc", "fix: follow-up")]
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=commits,
+        files_by_commit={"aaaaaaa": [ANCHOR], "ccccccc": [ANCHOR]},
+        dates_by_commit={
+            "aaaaaaa": "2026-01-10T00:00:00Z",
+            "ccccccc": "2026-02-01T00:00:00Z",
+        },
+        spans_by_range={
+            ("basesha", "headsha", ANCHOR): SPANS_AT_ANCHOR,
+            ("ccccccc^", "headsha", ANCHOR): SPANS_AT_ANCHOR,
+        },
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == ["t1"]
+    assert [thread_id for thread_id, _ in replied] == ["t1"]
 
 
 def test_pr78_head_side_anchor_matching_only_old_span_not_resolved(monkeypatch):

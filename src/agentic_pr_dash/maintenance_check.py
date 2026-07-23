@@ -121,6 +121,7 @@ from ._maintenance.completion import (  # noqa: F401, E402
     _thread_points_elsewhere,
     _thread_elsewhere_refs,
     _thread_completion_evidence,
+    _latest_reopening_followup,
     _spans_intersect_line,
     _ANCHOR_CONTEXT_LINES,
     _FILE_REF_RE,
@@ -429,6 +430,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 baseline, head_sha, path, cwd)
         return spans_by_path[path]
 
+    def _reopened_spans_for(
+        thread, path: str,  # type: ignore[no-untyped-def]
+    ) -> list[tuple[int, int, int, int]] | None:
+        followup = _latest_reopening_followup(thread)
+        if followup is None:
+            return None
+        followup_at = _parse_iso(followup)
+        if followup_at is None:
+            return None
+        for sha, _ in new_commits:
+            commit_at = _parse_iso(github_api.get_commit_date(sha, cwd) or "")
+            if commit_at is not None and commit_at > followup_at:
+                return github_api.get_changed_line_spans(
+                    f"{sha}^", head_sha, path, cwd)
+        return None
+
     # BOU-2095 P1 (PR #78 review): every unresolved thread this run does NOT
     # resolve — including `is_outdated` ones that the downstream
     # blocker/pending filters would otherwise hide — must survive as a
@@ -455,7 +472,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         # GitHub's "outdated" flag (pure line drift) is explicitly NOT evidence:
         # it used to widen resolution here and silently closed live feedback.
         spans = _spans_for(path) if path is not None else None
-        evidence = _thread_completion_evidence(thread, spans, head_date)
+        reopened_spans = (
+            _reopened_spans_for(thread, path) if path is not None else None
+        )
+        evidence = _thread_completion_evidence(thread, spans, reopened_spans)
         if evidence is None:
             left_unresolved.append(thread.node_id)
             anchor_line = (

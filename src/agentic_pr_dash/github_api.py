@@ -1773,6 +1773,22 @@ def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
     return [line for line in r.stdout.splitlines() if line.strip()]
 
 
+def get_commit_date(sha: str, cwd: str | None = None) -> str | None:
+    """Return a locally available commit's committer date in ISO-8601 form."""
+    if not sha:
+        return None
+    try:
+        r = subprocess.run(
+            ["git", "-C", cwd or ".", "show", "-s", "--format=%cI", sha],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return r.stdout.strip() or None
+
+
 # `@@ -old_start[,old_count] +new_start[,new_count] @@` (git unified hunk header)
 _HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
