@@ -502,6 +502,46 @@ def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch)
     assert replied == []
 
 
+def test_bou2320_reopened_thread_requires_fix_newer_than_reviewer_followup(
+        monkeypatch, capsys):
+    # The failed resolve left a marker, then the reviewer rejected the fix
+    # AFTER the current HEAD was pushed. Even if the old base..HEAD hunk still
+    # intersects the anchor, it is not evidence for this newer feedback.
+    top = ReviewThreadComment(
+        database_id=42, path=ANCHOR, line=7,
+        body="Guard against a None campaign here.", author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7,
+                body=f"{COMPLETE_MARKER}\nAddressed in an earlier attempt.",
+                author="bot", created_at="2026-01-15T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7,
+                body="This is still not fixed.", author="rev",
+                created_at="2026-03-01T00:00:00Z",
+            ),
+        ],
+    )
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+
+
 def test_pr78_head_side_anchor_matching_only_old_span_not_resolved(monkeypatch):
     # PR #78 review (comment 3605704914): a live thread's `line` is a HEAD-side
     # coordinate. A rewrite whose OLD-side span happens to overlap that number

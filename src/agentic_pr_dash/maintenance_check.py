@@ -455,7 +455,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         # GitHub's "outdated" flag (pure line drift) is explicitly NOT evidence:
         # it used to widen resolution here and silently closed live feedback.
         spans = _spans_for(path) if path is not None else None
-        evidence = _thread_completion_evidence(thread, spans)
+        evidence = _thread_completion_evidence(thread, spans, head_date)
         if evidence is None:
             left_unresolved.append(thread.node_id)
             anchor_line = (
