@@ -57,6 +57,7 @@ def _spans_intersect_line(
 def _thread_completion_evidence(
     thread,  # type: ignore[no-untyped-def]
     spans: list[tuple[int, int, int, int]] | None,
+    fixing_date: str | None = None,
 ) -> str | None:
     """Positive per-thread evidence that the completing commits addressed THIS thread.
 
@@ -78,10 +79,19 @@ def _thread_completion_evidence(
     - ``"file"``   — the thread is file-level (no line anchor at all) and the
       file's content changed; the whole file IS the anchor span.
 
+    A reopened thread additionally requires ``fixing_date`` to be newer than
+    its latest human follow-up, so an old hunk cannot re-complete rejected work.
+
     ``spans is None`` means the base..head diff was unavailable — that is
     absence of proof, never proof of absence, so it yields ``None``.
     """
-    from agentic_pr_dash.github_api import _thread_state  # noqa: PLC0415
+    from agentic_pr_dash._maintenance._common import _parse_iso  # noqa: PLC0415
+    from agentic_pr_dash.github_api import (  # noqa: PLC0415
+        CLAIM_MARKER,
+        COMPLETE_MARKER,
+        FAILED_MARKER,
+        _thread_state,
+    )
 
     replies_as_dicts = [
         {"body": r.body, "created_at": r.created_at, "author": r.author}
@@ -90,6 +100,21 @@ def _thread_completion_evidence(
     state, _ = _thread_state(replies_as_dicts, top_author=thread.top.author)
     if state == "completed":
         return "reply"
+    if state == "reopened":
+        # A marker followed by fresh human feedback invalidates the old fixing
+        # evidence. The same base..HEAD hunk may still intersect the anchor,
+        # but it cannot address feedback newer than HEAD. Fail closed unless a
+        # later fixing commit is established.
+        human_followups = [
+            _parse_iso(r.created_at)
+            for r in thread.replies
+            if not any(marker in r.body for marker in (
+                CLAIM_MARKER, COMPLETE_MARKER, FAILED_MARKER))
+        ]
+        human_followups = [stamp for stamp in human_followups if stamp is not None]
+        fixed_at = _parse_iso(fixing_date or "")
+        if not human_followups or fixed_at is None or fixed_at <= max(human_followups):
+            return None
     anchor_line = thread.top.line
     anchor_side = "new"  # non-outdated `line` is a head-side coordinate
     if anchor_line is None:
