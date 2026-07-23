@@ -301,8 +301,9 @@ def test_stop_runner_first_nonzero_error_code_when_no_block(tmp_path):
     assert rc == 3
 
 
-def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_values(
+def test_stop_runner_failure_report_captures_timeout_and_emits_structured_error(
     monkeypatch,
+    capsys,
 ):
     payload_text = json.dumps(
         {
@@ -342,6 +343,11 @@ def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_value
     )
 
     assert rc == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output == {
+        "hook_event_name": "Stop",
+        "error": "run_stop_checks: stop hook 'stop_example' timed out after 30 seconds",
+    }
     failure = runner.last_report.failures[0]
     assert failure.hook_name == "stop_example"
     assert failure.hook_path == "/repo/.claude/hooks/stop-example.py"
