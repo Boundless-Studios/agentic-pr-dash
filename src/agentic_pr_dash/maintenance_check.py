@@ -455,7 +455,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         # GitHub's "outdated" flag (pure line drift) is explicitly NOT evidence:
         # it used to widen resolution here and silently closed live feedback.
         spans = _spans_for(path) if path is not None else None
-        evidence = _thread_completion_evidence(thread, spans, head_date)
+        evidence = _thread_completion_evidence(thread, spans)
         if evidence is None:
             left_unresolved.append(thread.node_id)
             anchor_line = (
@@ -467,9 +467,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 f"{path or '<none>'} was touched by the fixing commits, but the "
                 f"thread's anchored line "
                 f"({anchor_line if anchor_line is not None else '<none>'}) was "
-                f"not changed in {baseline or '<no baseline>'}..HEAD "
+                f"not safely evidenced in {baseline or '<no baseline>'}..HEAD "
                 f"(outdated={thread.is_outdated}); file-touch/line-drift alone "
-                f"must not auto-resolve — needs manual confirmation",
+                f"must not auto-resolve — needs manual confirmation; reviewer "
+                f"feedback after a terminal completion marker is always treated "
+                f"as reopened regardless of later hunk inference",
                 file=sys.stderr,
             )
             continue

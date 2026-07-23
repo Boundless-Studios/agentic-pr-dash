@@ -62,7 +62,8 @@ def _pr():
 
 
 def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
-          threads=None, resolve_result=True, reply_result=True, events=None):
+          threads=None, resolve_result=True, reply_result=True, events=None,
+          commits=None, files_by_commit=None):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -82,12 +83,15 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     # One post-baseline commit exists (a real fixing push landed) ...
     monkeypatch.setattr(
         github_api, "get_new_pr_commits",
-        lambda *a, **k: [("c0ffee", "fix: logging")],
+        lambda *a, **k: commits or [("c0ffee", "fix: logging")],
     )
     # ... and it touched exactly `touched_files`.
     monkeypatch.setattr(
         github_api, "get_commit_changed_files",
-        lambda sha, cwd=None: list(touched_files),
+        lambda sha, cwd=None: list(
+            files_by_commit[sha] if files_by_commit is not None
+            else touched_files
+        ),
     )
     # ... changing exactly `spans` (hunk line ranges) in each touched file.
     monkeypatch.setattr(
@@ -502,11 +506,11 @@ def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch)
     assert replied == []
 
 
-def test_bou2320_reopened_thread_requires_fix_newer_than_reviewer_followup(
+def test_bou2320_reopened_thread_with_newer_head_requires_manual_confirmation(
         monkeypatch, capsys):
     # The failed resolve left a marker, then the reviewer rejected the fix
-    # AFTER the current HEAD was pushed. Even if the old base..HEAD hunk still
-    # intersects the anchor, it is not evidence for this newer feedback.
+    # AFTER the current HEAD was pushed. Even if the base..HEAD hunk still
+    # intersects the anchor, reopened feedback requires manual confirmation.
     top = ReviewThreadComment(
         database_id=42, path=ANCHOR, line=7,
         body="Guard against a None campaign here.", author="rev",
@@ -539,6 +543,90 @@ def test_bou2320_reopened_thread_requires_fix_newer_than_reviewer_followup(
     assert replied == []
     captured = capsys.readouterr()
     assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+
+
+def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
+        monkeypatch, capsys):
+    top = ReviewThreadComment(
+        database_id=42, path=ANCHOR, line=7,
+        body="Guard against a None campaign here.", author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7,
+                body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
+                author="bot", created_at="2026-01-15T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7,
+                body="The change in A is still wrong.", author="rev",
+                created_at="2026-01-20T00:00:00Z",
+            ),
+        ],
+    )
+    commits = [("aaaaaaa", "fix: change anchor"), ("bbbbbbb", "docs: unrelated")]
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=commits,
+        files_by_commit={"aaaaaaa": [ANCHOR], "bbbbbbb": ["README.md"]},
+        spans=SPANS_AT_ANCHOR,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+
+
+def test_bou2320_newer_anchor_change_still_requires_manual_confirmation(
+        monkeypatch, capsys):
+    top = ReviewThreadComment(
+        database_id=42, path=ANCHOR, line=7,
+        body="Guard against a None campaign here.", author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7,
+                body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
+                author="bot", created_at="2026-01-15T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7,
+                body="The change in A is still wrong.", author="rev",
+                created_at="2026-01-20T00:00:00Z",
+            ),
+        ],
+    )
+    commits = [("aaaaaaa", "fix: first attempt"), ("ccccccc", "fix: follow-up")]
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=commits,
+        files_by_commit={"aaaaaaa": [ANCHOR], "ccccccc": [ANCHOR]},
+        spans=SPANS_AT_ANCHOR,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == []
+    assert replied == []
+    captured = capsys.readouterr()
+    assert "manual confirmation" in captured.err
     assert "review_comments" in captured.out
 
 
