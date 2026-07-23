@@ -81,7 +81,14 @@ def _stub_gauntlet(
         _worktrees_mod,
         "_live_independent_owner_sessions",
         lambda paths, sid: (
-            {os.path.abspath(path): (FOREIGN_SID,) for path in paths}
+            {
+                os.path.abspath(path): (
+                    _worktrees_mod.IndependentOwnerIdentity(
+                        session_id=FOREIGN_SID, registry_backed=True
+                    ),
+                )
+                for path in paths
+            }
             if independent
             else {}
         ),

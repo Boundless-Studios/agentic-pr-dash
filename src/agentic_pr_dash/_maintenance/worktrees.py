@@ -1,6 +1,7 @@
 """Worktree discovery and ownership helpers."""
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import subprocess
 import time
@@ -8,6 +9,14 @@ import time
 from agentic_pr_dash.config import load as load_config
 from ._common import _resolve_owner_pid, _current_branch, _repo_slug
 from .pr_state import _list_my_open_prs
+
+
+@dataclass(frozen=True, slots=True)
+class IndependentOwnerIdentity:
+    """Identity and discovery provenance for a live independent owner."""
+
+    session_id: str
+    registry_backed: bool
 
 
 def _iter_worktrees_with_branch(cwd: str):
@@ -151,7 +160,7 @@ def _self_pid_chain(max_depth: int = 16) -> set[int]:
 
 def _live_independent_owner_sessions(
     paths, self_session_id: str
-) -> dict[str, tuple[str, ...]]:
+) -> dict[str, tuple[IndependentOwnerIdentity, ...]]:
     """Map paths with live independent owners to their session identities.
 
     Registry-backed owners retain their real session id so callers can inspect
@@ -167,7 +176,7 @@ def _live_independent_owner_sessions(
     self_pids = _self_pid_chain()
     reg_of = {c: session_registry.registry_path(c) for c in candidates}
     clis_of = {c: set(load_config(c).discovery_names) for c in candidates}
-    owned: dict[str, tuple[str, ...]] = {}
+    owned: dict[str, tuple[IndependentOwnerIdentity, ...]] = {}
 
     distinct_regs = {str(reg_of[c]): reg_of[c] for c in candidates}
     index_by_reg: dict[str, dict[str, list]] = {}
@@ -197,7 +206,13 @@ def _live_independent_owner_sessions(
             key=lambda state: state.session_id,
         )
         if matching_states:
-            owned[c] = tuple(state.session_id for state in matching_states)
+            owned[c] = tuple(
+                IndependentOwnerIdentity(
+                    session_id=state.session_id,
+                    registry_backed=True,
+                )
+                for state in matching_states
+            )
 
     remaining = [p for p in candidates if p not in owned]
     if remaining:
@@ -220,7 +235,11 @@ def _live_independent_owner_sessions(
             )
             if matching_agents:
                 owned[abs_path] = tuple(
-                    f"pid:{agent.pid}" for agent in matching_agents
+                    IndependentOwnerIdentity(
+                        session_id=f"pid:{agent.pid}",
+                        registry_backed=False,
+                    )
+                    for agent in matching_agents
                 )
 
     return owned

@@ -16,3 +16,6 @@ venv/
 
 # Local tooling state (serena MCP project cache)
 .serena/
+
+# Project-local isolated feature worktrees
+.worktrees/

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib
 import json
 import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -300,6 +301,141 @@ def test_stop_runner_first_nonzero_error_code_when_no_block(tmp_path):
     assert rc == 3
 
 
+def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_values(
+    monkeypatch,
+):
+    payload_text = json.dumps(
+        {
+            "session_id": "raw-stop-payload-secret",
+            "nested": {"scalar": "scalar-only-leak"},
+        }
+    )
+    hook_env = {
+        "HOOK_SECRET": "environment-secret-value",
+        "SHORT_SECRET": "xy",
+    }
+    timeout = subprocess.TimeoutExpired(
+        cmd=["python3", "/repo/.claude/hooks/stop-example.py"],
+        timeout=30,
+        stderr=(
+            "failed environment-secret-value xy scalar-only-leak "
+            + payload_text
+            + " "
+            + "x" * (runners_mod.HOOK_FAILURE_OUTPUT_LIMIT * 2)
+        ),
+    )
+    monkeypatch.setattr(
+        runners_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(timeout),
+    )
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: f"/repo/{path}",
+        is_enabled=lambda _name: True,
+        python="python3",
+    )
+
+    rc = runner.run(
+        [("stop_example", ".claude/hooks/stop-example.py")],
+        payload_text=payload_text,
+        hook_env=hook_env,
+    )
+
+    assert rc == 1
+    failure = runner.last_report.failures[0]
+    assert failure.hook_name == "stop_example"
+    assert failure.hook_path == "/repo/.claude/hooks/stop-example.py"
+    assert failure.failure_class == "timeout"
+    assert failure.exit_code is None
+    assert failure.timeout_seconds == 30
+    assert failure.retry_argv == (
+        "python3",
+        "/repo/.claude/hooks/stop-example.py",
+    )
+    assert len(failure.stderr) <= runners_mod.HOOK_FAILURE_OUTPUT_LIMIT
+    assert "environment-secret-value" not in failure.stderr
+    assert "xy" not in failure.stderr
+    assert "scalar-only-leak" not in failure.stderr
+    assert payload_text not in failure.stderr
+
+
+def test_stop_runner_failure_report_classifies_invalid_json_and_unexpected_exit(
+    tmp_path,
+):
+    invalid = _hook_script(
+        tmp_path,
+        "invalid.py",
+        "print('not-json')\nraise SystemExit(2)\n",
+    )
+    unexpected = _hook_script(
+        tmp_path,
+        "unexpected.py",
+        "import sys\nprint('boom', file=sys.stderr)\nraise SystemExit(7)\n",
+    )
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: path,
+        is_enabled=lambda _name: True,
+    )
+
+    rc = runner.run(
+        [("invalid", invalid), ("unexpected", unexpected)],
+        payload_text="{}",
+        hook_env=dict(os.environ),
+    )
+
+    assert rc == 2
+    assert [failure.failure_class for failure in runner.last_report.failures] == [
+        "invalid_json",
+        "unexpected_exit",
+    ]
+    assert runner.last_report.failures[0].exit_code == 2
+    assert runner.last_report.failures[1].exit_code == 7
+    assert all(
+        failure.timeout_seconds is None for failure in runner.last_report.failures
+    )
+    assert runner.last_report.final_rc == 2
+
+
+def test_stop_runner_failure_report_captures_spawn_failure(monkeypatch):
+    diagnostic = (
+        "attempt 17 ready true empty null from /repo; "
+        "secrets: / x xy token; proxy intact"
+    )
+    monkeypatch.setattr(
+        runners_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(diagnostic)),
+    )
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: f"/repo/{path}",
+        is_enabled=lambda _name: True,
+        python="python3",
+    )
+
+    assert (
+        runner.run(
+            [("stop_example", ".claude/hooks/stop-example.py")],
+            payload_text=json.dumps(
+                {
+                    "attempt": 17,
+                    "ready": True,
+                    "empty": None,
+                    "secret": "token",
+                }
+            ),
+            hook_env={"ROOT": "/", "ONE": "x", "SHORT": "xy"},
+        )
+        == 1
+    )
+    failure = runner.last_report.failures[0]
+    assert failure.failure_class == "spawn_failure"
+    assert failure.exit_code is None
+    assert failure.timeout_seconds is None
+    assert "attempt 17 ready true empty null from /repo" in failure.stderr
+    assert "proxy intact" in failure.stderr
+    assert "secrets: [REDACTED] [REDACTED] [REDACTED] [REDACTED]" in failure.stderr
+
+
 def test_human_output_buffer_dedups_and_condenses(capsys):
     buf = runners_mod.HumanOutputBuffer()
     buf.add("same")
@@ -450,6 +586,9 @@ def test_package_reexports_public_symbols():
         "load_settings",
         "SettingsResolver",
         "StopChecksRunner",
+        "HOOK_FAILURE_OUTPUT_LIMIT",
+        "HookFailure",
+        "StopChecksReport",
         "run_shared_hook",
         "run_session_commands",
         "HumanOutputBuffer",
