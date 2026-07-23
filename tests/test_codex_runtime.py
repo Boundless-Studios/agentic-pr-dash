@@ -304,14 +304,23 @@ def test_stop_runner_first_nonzero_error_code_when_no_block(tmp_path):
 def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_values(
     monkeypatch,
 ):
-    payload_text = '{"session_id":"raw-stop-payload-secret"}'
-    hook_env = {"HOOK_SECRET": "environment-secret-value"}
+    payload_text = json.dumps(
+        {
+            "session_id": "raw-stop-payload-secret",
+            "nested": {"scalar": "scalar-only-leak"},
+        }
+    )
+    hook_env = {
+        "HOOK_SECRET": "environment-secret-value",
+        "SHORT_SECRET": "xy",
+    }
     timeout = subprocess.TimeoutExpired(
         cmd=["python3", "/repo/.claude/hooks/stop-example.py"],
         timeout=30,
         stderr=(
-            "failed environment-secret-value "
-            '{"session_id":"raw-stop-payload-secret"} '
+            "failed environment-secret-value xy scalar-only-leak "
+            + payload_text
+            + " "
             + "x" * (runners_mod.HOOK_FAILURE_OUTPUT_LIMIT * 2)
         ),
     )
@@ -337,12 +346,16 @@ def test_stop_runner_failure_report_captures_timeout_and_redacts_sensitive_value
     assert failure.hook_name == "stop_example"
     assert failure.hook_path == "/repo/.claude/hooks/stop-example.py"
     assert failure.failure_class == "timeout"
+    assert failure.exit_code is None
+    assert failure.timeout_seconds == 30
     assert failure.retry_argv == (
         "python3",
         "/repo/.claude/hooks/stop-example.py",
     )
     assert len(failure.stderr) <= runners_mod.HOOK_FAILURE_OUTPUT_LIMIT
     assert "environment-secret-value" not in failure.stderr
+    assert "xy" not in failure.stderr
+    assert "scalar-only-leak" not in failure.stderr
     assert payload_text not in failure.stderr
 
 
@@ -375,7 +388,39 @@ def test_stop_runner_failure_report_classifies_invalid_json_and_unexpected_exit(
         "invalid_json",
         "unexpected_exit",
     ]
+    assert runner.last_report.failures[0].exit_code == 2
+    assert runner.last_report.failures[1].exit_code == 7
+    assert all(
+        failure.timeout_seconds is None for failure in runner.last_report.failures
+    )
     assert runner.last_report.final_rc == 2
+
+
+def test_stop_runner_failure_report_captures_spawn_failure(monkeypatch):
+    monkeypatch.setattr(
+        runners_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cannot spawn")),
+    )
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: f"/repo/{path}",
+        is_enabled=lambda _name: True,
+        python="python3",
+    )
+
+    assert (
+        runner.run(
+            [("stop_example", ".claude/hooks/stop-example.py")],
+            payload_text="{}",
+            hook_env={},
+        )
+        == 1
+    )
+    failure = runner.last_report.failures[0]
+    assert failure.failure_class == "spawn_failure"
+    assert failure.exit_code is None
+    assert failure.timeout_seconds is None
+    assert failure.stderr == "cannot spawn"
 
 
 def test_human_output_buffer_dedups_and_condenses(capsys):

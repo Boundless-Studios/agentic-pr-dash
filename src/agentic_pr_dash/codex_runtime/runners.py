@@ -45,6 +45,8 @@ class HookFailure:
     failure_class: HookFailureClass
     retry_argv: tuple[str, ...]
     stderr: str
+    exit_code: int | None
+    timeout_seconds: float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,7 +68,29 @@ def _bounded_failure_output(
         text = stderr.decode(errors="replace")
     else:
         text = stderr or ""
-    sensitive_values = {payload_text, *(value for value in hook_env.values() if len(value) >= 4)}
+    sensitive_values = {payload_text, *(value for value in hook_env.values() if value)}
+    try:
+        payload = json.loads(payload_text)
+        payload_is_json = True
+    except json.JSONDecodeError:
+        payload = None
+        payload_is_json = False
+
+    def add_scalars(value: object) -> None:
+        if isinstance(value, dict):
+            for child in value.values():
+                add_scalars(child)
+        elif isinstance(value, list):
+            for child in value:
+                add_scalars(child)
+        elif isinstance(value, str):
+            if value:
+                sensitive_values.add(value)
+        else:
+            sensitive_values.add(json.dumps(value))
+
+    if payload_is_json:
+        add_scalars(payload)
     for value in sorted(sensitive_values, key=len, reverse=True):
         if value:
             text = text.replace(value, "[REDACTED]")
@@ -282,6 +306,8 @@ class StopChecksRunner:
                             payload_text=payload_text,
                             hook_env=hook_env,
                         ),
+                        exit_code=None,
+                        timeout_seconds=float(self._timeout_seconds),
                     )
                 )
                 if final_rc == 0:
@@ -299,6 +325,8 @@ class StopChecksRunner:
                             payload_text=payload_text,
                             hook_env=hook_env,
                         ),
+                        exit_code=None,
+                        timeout_seconds=None,
                     )
                 )
                 if final_rc == 0:
@@ -323,6 +351,8 @@ class StopChecksRunner:
                             payload_text=payload_text,
                             hook_env=hook_env,
                         ),
+                        exit_code=result.returncode,
+                        timeout_seconds=None,
                     )
                 )
 
