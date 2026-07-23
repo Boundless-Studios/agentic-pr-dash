@@ -330,7 +330,11 @@ class StopChecksRunner:
                         ),
                     }
                 )
-                if chosen_json is None:
+                # A timeout is authoritative over an earlier non-blocking
+                # approval, but must not hide an earlier blocking response.
+                if chosen_json is None or not chosen_json_blocking:
+                    if chosen_json is not None:
+                        human_output.add(chosen_json)
                     chosen_json = error_json
                 continue
             except OSError as exc:
