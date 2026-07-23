@@ -397,10 +397,14 @@ def test_stop_runner_failure_report_classifies_invalid_json_and_unexpected_exit(
 
 
 def test_stop_runner_failure_report_captures_spawn_failure(monkeypatch):
+    diagnostic = (
+        "attempt 17 ready true empty null from /repo; "
+        "secrets: / x xy token; proxy intact"
+    )
     monkeypatch.setattr(
         runners_mod.subprocess,
         "run",
-        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("cannot spawn")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError(diagnostic)),
     )
     runner = runners_mod.StopChecksRunner(
         resolve_path=lambda path: f"/repo/{path}",
@@ -411,8 +415,15 @@ def test_stop_runner_failure_report_captures_spawn_failure(monkeypatch):
     assert (
         runner.run(
             [("stop_example", ".claude/hooks/stop-example.py")],
-            payload_text="{}",
-            hook_env={},
+            payload_text=json.dumps(
+                {
+                    "attempt": 17,
+                    "ready": True,
+                    "empty": None,
+                    "secret": "token",
+                }
+            ),
+            hook_env={"ROOT": "/", "ONE": "x", "SHORT": "xy"},
         )
         == 1
     )
@@ -420,7 +431,9 @@ def test_stop_runner_failure_report_captures_spawn_failure(monkeypatch):
     assert failure.failure_class == "spawn_failure"
     assert failure.exit_code is None
     assert failure.timeout_seconds is None
-    assert failure.stderr == "cannot spawn"
+    assert "attempt 17 ready true empty null from /repo" in failure.stderr
+    assert "proxy intact" in failure.stderr
+    assert "secrets: [REDACTED] [REDACTED] [REDACTED] [REDACTED]" in failure.stderr
 
 
 def test_human_output_buffer_dedups_and_condenses(capsys):

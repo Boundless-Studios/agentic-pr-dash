@@ -18,6 +18,7 @@ None of these embed a hook list or a path layout — that is host config.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Sequence
@@ -68,7 +69,8 @@ def _bounded_failure_output(
         text = stderr.decode(errors="replace")
     else:
         text = stderr or ""
-    sensitive_values = {payload_text, *(value for value in hook_env.values() if value)}
+    literal_values = {payload_text}
+    token_values = {value for value in hook_env.values() if value}
     try:
         payload = json.loads(payload_text)
         payload_is_json = True
@@ -85,15 +87,22 @@ def _bounded_failure_output(
                 add_scalars(child)
         elif isinstance(value, str):
             if value:
-                sensitive_values.add(value)
-        else:
-            sensitive_values.add(json.dumps(value))
+                token_values.add(value)
 
     if payload_is_json:
         add_scalars(payload)
-    for value in sorted(sensitive_values, key=len, reverse=True):
+    for value in sorted(literal_values, key=len, reverse=True):
         if value:
             text = text.replace(value, "[REDACTED]")
+    for value in sorted(token_values, key=len, reverse=True):
+        if len(value) >= 4:
+            text = text.replace(value, "[REDACTED]")
+            continue
+        text = re.sub(
+            rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
+            "[REDACTED]",
+            text,
+        )
     return text.strip()[:HOOK_FAILURE_OUTPUT_LIMIT]
 
 
