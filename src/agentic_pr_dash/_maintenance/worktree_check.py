@@ -508,19 +508,24 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         [cwd], self_session_id
     ).get(cwd, ())
     if independent_owners:
+        has_registry_owner = any(
+            owner.registry_backed for owner in independent_owners
+        )
         waiter_owner = next(
             (
                 owner
                 for owner in independent_owners
-                if waiter._await_alive(cwd, owner)
+                if waiter._await_alive(cwd, owner.session_id)
             ),
             None,
         )
-        if waiter_owner is not None:
+        if has_registry_owner or waiter_owner is not None:
             _clear_wakeless_defer(cwd)
             take_over = False
         else:
-            owner_key = "independent:" + "|".join(independent_owners)
+            owner_key = "independent:" + "|".join(
+                owner.session_id for owner in independent_owners
+            )
             take_over = _wakeless_grace_exhausted(cwd, owner_key)
         if not take_over:
             return 0, _blocked_defer_text(

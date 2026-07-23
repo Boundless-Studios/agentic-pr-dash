@@ -23,6 +23,15 @@ SID = "sess-self"
 OWNER = "sess-wakeless-owner"
 
 
+def _independent_owner(
+    session_id: str, *, registry_backed: bool
+) -> _worktrees_mod.IndependentOwnerIdentity:
+    return _worktrees_mod.IndependentOwnerIdentity(
+        session_id=session_id,
+        registry_backed=registry_backed,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _isolated_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(tmp_path / "claims.jsonl"))
@@ -98,7 +107,9 @@ def test_independent_owner_without_waiter_defers_once_then_takes_over(
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_sessions",
-        lambda paths, sid: {str(worktree): (OWNER,)},
+        lambda paths, sid: {
+            str(worktree): (_independent_owner(OWNER, registry_backed=False),)
+        },
     )
     from agentic_pr_dash import github_api
 
@@ -129,7 +140,9 @@ def test_independent_owner_with_waiter_keeps_deferring(monkeypatch, tmp_path):
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_sessions",
-        lambda paths, sid: {str(worktree): (OWNER,)},
+        lambda paths, sid: {
+            str(worktree): (_independent_owner(OWNER, registry_backed=False),)
+        },
     )
     from agentic_pr_dash import github_api
 
@@ -171,7 +184,12 @@ def test_independent_owner_group_keeps_deferring_when_any_waiter_is_live(
     monkeypatch.setattr(
         _worktrees_mod,
         "_live_independent_owner_sessions",
-        lambda paths, sid: {str(worktree): (OWNER, "sess-with-waiter")},
+        lambda paths, sid: {
+            str(worktree): (
+                _independent_owner(OWNER, registry_backed=False),
+                _independent_owner("sess-with-waiter", registry_backed=False),
+            )
+        },
     )
     from agentic_pr_dash import github_api
 
@@ -184,3 +202,38 @@ def test_independent_owner_group_keeps_deferring_when_any_waiter_is_live(
         assert code == 0, text
         assert "live independent owner" in text
     assert "sess-with-waiter" in waiter_probes
+
+
+def test_registered_independent_owner_without_waiter_keeps_deferring(
+    monkeypatch, tmp_path
+):
+    """A live registry session remains primary even without a wake waiter."""
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    pr = _review_pr(worktree)
+
+    monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
+    monkeypatch.setattr(_markers_mod, "_live_pr_owner_record", lambda *args: None)
+    monkeypatch.setattr(_markers_mod, "_live_pr_owner", lambda *args: None)
+    monkeypatch.setattr(_markers_mod, "_marker_session_id", lambda cwd: None)
+    monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, owner: False)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    monkeypatch.setattr(_pr_state_mod, "_unresolved_review_threads", lambda n, cwd: [])
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_live_independent_owner_sessions",
+        lambda paths, sid: {
+            str(worktree): (_independent_owner(OWNER, registry_backed=True),)
+        },
+    )
+    from agentic_pr_dash import github_api
+
+    monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd: False)
+
+    for _ in range(3):
+        code, text = maintenance_check._check_worktree(
+            str(worktree), SID, claim=True
+        )
+        assert code == 0, text
+        assert "live independent owner" in text
