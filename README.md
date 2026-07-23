@@ -128,6 +128,17 @@ var (an explicit path), then a repo-local `agentic-pr-dash.toml` (walking up fro
 the cwd), then a global `~/.config/agentic-pr-dash/config.toml`. The global
 fallback is handy for `serve`, which runs from an arbitrary cwd.
 
+### GitHub authentication
+
+The normal `gh` identity (including an App installation token in `GH_TOKEN`)
+is used for reads and review replies. GitHub Apps cannot perform the GraphQL
+`resolveReviewThread` mutation, so unattended App-based loops should also set
+`AGENTIC_PR_DASH_GH_RESOLVE_TOKEN` to a dedicated machine-user fine-grained
+personal access token. Scope that token only to the repositories the loop
+maintains and grant **Pull requests: Read and write**. The token is used only
+as the fallback identity for thread-resolution mutations; other GitHub calls
+continue using the normal identity.
+
 ```toml
 [project]
 # repo = "owner/name"          # auto-detected from the git remote if omitted

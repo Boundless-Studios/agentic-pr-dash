@@ -492,13 +492,6 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             )
             continue
         try:
-            if not github_api.resolve_review_thread(thread.node_id, cwd):
-                left_unresolved.append(thread.node_id)
-                print(
-                    f"warning: could not resolve thread {thread.node_id}; leaving open for retry",
-                    file=sys.stderr,
-                )
-                continue
             stub = ReviewComment(
                 id=thread.top.database_id,
                 author=thread.top.author,
@@ -509,12 +502,32 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 is_inline=True,
                 thread_id=thread.node_id,
             )
-            body = _completion_reply_body(COMPLETE_MARKER, path, commits_by_file, new_commits)
-            github_api.reply_to_review_comment(resolved_pr_number, stub, body, cwd)
+            # Reply first so the reviewer sees a response even when GitHub
+            # rejects the subsequent resolve mutation. A prior terminal marker
+            # is retry evidence, so do not post it again on the next run.
+            if evidence != "reply":
+                body = _completion_reply_body(
+                    COMPLETE_MARKER, path, commits_by_file, new_commits)
+                if not github_api.reply_to_review_comment(
+                        resolved_pr_number, stub, body, cwd):
+                    left_unresolved.append(thread.node_id)
+                    print(
+                        f"warning: could not reply to thread {thread.node_id}; "
+                        "leaving open for retry",
+                        file=sys.stderr,
+                    )
+                    continue
+            if not github_api.resolve_review_thread(thread.node_id, cwd):
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"warning: could not resolve thread {thread.node_id}; leaving open for retry",
+                    file=sys.stderr,
+                )
+                continue
         except Exception as exc:  # noqa: BLE001
-            # The thread may or may not have been resolved before the error —
-            # count it as left open; a spurious blocker self-heals on the next
-            # `complete` run, a silently-dropped thread does not.
+            # Count any completion error as left open. A spurious blocker
+            # self-heals on the next `complete` run; a silently-dropped thread
+            # does not.
             left_unresolved.append(thread.node_id)
             print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
 

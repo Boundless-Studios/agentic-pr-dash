@@ -62,7 +62,7 @@ def _pr():
 
 
 def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
-          threads=None):
+          threads=None, resolve_result=True, reply_result=True, events=None):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -99,12 +99,16 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
                         lambda n, cwd=None: list(all_threads))
 
     def _resolve(node_id, cwd=None):
+        if events is not None:
+            events.append(("resolve", node_id))
         resolved_calls.append(node_id)
-        return True
+        return resolve_result
 
     def _reply(pr_number, comment, body, cwd=None):
+        if events is not None:
+            events.append(("reply", comment.thread_id))
         reply_calls.append((comment.thread_id, body))
-        return True
+        return reply_result
 
     monkeypatch.setattr(github_api, "resolve_review_thread", _resolve)
     monkeypatch.setattr(github_api, "reply_to_review_comment", _reply)
@@ -351,6 +355,58 @@ def test_bou2095_anchored_hunk_content_changed_resolves(monkeypatch):
     assert [t for t, _ in replied] == ["t1"]
 
 
+def test_bou2320_completion_replies_before_resolving(monkeypatch):
+    thread = _thread("Guard against a None campaign here.")
+    events = []
+    _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR, events=events,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert events == [("reply", "t1"), ("resolve", "t1")]
+
+
+def test_bou2320_resolve_failure_keeps_marker_reply_and_blocker(
+        monkeypatch, capsys):
+    thread = _thread("Guard against a None campaign here.")
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR, resolve_result=False,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == ["t1"]
+    assert len(replied) == 1
+    assert COMPLETE_MARKER in replied[0][1]
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+    assert "could not resolve thread t1" in captured.err
+
+
+def test_bou2320_reply_failure_prevents_resolution(monkeypatch, capsys):
+    thread = _thread("Guard against a None campaign here.")
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR, reply_result=False,
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert len(replied) == 1
+    assert resolved == []
+    captured = capsys.readouterr()
+    assert "bead left open" in captured.out
+    assert "review_comments" in captured.out
+    assert "could not reply to thread t1" in captured.err
+
+
 def test_bou2095_multi_thread_same_file_only_fixed_hunk_resolves(monkeypatch):
     # Case (d): two threads on the same file; the fix changed only t1's hunk
     # (line 7). t2 (line 200) must stay OPEN.
@@ -410,7 +466,7 @@ def test_bou2095_existing_completion_reply_resolves_as_retry(monkeypatch):
         "Guard against a None campaign here.",
         replies=(f"{COMPLETE_MARKER}\nAddressed by the local maintenance loop.",),
     )
-    resolved, _ = _wire(
+    resolved, replied = _wire(
         monkeypatch, thread=thread, touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
@@ -419,6 +475,7 @@ def test_bou2095_existing_completion_reply_resolves_as_retry(monkeypatch):
 
     assert rc == 0
     assert resolved == ["t1"]
+    assert replied == []
 
 
 def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch):
