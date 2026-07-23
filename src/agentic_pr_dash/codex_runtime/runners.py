@@ -21,9 +21,56 @@ import json
 import subprocess
 import sys
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 MAX_CONDENSED_HOOK_OUTPUT_LINES = 20
+HOOK_FAILURE_OUTPUT_LIMIT = 4096
+STOP_HOOK_TIMEOUT_SECONDS = 30
+HookFailureClass = Literal[
+    "timeout",
+    "spawn_failure",
+    "invalid_json",
+    "unexpected_exit",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class HookFailure:
+    """Bounded, replayable details for a Stop hook that needs repair."""
+
+    hook_name: str
+    hook_path: str
+    failure_class: HookFailureClass
+    retry_argv: tuple[str, ...]
+    stderr: str
+
+
+@dataclass(frozen=True, slots=True)
+class StopChecksReport:
+    """Structured result retained without changing ``StopChecksRunner.run``."""
+
+    final_rc: int
+    failures: tuple[HookFailure, ...]
+
+
+def _bounded_failure_output(
+    stderr: str | bytes | None,
+    *,
+    payload_text: str,
+    hook_env: dict[str, str],
+) -> str:
+    """Redact runner inputs from child diagnostics, then enforce the output bound."""
+    if isinstance(stderr, bytes):
+        text = stderr.decode(errors="replace")
+    else:
+        text = stderr or ""
+    sensitive_values = {payload_text, *(value for value in hook_env.values() if len(value) >= 4)}
+    for value in sorted(sensitive_values, key=len, reverse=True):
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    return text.strip()[:HOOK_FAILURE_OUTPUT_LIMIT]
 
 
 def run_shared_hook(
@@ -168,10 +215,13 @@ class StopChecksRunner:
         resolve_path: Callable[[str], str],
         is_enabled: Callable[[str], bool],
         python: str | None = None,
+        timeout_seconds: int = STOP_HOOK_TIMEOUT_SECONDS,
     ) -> None:
         self._resolve_path = resolve_path
         self._is_enabled = is_enabled
         self._python = python or sys.executable
+        self._timeout_seconds = timeout_seconds
+        self.last_report = StopChecksReport(final_rc=0, failures=())
 
     @staticmethod
     def emit_error_json(message: str) -> None:
@@ -193,6 +243,8 @@ class StopChecksRunner:
         lists where every entry is intended to run).
         """
         final_rc = 0
+        failures: list[HookFailure] = []
+        self.last_report = StopChecksReport(final_rc=0, failures=())
         human_output = HumanOutputBuffer()
         # Defer JSON emission until every hook has run so a later BLOCKING
         # (exit-2) JSON can win over an earlier success/approval JSON. With
@@ -206,16 +258,73 @@ class StopChecksRunner:
             forced = bypass_enable_check is not None and bypass_enable_check(hook_name)
             if not forced and not self._is_enabled(hook_name):
                 continue
-            result = subprocess.run(
-                [self._python, self._resolve_path(hook_path)],
-                input=payload_text,
-                text=True,
-                capture_output=True,
-                check=False,
-                env=hook_env,
-            )
+            resolved_path = self._resolve_path(hook_path)
+            retry_argv = (self._python, resolved_path)
+            try:
+                result = subprocess.run(
+                    list(retry_argv),
+                    input=payload_text,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                    env=hook_env,
+                    timeout=self._timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                failures.append(
+                    HookFailure(
+                        hook_name=hook_name,
+                        hook_path=resolved_path,
+                        failure_class="timeout",
+                        retry_argv=retry_argv,
+                        stderr=_bounded_failure_output(
+                            exc.stderr,
+                            payload_text=payload_text,
+                            hook_env=hook_env,
+                        ),
+                    )
+                )
+                if final_rc == 0:
+                    final_rc = 1
+                continue
+            except OSError as exc:
+                failures.append(
+                    HookFailure(
+                        hook_name=hook_name,
+                        hook_path=resolved_path,
+                        failure_class="spawn_failure",
+                        retry_argv=retry_argv,
+                        stderr=_bounded_failure_output(
+                            str(exc),
+                            payload_text=payload_text,
+                            hook_env=hook_env,
+                        ),
+                    )
+                )
+                if final_rc == 0:
+                    final_rc = 1
+                continue
             child_stdout_is_json = _stdout_is_json(result.stdout)
             child_blocking = result.returncode == 2
+            failure_class: HookFailureClass | None = None
+            if child_blocking and not child_stdout_is_json:
+                failure_class = "invalid_json"
+            elif result.returncode not in (0, 2):
+                failure_class = "unexpected_exit"
+            if failure_class is not None:
+                failures.append(
+                    HookFailure(
+                        hook_name=hook_name,
+                        hook_path=resolved_path,
+                        failure_class=failure_class,
+                        retry_argv=retry_argv,
+                        stderr=_bounded_failure_output(
+                            result.stderr,
+                            payload_text=payload_text,
+                            hook_env=hook_env,
+                        ),
+                    )
+                )
 
             if result.returncode != 0 and not child_stdout_is_json:
                 if result.stdout:
@@ -267,4 +376,5 @@ class StopChecksRunner:
         if chosen_json is not None:
             print(chosen_json, end="")
         human_output.emit()
+        self.last_report = StopChecksReport(final_rc=final_rc, failures=tuple(failures))
         return final_rc
