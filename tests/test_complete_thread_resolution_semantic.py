@@ -63,8 +63,7 @@ def _pr():
 
 def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
           threads=None, resolve_result=True, reply_result=True, events=None,
-          commits=None, files_by_commit=None, spans_by_range=None,
-          dates_by_commit=None):
+          commits=None, files_by_commit=None):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -97,18 +96,8 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     # ... changing exactly `spans` (hunk line ranges) in each touched file.
     monkeypatch.setattr(
         github_api, "get_changed_line_spans",
-        lambda base, head, path, cwd=None: (
-            spans_by_range.get((base, head, path))
-            if spans_by_range is not None
-            else None if spans is None else list(spans)
-        ),
+        lambda base, head, path, cwd=None: None if spans is None else list(spans),
     )
-    if dates_by_commit is not None:
-        monkeypatch.setattr(
-            github_api, "get_commit_date",
-            lambda sha, cwd=None: dates_by_commit.get(sha),
-            raising=False,
-        )
     all_threads = threads if threads is not None else [thread]
     monkeypatch.setattr(github_api, "get_review_threads",
                         lambda n, cwd=None: list(all_threads))
@@ -517,11 +506,11 @@ def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch)
     assert replied == []
 
 
-def test_bou2320_reopened_thread_requires_fix_newer_than_reviewer_followup(
+def test_bou2320_reopened_thread_with_newer_head_requires_manual_confirmation(
         monkeypatch, capsys):
     # The failed resolve left a marker, then the reviewer rejected the fix
-    # AFTER the current HEAD was pushed. Even if the old base..HEAD hunk still
-    # intersects the anchor, it is not evidence for this newer feedback.
+    # AFTER the current HEAD was pushed. Even if the base..HEAD hunk still
+    # intersects the anchor, reopened feedback requires manual confirmation.
     top = ReviewThreadComment(
         database_id=42, path=ANCHOR, line=7,
         body="Guard against a None campaign here.", author="rev",
@@ -586,14 +575,7 @@ def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
         touched_files=[],
         commits=commits,
         files_by_commit={"aaaaaaa": [ANCHOR], "bbbbbbb": ["README.md"]},
-        dates_by_commit={
-            "aaaaaaa": "2026-01-10T00:00:00Z",
-            "bbbbbbb": "2026-02-01T00:00:00Z",
-        },
-        spans_by_range={
-            ("basesha", "headsha", ANCHOR): SPANS_AT_ANCHOR,
-            ("aaaaaaa^", "aaaaaaa", ANCHOR): SPANS_AT_ANCHOR,
-        },
+        spans=SPANS_AT_ANCHOR,
     )
 
     rc = mc._cmd_complete(_args())
@@ -606,7 +588,8 @@ def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
     assert "review_comments" in captured.out
 
 
-def test_bou2320_post_followup_anchor_change_resolves_reopened_thread(monkeypatch):
+def test_bou2320_newer_anchor_change_still_requires_manual_confirmation(
+        monkeypatch, capsys):
     top = ReviewThreadComment(
         database_id=42, path=ANCHOR, line=7,
         body="Guard against a None campaign here.", author="rev",
@@ -634,21 +617,17 @@ def test_bou2320_post_followup_anchor_change_resolves_reopened_thread(monkeypatc
         touched_files=[],
         commits=commits,
         files_by_commit={"aaaaaaa": [ANCHOR], "ccccccc": [ANCHOR]},
-        dates_by_commit={
-            "aaaaaaa": "2026-01-10T00:00:00Z",
-            "ccccccc": "2026-02-01T00:00:00Z",
-        },
-        spans_by_range={
-            ("basesha", "headsha", ANCHOR): SPANS_AT_ANCHOR,
-            ("ccccccc^", "headsha", ANCHOR): SPANS_AT_ANCHOR,
-        },
+        spans=SPANS_AT_ANCHOR,
     )
 
     rc = mc._cmd_complete(_args())
 
     assert rc == 0
-    assert resolved == ["t1"]
-    assert [thread_id for thread_id, _ in replied] == ["t1"]
+    assert resolved == []
+    assert replied == []
+    captured = capsys.readouterr()
+    assert "manual confirmation" in captured.err
+    assert "review_comments" in captured.out
 
 
 def test_pr78_head_side_anchor_matching_only_old_span_not_resolved(monkeypatch):

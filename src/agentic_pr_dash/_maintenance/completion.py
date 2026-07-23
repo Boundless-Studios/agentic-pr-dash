@@ -57,7 +57,6 @@ def _spans_intersect_line(
 def _thread_completion_evidence(
     thread,  # type: ignore[no-untyped-def]
     spans: list[tuple[int, int, int, int]] | None,
-    reopened_spans: list[tuple[int, int, int, int]] | None = None,
 ) -> str | None:
     """Positive per-thread evidence that the completing commits addressed THIS thread.
 
@@ -79,8 +78,10 @@ def _thread_completion_evidence(
     - ``"file"``   — the thread is file-level (no line anchor at all) and the
       file's content changed; the whole file IS the anchor span.
 
-    A reopened thread uses only ``reopened_spans`` proven to have changed after
-    its latest human follow-up, so an old hunk cannot re-complete rejected work.
+    A terminal marker followed by non-marker human feedback is ``reopened``.
+    Reopened threads always return ``None``: commit timestamps and inferred diff
+    coordinates cannot prove that the reviewer accepted a later attempt, so
+    automation must leave the thread open for manual confirmation.
 
     ``spans is None`` means the base..head diff was unavailable — that is
     absence of proof, never proof of absence, so it yields ``None``.
@@ -95,7 +96,7 @@ def _thread_completion_evidence(
     if state == "completed":
         return "reply"
     if state == "reopened":
-        spans = reopened_spans
+        return None
     anchor_line = thread.top.line
     anchor_side = "new"  # non-outdated `line` is a head-side coordinate
     if anchor_line is None:
@@ -106,33 +107,6 @@ def _thread_completion_evidence(
     if spans and _spans_intersect_line(spans, anchor_line, anchor_side):
         return "hunk"
     return None
-
-
-def _latest_reopening_followup(thread) -> str | None:  # type: ignore[no-untyped-def]
-    """Latest human follow-up that reopened a terminally marked thread."""
-    from agentic_pr_dash._maintenance._common import _parse_iso  # noqa: PLC0415
-    from agentic_pr_dash.github_api import (  # noqa: PLC0415
-        CLAIM_MARKER,
-        COMPLETE_MARKER,
-        FAILED_MARKER,
-        _thread_state,
-    )
-
-    replies_as_dicts = [
-        {"body": r.body, "created_at": r.created_at, "author": r.author}
-        for r in thread.replies
-    ]
-    state, _ = _thread_state(replies_as_dicts, top_author=thread.top.author)
-    if state != "reopened":
-        return None
-    followups = [
-        r.created_at
-        for r in thread.replies
-        if not any(marker in r.body for marker in (
-            CLAIM_MARKER, COMPLETE_MARKER, FAILED_MARKER))
-        and _parse_iso(r.created_at) is not None
-    ]
-    return max(followups, key=_parse_iso) if followups else None
 
 
 def _commit_subject(message: str) -> str:
