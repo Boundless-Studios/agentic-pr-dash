@@ -243,6 +243,56 @@ def resolved_decision_for_pr(pr: PRData):
     return max(resumable, key=lambda record: record.request.created_at)
 
 
+def decision_by_id_for_pr(pr: PRData, decision_id: str):
+    """A single decision for this PR by id, fingerprint-independent."""
+    for record in _decisions_for_pr_task(pr):
+        if record.request.decision_id == decision_id:
+            return record
+    return None
+
+
+def record_task_resume(pr: PRData, record, session_id: str) -> bool:
+    """Record ``task_resumed`` for a resolved decision under the PR's live claim.
+
+    Closes the coordinator's resume protocol so the completed work can cite the
+    direction it was given. Returns False (without raising) when there is no
+    live claim to resume under, or when the epoch fence rejects us — a deposed
+    owner must not be able to record a resume.
+    """
+    claim = _best_active_claim_for_pr(pr)
+    if claim is None:
+        return False
+    try:
+        _coordinator().resume_task(
+            record.request.decision_id,
+            claim_id=claim.claim_id,
+            owner_session_id=claim.owner.session_id,
+            lease_epoch=claim.lease_epoch,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def decision_block_reason(pr: PRData) -> str | None:
+    """Why this PR must not be dispatched right now, or None.
+
+    The single gate BOTH the automatic poll path and the manual dashboard
+    actions consult. ``/api/fix-comments`` and ``/api/retry-ci`` reach
+    ``dispatch_pr_maintenance`` without going through
+    ``dispatch_decision_for_pr``, so gating only the latter would let a button
+    click queue an executor against an unresolved boundary (PR #109 review).
+    """
+    waiting = pending_decision_for_pr(pr)
+    if waiting is None:
+        return None
+    request = waiting.request
+    return (
+        f"PR #{pr.number} is waiting on a human {request.category} decision "
+        f"{request.decision_id}: {request.question}"
+    )
+
+
 def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> DispatchDecision:
     # BOU-2040: a question owed to a human outranks every claim consideration
     # below. Checking it first keeps the loop from reading "reclaimable" and
