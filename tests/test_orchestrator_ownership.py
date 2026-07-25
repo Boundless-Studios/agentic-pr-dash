@@ -706,8 +706,13 @@ def test_build_cards_keeps_live_agent_when_different_session_is_terminal(monkeyp
 
     card = dashboard_app.build_worktree_cards()[0][0]
 
-    assert card.status == PRStatus.AGENT_WORKING
-    assert card.activity_message == "Codex working"
+    # The live agent survives the terminal sibling session — but with no
+    # activity evidence it reads as waiting, not working (BOU-2365).
+    assert card.status == PRStatus.CLEAN
+    assert card.session_activity == "waiting"
+    assert card.agent_state == "waiting"
+    assert card.active_agents and card.active_agents[0].pid == 999
+    assert card.activity_message == "Codex watching"
 
 
 def test_build_cards_keeps_activity_only_agent_when_terminal_session_has_no_agent_match(monkeypatch, tmp_path: Path):

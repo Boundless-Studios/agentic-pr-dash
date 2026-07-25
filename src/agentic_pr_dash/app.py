@@ -118,6 +118,11 @@ KANBAN_COLUMNS = [
         "statuses": {PRStatus.AGENT_WORKING},
     },
     {
+        "id": "waiting",
+        "title": "Waiting",
+        "statuses": {PRStatus.AGENT_WAITING},
+    },
+    {
         "id": "no_pr",
         "title": "No PR",
         "statuses": {PRStatus.NO_PR},
@@ -126,6 +131,11 @@ KANBAN_COLUMNS = [
         "id": "pending",
         "title": "CI Pending",
         "statuses": {PRStatus.CI_PENDING},
+    },
+    {
+        "id": "ready_cleanup",
+        "title": "Ready / Cleanup",
+        "statuses": {PRStatus.READY_CLEANUP},
     },
     {
         "id": "done",
@@ -195,17 +205,25 @@ def _load_babysit_activity() -> tuple[dict[int, str], dict[str, str]]:
 # own ticks both sit above the CPU floor).
 _ACTIVITY_DEBOUNCE_SECONDS = 20    # a turn must last this long to read as "working"
 _HARNESS_STATUS_STALE_SECONDS = 90
-_HARNESS_TRANSITION_STATES = {
-    "draining",
+# Rotation machinery that is genuinely mid-flight: short-lived, and reaping or
+# re-dispatching against it would be wrong, so it counts as work.
+_HARNESS_ACTIVE_TRANSITION_STATES = {
     "checkpointing",
     "checkpointed",
     "fencing",
     "fenced",
-    "stopping",
-    "stopped",
     "claiming",
     "launching",
     "awaiting_ack",
+}
+# Wind-down and blocked phases. `draining` in particular means "waiting for the
+# session to fall idle before rotating" — and it is also where a session whose
+# hooks broke parks — so it is never active coding (BOU-2365).
+_HARNESS_WAITING_STATES = {
+    "draining",
+    "stopping",
+    "stopped",
+    "blocked",
 }
 _DEFERRED_STOP_DIR = ".agent-activity-deferred-stops"
 
@@ -227,7 +245,7 @@ def _legacy_agent_activity_state(worktree_path: str | None) -> str:
 
       "working" — a session is in a sustained turn: state busy, past the debounce,
                   AND its owning pid is still alive.
-      "idle"    — sessions exist but none are actively working (idle, sub-debounce
+      "waiting" — sessions exist but none are actively working (idle, sub-debounce
                   quick ticks, or busy records whose owning process is gone).
       "none"    — no activity data; caller falls back to CPU detection.
 
@@ -289,7 +307,7 @@ def _legacy_agent_activity_state(worktree_path: str | None) -> str:
         if isinstance(pid, int) and session_registry.pid_is_live(pid):
             return "working"
         # busy stamp whose owner pid is gone → orphan; ignore it
-    return "idle"
+    return "waiting"
 
 
 def _harness_activity_state(
@@ -297,7 +315,11 @@ def _harness_activity_state(
     *,
     now: datetime | None = None,
 ) -> str:
-    """Return fresh canonical activity, or ``none`` to preserve fallbacks."""
+    """Return fresh canonical activity, or ``none`` to preserve fallbacks.
+
+    One of ``working`` (real work or rotation mid-flight), ``waiting`` (live but
+    idle, winding down, or blocked) or ``none`` (no usable signal).
+    """
     if runtime_session is None or runtime_session.is_terminal:
         return "none"
     if not _harness_report_is_fresh(runtime_session, now=now):
@@ -311,12 +333,14 @@ def _harness_activity_state(
         )
     ):
         return "working"
-    if runtime_session.supervisor_state in _HARNESS_TRANSITION_STATES:
+    if runtime_session.supervisor_state in _HARNESS_ACTIVE_TRANSITION_STATES:
         return "working"
+    if runtime_session.supervisor_state in _HARNESS_WAITING_STATES:
+        return "waiting"
     if runtime_session.quiescence == "busy":
         return "working"
     if runtime_session.quiescence == "idle":
-        return "idle"
+        return "waiting"
     return "none"
 
 
@@ -364,24 +388,39 @@ def _agent_activity_state(
     return _legacy_agent_activity_state(worktree_path)
 
 
-def _resolve_agent_working(
+def _resolve_agent_activity(
     worktree_path: str | None,
     live: bool,
     runtime_session: session_registry.RuntimeSessionState | None = None,
-) -> bool:
+) -> str:
     """Combine turn-state with live-process presence (PR #1918 review):
 
-      * "working" → True (the owning pid was already verified alive).
-      * "idle"    → False even if a process lingers (the idle /loop watch case —
-        the whole point: don't show working between turns).
-      * "none"    → defer to CPU-discovered presence (sessions without the hook).
+      * "working" → the owning pid was already verified alive and in a turn.
+      * "waiting" → a session is present but between turns (the idle /loop watch
+        case — the whole point: don't show working between turns).
+      * "none"    → no session at all.
+
+    With no activity signal, a bare live process resolves to ``waiting``, never
+    ``working`` (BOU-2365): liveness is not work. Hook-less sessions that ARE
+    working are still caught upstream by the maintenance state, which the loop
+    sets to RUNNING when it dispatches an executor.
     """
     state = _agent_activity_state(worktree_path, runtime_session)
-    if state == "working":
-        return True
-    if state == "idle":
-        return False
-    return live
+    if state in ("working", "waiting"):
+        return state
+    return "waiting" if live else "none"
+
+
+def _waiting_reason(
+    pr: PRData | None,
+    runtime_session: session_registry.RuntimeSessionState | None,
+) -> str:
+    """Why an idle live session is idle — shown on the card's state chip."""
+    if runtime_session is not None and runtime_session.supervisor_state in _HARNESS_WAITING_STATES:
+        return "winding down"
+    if pr is not None and (pr.ci_watch_pending or pr.status == PRStatus.CI_PENDING):
+        return "external checks"
+    return "user input"
 
 
 def _card_activity_message(
@@ -511,20 +550,35 @@ ACTIVE_MAINTENANCE_STATES = {
     MaintenanceStatus.WAITING_FOR_PUSH,
 }
 
+def _card_status(
+    pr: PRData | None, activity: str, reclaimable: bool = False
+) -> PRStatus:
+    """Route a card to its board column.
 
-def _card_status(pr: PRData | None, has_active_agents: bool) -> PRStatus:
+    ``activity`` is the tri-state from :func:`_resolve_agent_activity`. A card
+    with a PR keeps that PR's status so the column always answers "what does
+    this PR need" — the idle-session signal rides on ``session_activity`` and
+    shows up on the state chip instead (BOU-2365). Only a worktree with no PR
+    is routed by activity alone.
+    """
+    # A reclaimable worktree is terminal — a lingering chat process must not
+    # keep it on the board as live work. A genuinely working agent still wins.
+    if reclaimable and activity != "working":
+        return PRStatus.READY_CLEANUP
     if pr:
         maintenance_is_active = (
             pr.maintenance is not None
             and pr.maintenance.state in ACTIVE_MAINTENANCE_STATES
         )
-        if has_active_agents or maintenance_is_active:
+        if activity == "working" or maintenance_is_active:
             return PRStatus.AGENT_WORKING
         if pr.status == PRStatus.CLEAN and pr.review_comments:
             return PRStatus.HAS_COMMENTS
         return pr.status
-    if has_active_agents:
+    if activity == "working":
         return PRStatus.AGENT_WORKING
+    if activity == "waiting":
+        return PRStatus.AGENT_WAITING
     return PRStatus.NO_PR
 
 
@@ -774,17 +828,28 @@ def _build_card_for_worktree(
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
     # has an activity stamp; fall back to CPU-discovered active_agents otherwise.
-    if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
-        agent_working = False
+    if _dashboard_dispatch_inflight(pr):
+        activity = "working"
+    elif _terminal_session_matches_active_agents(runtime_session, fallback_agents):
+        activity = "none"
     else:
-        agent_working = _resolve_agent_working(
+        activity = _resolve_agent_activity(
             worktree.get("path"), bool(fallback_agents), runtime_session
         )
-    status = _card_status(pr, agent_working)
-    activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
-    cleanup_candidate = False
-    if pr is None:
-        cleanup_candidate, _ = _selected_worktree_cleanup_reason(worktree, fallback_agents)
+    # Reclaimability is evaluated with NO agents so a lingering chat process
+    # can't hide a merged/closed branch; the dirty-tree and protected-worktree
+    # guards still apply. `cleanup_candidate` keeps the conservative semantics
+    # it has always had, because it arms the destructive cleanup button.
+    # Skipped entirely while the agent is working — nothing downstream consumes
+    # it in that case, and the probe shells out to `gh` on every board poll.
+    reclaimable = False
+    if pr is None and activity != "working":
+        reclaimable, _ = _selected_worktree_cleanup_reason(worktree, [])
+    cleanup_candidate = reclaimable and not fallback_agents
+    status = _card_status(pr, activity, reclaimable)
+    activity_message, activity_source = _card_activity_message(
+        pr, fallback_agents, activity == "working"
+    )
 
     # Prefer the PR's creation timestamp as "started_at"; fall back to the
     # worktree directory's birth/ctime when no PR (or PR has no created_at).
@@ -831,6 +896,10 @@ def _build_card_for_worktree(
         agent_failure_reason=pr.agent_failure_reason if pr else None,
         agent_session_id=pr.agent_session_id if pr else None,
         agent_output=pr.agent_output if pr else [],
+        session_activity=activity,
+        waiting_reason=(
+            _waiting_reason(pr, runtime_session) if activity == "waiting" else None
+        ),
         last_polled=pr.last_polled if pr else None,
         last_agent_dispatch=pr.last_agent_dispatch if pr else None,
         maintenance=pr.maintenance if pr else None,
@@ -865,14 +934,18 @@ def _build_unassigned_pr_card(
     # Turn-activity signal is keyed on the worktree the agent is actually in —
     # the session's worktree when branch-matched, else the PR's own.
     activity_worktree_path = session_worktree_path or pr.worktree_path
-    if _terminal_session_matches_active_agents(runtime_session, fallback_agents):
-        agent_working = False
+    if _dashboard_dispatch_inflight(pr):
+        activity = "working"
+    elif _terminal_session_matches_active_agents(runtime_session, fallback_agents):
+        activity = "none"
     else:
-        agent_working = _resolve_agent_working(
+        activity = _resolve_agent_activity(
             activity_worktree_path, bool(fallback_agents), runtime_session
         )
-    status = _card_status(pr, agent_working)
-    activity_message, activity_source = _card_activity_message(pr, fallback_agents, agent_working)
+    status = _card_status(pr, activity)
+    activity_message, activity_source = _card_activity_message(
+        pr, fallback_agents, activity == "working"
+    )
 
     if worktree_hidden:
         worktree_name = "Agent worktree hidden"
@@ -921,6 +994,10 @@ def _build_unassigned_pr_card(
         agent_failure_reason=pr.agent_failure_reason,
         agent_session_id=pr.agent_session_id,
         agent_output=pr.agent_output,
+        session_activity=activity,
+        waiting_reason=(
+            _waiting_reason(pr, runtime_session) if activity == "waiting" else None
+        ),
         last_polled=pr.last_polled,
         last_agent_dispatch=pr.last_agent_dispatch,
         maintenance=pr.maintenance,
@@ -932,8 +1009,18 @@ def _build_unassigned_pr_card(
     )
 
 
+def _dashboard_dispatch_inflight(pr: PRData | None) -> bool:
+    """True when the dashboard itself has an executor in flight for this PR.
+
+    Unlike process liveness this is an unambiguous "we started work" signal, so
+    it resolves to ``working`` even before the executor is CPU-visible or has
+    stamped any activity (BOU-2365).
+    """
+    return bool(pr and pr.number in orchestrator._inflight_prs)
+
+
 def _fallback_dashboard_agent(pr: PRData | None) -> list[AgentProcess]:
-    if not pr or pr.number not in orchestrator._inflight_prs:
+    if pr is None or not _dashboard_dispatch_inflight(pr):
         return []
     cli_name = pr.agent_cli_name or "codex"
     return [AgentProcess(pid=0, cli_name=cli_name, label=cli_name.capitalize())]
@@ -1355,7 +1442,53 @@ def _proof_fixture_cards(scenario: str) -> list[WorktreeCard]:
                 latest_commit_date="2026-05-25T15:09:00Z",
                 last_updated_label="30s ago",
             ),
-            # Column 3 — Clean: ready to merge.
+            # Column 3 — Waiting: a worktree with no PR whose session is alive
+            # but between turns. Liveness is not work (BOU-2365).
+            WorktreeCard(
+                id="demo-waiting",
+                worktree_name="invoice-export",
+                worktree_path="/home/dev/worktrees/invoice-export",
+                branch="feature/invoice-export",
+                environment_name="invoice-export",
+                frontend_port="3004",
+                backend_port="8040",
+                slot="4",
+                status=PRStatus.AGENT_WAITING,
+                session_activity="waiting",
+                waiting_reason="user input",
+                ci_checks=[CICheck(name="unit", status="in_progress")],
+                active_agents=[AgentProcess(pid=4343, cli_name="claude", label="Claude")],
+                agent_name="amber-heron",
+                activity_message="Claude watching",
+                activity_source="local",
+                supervisor_state="running",
+                runtime_quiescence="idle",
+                latest_commit_sha="c3d4e5f",
+                latest_commit_date="2026-05-25T15:05:00Z",
+                last_updated_label="7m ago",
+            ),
+            # Column 4 — Ready / Cleanup: merged, worktree reclaimable, and the
+            # chat process is still draining. Terminal, not working.
+            WorktreeCard(
+                id="demo-ready-cleanup",
+                worktree_name="local-agent-linear",
+                worktree_path="/home/dev/worktrees/local-agent-linear",
+                branch="feature/local-agent-linear",
+                environment_name="local-agent-linear",
+                frontend_port="3005",
+                backend_port="8050",
+                slot="5",
+                status=PRStatus.READY_CLEANUP,
+                cleanup_candidate=True,
+                session_activity="waiting",
+                agent_name="fleet-mantis",
+                supervisor_state="draining",
+                runtime_quiescence="idle",
+                latest_commit_sha="e5f6a7b",
+                latest_commit_date="2026-05-25T14:40:00Z",
+                last_updated_label="32m ago",
+            ),
+            # Column 5 — Clean: ready to merge.
             WorktreeCard(
                 id="demo-clean",
                 worktree_name="checkout-retry",
@@ -1426,6 +1559,8 @@ def status_label(status: PRStatus) -> str:
         PRStatus.CI_AND_COMMENTS: "CI + Comments",
         PRStatus.MERGE_CONFLICT: "Conflicts",
         PRStatus.AGENT_WORKING: "Agent Working",
+        PRStatus.AGENT_WAITING: "Waiting",
+        PRStatus.READY_CLEANUP: "Ready / Cleanup",
         PRStatus.AGENT_FAILED: "Agent Failed",
     }.get(status, "Unknown")
 

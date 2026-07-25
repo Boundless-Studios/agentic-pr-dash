@@ -310,6 +310,55 @@ The key models are in `models.py`:
 Keep GitHub response parsing in `github_api.py`. Convert external data into
 models before handing it to the dashboard or maintenance flows.
 
+### Card State Precedence
+
+**Liveness is not work.** A session process being alive, or a heartbeat still
+arriving, never by itself means the agent is doing something. The board keeps
+three separate activity states so a merged PR whose chat window is still open
+does not sit in `Agent Working` forever (BOU-2365).
+
+`app._resolve_agent_activity` produces a tri-state used by `app._card_status`:
+
+| activity | Meaning |
+|---|---|
+| `working` | Real work: an open turn/tool/subagent/critical section, `quiescence == busy`, or rotation machinery mid-flight (`checkpointing`, `checkpointed`, `fencing`, `fenced`, `claiming`, `launching`, `awaiting_ack`). |
+| `waiting` | A live session that is not working: `quiescence == idle`, a wind-down or blocked supervisor phase (`draining`, `stopping`, `stopped`, `blocked`), or a bare live process with no activity signal at all. |
+| `none` | No session. |
+
+Sessions with no activity hook that genuinely *are* working still read as
+`working`, because the loop sets `MaintenanceStatus.RUNNING` when it dispatches
+an executor and `_card_status` treats an active maintenance state as work.
+
+**Column and chip are decoupled.** The card's `status` (which column it lands
+in) answers *what does this PR need*; `session_activity` + `agent_state` (the
+state chip) answer *what is the session doing*. A clean PR with an idle session
+stays in `Clean` — so the bug-bash "ready to merge" count keeps working — while
+its chip reads `Waiting · user input`. Only a worktree with **no** PR is routed
+to a column by activity alone: that is the `Waiting` column, and it is exactly
+the bucket that used to be mislabelled `Agent Working`.
+
+`WorktreeCard.agent_state` resolves in this order:
+
+```
+failed > ready_cleanup > queued > working > awaiting_fixes
+       > ci_failing > merge_conflict > waiting > ci_pending > no_pr > clean
+```
+
+Two rules carry most of the weight:
+
+- `ready_cleanup` outranks `waiting` but **not** `working`. A merged/closed
+  branch with a reclaimable worktree is terminal even if the conversation is
+  still alive; an agent genuinely mid-turn on a stale branch is not.
+- `waiting` never masks an actionable PR. When the PR is CI-failing, has review
+  comments, or conflicts, the card keeps that state — only the passive states
+  (`ci_pending`, `no_pr`, `clean`) are overridden, with a `waiting_reason` of
+  `user input`, `external checks`, or `winding down`.
+
+Reclaimability for *display* is evaluated with an empty agent list so a
+lingering process cannot hide a finished worktree; the `cleanup_candidate` flag
+that arms the destructive cleanup button keeps its conservative "no agents
+present" requirement.
+
 ## State Files
 
 State is local and file-based:

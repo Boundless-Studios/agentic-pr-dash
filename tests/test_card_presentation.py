@@ -150,13 +150,13 @@ def test_agent_state_agent_failed_status():
 # ---------------------------------------------------------------------------
 
 _ALL_STATES = [
-    "failed", "working", "queued", "awaiting_fixes",
+    "failed", "working", "waiting", "ready_cleanup", "queued", "awaiting_fixes",
     "ci_failing", "ci_pending", "merge_conflict", "no_pr", "clean",
 ]
 
 
 def test_agent_state_label_non_empty_and_distinct():
-    """Each of the 9 states must map to a non-empty, distinct human label."""
+    """Each state must map to a non-empty, distinct human label."""
     labels: dict[str, str] = {}
     for state_val in _ALL_STATES:
         # Build a card that produces this agent_state
@@ -164,6 +164,10 @@ def test_agent_state_label_non_empty_and_distinct():
             card = _minimal_card(status=PRStatus.AGENT_FAILED)
         elif state_val == "working":
             card = _minimal_card(status=PRStatus.AGENT_WORKING)
+        elif state_val == "waiting":
+            card = _minimal_card(status=PRStatus.AGENT_WAITING)
+        elif state_val == "ready_cleanup":
+            card = _minimal_card(status=PRStatus.READY_CLEANUP)
         elif state_val == "queued":
             card = _minimal_card(
                 status=PRStatus.AGENT_WORKING,

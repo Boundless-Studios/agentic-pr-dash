@@ -240,7 +240,7 @@ def test_activity_stop_timeout_still_makes_dashboard_idle(tmp_path, monkeypatch)
         argv=["Stop"],
     )
 
-    assert app._legacy_agent_activity_state(str(tmp_path)) == "idle"
+    assert app._legacy_agent_activity_state(str(tmp_path)) == "waiting"
 
     monkeypatch.setattr(run_agent_activity, "_acquire", real_acquire)
     monkeypatch.setattr(app, "_ACTIVITY_DEBOUNCE_SECONDS", 0)

@@ -41,13 +41,14 @@ def _session(**overrides: object) -> session_registry.RuntimeSessionState:
     [
         ("running", "busy", 1, "working"),
         ("warning", "busy", 0, "working"),
-        ("draining", "idle", 0, "working"),
         ("checkpointing", "idle", 0, "working"),
         ("fenced", "idle", 0, "working"),
         ("launching", "idle", 0, "working"),
         ("awaiting_ack", "idle", 0, "working"),
-        ("running", "idle", 0, "idle"),
-        ("blocked", "idle", 0, "idle"),
+        # BOU-2365: wind-down phases are not work.
+        ("draining", "idle", 0, "waiting"),
+        ("running", "idle", 0, "waiting"),
+        ("blocked", "idle", 0, "waiting"),
         ("running", "unknown", 0, "none"),
     ],
 )
@@ -69,7 +70,7 @@ def test_harness_activity_maps_supervisor_and_quiescence(
 
 
 def test_fresh_harness_activity_wins_and_stale_status_falls_back(monkeypatch):
-    monkeypatch.setattr(app, "_legacy_agent_activity_state", lambda path: "idle")
+    monkeypatch.setattr(app, "_legacy_agent_activity_state", lambda path: "waiting")
     fresh = _session(quiescence="busy")
     stale = _session(
         harness_reported_at=(
@@ -77,8 +78,8 @@ def test_fresh_harness_activity_wins_and_stale_status_falls_back(monkeypatch):
         ).isoformat()
     )
 
-    assert app._resolve_agent_working("/tmp/worktree", False, fresh) is True
-    assert app._resolve_agent_working("/tmp/worktree", True, stale) is False
+    assert app._resolve_agent_activity("/tmp/worktree", False, fresh) == "working"
+    assert app._resolve_agent_activity("/tmp/worktree", True, stale) == "waiting"
 
 
 def test_runtime_selection_prefers_live_conversation_over_newer_terminal_one():

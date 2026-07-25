@@ -24,6 +24,13 @@ class PRStatus(str, Enum):
     CI_AND_COMMENTS = "ci_and_comments"
     MERGE_CONFLICT = "merge_conflict"
     AGENT_WORKING = "agent_working"
+    # A live session that is not actually working — awaiting user input, an
+    # external check, or winding down. Liveness alone never means AGENT_WORKING
+    # (BOU-2365).
+    AGENT_WAITING = "agent_waiting"
+    # The deliverable is merged/closed and the worktree is reclaimable, even if
+    # the chat process is still alive.
+    READY_CLEANUP = "ready_cleanup"
     AGENT_FAILED = "agent_failed"
 
 
@@ -260,6 +267,13 @@ class WorktreeCard(BaseModel):
     agent_failure_reason: str | None = None
     agent_session_id: str | None = None
     agent_output: list[str] = []
+    # Tri-state session activity: "working", "waiting", or "none". Kept
+    # separate from `status` so the column stays driven by what the PR needs
+    # while the state chip still tells the truth about the session (BOU-2365).
+    session_activity: str = "none"
+    # Why a live session is idle, set alongside session_activity == "waiting":
+    # "user input", "external checks", or "winding down".
+    waiting_reason: str | None = None
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
@@ -361,8 +375,23 @@ class WorktreeCard(BaseModel):
     @property
     def agent_state(self) -> str:
         """Single canonical state string for the card, in priority order:
-        failed > working > queued > awaiting_fixes > ci_failing > ci_pending
-        > merge_conflict > no_pr > clean.
+
+        ``failed > ready_cleanup > queued > working > awaiting_fixes >
+        ci_failing > merge_conflict > waiting > ci_pending > no_pr > clean``
+
+        The three activity states are deliberately distinct (BOU-2365):
+
+        * ``working`` — the agent is coding, testing, or remediating feedback.
+        * ``waiting`` — a live session that is idle: awaiting user input, an
+          external check, or winding down. Process/heartbeat liveness alone
+          resolves here, never to ``working``. It outranks ``ci_pending`` and
+          ``clean`` so an idle session is always visible, but never outranks an
+          actionable PR state — a red PR still reads ``ci_failing``.
+        * ``ready_cleanup`` — the PR is merged/closed and the worktree is
+          reclaimable, even when the chat process is still alive. It outranks
+          ``waiting`` so a lingering conversation cannot hide a finished
+          worktree, but not ``working`` — an agent genuinely mid-turn on a
+          stale branch still reads as working.
         """
         # --- failed ---
         if (
@@ -371,6 +400,10 @@ class WorktreeCard(BaseModel):
             or (self.maintenance is not None and self.maintenance.state == MaintenanceStatus.FAILED)
         ):
             return "failed"
+
+        # --- terminal: the deliverable is done, the worktree is reclaimable ---
+        if self.status == PRStatus.READY_CLEANUP:
+            return "ready_cleanup"
 
         # --- maintenance signals override status-based states ---
         if self.maintenance is not None:
@@ -387,10 +420,15 @@ class WorktreeCard(BaseModel):
             return "awaiting_fixes"
         if self.status == PRStatus.CI_FAILING:
             return "ci_failing"
-        if self.status == PRStatus.CI_PENDING:
-            return "ci_pending"
         if self.status == PRStatus.MERGE_CONFLICT:
             return "merge_conflict"
+
+        # --- an idle live session outranks the passive PR states ---
+        if self.status == PRStatus.AGENT_WAITING or self.session_activity == "waiting":
+            return "waiting"
+
+        if self.status == PRStatus.CI_PENDING:
+            return "ci_pending"
         if self.status == PRStatus.NO_PR:
             return "no_pr"
         return "clean"
@@ -401,6 +439,8 @@ class WorktreeCard(BaseModel):
         return {
             "failed": "Failed",
             "working": "Agent Working",
+            "waiting": "Waiting",
+            "ready_cleanup": "Ready / Cleanup",
             "queued": "Queued",
             "awaiting_fixes": "Awaiting Fixes",
             "ci_failing": "CI Failing",
@@ -409,6 +449,20 @@ class WorktreeCard(BaseModel):
             "no_pr": "No PR",
             "clean": "Clean",
         }.get(self.agent_state, "Unknown")
+
+    @property
+    def state_chip_label(self) -> str:
+        """Text for the card's single state badge.
+
+        ``agent_state_label`` for every state, extended to
+        ``Waiting · user input`` when a waiting reason is known. It always
+        starts with ``agent_state_label`` so the single-badge card contract
+        still renders the canonical label.
+        """
+        label = self.agent_state_label
+        if self.agent_state == "waiting" and self.waiting_reason:
+            return f"{label} · {self.waiting_reason}"
+        return label
 
     @property
     def runner_issue_count(self) -> int:
@@ -464,6 +518,9 @@ class WorktreeCard(BaseModel):
             self.agent_name,
             self.agent_state,
             self.agent_state_label,
+            # "none" is not a searchable fact — it would match any query for it.
+            self.session_activity if self.session_activity != "none" else None,
+            self.waiting_reason,
             self.started_at_label,
             self.merge_state,
             self.review_decision,
