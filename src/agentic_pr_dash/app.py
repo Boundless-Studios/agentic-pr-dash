@@ -106,6 +106,15 @@ async def service_worker():
 # -- Kanban columns --
 
 KANBAN_COLUMNS = [
+    # First by design (BOU-2402): this is the only column whose work is blocked
+    # on the VIEWER. Everything else is either an agent's job or a wait on CI;
+    # these PRs move only when a person answers, so they must not be mixed into
+    # a generic "Waiting" bucket where they read as someone else's problem.
+    {
+        "id": "needs_decision",
+        "title": "Needs Your Decision",
+        "statuses": {PRStatus.WAITING_HUMAN_DECISION},
+    },
     {
         "id": "needs_attention",
         "title": "Needs Attention",

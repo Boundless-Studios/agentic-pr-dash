@@ -28,6 +28,11 @@ class PRStatus(str, Enum):
     # external check, or winding down. Liveness alone never means AGENT_WORKING
     # (BOU-2365).
     AGENT_WAITING = "agent_waiting"
+    # Blocked on a human answering an architecture/product decision (BOU-2040).
+    # Distinct from AGENT_WAITING: nothing is running and nothing will run until
+    # a person acts, so this is the one waiting state that is actionable BY the
+    # viewer rather than by the agent.
+    WAITING_HUMAN_DECISION = "waiting_human_decision"
     # The deliverable is merged/closed and the worktree is reclaimable, even if
     # the chat process is still alive.
     READY_CLEANUP = "ready_cleanup"
@@ -223,6 +228,14 @@ class PRData(BaseModel):
     # True when at least one required CI check is still queued/in_progress.
     # Set by _check_worktree for non-draft PRs via github_api.required_checks_pending.
     ci_watch_pending: bool = False
+    # The unresolved human decision gating this PR, if any (BOU-2040/BOU-2402).
+    # Carried on the PR so a viewer can see WHAT is being asked without going to
+    # the coordinator ledger. Populated by _check_worktree; the ledger stays the
+    # source of truth.
+    waiting_decision_id: str | None = None
+    waiting_decision_question: str | None = None
+    waiting_decision_category: str | None = None
+    waiting_decision_runtime: str | None = None
     # True when this PR has been escalated due to repeated executor failures.
     escalated: bool = False
     escalated_reason: str | None = None
