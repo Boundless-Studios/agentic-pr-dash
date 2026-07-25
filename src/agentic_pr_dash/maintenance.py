@@ -47,6 +47,12 @@ def pr_markdown_link(pr_number: int | str, fallback_url: str | None = None) -> s
 
 
 def blockers_for_pr(pr: PRData) -> list[str]:
+    """What an executor can fix *right now* — the dispatch predicate.
+
+    Deliberately excludes still-running CI: a merely-running PR has nothing to
+    fix, and dispatching against one burns an executor on a moving target. Use
+    :func:`terminal_clean_blockers` to decide whether work may be declared done.
+    """
     blockers: list[str] = []
     if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
         blockers.append("merge_conflict")
@@ -54,6 +60,41 @@ def blockers_for_pr(pr: PRData) -> list[str]:
         blockers.append("ci_failure")
     if pr.review_comments:
         blockers.append("review_comments")
+    return blockers
+
+
+def terminal_clean_blockers(
+    pr: PRData, *, validated_head: str | None = None
+) -> list[str]:
+    """Everything denying "this PR is done" — the completion predicate.
+
+    Strictly stronger than :func:`blockers_for_pr`, which answers the narrower
+    "what can an executor fix right now". Opening or pushing a PR is not
+    terminal success (BOU-2038), so completion additionally requires:
+
+    ``ci_pending``
+        A required check is still queued or in progress. "No failures yet" is
+        not "checks succeeded" — closing here declares victory before the
+        evidence exists.
+
+    ``head_drift``
+        ``validated_head`` is not the PR's live head. Completion gathers its
+        evidence (which threads the fixing commits addressed, which files they
+        touched) against one head; if a push lands mid-run, every other signal
+        reads clean precisely *because* it was measured against the superseded
+        head. Drift alone must therefore deny completion, and the caller should
+        re-evaluate from live state.
+
+    Pass ``validated_head=None`` when there is no head to compare against;
+    absence of a baseline is not evidence of drift. Likewise an empty live sha
+    means the API did not report one, not that it moved.
+    """
+    blockers = blockers_for_pr(pr)
+    if pr.ci_watch_pending:
+        blockers.append("ci_pending")
+    live_head = pr.latest_commit_sha or ""
+    if validated_head and live_head and validated_head != live_head:
+        blockers.append("head_drift")
     return blockers
 
 
