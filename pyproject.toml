@@ -31,10 +31,18 @@ dependencies = [
     # Additive for us: ``StaleClaimError`` gains ``current_claim_id`` and the
     # claimed event gains ``superseded_claim_ids``; no signature we call changed.
     #
+    # ``853a40c`` is agent-coordinator 0.4.0 (BOU-2039): the durable human-decision
+    # protocol this package's decision-wait path is built on —
+    # ``request_decision`` / ``resolve_decision`` / ``decision_status`` /
+    # ``pending_decisions`` / ``resume_task``, plus ``DecisionPendingError`` on a
+    # terminal ``release_claim``. Also additive: every existing claim/lease
+    # signature is unchanged, and a ledger written by 0.3.2 reads back cleanly
+    # (no decision events -> no decisions).
+    #
     # Gaia pins this same package (BOU-2228). uv cannot resolve two different git
     # revs for one package, so gaia's harness pin cannot move past the v0.3.2-based
     # harness until this bump lands and APD_REF follows it.
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@9904b242e54cb2c73ce2f78091a923c82b9ec284",
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@853a40c0c9d0567855ef52a2ae8f814cef443b6a",
 ]
 
 [project.optional-dependencies]

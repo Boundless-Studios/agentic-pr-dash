@@ -563,6 +563,26 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     self_owned = active_owner is not None and active_owner.session_id == owner_session_id
 
     coord_decision = coordinator.dispatch_decision_for_pr(pr)
+
+    # BOU-2040: a pending human decision defers UNCONDITIONALLY — it must
+    # outrank both `new_feedback` and `self_owned`, unlike a foreign claim.
+    # Those two exist to stop a live owner's work being stolen; neither says
+    # anything about whether the human has answered. A comment landing while we
+    # wait flips `new_feedback` true, and the owning session re-entering flips
+    # `self_owned` true — either would fall through to dispatch and send an
+    # executor straight back into the boundary nobody has ruled on, which is the
+    # retry loop this whole path exists to prevent.
+    if coord_decision.state == "waiting_human":
+        return 0, _blocked_defer_text(
+            pr_number=pr.number,
+            blockers=blockers,
+            owner_desc=(
+                f"agent-coordinator {coord_decision.state}: {coord_decision.reason} "
+                f"(claim {coord_decision.claim_id}, "
+                f"owner session {coord_decision.owner_session_id})"
+            ),
+        )
+
     if not coord_decision.should_dispatch and not new_feedback and not self_owned:
         # A LIVE foreign claim owns this PR's blocker set — defer (exit 0) in both
         # modes. Preserve the coordinator's own state + reason (e.g. the

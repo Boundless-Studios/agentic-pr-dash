@@ -837,6 +837,39 @@ def _head_sha(cwd: str) -> str:
     return out.stdout.strip()
 
 
+def _decision_requested_during_dispatch(cwd: str, pr: int | None) -> bool:
+    """Whether the executor left an unresolved human decision for this PR.
+
+    BOU-2040 / BOU-2038: an executor that reaches a boundary it does not own
+    records a coordinator decision request and stops. From out here that is
+    indistinguishable from a failed run by exit code alone, so the coordinator
+    ledger is the authority — deliberately not a stdout phrase, which an agent
+    could emit accidentally or a log could swallow.
+
+    The probe carries ``worktree_path`` and no url on purpose:
+    ``_repo_slug_for_pr`` then resolves the slug from this worktree's config,
+    with no subprocess and no network. Shelling out to ``gh repo view`` here
+    would put a timeout-bounded child process on the failure path of every loop
+    tick.
+
+    Best-effort: any lookup error means we cannot prove a decision is pending,
+    so the caller falls through to normal failure handling. Suppressing a real
+    failure on a bad read would be the more dangerous mistake.
+    """
+    if pr is None:
+        return False
+    try:
+        from . import coordinator as _coordinator_mod  # noqa: PLC0415
+        from .models import PRData  # noqa: PLC0415
+
+        probe = PRData(
+            number=pr, title="", branch="", url="", worktree_path=cwd,
+        )
+        return _coordinator_mod.pending_decision_for_pr(probe) is not None
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _baseline_sha(cwd: str, pr: int | None) -> str:
     """The PR branch's PUBLISHED head BEFORE the executor runs.
 
@@ -1124,6 +1157,23 @@ def _service_cwd(
         except StaleClaimError:
             return
     serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
+    if not serviced and _decision_requested_during_dispatch(cwd, pr):
+        # BOU-2040: the executor stopped because it owes a human an answer, not
+        # because it failed. The coordinator ledger — not an exit code or a
+        # stdout phrase — is the source of truth here (BOU-2038). Recording a
+        # failure would burn a streak slot toward escalation and re-dispatch an
+        # executor that will hit the same boundary and stop again.
+        #
+        # Release the claim NON-terminally so the PR is not left wrongly owned
+        # while a human thinks, and so a replacement owner may pick the work up
+        # after resolution. `completed` would be rejected by the coordinator
+        # anyway while the decision is unresolved.
+        if claim_handle:
+            try:
+                coordinator.release_claim(claim_handle, session, "waiting_human")
+            except StaleClaimError:
+                pass
+        return
     if not serviced:
         # Primary (and fallback, if any) failed. Record the failure streak,
         # then release the claim so the PR is not left wrongly owned until
