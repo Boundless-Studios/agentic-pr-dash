@@ -448,6 +448,36 @@ def _cmd_complete(args: argparse.Namespace) -> int:
         )
         if not addressed:
             left_unresolved.append(thread.node_id)
+            # BOU-2408: say WHY. This was the only one of the three
+            # leave-open paths that stayed silent, so `complete` printed
+            # "blockers remain: review_comments" with nothing on stderr and
+            # read as a tool failure rather than a deliberate refusal. The
+            # refusal is usually correct — commonly the fix landed in a test
+            # file while the thread is anchored on the module under test — but
+            # an agent cannot act on a reason it is never told.
+            if not new_commits:
+                reason = (
+                    f"no new commits in {baseline or '<no baseline>'}..HEAD "
+                    "(nothing was pushed after the baseline, so there is no "
+                    "fix to evidence)"
+                )
+            elif head_date <= thread.top.created_at:
+                reason = (
+                    f"the thread ({thread.top.created_at}) is newer than the "
+                    f"completing head ({head_date}) — it is feedback ON the fix, "
+                    "not feedback the fix addresses"
+                )
+            else:
+                reason = (
+                    f"anchored file {path or '<none>'} was not touched by the "
+                    f"fixing commits (they touched: "
+                    f"{', '.join(sorted(touched)) or '<nothing>'})"
+                )
+            print(
+                f"info: leaving thread {thread.node_id} open — {reason}; "
+                "resolve it manually if the feedback is genuinely addressed",
+                file=sys.stderr,
+            )
             continue
         # BOU-2095: "anchor file touched" is necessary but NOT sufficient.
         # Require positive per-thread evidence — the completing commits changed

@@ -790,3 +790,61 @@ def test_get_changed_line_spans_parses_real_git_diff(tmp_path):
         "0" * 40, head, "a.py", str(tmp_path)) is None
     # Untouched path -> [] (real evidence of no change).
     assert github_api.get_changed_line_spans(base, head, "other.py", str(tmp_path)) == []
+
+
+# --- BOU-2408: the "not addressed" skip must explain itself --------------------
+#
+# Of the three paths that leave a thread unresolved, `not addressed` was the
+# only silent one. The `evidence is None` and cross-file `elsewhere` cases each
+# print an `info:` line; this one appended to `left_unresolved` and moved on.
+#
+# The visible result was `complete` printing
+#     completed (bead left open; blockers remain: review_comments)
+# with NOTHING on stderr, which reads as "the tool failed" rather than "the
+# fixing commits never touched the file this thread is anchored on". Observed
+# on gaia-free PR #2801, where the fix landed entirely in a test file while the
+# thread was anchored on the script under test — a correct refusal, reported
+# as silence.
+
+
+def test_bou2408_untouched_anchor_explains_why_thread_stays_open(monkeypatch, capsys):
+    """Anchored file not touched by the fixing commits -> say so."""
+    thread = _thread("Force the Docker path in remote-mount tests.")
+    resolved, replied = _wire(
+        monkeypatch, thread=thread, touched_files=["some/other/file.py"],
+    )
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == [], "must not auto-resolve an untouched anchor"
+    assert replied == [], "must not reply to an untouched anchor"
+
+    err = capsys.readouterr().err
+    assert "leaving thread t1 open" in err, (
+        "the untouched-anchor skip must announce itself like the other two "
+        f"skip paths do; stderr was: {err!r}"
+    )
+    assert ANCHOR in err, "the message must name the anchored file"
+    assert "not touched by the fixing commits" in err
+
+
+def test_bou2408_no_new_commits_explains_why_thread_stays_open(monkeypatch, capsys):
+    """Nothing pushed since the baseline -> say that, not nothing.
+
+    `_wire` cannot express this case: it does `commits or [default]`, so an
+    empty list falls back to the default one-commit fixture. Patch the boundary
+    directly after wiring.
+    """
+    thread = _thread("Please fix this.")
+    _wire(monkeypatch, thread=thread, touched_files=[ANCHOR])
+    monkeypatch.setattr(github_api, "get_new_pr_commits", lambda *a, **k: [])
+
+    rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "leaving thread t1 open" in err
+    assert "no new commits" in err, (
+        f"an empty baseline..HEAD range must be named as the reason; got: {err!r}"
+    )
