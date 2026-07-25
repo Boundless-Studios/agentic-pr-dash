@@ -194,7 +194,127 @@ def worktree_has_dirty_or_unpushed_changes(path: str) -> bool:
         return False
 
 
+def _decisions_for_pr_task(pr: PRData) -> list:
+    """Every decision recorded against this PR, ignoring the blocker fingerprint.
+
+    Same reasoning as :func:`_best_active_claim_for_pr` (BOU-1637): a decision is
+    recorded against the task identity that was current when the executor asked,
+    and that identity carries the blocker fingerprint. A review comment landing
+    while we wait changes the fingerprint, so a full-identity lookup would stop
+    finding the decision — and dispatch would resume straight back into the
+    boundary nobody has ruled on yet. Match on ``task_id`` alone.
+    """
+    task_id = task_identity_for_pr(pr).task_id
+    return [
+        record
+        for record in _coordinator().list_decisions()
+        if record.request.task.task_id == task_id
+    ]
+
+
+def pending_decision_for_pr(pr: PRData):
+    """The decision blocking this PR, if a human still owes an answer.
+
+    Returns ``None`` once the decision is resolved, cancelled, or superseded —
+    an explicit human act is the only thing that lifts the wait. Nothing about
+    elapsed time is consulted, by design (BOU-2039).
+    """
+    waiting = [record for record in _decisions_for_pr_task(pr) if record.is_blocking]
+    if not waiting:
+        return None
+    return max(waiting, key=lambda record: record.request.created_at)
+
+
+def resolved_decision_for_pr(pr: PRData):
+    """The answered-but-not-yet-resumed decision for this PR, if any.
+
+    Carries the human's selected option/direction so a redispatched run can cite
+    the direction it was given rather than re-deriving it.
+    """
+    from agent_coordinator.models import DecisionState  # noqa: PLC0415
+
+    resumable = [
+        record
+        for record in _decisions_for_pr_task(pr)
+        if record.state is DecisionState.RESUMABLE
+    ]
+    if not resumable:
+        return None
+    return max(resumable, key=lambda record: record.request.created_at)
+
+
+def decision_by_id_for_pr(pr: PRData, decision_id: str):
+    """A single decision for this PR by id, fingerprint-independent."""
+    for record in _decisions_for_pr_task(pr):
+        if record.request.decision_id == decision_id:
+            return record
+    return None
+
+
+def record_task_resume(pr: PRData, record, session_id: str) -> bool:
+    """Record ``task_resumed`` for a resolved decision under the PR's live claim.
+
+    Closes the coordinator's resume protocol so the completed work can cite the
+    direction it was given. Returns False (without raising) when there is no
+    live claim to resume under, or when the epoch fence rejects us — a deposed
+    owner must not be able to record a resume.
+    """
+    claim = _best_active_claim_for_pr(pr)
+    if claim is None:
+        return False
+    try:
+        _coordinator().resume_task(
+            record.request.decision_id,
+            claim_id=claim.claim_id,
+            owner_session_id=claim.owner.session_id,
+            lease_epoch=claim.lease_epoch,
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def decision_block_reason(pr: PRData) -> str | None:
+    """Why this PR must not be dispatched right now, or None.
+
+    The single gate BOTH the automatic poll path and the manual dashboard
+    actions consult. ``/api/fix-comments`` and ``/api/retry-ci`` reach
+    ``dispatch_pr_maintenance`` without going through
+    ``dispatch_decision_for_pr``, so gating only the latter would let a button
+    click queue an executor against an unresolved boundary (PR #109 review).
+    """
+    waiting = pending_decision_for_pr(pr)
+    if waiting is None:
+        return None
+    request = waiting.request
+    return (
+        f"PR #{pr.number} is waiting on a human {request.category} decision "
+        f"{request.decision_id}: {request.question}"
+    )
+
+
 def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> DispatchDecision:
+    # BOU-2040: a question owed to a human outranks every claim consideration
+    # below. Checking it first keeps the loop from reading "reclaimable" and
+    # re-dispatching an executor that will hit the same boundary and stop again.
+    # This is a WAITING state, not a failure: callers must not count it toward an
+    # executor-failure streak or escalate on it.
+    waiting = pending_decision_for_pr(pr)
+    if waiting is not None:
+        request = waiting.request
+        return DispatchDecision(
+            should_dispatch=False,
+            state="waiting_human",
+            reason=(
+                f"PR #{pr.number} is waiting on a human {request.category} "
+                f"decision {request.decision_id} "
+                f"(asked by {request.requesting_runtime}): {request.question}"
+            ),
+            claim_id=request.claim_id,
+            owner_session_id=request.requesting_session_id,
+            owner_pid=None,
+        )
+
     decision = _coordinator().status(task_identity_for_pr(pr), now=now)
     claim = decision.claim
     if decision.reclaimable and claim and claim.owner.worktree_path:
