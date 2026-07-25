@@ -540,7 +540,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if fresh is _GH_UNAVAILABLE or fresh is None:
         remaining = ["unknown"]
     else:
-        remaining = maintenance.blockers_for_pr(fresh)
+        # BOU-2041: completion must clear the *terminal-clean* bar, not merely
+        # the dispatch bar. `blockers_for_pr` answers "what can an executor fix
+        # right now" and is silent on two states that still deny completion:
+        # required CI that has not concluded, and a head that moved while this
+        # run was gathering its evidence. Thread resolution above was evidenced
+        # against `head_sha`; if the live head is no longer that sha, every
+        # signal here reads clean only because it was measured against the
+        # superseded head, so completion must re-evaluate rather than close.
+        remaining = maintenance.terminal_clean_blockers(
+            fresh, validated_head=head_sha)
 
     # BOU-2095 P1 (PR #78 review): `blockers_for_pr` sees only the comments the
     # scan path picked, and that path skips `is_outdated` threads — exactly the
