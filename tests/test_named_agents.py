@@ -112,7 +112,11 @@ def test_live_session_for_branch_ignores_dead_and_terminal(monkeypatch):
 
 def test_unassigned_pr_card_attributes_to_session_worktree(monkeypatch):
     """An unassigned PR with a live branch session shows the agent + worktree,
-    not 'No worktree', and reads as agent-working."""
+    not 'No worktree'.
+
+    The session carries no activity evidence, so it reads as waiting rather than
+    working — liveness alone is not work (BOU-2365). Attribution is unaffected.
+    """
     monkeypatch.setattr(app.orchestrator, "_inflight_prs", set(), raising=False)
     session = _session(cli="claude", agent_name="brave-otter",
                        worktree_path="/w/foo", branch="b", pid=4242)
@@ -125,7 +129,8 @@ def test_unassigned_pr_card_attributes_to_session_worktree(monkeypatch):
     assert card.agent_name == "brave-otter"
     assert card.worktree_name == "foo"
     assert card.worktree_path == "/w/foo"
-    assert card.status is PRStatus.AGENT_WORKING
+    assert card.session_activity == "waiting"
+    assert card.agent_state == "waiting"
 
 
 def test_unassigned_pr_card_without_session_says_no_worktree(monkeypatch):

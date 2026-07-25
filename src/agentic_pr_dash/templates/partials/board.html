@@ -42,7 +42,7 @@
 
             {# ── Card header: name + branch + single state badge ── #}
             <div class="card-top">
-                <div>
+                <div class="card-identity">
                     <div class="card-worktree-name">{{ card.worktree_name }}</div>
                     {% if card.branch != card.worktree_name %}
                     <div class="card-branch">{{ card.branch }}</div>
@@ -51,7 +51,8 @@
                     <div class="card-agent-name" title="Agent session name">🤖 {{ card.agent_name }}</div>
                     {% endif %}
                 </div>
-                <span class="card-state state-{{ card.agent_state }}">{{ card.agent_state_label }}</span>
+                <span class="card-state state-{{ card.agent_state }}"
+                      title="{{ card.state_chip_label }}">{{ card.state_chip_label }}</span>
             </div>
 
             {% if card.supervisor_state or card.context_percent is not none or card.runtime_status_stale %}
