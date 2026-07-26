@@ -60,6 +60,7 @@ from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
 from .config import load as load_config
+from .models import MaintenanceActor
 from .worktrees import find_worktree_for_path, remove_worktree, selected_worktree_cleanup_reason
 
 CHECK_WORK_FOUND = 10
@@ -510,16 +511,28 @@ def executor_failure_streak(cwd: str, pr: int | None) -> int:
     return _entry_streak(_load_health(cwd).get(str(pr), {}))
 
 
-def _emit_loop_event(cwd: str, kind: str, pr: int | None, details: dict) -> None:
+def _emit_loop_event(
+    cwd: str, kind: str, pr: int | None, details: dict, session_id: str = ""
+) -> None:
     """Best-effort observability emit (BOU-1880): persist streak/escalation to the
     decoupled events.jsonl so they survive restart. Never raises, never alters the
-    loop's dispatch flow (mirrors orchestrator._emit)."""
+    loop's dispatch flow (mirrors orchestrator._emit).
+
+    Always stamps ``actor=loop-executor`` (BOU-2490). This emitter belongs to the
+    one surface in the package that actually runs the configured executor, so its
+    ``kind="dispatch"`` means "codex ran, committed and pushed" — as opposed to the
+    dashboard's identically-named event, which means "wrote a work order". Passing
+    ``session_id`` records *which* loop, which the dispatch path already computes
+    and previously discarded.
+    """
     try:
         from datetime import datetime, timezone  # noqa: PLC0415
+        from .models import MaintenanceActor  # noqa: PLC0415
         from .observability.event_store import ObservabilityEvent, get_event_store  # noqa: PLC0415
         get_event_store(cwd).append(ObservabilityEvent(
             ts=datetime.now(timezone.utc), repo=cwd, pr_number=pr, kind=kind,
-            session_id=None, details=details,
+            actor=MaintenanceActor.LOOP_EXECUTOR.value,
+            session_id=session_id or f"pid:{_loop_pid()}", details=details,
         ))
     except Exception:  # noqa: BLE001
         pass
@@ -736,7 +749,7 @@ def _maybe_escalate(cwd: str, pr: int | None, err: str, streak: int) -> None:
         f"Executor failed {streak} times in a row: {err[:120]}",
     )
     print(
-        f"[agentic-pr-dash] ESCALATION: PR #{pr} executor failed {streak} times "
+        f"[apd:loop] ESCALATION: PR #{pr} executor failed {streak} times "
         f"(threshold={threshold}); notified user and wrote escalation marker.",
         file=sys.stderr,
     )
@@ -1065,7 +1078,34 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
             parts.append(prompt if tok == "{prompt}" else tok)
     else:
         parts = [*shlex.split(executor), prompt]
-    return subprocess.run(parts, cwd=cwd).returncode
+    return subprocess.run(parts, cwd=cwd, env=_executor_env()).returncode
+
+
+#: Git committer identity stamped on everything the loop's executor commits
+#: (BOU-2490). Author is deliberately left alone — the human stays the author, so
+#: blame and GitHub's contribution graph are unchanged — while the committer
+#: records the machine. This is exactly the distinction git's author/committer
+#: split exists for, and it works with ANY configured executor: no hook, no
+#: cooperation from codex, no commit-message convention to enforce.
+#:
+#: Without it, loop-authored commits are indistinguishable from the session's own
+#: (codex commits under the user's git identity), which is why a session that
+#: found unexplained commits concluded a daemon had taken over its work with no
+#: way to check. Now: `git log --format='%h %cn %s'`.
+LOOP_COMMITTER_NAME = "apd-loop-executor"
+LOOP_COMMITTER_EMAIL = "loop@agentic-pr-dash.local"
+
+
+def _executor_env() -> dict[str, str]:
+    """Environment for the dispatched executor: inherited, plus committer identity."""
+    return {
+        **os.environ,
+        "GIT_COMMITTER_NAME": LOOP_COMMITTER_NAME,
+        "GIT_COMMITTER_EMAIL": LOOP_COMMITTER_EMAIL,
+        # Let the executor (and anything it spawns) know it is running under the
+        # loop, so in-process checks don't have to infer it from the process tree.
+        "AGENTIC_PR_DASH_ACTOR": MaintenanceActor.LOOP_EXECUTOR.value,
+    }
 
 
 _SPAWN_FAILED_PREFIX = "spawn failed: "
@@ -1153,7 +1193,7 @@ def _network_reachable() -> bool:
         # promise instead of trusting a nonsensical configured value.
         if not (timeout > 0) or timeout == float("inf"):
             print(
-                f"[agentic-pr-dash] ignoring non-positive APD_LOOP_PROBE_TIMEOUT_S "
+                f"[apd:loop] ignoring non-positive APD_LOOP_PROBE_TIMEOUT_S "
                 f"({timeout!r}); treating reachability as unknown",
                 file=sys.stderr,
             )
@@ -1171,7 +1211,7 @@ def _network_reachable() -> bool:
             # The subprocess is killed by `run` on timeout — nothing leaks. We
             # still cannot prove the network is down, so fail open.
             print(
-                "[agentic-pr-dash] reachability probe timed out (stalled DNS or "
+                "[apd:loop] reachability probe timed out (stalled DNS or "
                 "connect); treating the result as inconclusive-unknown",
                 file=sys.stderr,
             )
@@ -1194,7 +1234,7 @@ def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
     try:
         rc = _run_executor(executor, prompt, cwd)
     except Exception as exc:
-        print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
+        print(f"[apd:loop] could not launch executor: {exc}", file=sys.stderr)
         return None, f"{_SPAWN_FAILED_PREFIX}{exc}"
     return rc, ("" if rc == 0 else f"exit {rc}")
 
@@ -1225,21 +1265,21 @@ def _dispatch_with_fallback(
     errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
     if _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
         print(
-            f"[agentic-pr-dash] primary executor recorded a human decision for PR #{pr}; "
+            f"[apd:loop] primary executor recorded a human decision for PR #{pr}; "
             "not falling back", file=sys.stderr,
         )
         return False, errors
     if not fallback:
         # Legacy single-executor behavior: leave the PR for the next tick.
-        print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
+        print(f"[apd:loop] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
         return False, errors
-    print(f"[agentic-pr-dash] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
+    print(f"[apd:loop] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
     rc2, err2 = _try_run(fallback, prompt, cwd)
     if rc2 == 0:
         return True, {}
     errors["fallback"] = f"{_executor_program(fallback) or fallback}: {err2}"
     print(
-        f"[agentic-pr-dash] ERROR: both executors failed for PR #{pr} "
+        f"[apd:loop] ERROR: both executors failed for PR #{pr} "
         f"(primary={rc}, fallback={rc2}); leaving for next tick",
         file=sys.stderr,
     )
@@ -1266,7 +1306,7 @@ def _dispatch_was_inconclusive(exec_errors: dict[str, str], pr: int | None) -> b
         return False
     if not _network_reachable():
         print(
-            f"[agentic-pr-dash] network unreachable after dispatch for PR #{pr}; "
+            f"[apd:loop] network unreachable after dispatch for PR #{pr}; "
             "tick is inconclusive — streak, escalation and claim left untouched",
             file=sys.stderr,
         )
@@ -1288,9 +1328,9 @@ def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
     removed, detail = remove_worktree(cwd)
     name = Path(cwd).name
     if removed:
-        print(f"[agentic-pr-dash] cleaned stale no-PR worktree {name}: {reason}", file=sys.stderr)
+        print(f"[apd:loop] cleaned stale no-PR worktree {name}: {reason}", file=sys.stderr)
         return True
-    print(f"[agentic-pr-dash] failed to clean stale no-PR worktree {name}: {detail}", file=sys.stderr)
+    print(f"[apd:loop] failed to clean stale no-PR worktree {name}: {detail}", file=sys.stderr)
     return False
 
 
@@ -1348,7 +1388,7 @@ def _tick(args, executor: str) -> None:
             )
         except Exception as exc:  # noqa: BLE001 — a daemon must survive one PR
             print(
-                f"[agentic-pr-dash] tick for {cwd} failed: "
+                f"[apd:loop] tick for {cwd} failed: "
                 f"{type(exc).__name__}: {exc} — continuing",
                 file=sys.stderr,
             )
@@ -1395,7 +1435,7 @@ def _service_cwd(
         notice = check.stdout.strip()
         is_warn_only = bool(notice and worktree_check.WARN_ONLY_MARKER in notice)
         if is_warn_only:
-            print(f"[agentic-pr-dash] {notice}", file=sys.stderr)
+            print(f"[apd:loop] {notice}", file=sys.stderr)
         # On a genuinely clean result, drop any stale streak/escalation marker
         # for this PR (it recovered without an executor dispatch). Skip rc 2
         # (gh failure is not evidence of recovery) AND skip warn-only defers —
@@ -1408,7 +1448,7 @@ def _service_cwd(
     claim_handle = _parse_coordinator_claim_handle(check.stdout)
     prompt = check.stdout
     baseline = _baseline_sha(cwd, pr)
-    print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
+    print(f"[apd:loop] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
     session = args.session_id or f"pid:{_loop_pid()}"
     # Resolve the slug ONCE, here, where a subprocess is already acceptable —
     # rather than inside the per-failure probe, which must stay allocation-only
@@ -1604,7 +1644,7 @@ def main(argv: list[str] | None = None) -> int:
                 _tick(args, executor)
             except Exception as exc:  # noqa: BLE001 — the daemon must survive
                 print(
-                    f"[agentic-pr-dash] loop tick failed: "
+                    f"[apd:loop] loop tick failed: "
                     f"{type(exc).__name__}: {exc} — retrying next interval",
                     file=sys.stderr,
                 )

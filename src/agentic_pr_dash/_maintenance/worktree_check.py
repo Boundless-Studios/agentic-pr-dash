@@ -13,6 +13,7 @@ import os
 
 from agentic_pr_dash import observability
 from agentic_pr_dash.config import load as load_config
+from agentic_pr_dash import models
 from agentic_pr_dash.models import PRStatus
 
 # Cross-module dependencies are called module-qualified (e.g.
@@ -678,6 +679,14 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             pid=_common._resolve_owner_pid(),
             agent="agentic-pr-dash-check",
             lease_seconds=_common._fix_lease_seconds(),
+            # Unlike the dashboard's advisory claim, this one is taken by the
+            # active `check` path — the immediate precursor to a real dispatch
+            # (loop._service_cwd shells out to `check`, then runs the executor on
+            # the prompt it returns). So the holder genuinely will write code, and
+            # deferring to it is correct. Both executing actors answer can_execute
+            # the same way, so this classification does not change today's
+            # behavior — only the dashboard's claim becomes advisory (BOU-2490).
+            actor=models.MaintenanceActor.LOOP_EXECUTOR,
         )
         if claimed is None and not new_feedback and not self_owned:
             return 0, _blocked_defer_text(

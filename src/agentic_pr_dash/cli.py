@@ -116,7 +116,12 @@ def _observe_main(argv: list[str]) -> int:
     for ev in events:
         pr_str = f"PR#{ev.pr_number}" if ev.pr_number is not None else "PR#-"
         short = _short_detail(ev.details)
-        print(f"{ev.ts.isoformat()}  {ev.kind}  {pr_str}  {short}")
+        # actor is what disambiguates same-`kind` events from different surfaces —
+        # notably dashboard-queue's "wrote a work order" vs loop-executor's "ran
+        # the executor and pushed", both of which are kind="dispatch" (BOU-2490).
+        # Rows written before BOU-2490 have no actor; show that rather than guess.
+        actor = ev.actor or "unknown"
+        print(f"{ev.ts.isoformat()}  {ev.kind:<16}  {actor:<15}  {pr_str}  {short}")
     return 0
 
 

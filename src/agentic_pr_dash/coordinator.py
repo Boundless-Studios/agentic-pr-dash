@@ -24,7 +24,7 @@ from agent_coordinator.store import JsonlClaimStore
 
 from .config import load as load_config
 from . import maintenance
-from .models import ClaimHandle, PRData
+from .models import ClaimHandle, MaintenanceActor, PRData, can_execute
 
 TASK_TYPE = "pr-maintenance"
 STORE_ENV = "AGENTIC_PR_DASH_COORDINATOR_STORE"
@@ -402,12 +402,32 @@ def claim_pr(
     pid: int | None,
     agent: str,
     lease_seconds: int,
+    actor: MaintenanceActor | None = None,
 ) -> ClaimHandle | None:
+    """Claim ``pr`` for ``session_id``.
+
+    ``actor`` (BOU-2490) records *what kind of owner this is* and, derived from it,
+    whether that owner can actually run an executor. It rides in the coordinator's
+    free-form ``OwnerIdentity.metadata`` rather than a new field, because
+    agent-coordinator is pinned to an immutable commit and must not change.
+
+    This distinction is load-bearing, not cosmetic: the dashboard claims PRs it can
+    never fix (it only queues a handoff, and nothing consumes that handoff), and a
+    reader that treats "someone holds a claim" as "someone is fixing it" will leave
+    a red PR uncovered — see BOU-2491.
+    """
+    metadata: dict[str, str] = {}
+    if actor is not None:
+        metadata = {
+            "actor": actor.value,
+            "can_execute": "true" if can_execute(actor) else "false",
+        }
     owner = OwnerIdentity(
         session_id=session_id,
         pid=pid,
         agent=agent,
         worktree_path=getattr(pr, "worktree_path", None),
+        metadata=metadata,
     )
     try:
         record = _coordinator().claim_task(

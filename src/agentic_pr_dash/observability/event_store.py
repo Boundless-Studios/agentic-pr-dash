@@ -11,6 +11,12 @@ Known event kinds (free-form strings, not an enum):
     dispatch_result  — outcome of a dispatch (success/failure/timeout)
     state_transition — PR maintenance-state changed (e.g. queued → running)
     ownership        — ownership marker claimed or released
+
+Every event also carries an ``actor`` (BOU-2490). ``kind`` says *what happened*;
+``actor`` says *who did it and whether they could write code*. Both matter —
+``kind="dispatch"`` is emitted by the dashboard (queued a work order, wrote
+nothing) and by the loop (ran ``codex --full-auto`` and pushed), and telling
+those apart is the whole point.
 """
 
 from __future__ import annotations
@@ -28,6 +34,12 @@ class ObservabilityEvent(BaseModel):
     repo: str | None = None
     pr_number: int | None = None
     kind: str
+    #: Which maintenance surface emitted this (a :class:`~..models.MaintenanceActor`
+    #: value). ``kind`` alone is ambiguous: the dashboard's "queued a work order"
+    #: and the loop's "ran the executor and pushed" are both ``kind="dispatch"``.
+    #: Optional so rows written before BOU-2490 still deserialize; readers render
+    #: a missing actor as ``unknown`` rather than guessing.
+    actor: str | None = None
     session_id: str | None = None
     details: dict = Field(default_factory=dict)
 

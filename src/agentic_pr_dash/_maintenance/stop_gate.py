@@ -79,7 +79,18 @@ def _build_stop_block(pending: list[tuple[str, str]]) -> str:
     lines = [
         "[pr-watch] Open PR(s) you own have pending review/CI work. Address it "
         "before stopping — commit and push to the EXISTING branch (do not open a "
-        "new PR), then re-stop:\n"
+        "new PR), then re-stop:\n",
+        # BOU-2490: this gate writes no code — it asks YOU to. But the detached
+        # pr-maintenance-loop shares your worktree and DOES run an executor that
+        # commits and pushes. Say so here, because a session that later finds
+        # commits it did not write has otherwise no way to attribute them, and
+        # concludes something "took over its work".
+        "NOTE: this gate only asks — it never edits, commits or pushes. A detached "
+        "pr-maintenance-loop may run an executor in this same worktree, which does. "
+        "If you find commits you did not write, attribute them before reacting:\n"
+        "  git log --format='%h %cn %s' -10   # committer `apd-loop-executor` ⇒ the loop\n"
+        "Commit your own work promptly; the loop dispatches on unresolved feedback, "
+        "so clearing the feedback is what stops it — not fighting the daemon.\n",
     ]
     for path, text in pending:
         lines.append(f"───── worktree: {path} ─────")
