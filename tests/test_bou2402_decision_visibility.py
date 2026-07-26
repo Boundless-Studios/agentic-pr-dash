@@ -131,7 +131,13 @@ def test_the_status_is_not_conflated_with_agent_waiting(monkeypatch, tmp_path):
     assert pr.status is not PRStatus.AGENT_WAITING
 
 
-def test_the_status_has_its_own_board_column(monkeypatch, tmp_path):
+def test_the_status_leads_the_first_board_column(monkeypatch, tmp_path):
+    """BOU-2431 merged the dedicated column into Needs Attention.
+
+    The guarantee that mattered survives the merge and is asserted here: a
+    decision-blocked PR still appears in the FIRST column, and still ahead of
+    the agent-owned work inside it. Only the column count changed.
+    """
     from agentic_pr_dash.app import KANBAN_COLUMNS
 
     owning = [
@@ -140,7 +146,7 @@ def test_the_status_has_its_own_board_column(monkeypatch, tmp_path):
         if PRStatus.WAITING_HUMAN_DECISION in column["statuses"]
     ]
     assert len(owning) == 1, "status must map to exactly one column"
-    assert owning[0]["id"] == "needs_decision"
+    assert owning[0]["id"] == "needs_attention"
     # Blocked on the viewer -> surfaced before agent-owned work.
     assert KANBAN_COLUMNS.index(owning[0]) == 0
 

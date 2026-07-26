@@ -78,6 +78,7 @@
     <nav class="dashboard-tabs" aria-label="Dashboard views">
         <a class="dashboard-tab{% if active_tab == 'board' %} dashboard-tab-active{% endif %}" href="{{ board_tab_url | default('/?tab=board', true) }}">Board</a>
         <a class="dashboard-tab{% if active_tab == 'runner_issues' %} dashboard-tab-active{% endif %}" href="{{ runner_issues_tab_url | default('/?tab=runner_issues', true) }}">Runner Issues</a>
+        <a class="dashboard-tab{% if active_tab == 'worktrees' %} dashboard-tab-active{% endif %}" href="{{ worktrees_tab_url | default('/?tab=worktrees', true) }}">Worktrees</a>
     </nav>
 
     <div class="layout">
@@ -87,6 +88,13 @@
                  hx-trigger="every 5s"
                  hx-swap="innerHTML">
             {% include 'partials/runner_issues.html' %}
+        </section>
+        {% elif active_tab == 'worktrees' %}
+        <section class="worktrees-panel"
+                 hx-get="{{ worktrees_partial_url | default('/partials/worktrees', true) }}"
+                 hx-trigger="every 5s"
+                 hx-swap="innerHTML">
+            {% include 'partials/worktrees.html' %}
         </section>
         {% else %}
         <section class="board"

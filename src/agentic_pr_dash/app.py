@@ -105,36 +105,30 @@ async def service_worker():
 
 # -- Kanban columns --
 
+# BOU-2431: five columns, sized to fit without horizontal scrolling. Three
+# distinctions were dropped because they cost a column each and paid nothing:
+#   * "Needs Your Decision" merged INTO "Needs Attention" — both mean "this
+#     PR is stuck until a human touches it", and the split doubled the number
+#     of places to look. The BOU-2402 signal is not lost: decision cards sort
+#     FIRST inside the column and still render their question via the
+#     `decision-wait` block, which is the surface that actually tells the
+#     viewer what they're blocking.
+#   * "Waiting" merged into "Agent Working" — an agent waiting on its own poll
+#     is still an agent's job, not the viewer's.
+#   * "No PR" left the board entirely for its own tab (see NO_PR_TAB): a
+#     worktree with no PR is not PR work, and it crowded out the columns that
+#     are.
 KANBAN_COLUMNS = [
-    # First by design (BOU-2402): this is the only column whose work is blocked
-    # on the VIEWER. Everything else is either an agent's job or a wait on CI;
-    # these PRs move only when a person answers, so they must not be mixed into
-    # a generic "Waiting" bucket where they read as someone else's problem.
-    {
-        "id": "needs_decision",
-        "title": "Needs Your Decision",
-        "statuses": {PRStatus.WAITING_HUMAN_DECISION},
-    },
     {
         "id": "needs_attention",
         "title": "Needs Attention",
-        "statuses": {PRStatus.CI_FAILING, PRStatus.HAS_COMMENTS, PRStatus.CI_AND_COMMENTS,
-                     PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED},
+        "statuses": {PRStatus.WAITING_HUMAN_DECISION, PRStatus.CI_FAILING, PRStatus.HAS_COMMENTS,
+                     PRStatus.CI_AND_COMMENTS, PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED},
     },
     {
         "id": "in_progress",
         "title": "Agent Working",
-        "statuses": {PRStatus.AGENT_WORKING},
-    },
-    {
-        "id": "waiting",
-        "title": "Waiting",
-        "statuses": {PRStatus.AGENT_WAITING},
-    },
-    {
-        "id": "no_pr",
-        "title": "No PR",
-        "statuses": {PRStatus.NO_PR},
+        "statuses": {PRStatus.AGENT_WORKING, PRStatus.AGENT_WAITING},
     },
     {
         "id": "pending",
@@ -154,10 +148,29 @@ KANBAN_COLUMNS = [
 ]
 
 
+# Statuses that no longer have a column: they belong to the no-PR tab instead.
+NO_PR_TAB_STATUSES = {PRStatus.NO_PR}
+
+VALID_DASHBOARD_TABS = {"board", "runner_issues", "worktrees"}
+
+
+def no_pr_cards(cards: list[WorktreeCard]) -> list[WorktreeCard]:
+    """Worktrees with no PR — the contents of the Worktrees tab (BOU-2431)."""
+    return [card for card in cards if card.status in NO_PR_TAB_STATUSES]
+
+
+def _needs_attention_sort_key(card: WorktreeCard) -> int:
+    """Decision-blocked cards sort first within Needs Attention (BOU-2402)."""
+    return 0 if card.status == PRStatus.WAITING_HUMAN_DECISION else 1
+
+
 def build_columns(cards: list[WorktreeCard]) -> list[dict]:
     columns = []
     for col in KANBAN_COLUMNS:
         column_cards = [card for card in cards if card.status in col["statuses"]]
+        if col["id"] == "needs_attention":
+            # Stable sort: within each group the existing card order is kept.
+            column_cards.sort(key=_needs_attention_sort_key)
         columns.append(
             {
                 "id": col["id"],
@@ -1093,11 +1106,14 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
         "bug_bash_ready_count": _bug_bash_ready_count(cards),
         "show_agent_worktrees": show_agent_worktrees,
         "escalated_prs": escalated_prs,
-        "active_tab": active_tab if active_tab in {"board", "runner_issues"} else "board",
+        "active_tab": active_tab if active_tab in VALID_DASHBOARD_TABS else "board",
         "board_tab_url": "/?tab=board&show_agents=1" if show_agent_worktrees else "/?tab=board",
         "runner_issues_tab_url": "/?tab=runner_issues&show_agents=1" if show_agent_worktrees else "/?tab=runner_issues",
         "board_partial_url": "/partials/board?show_agents=1" if show_agent_worktrees else "/partials/board",
         "runner_issues_partial_url": "/partials/runner-issues?show_agents=1" if show_agent_worktrees else "/partials/runner-issues",
+        "worktrees_tab_url": "/?tab=worktrees&show_agents=1" if show_agent_worktrees else "/?tab=worktrees",
+        "worktrees_partial_url": "/partials/worktrees?show_agents=1" if show_agent_worktrees else "/partials/worktrees",
+        "no_pr_cards": no_pr_cards(cards),
         "asset_version": _asset_version(),
     }
 
@@ -1208,6 +1224,9 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
         ),
         "show_agent_worktrees": show_agent_worktrees,
         "active_tab": active_tab if active_tab == "runner_issues" else "runner_issues",
+        "worktrees_tab_url": "/?tab=worktrees&show_agents=1" if show_agent_worktrees else "/?tab=worktrees",
+        "worktrees_partial_url": "/partials/worktrees?show_agents=1" if show_agent_worktrees else "/partials/worktrees",
+        "no_pr_cards": [],
         "board_tab_url": "/?tab=board&show_agents=1" if show_agent_worktrees else "/?tab=board",
         "runner_issues_tab_url": "/?tab=runner_issues&show_agents=1" if show_agent_worktrees else "/?tab=runner_issues",
         "board_partial_url": "/partials/board?show_agents=1" if show_agent_worktrees else "/partials/board",
@@ -1217,7 +1236,7 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
 
 
 def _canonical_dashboard_tab(active_tab: str) -> str:
-    return active_tab if active_tab in {"board", "runner_issues"} else "board"
+    return active_tab if active_tab in VALID_DASHBOARD_TABS else "board"
 
 
 async def _dashboard_context_async(
@@ -1538,7 +1557,7 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
     runner_issues = _runner_issues(cards)
     running_github_jobs = _running_github_jobs(cards)
     desktop_docker_instances = _desktop_docker_instances(cards)
-    active_tab = active_tab if active_tab in {"board", "runner_issues"} else "board"
+    active_tab = active_tab if active_tab in VALID_DASHBOARD_TABS else "board"
     return {
         "columns": build_columns(cards),
         "runner_summary": runner_summary,
@@ -1558,6 +1577,7 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
         "active_tab": active_tab,
         "board_tab_url": f"/proof/pr-dashboard-fixture/{scenario}?tab=board",
         "runner_issues_tab_url": f"/proof/pr-dashboard-fixture/{scenario}?tab=runner_issues",
+        "worktrees_tab_url": f"/proof/pr-dashboard-fixture/{scenario}?tab=worktrees",
         "board_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/board",
         "runner_issues_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/runner-issues",
         "asset_version": _asset_version(),
@@ -1661,6 +1681,19 @@ async def runner_issues_partial(request: Request):
         context=await _dashboard_context_async(
             show_agent_worktrees=show_agent_worktrees,
             active_tab="runner_issues",
+        ),
+    )
+
+
+@app.get("/partials/worktrees", response_class=HTMLResponse)
+async def worktrees_partial(request: Request):
+    show_agent_worktrees = _show_agent_worktrees(request)
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/worktrees.html",
+        context=await _dashboard_context_async(
+            show_agent_worktrees=show_agent_worktrees,
+            active_tab="worktrees",
         ),
     )
 

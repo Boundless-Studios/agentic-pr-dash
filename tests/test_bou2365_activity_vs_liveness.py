@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 import pytest
 
 from agentic_pr_dash import app, session_registry
-from agentic_pr_dash.models import AgentProcess, PRData, PRStatus
+from agentic_pr_dash.models import AgentProcess, PRData, PRStatus, WorktreeCard
 
 
 def _session(**overrides: object) -> session_registry.RuntimeSessionState:
@@ -288,11 +288,19 @@ def test_working_agent_on_a_reclaimable_worktree_still_reads_as_working(monkeypa
 # Board wiring
 # ---------------------------------------------------------------------------
 
-def test_every_status_is_claimed_by_exactly_one_column():
+def test_every_status_is_claimed_exactly_once():
+    """No status renders twice, and none renders nowhere.
+
+    BOU-2431 moved NO_PR off the board onto the Worktrees tab, so a column is
+    no longer the only way to be claimed — but being claimed exactly once is
+    still the invariant that keeps a card from duplicating or vanishing.
+    """
     claimed: dict[PRStatus, int] = {}
     for column in app.KANBAN_COLUMNS:
         for status in column["statuses"]:
             claimed[status] = claimed.get(status, 0) + 1
+    for status in app.NO_PR_TAB_STATUSES:
+        claimed[status] = claimed.get(status, 0) + 1
 
     assert set(claimed) == set(PRStatus), (
         f"Unclaimed statuses: {set(PRStatus) - set(claimed)}"
@@ -300,9 +308,25 @@ def test_every_status_is_claimed_by_exactly_one_column():
     assert all(count == 1 for count in claimed.values()), claimed
 
 
-def test_board_has_distinct_waiting_and_cleanup_columns():
-    titles = {column["id"]: column["title"] for column in app.KANBAN_COLUMNS}
+def test_waiting_and_working_stay_distinct_states_inside_one_column():
+    """BOU-2431 folded the "Waiting" COLUMN away; the distinction remains.
 
-    assert titles["waiting"] == "Waiting"
+    Sharing a column is a layout decision. What BOU-2365 protects is that an
+    agent idling on a poll is not indistinguishable from one doing work — that
+    now lives on the card's state chip rather than in the column header.
+    """
+    titles = {column["id"]: column["title"] for column in app.KANBAN_COLUMNS}
     assert titles["ready_cleanup"] == "Ready / Cleanup"
     assert titles["in_progress"] == "Agent Working"
+
+    working = WorktreeCard(id="w", worktree_name="w", branch="w", status=PRStatus.AGENT_WORKING)
+    waiting = WorktreeCard(id="x", worktree_name="x", branch="x", status=PRStatus.AGENT_WAITING)
+
+    column_ids = {
+        card.status: column["id"]
+        for column in app.build_columns([working, waiting])
+        for card in column["cards"]
+    }
+    assert column_ids[PRStatus.AGENT_WORKING] == "in_progress"
+    assert column_ids[PRStatus.AGENT_WAITING] == "in_progress"
+    assert working.agent_state != waiting.agent_state

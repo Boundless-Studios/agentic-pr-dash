@@ -1146,7 +1146,8 @@ header h1 {
 }
 
 /* ─── Runner Issues tab ──────────────────────────────────────────────────── */
-.runner-issues-panel {
+.runner-issues-panel,
+.worktrees-panel {
     flex: 1;
     overflow-y: auto;
     padding: 16px 20px;
