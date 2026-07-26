@@ -505,6 +505,41 @@ header h1 {
     color: var(--danger);
 }
 
+/* State → blocked on the viewer (BOU-2402). Warn-tinted and outlined so it
+   reads as "you are the blocker", never as a passive/clean state. */
+.card-state.state-needs_decision {
+    background: color-mix(in srgb, var(--warn) 22%, transparent);
+    color: var(--warn);
+    box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--warn) 55%, transparent);
+}
+
+.decision-wait {
+    margin: 6px 0 2px;
+    padding: 8px 10px;
+    border-left: 3px solid var(--warn);
+    background: color-mix(in srgb, var(--warn) 8%, transparent);
+    border-radius: 4px;
+}
+
+.decision-wait-label {
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--warn);
+}
+
+.decision-wait-question {
+    margin: 4px 0 4px;
+    font-size: 0.85rem;
+    line-height: 1.35;
+}
+
+.decision-wait-meta {
+    font-size: 0.72rem;
+    color: var(--neutral);
+}
+
 /* State → warn */
 .card-state.state-awaiting_fixes,
 .card-state.state-queued {

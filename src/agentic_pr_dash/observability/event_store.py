@@ -132,3 +132,33 @@ def get_event_store(cwd: str | None = None) -> EventStore:
     cfg = _load_config(cwd)
     path = cfg.state_dir / "observability" / "events.jsonl"
     return EventStore(path)
+
+
+def emit(
+    cwd: str | None,
+    kind: str,
+    *,
+    pr_number: int | None = None,
+    session_id: str | None = None,
+    details: dict | None = None,
+) -> None:
+    """Best-effort event emission from a module-level call site. Never raises.
+
+    ``Orchestrator._emit`` is the same contract bound to an instance; this is
+    for the maintenance-path modules that have a ``cwd`` but no orchestrator.
+    Emission must never alter control flow (BOU-1801), so every failure —
+    unwritable state dir, malformed details, missing config — is swallowed.
+    """
+    try:
+        get_event_store(cwd).append(
+            ObservabilityEvent(
+                ts=datetime.now(timezone.utc),
+                repo=cwd,
+                pr_number=pr_number,
+                kind=kind,
+                session_id=session_id,
+                details=details or {},
+            )
+        )
+    except Exception:  # noqa: BLE001
+        pass

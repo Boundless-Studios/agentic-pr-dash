@@ -106,6 +106,15 @@ async def service_worker():
 # -- Kanban columns --
 
 KANBAN_COLUMNS = [
+    # First by design (BOU-2402): this is the only column whose work is blocked
+    # on the VIEWER. Everything else is either an agent's job or a wait on CI;
+    # these PRs move only when a person answers, so they must not be mixed into
+    # a generic "Waiting" bucket where they read as someone else's problem.
+    {
+        "id": "needs_decision",
+        "title": "Needs Your Decision",
+        "statuses": {PRStatus.WAITING_HUMAN_DECISION},
+    },
     {
         "id": "needs_attention",
         "title": "Needs Attention",
@@ -879,6 +888,10 @@ def _build_card_for_worktree(
         pr_url=pr.url if pr else None,
         is_draft=pr.is_draft if pr else False,
         status=status,
+        waiting_decision_id=pr.waiting_decision_id if pr else None,
+        waiting_decision_question=pr.waiting_decision_question if pr else None,
+        waiting_decision_category=pr.waiting_decision_category if pr else None,
+        waiting_decision_runtime=pr.waiting_decision_runtime if pr else None,
         ci_checks=pr.ci_checks if pr else [],
         queued_jobs=pr.queued_jobs if pr else [],
         runner_pool_health=pr.runner_pool_health if pr else [],
@@ -977,6 +990,10 @@ def _build_unassigned_pr_card(
         pr_url=pr.url,
         is_draft=pr.is_draft,
         status=status,
+        waiting_decision_id=pr.waiting_decision_id,
+        waiting_decision_question=pr.waiting_decision_question,
+        waiting_decision_category=pr.waiting_decision_category,
+        waiting_decision_runtime=pr.waiting_decision_runtime,
         ci_checks=pr.ci_checks,
         queued_jobs=pr.queued_jobs,
         runner_pool_health=pr.runner_pool_health,

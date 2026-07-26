@@ -635,6 +635,31 @@ class Orchestrator:
         return pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING"
 
     def _compute_status(self, pr: PRData) -> PRStatus:
+        # BOU-2402 (PR #110 review): highest precedence, and it must live HERE.
+        # This method is what the board's own PRData objects get re-stamped with
+        # on every enrichment pass; setting the status anywhere else (e.g. on the
+        # transient PRData that `_maintenance/pr_state` builds) is overwritten
+        # before a card is ever rendered, so no real card would acquire the
+        # status and the "Needs Your Decision" column would stay permanently
+        # empty while maintenance was in fact deferring.
+        #
+        # First because nothing below it can be acted on: a failing check or an
+        # open comment on a PR whose architecture question is unanswered is not
+        # the thing a human should be looking at.
+        blocked = self._pending_decision_for(pr)
+        if blocked is not None:
+            pr.waiting_decision_id = blocked.request.decision_id
+            pr.waiting_decision_question = blocked.request.question
+            pr.waiting_decision_category = blocked.request.category
+            pr.waiting_decision_runtime = blocked.request.requesting_runtime
+            return PRStatus.WAITING_HUMAN_DECISION
+        # Clear stale projections once the decision is answered or cancelled, so
+        # a resolved question cannot keep rendering on the card.
+        pr.waiting_decision_id = None
+        pr.waiting_decision_question = None
+        pr.waiting_decision_category = None
+        pr.waiting_decision_runtime = None
+
         has_ci_failure = bool(pr.failing_checks)
         has_comments = bool(pr.review_comments)
         ci_pending = any(c.status in ("queued", "in_progress") for c in pr.ci_checks)
@@ -655,6 +680,17 @@ class Orchestrator:
         if ci_pending:
             return PRStatus.CI_PENDING
         return PRStatus.CLEAN
+
+    def _pending_decision_for(self, pr: PRData):
+        """The unresolved human decision gating ``pr``, if any. Never raises.
+
+        Read on every status computation, so a coordinator/ledger problem must
+        degrade to "no decision" rather than break the board.
+        """
+        try:
+            return coordinator.pending_decision_for_pr(pr)
+        except Exception:  # noqa: BLE001
+            return None
 
     def _reserve_pr(self, pr_number: int) -> bool:
         if pr_number in self._inflight_prs:

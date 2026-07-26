@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import os
 
+from agentic_pr_dash import observability
 from agentic_pr_dash.config import load as load_config
+from agentic_pr_dash.models import PRStatus
 
 # Cross-module dependencies are called module-qualified (e.g.
 # ``pr_state._resolve_pr_for_branch``) so the OWNING module is the single seam
@@ -289,6 +291,37 @@ def _should_reclaim_stuck_owner(
         _clear_no_progress(cwd)
         return True
     return False
+
+
+def _decision_wait_marker_path(cwd: str):
+    return _wakeless_defer_path(cwd).parent / "decision-wait.emitted"
+
+
+def _mark_decision_wait_emitted(cwd: str, decision_id: str) -> bool:
+    """True the first time we see ``decision_id``; False on every later pass.
+
+    Edge-triggering for the ``decision_wait`` event. The marker records the last
+    decision id emitted for this worktree, so a NEW decision (including one that
+    superseded the previous) still emits, while repeated polls on the same
+    unanswered question stay silent.
+
+    Best-effort: if the marker cannot be read or written we return True and
+    accept a duplicate event rather than losing the signal entirely — a missing
+    record is worse than a repeated one.
+    """
+    path = _decision_wait_marker_path(cwd)
+    try:
+        previous = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        previous = ""
+    if previous == decision_id:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(decision_id, encoding="utf-8")
+    except OSError:
+        pass
+    return True
 
 
 def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str) -> str:
@@ -573,6 +606,36 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # executor straight back into the boundary nobody has ruled on, which is the
     # retry loop this whole path exists to prevent.
     if coord_decision.state == "waiting_human":
+        # BOU-2402: make the pause legible. The status moves the card into its
+        # own board column, the carried fields let a viewer read the question
+        # without opening the coordinator ledger, and the event lets
+        # `pr-observe` answer "why did this PR stop being dispatched?".
+        waiting = coordinator.pending_decision_for_pr(pr)
+        if waiting is not None:
+            pr.status = PRStatus.WAITING_HUMAN_DECISION
+            pr.waiting_decision_id = waiting.request.decision_id
+            pr.waiting_decision_question = waiting.request.question
+            pr.waiting_decision_category = waiting.request.category
+            pr.waiting_decision_runtime = waiting.request.requesting_runtime
+            # Edge-triggered, not level-triggered (PR #110 review). The waiter
+            # polls this every ~150s and detached loops check the same worktree,
+            # so emitting on every pass would fill the bounded event store with
+            # identical records and evict the history observability exists to
+            # preserve. Emit once per decision, on entry.
+            if _mark_decision_wait_emitted(cwd, waiting.request.decision_id):
+                observability.emit(
+                    cwd,
+                    "decision_wait",
+                    pr_number=pr.number,
+                    session_id=owner_session_id,
+                    details={
+                        "decision_id": waiting.request.decision_id,
+                        "claim_id": waiting.request.claim_id,
+                        "category": waiting.request.category,
+                        "requesting_runtime": waiting.request.requesting_runtime,
+                        "logical_key": waiting.request.logical_key,
+                    },
+                )
         return 0, _blocked_defer_text(
             pr_number=pr.number,
             blockers=blockers,

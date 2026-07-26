@@ -28,6 +28,11 @@ class PRStatus(str, Enum):
     # external check, or winding down. Liveness alone never means AGENT_WORKING
     # (BOU-2365).
     AGENT_WAITING = "agent_waiting"
+    # Blocked on a human answering an architecture/product decision (BOU-2040).
+    # Distinct from AGENT_WAITING: nothing is running and nothing will run until
+    # a person acts, so this is the one waiting state that is actionable BY the
+    # viewer rather than by the agent.
+    WAITING_HUMAN_DECISION = "waiting_human_decision"
     # The deliverable is merged/closed and the worktree is reclaimable, even if
     # the chat process is still alive.
     READY_CLEANUP = "ready_cleanup"
@@ -223,6 +228,14 @@ class PRData(BaseModel):
     # True when at least one required CI check is still queued/in_progress.
     # Set by _check_worktree for non-draft PRs via github_api.required_checks_pending.
     ci_watch_pending: bool = False
+    # The unresolved human decision gating this PR, if any (BOU-2040/BOU-2402).
+    # Carried on the PR so a viewer can see WHAT is being asked without going to
+    # the coordinator ledger. Populated by _check_worktree; the ledger stays the
+    # source of truth.
+    waiting_decision_id: str | None = None
+    waiting_decision_question: str | None = None
+    waiting_decision_category: str | None = None
+    waiting_decision_runtime: str | None = None
     # True when this PR has been escalated due to repeated executor failures.
     escalated: bool = False
     escalated_reason: str | None = None
@@ -274,6 +287,14 @@ class WorktreeCard(BaseModel):
     # Why a live session is idle, set alongside session_activity == "waiting":
     # "user input", "external checks", or "winding down".
     waiting_reason: str | None = None
+    # The unresolved human decision gating this card (BOU-2402). Projected from
+    # PRData so the template can render the actual question — without these the
+    # viewer sees a "Needs Your Decision" chip and has no way to learn what is
+    # being asked short of reading the coordinator ledger.
+    waiting_decision_id: str | None = None
+    waiting_decision_question: str | None = None
+    waiting_decision_category: str | None = None
+    waiting_decision_runtime: str | None = None
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
@@ -405,6 +426,16 @@ class WorktreeCard(BaseModel):
         if self.status == PRStatus.READY_CLEANUP:
             return "ready_cleanup"
 
+        # --- blocked on a human answer ---
+        # Above the maintenance signals on purpose (BOU-2402, PR #110 review):
+        # a stale QUEUED/RUNNING maintenance record must not paint this card
+        # "working" when nothing is running and nothing will run until a person
+        # answers. Without this case the status fell through every branch below
+        # and returned "clean" — a Clean chip on a blocked PR, which is worse
+        # than the invisibility this was meant to fix.
+        if self.status == PRStatus.WAITING_HUMAN_DECISION:
+            return "needs_decision"
+
         # --- maintenance signals override status-based states ---
         if self.maintenance is not None:
             m = self.maintenance.state
@@ -438,6 +469,7 @@ class WorktreeCard(BaseModel):
         """Human-readable label for agent_state."""
         return {
             "failed": "Failed",
+            "needs_decision": "Needs Your Decision",
             "working": "Agent Working",
             "waiting": "Waiting",
             "ready_cleanup": "Ready / Cleanup",
