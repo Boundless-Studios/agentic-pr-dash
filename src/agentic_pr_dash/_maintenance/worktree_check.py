@@ -293,6 +293,37 @@ def _should_reclaim_stuck_owner(
     return False
 
 
+def _decision_wait_marker_path(cwd: str):
+    return _wakeless_defer_path(cwd).parent / "decision-wait.emitted"
+
+
+def _mark_decision_wait_emitted(cwd: str, decision_id: str) -> bool:
+    """True the first time we see ``decision_id``; False on every later pass.
+
+    Edge-triggering for the ``decision_wait`` event. The marker records the last
+    decision id emitted for this worktree, so a NEW decision (including one that
+    superseded the previous) still emits, while repeated polls on the same
+    unanswered question stay silent.
+
+    Best-effort: if the marker cannot be read or written we return True and
+    accept a duplicate event rather than losing the signal entirely — a missing
+    record is worse than a repeated one.
+    """
+    path = _decision_wait_marker_path(cwd)
+    try:
+        previous = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        previous = ""
+    if previous == decision_id:
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(decision_id, encoding="utf-8")
+    except OSError:
+        pass
+    return True
+
+
 def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str) -> str:
     """Warn-only defer text for a NON-owning checker that sees a blocked owned PR.
 
@@ -586,19 +617,25 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             pr.waiting_decision_question = waiting.request.question
             pr.waiting_decision_category = waiting.request.category
             pr.waiting_decision_runtime = waiting.request.requesting_runtime
-            observability.emit(
-                cwd,
-                "decision_wait",
-                pr_number=pr.number,
-                session_id=owner_session_id,
-                details={
-                    "decision_id": waiting.request.decision_id,
-                    "claim_id": waiting.request.claim_id,
-                    "category": waiting.request.category,
-                    "requesting_runtime": waiting.request.requesting_runtime,
-                    "logical_key": waiting.request.logical_key,
-                },
-            )
+            # Edge-triggered, not level-triggered (PR #110 review). The waiter
+            # polls this every ~150s and detached loops check the same worktree,
+            # so emitting on every pass would fill the bounded event store with
+            # identical records and evict the history observability exists to
+            # preserve. Emit once per decision, on entry.
+            if _mark_decision_wait_emitted(cwd, waiting.request.decision_id):
+                observability.emit(
+                    cwd,
+                    "decision_wait",
+                    pr_number=pr.number,
+                    session_id=owner_session_id,
+                    details={
+                        "decision_id": waiting.request.decision_id,
+                        "claim_id": waiting.request.claim_id,
+                        "category": waiting.request.category,
+                        "requesting_runtime": waiting.request.requesting_runtime,
+                        "logical_key": waiting.request.logical_key,
+                    },
+                )
         return 0, _blocked_defer_text(
             pr_number=pr.number,
             blockers=blockers,

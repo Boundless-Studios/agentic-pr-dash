@@ -287,6 +287,14 @@ class WorktreeCard(BaseModel):
     # Why a live session is idle, set alongside session_activity == "waiting":
     # "user input", "external checks", or "winding down".
     waiting_reason: str | None = None
+    # The unresolved human decision gating this card (BOU-2402). Projected from
+    # PRData so the template can render the actual question — without these the
+    # viewer sees a "Needs Your Decision" chip and has no way to learn what is
+    # being asked short of reading the coordinator ledger.
+    waiting_decision_id: str | None = None
+    waiting_decision_question: str | None = None
+    waiting_decision_category: str | None = None
+    waiting_decision_runtime: str | None = None
     last_polled: datetime | None = None
     last_agent_dispatch: datetime | None = None
     maintenance: MaintenanceState | None = None
@@ -418,6 +426,16 @@ class WorktreeCard(BaseModel):
         if self.status == PRStatus.READY_CLEANUP:
             return "ready_cleanup"
 
+        # --- blocked on a human answer ---
+        # Above the maintenance signals on purpose (BOU-2402, PR #110 review):
+        # a stale QUEUED/RUNNING maintenance record must not paint this card
+        # "working" when nothing is running and nothing will run until a person
+        # answers. Without this case the status fell through every branch below
+        # and returned "clean" — a Clean chip on a blocked PR, which is worse
+        # than the invisibility this was meant to fix.
+        if self.status == PRStatus.WAITING_HUMAN_DECISION:
+            return "needs_decision"
+
         # --- maintenance signals override status-based states ---
         if self.maintenance is not None:
             m = self.maintenance.state
@@ -451,6 +469,7 @@ class WorktreeCard(BaseModel):
         """Human-readable label for agent_state."""
         return {
             "failed": "Failed",
+            "needs_decision": "Needs Your Decision",
             "working": "Agent Working",
             "waiting": "Waiting",
             "ready_cleanup": "Ready / Cleanup",

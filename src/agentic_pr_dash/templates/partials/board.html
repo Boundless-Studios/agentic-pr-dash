@@ -55,6 +55,20 @@
                       title="{{ card.state_chip_label }}">{{ card.state_chip_label }}</span>
             </div>
 
+            {# ── Pending human decision (BOU-2402) ──
+               Render the actual question. A chip alone tells the viewer they
+               are blocking without telling them on what. #}
+            {% if card.waiting_decision_question %}
+            <div class="decision-wait">
+                <span class="decision-wait-label">Awaiting your {{ card.waiting_decision_category or "decision" }} decision</span>
+                <p class="decision-wait-question">{{ card.waiting_decision_question }}</p>
+                <span class="decision-wait-meta">
+                    asked by {{ card.waiting_decision_runtime or "agent" }}
+                    {%- if card.waiting_decision_id %} · {{ card.waiting_decision_id[:12] }}{% endif %}
+                </span>
+            </div>
+            {% endif %}
+
             {% if card.supervisor_state or card.context_percent is not none or card.runtime_status_stale %}
             <div class="harness-summary">
                 {% if card.supervisor_state %}
