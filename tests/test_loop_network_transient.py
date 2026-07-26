@@ -118,6 +118,14 @@ def _wire_loop(monkeypatch, wt, *, reachable: bool, released: list, exit_code: i
     monkeypatch.setattr(loop, "_network_reachable", lambda: reachable)
 
 
+# Deliberately NOT a real binary. `_run_executor` is monkeypatched in every test
+# here, so this name only ever feeds `_validate_executor`. Hardcoding a real one
+# ("codex") made these tests depend on the dev box's PATH — tick-level viability
+# resolved True locally and False in CI, which is a property of the machine, not
+# of the behavior under test.
+_EXECUTOR = "apd-test-executor-does-not-exist-2417 {prompt}"
+
+
 def _args(tmp_path):
     return types.SimpleNamespace(
         no_discover_worktrees=False, session_id="sess-1", cwd=[str(tmp_path)],
@@ -135,7 +143,7 @@ def test_outage_ticks_do_not_burn_the_streak(monkeypatch, tmp_path):
     _wire_loop(monkeypatch, wt, reachable=False, released=released)
 
     for _ in range(3):  # 3 > threshold of 2
-        loop._tick(_args(tmp_path), "codex {prompt}")
+        loop._tick(_args(tmp_path), _EXECUTOR)
 
     assert loop.executor_failure_streak(str(wt), 4242) == 0, (
         "an unreachable network must not burn the per-PR escalation streak"
@@ -152,7 +160,7 @@ def test_outage_ticks_write_no_escalation_marker(monkeypatch, tmp_path):
     _wire_loop(monkeypatch, wt, reachable=False, released=released)
 
     for _ in range(3):
-        loop._tick(_args(tmp_path), "codex {prompt}")
+        loop._tick(_args(tmp_path), _EXECUTOR)
 
     marker = loop._escalated_marker_path(str(wt))
     if marker.exists():
@@ -170,7 +178,7 @@ def test_outage_tick_holds_the_coordinator_claim(monkeypatch, tmp_path):
     _wire_loop(monkeypatch, wt, reachable=False, released=released)
 
     for _ in range(3):
-        loop._tick(_args(tmp_path), "codex {prompt}")
+        loop._tick(_args(tmp_path), _EXECUTOR)
 
     assert released == [], (
         "ownership must lapse via the coordinator lease if the process is dead, "
@@ -185,6 +193,11 @@ def test_outage_does_not_flip_executors_viable(monkeypatch, tmp_path):
     which is set only when `subprocess.run` itself raises (binary missing). A
     network outage lets the binary spawn and exit non-zero, so viability must
     stay true. This pins behavior the ticket assumed was broken.
+
+    `_tick_executor_viability` is pinned to viable here so the assertion is
+    about the DISPATCH path only. Without it the test just measures whether the
+    configured executor happens to be on PATH — true on a dev box, false in CI,
+    where the tick-level stamp is legitimately False before any dispatch runs.
     """
     monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "2")
     config.load.cache_clear()
@@ -192,6 +205,7 @@ def test_outage_does_not_flip_executors_viable(monkeypatch, tmp_path):
     wt.mkdir()
     released: list = []
     _wire_loop(monkeypatch, wt, reachable=False, released=released)
+    monkeypatch.setattr(loop, "_tick_executor_viability", lambda executor, fallback: (True, {}))
 
     viability: list[bool] = []
     real_record = loop.record_loop_health
@@ -202,7 +216,7 @@ def test_outage_does_not_flip_executors_viable(monkeypatch, tmp_path):
     )
 
     for _ in range(3):
-        loop._tick(_args(tmp_path), "codex {prompt}")
+        loop._tick(_args(tmp_path), _EXECUTOR)
 
     assert viability, "the tick should have stamped at least one health record"
     assert all(v is True for v in viability), (
@@ -221,7 +235,7 @@ def test_genuine_executor_failure_still_escalates(monkeypatch, tmp_path):
     monkeypatch.setattr("agentic_pr_dash.iterm.notify", lambda *a, **k: None)
 
     for _ in range(2):
-        loop._tick(_args(tmp_path), "codex {prompt}")
+        loop._tick(_args(tmp_path), _EXECUTOR)
 
     assert loop.executor_failure_streak(str(wt), 4242) == 2, (
         "a reachable network means a genuine executor failure — streak must still burn"
