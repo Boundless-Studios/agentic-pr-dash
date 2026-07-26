@@ -147,13 +147,24 @@ _CONNECTIVITY_STDERR_PATTERNS = (
 )
 
 
+def is_transient_connectivity_text(text: str) -> bool:
+    """True when arbitrary process output carries a transport-failure signature.
+
+    Split out from :func:`_is_transient_connectivity_failure` so callers that do
+    not hold a `CompletedProcess` can reuse the same patterns — notably the
+    maintenance loop, which tees its executor's output and needs to tell "my
+    model endpoint was unreachable" from "I failed the task" (BOU-2417).
+    """
+    lowered = (text or "").lower()
+    return any(pat in lowered for pat in _CONNECTIVITY_STDERR_PATTERNS)
+
+
 def _is_transient_connectivity_failure(result: subprocess.CompletedProcess) -> bool:
     """True when a failed gh result looks like a transient transport failure
     that is worth retrying (the request never reached GitHub)."""
     if result.returncode == 0:
         return False
-    stderr = (result.stderr or "").lower()
-    return any(pat in stderr for pat in _CONNECTIVITY_STDERR_PATTERNS)
+    return is_transient_connectivity_text(result.stderr or "")
 
 
 # GitHub rate-limit signatures (BOU-1921). Two distinct modes: PRIMARY quota

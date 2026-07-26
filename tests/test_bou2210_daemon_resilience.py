@@ -95,7 +95,7 @@ def _tick_harness(monkeypatch, tmp_path, *, heartbeat, release, calls):
     monkeypatch.setattr(
         loop,
         "_run_executor",
-        lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0,
+        lambda executor, prompt, cwd: (calls.append(("executor", cwd)), (0, ""))[1],
     )
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", heartbeat)
     monkeypatch.setattr(loop.coordinator, "release_claim", release)

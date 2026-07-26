@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import socket
+import threading
+import time
 import types
 
 import pytest
@@ -90,7 +92,10 @@ _CHECK_STDOUT = (
 )
 
 
-def _wire_loop(monkeypatch, wt, *, reachable: bool, released: list, exit_code: int = 1):
+def _wire_loop(
+    monkeypatch, wt, *, reachable: bool, released: list, exit_code: int = 1,
+    executor_output: str = "",
+):
     """Wire a tick that finds work for PR #4242 and whose executor exits non-zero.
 
     NOTE the executor EXITS non-zero rather than failing to spawn: that is what a
@@ -109,7 +114,8 @@ def _wire_loop(monkeypatch, wt, *, reachable: bool, released: list, exit_code: i
         lambda cmd, *a, **k: types.SimpleNamespace(
             returncode=loop.CHECK_WORK_FOUND, stdout=_CHECK_STDOUT, stderr=""),
     )
-    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: exit_code)
+    monkeypatch.setattr(
+        loop, "_run_executor", lambda executor, prompt, cwd: (exit_code, executor_output))
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
     monkeypatch.setattr(
         loop.coordinator, "release_claim",
@@ -244,6 +250,110 @@ def test_genuine_executor_failure_still_escalates(monkeypatch, tmp_path):
     assert marker.exists(), "reaching the threshold must file an escalation marker"
     assert "4242" in json.loads(marker.read_text(encoding="utf-8"))
     assert released, "a genuine failure must still release the claim"
+
+
+# --------------------------------------------------------------------------
+# PR #113 review findings
+# --------------------------------------------------------------------------
+
+def test_executor_transport_error_is_inconclusive_even_when_github_is_up(
+    monkeypatch, tmp_path
+):
+    """P1: a provider-specific outage leaves GitHub reachable.
+
+    The executor's OWN output is the primary evidence — probing api.github.com
+    would classify the very scenario this change targets as a real failure.
+    """
+    monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "2")
+    config.load.cache_clear()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    released: list = []
+    _wire_loop(
+        monkeypatch, wt, reachable=True, released=released,  # GitHub is fine
+        executor_output="stream error: connection reset by peer\n",
+    )
+    monkeypatch.setattr(loop, "_tick_executor_viability", lambda e, f: (True, {}))
+
+    for _ in range(3):
+        loop._tick(_args(tmp_path), _EXECUTOR)
+
+    assert loop.executor_failure_streak(str(wt), 4242) == 0, (
+        "an unreachable model endpoint must not burn the streak just because "
+        "GitHub happens to be reachable"
+    )
+    assert released == [], "the claim must be held through a provider outage"
+
+
+def test_all_spawn_failures_still_counted_during_a_concurrent_outage(
+    monkeypatch, tmp_path
+):
+    """P2: a local executor defect stays actionable regardless of network state.
+
+    A binary removed or chmod'd after startup validation must still burn the
+    streak and downgrade viability even if the network is down at the same time.
+    """
+    monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "2")
+    config.load.cache_clear()
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    released: list = []
+    _wire_loop(monkeypatch, wt, reachable=False, released=released)  # network DOWN
+
+    def _boom(executor, prompt, cwd):
+        raise FileNotFoundError("executor vanished")
+
+    monkeypatch.setattr(loop, "_run_executor", _boom)
+
+    loop._tick(_args(tmp_path), _EXECUTOR)
+
+    assert loop.executor_failure_streak(str(wt), 4242) == 1, (
+        "an all-spawn-failure is a LOCAL defect and must be counted even during "
+        "a concurrent network outage"
+    )
+    assert released, "a local executor defect must still release the claim"
+
+
+def test_probe_is_bounded_when_dns_stalls(monkeypatch):
+    """P2: a wedged resolver must not block the loop.
+
+    `socket.create_connection` resolves via a synchronous getaddrinfo BEFORE the
+    socket timeout applies, so the probe needs its own overall deadline.
+    """
+    monkeypatch.setenv("APD_LOOP_PROBE_HOSTS", "stalled.invalid:443")
+    monkeypatch.setenv("APD_LOOP_PROBE_TIMEOUT_S", "0.2")
+
+    release = threading.Event()
+
+    def _hang(addr, timeout=None):
+        release.wait(30)  # emulate a stuck resolver
+        raise OSError("never gets here in time")
+
+    monkeypatch.setattr(socket, "create_connection", _hang)
+
+    started = time.monotonic()
+    try:
+        assert loop._network_reachable() is False, (
+            "a probe that cannot complete is evidence of a network problem"
+        )
+        elapsed = time.monotonic() - started
+        assert elapsed < 10, f"probe was not bounded; took {elapsed:.1f}s"
+    finally:
+        release.set()
+
+
+def test_run_executor_tees_output_and_returns_tail(monkeypatch, tmp_path, capfd):
+    """The tee must preserve the live stream AND retain a tail for classification."""
+    rc, tail = loop._run_executor(
+        "sh -c 'echo hello-from-executor; echo could not resolve host >&2; exit 3'",
+        "unused-prompt", str(tmp_path),
+    )
+    captured = capfd.readouterr()
+    assert rc == 3
+    assert "hello-from-executor" in tail
+    assert "could not resolve host" in tail
+    assert "hello-from-executor" in captured.err, "output must still stream through"
+    assert github_api.is_transient_connectivity_text(tail)
 
 
 # --------------------------------------------------------------------------

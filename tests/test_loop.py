@@ -329,7 +329,9 @@ def test_tick_heartbeats_and_releases_coordinator_claim(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "base-sha")
     monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
-    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0)
+    monkeypatch.setattr(
+        loop, "_run_executor",
+        lambda executor, prompt, cwd: (calls.append(("executor", cwd)), (0, ""))[1])
     monkeypatch.setattr(
         loop.coordinator,
         "heartbeat_claim",
@@ -451,7 +453,7 @@ def test_tick_treats_stale_claim_as_handoff_and_continues(
     monkeypatch.setattr(
         loop,
         "_run_executor",
-        lambda executor, prompt, cwd: calls.append(("executor", cwd)) or 0,
+        lambda executor, prompt, cwd: (calls.append(("executor", cwd)), (0, ""))[1],
     )
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", heartbeat_claim)
     monkeypatch.setattr(loop.coordinator, "release_claim", release_claim)

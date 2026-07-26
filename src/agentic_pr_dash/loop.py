@@ -27,14 +27,16 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import traceback
+from collections import deque
 from functools import lru_cache
 from pathlib import Path
 
 from agent_coordinator.service import StaleClaimError
 
-from . import coordinator
+from . import coordinator, github_api
 from ._maintenance import worktree_check
 from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
@@ -1018,8 +1020,30 @@ def _validate_executor(executor: str) -> str | None:
     return None
 
 
-def _run_executor(executor: str, prompt: str, cwd: str) -> int:
-    """Run the configured executor with the prompt, in the worktree dir."""
+# How much of the executor's output to retain for failure classification. The
+# transport-error signature we look for is emitted near the end of a failed run,
+# and this buffer is held per dispatch, so a small tail is plenty (BOU-2417).
+_EXECUTOR_TAIL_LINES = 200
+
+
+def _run_executor(executor: str, prompt: str, cwd: str) -> tuple[int, str]:
+    """Run the configured executor with the prompt, in the worktree dir.
+
+    Returns ``(exit code, tail of the executor's output)``.
+
+    The output is TEE'd — streamed through to this process's stderr line by line
+    exactly as before, while a bounded tail is retained for classification. The
+    tail is what lets a failed dispatch be attributed to an unreachable model
+    endpoint rather than a broken executor (BOU-2417); plain ``capture_output``
+    would have bought the same evidence at the cost of the live daemon log,
+    which is the whole reason the original call passed the streams through.
+
+    NB: the executor's stdio is now a pipe rather than an inherited handle, so
+    it no longer sees a TTY. The loop invokes executors non-interactively by
+    contract (the command template must accept the prompt as an argument), and
+    the daemon already redirects both streams to a log file, so this changes
+    only whether a foreground run gets TTY-styled output.
+    """
     if "{prompt}" in executor:
         # Split the template, then inject the prompt as a single argv element so
         # it is never re-split by the shell.
@@ -1028,7 +1052,21 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
             parts.append(prompt if tok == "{prompt}" else tok)
     else:
         parts = [*shlex.split(executor), prompt]
-    return subprocess.run(parts, cwd=cwd).returncode
+    tail: deque[str] = deque(maxlen=_EXECUTOR_TAIL_LINES)
+    proc = subprocess.Popen(
+        parts, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, errors="replace",
+    )
+    assert proc.stdout is not None
+    with proc.stdout:
+        for line in proc.stdout:
+            sys.stderr.write(line)
+            tail.append(line)
+    try:
+        sys.stderr.flush()
+    except ValueError:
+        pass
+    return proc.wait(), "".join(tail)
 
 
 _SPAWN_FAILED_PREFIX = "spawn failed: "
@@ -1066,12 +1104,33 @@ def _probe_targets() -> list[tuple[str, int]]:
     return targets
 
 
+def _connect_once(host: str, port: int, timeout: float) -> bool:
+    """One bounded TCP connect. True on success."""
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+    except OSError:
+        return False
+    try:
+        sock.close()
+    except OSError:
+        pass
+    return True
+
+
 def _network_reachable() -> bool:
     """True when at least one probe host accepts a TCP connection.
 
     Deliberately FAILS OPEN: any unexpected internal error returns True, so a
     bug in the probe degrades to the pre-BOU-2417 behavior (count the failure)
     rather than silently suppressing genuine executor defects forever.
+
+    The probe runs on a worker thread with an OVERALL deadline (PR #113 review).
+    ``socket.create_connection`` resolves the host with a synchronous
+    ``getaddrinfo`` BEFORE the socket timeout applies, so a stalled resolver —
+    exactly the outage this path exists to detect — would otherwise block the
+    whole maintenance loop and stall every later worktree. The worker is a
+    daemon thread: if resolution is wedged we abandon it and move on rather
+    than joining forever.
     """
     try:
         timeout = float(
@@ -1080,22 +1139,32 @@ def _network_reachable() -> bool:
         targets = _probe_targets()
         if not targets:
             return True
-        for host, port in targets:
-            try:
-                sock = socket.create_connection((host, port), timeout=timeout)
-            except OSError:
-                continue
-            try:
-                sock.close()
-            except OSError:
-                pass
-            return True
-        return False
+
+        result: list[bool] = []
+
+        def _probe() -> None:
+            result.append(any(_connect_once(h, p, timeout) for h, p in targets))
+
+        worker = threading.Thread(target=_probe, daemon=True)
+        worker.start()
+        # Whole-probe deadline: per-target budget plus a small margin.
+        worker.join(timeout * len(targets) + 1.0)
+        if not result:
+            # Wedged resolver / stuck connect. That IS a network problem, so
+            # report unreachable — the caller's inconclusive path leaves the
+            # streak and the claim untouched, which is the safe outcome here.
+            print(
+                "[agentic-pr-dash] reachability probe exceeded its deadline "
+                "(stalled DNS or connect); treating the network as unreachable",
+                file=sys.stderr,
+            )
+            return False
+        return result[0]
     except Exception:  # noqa: BLE001 — a broken probe must never suppress a failure
         return True
 
 
-def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
+def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str, str]:
     """Run an executor; return ``(exit code | None, concrete error text)``.
 
     The executor binary may be missing from PATH (OSError/FileNotFoundError) or
@@ -1104,19 +1173,22 @@ def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
     the whole loop on one bad spawn. The error text retains the CONCRETE cause
     (the spawn exception, or the exit code) instead of collapsing it (BOU-2086);
     it is ``""`` on success.
+
+    The third element is the tail of the executor's output (BOU-2417), used to
+    classify WHY it failed; it is ``""`` when the process never launched.
     """
     try:
-        rc = _run_executor(executor, prompt, cwd)
+        rc, tail = _run_executor(executor, prompt, cwd)
     except Exception as exc:
         print(f"[agentic-pr-dash] could not launch executor: {exc}", file=sys.stderr)
-        return None, f"{_SPAWN_FAILED_PREFIX}{exc}"
-    return rc, ("" if rc == 0 else f"exit {rc}")
+        return None, f"{_SPAWN_FAILED_PREFIX}{exc}", ""
+    return rc, ("" if rc == 0 else f"exit {rc}"), tail
 
 
 def _dispatch_with_fallback(
     primary: str, fallback: str, prompt: str, cwd: str, pr: int | None,
     repo_slug: str | None = None,
-) -> tuple[bool, dict[str, str]]:
+) -> tuple[bool, dict[str, str], str]:
     """Dispatch the fix to the primary executor, falling back on any failure.
 
     Chain (BOU-1734): run ``primary``; if it fails (non-zero exit or a failed
@@ -1131,32 +1203,77 @@ def _dispatch_with_fallback(
     unresolved boundary, and — worse — if the fallback happens to exit 0 the
     caller sees ``serviced=True``, never probes the ledger, and proceeds to
     completion with the question still unanswered.
+
+    The third return element is the concatenated tail of every failed
+    executor's output, for transient-failure classification (BOU-2417).
     """
-    rc, err = _try_run(primary, prompt, cwd)
+    rc, err, tail = _try_run(primary, prompt, cwd)
     if rc == 0:
-        return True, {}
+        return True, {}, ""
     errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
     if _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
         print(
             f"[agentic-pr-dash] primary executor recorded a human decision for PR #{pr}; "
             "not falling back", file=sys.stderr,
         )
-        return False, errors
+        return False, errors, tail
     if not fallback:
         # Legacy single-executor behavior: leave the PR for the next tick.
         print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
-        return False, errors
+        return False, errors, tail
     print(f"[agentic-pr-dash] primary executor failed (rc={rc}); falling back for PR #{pr}", file=sys.stderr)
-    rc2, err2 = _try_run(fallback, prompt, cwd)
+    rc2, err2, tail2 = _try_run(fallback, prompt, cwd)
     if rc2 == 0:
-        return True, {}
+        return True, {}, ""
     errors["fallback"] = f"{_executor_program(fallback) or fallback}: {err2}"
     print(
         f"[agentic-pr-dash] ERROR: both executors failed for PR #{pr} "
         f"(primary={rc}, fallback={rc2}); leaving for next tick",
         file=sys.stderr,
     )
-    return False, errors
+    return False, errors, "\n".join(t for t in (tail, tail2) if t)
+
+
+def _dispatch_was_inconclusive(
+    exec_errors: dict[str, str], exec_output: str, pr: int | None
+) -> bool:
+    """True when a failed dispatch carries no information about the executor.
+
+    Ordering matters (PR #113 review):
+
+    1. **Spawn failures win, always.** If every attempted executor failed to
+       even launch, that is a LOCAL defect — a binary removed or chmod'd after
+       startup validation, or process creation raising ``OSError``. It must stay
+       actionable (streak, viability downgrade, claim release) no matter what
+       the network is doing concurrently, so it is checked FIRST and never
+       reaches the outage shortcut.
+    2. **The executor's own output is the primary evidence.** A GitHub socket is
+       the wrong thing to ask about a Claude/OpenAI outage: a provider-specific
+       failure leaves ``api.github.com`` perfectly reachable, so probing it
+       would classify the very scenario this change targets as a real failure.
+       We tee the executor's output (see :func:`_run_executor`) and match it
+       against the transport-error signatures ``github_api`` already maintains.
+    3. **The reachability probe is corroboration, not the classifier.** It only
+       gets a say when the executor's output offers no verdict — the network
+       being demonstrably down means we cannot trust any dispatch result.
+    """
+    if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
+        return False
+    if github_api.is_transient_connectivity_text(exec_output):
+        print(
+            f"[agentic-pr-dash] executor for PR #{pr} reported a transport failure; "
+            "tick is inconclusive — streak, escalation and claim left untouched",
+            file=sys.stderr,
+        )
+        return True
+    if not _network_reachable():
+        print(
+            f"[agentic-pr-dash] network unreachable after dispatch for PR #{pr}; "
+            "tick is inconclusive — streak, escalation and claim left untouched",
+            file=sys.stderr,
+        )
+        return True
+    return False
 
 
 def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
@@ -1309,7 +1426,7 @@ def _service_cwd(
             coordinator.heartbeat_claim(claim_handle, session)
         except StaleClaimError:
             return
-    serviced, exec_errors = _dispatch_with_fallback(
+    serviced, exec_errors, exec_output = _dispatch_with_fallback(
         executor, fallback, prompt, cwd, pr, repo_slug=repo_slug)
     if not serviced and _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
         # BOU-2040: the executor stopped because it owes a human an answer, not
@@ -1328,29 +1445,15 @@ def _service_cwd(
             except StaleClaimError:
                 pass
         return
-    if not serviced and not _network_reachable():
-        # BOU-2417: the network is unreachable RIGHT NOW, so this dispatch tells
-        # us nothing about the executor. Treat it as INCONCLUSIVE, exactly like
-        # the BOU-2040 decision path above: no streak, no escalation, no
-        # viability downgrade — and critically, do NOT release the claim. The
-        # claim store is local, so the outage never threatened ownership; the
-        # loop was giving it away and re-acquiring on the next tick. Ownership
-        # must lapse via the coordinator lease if this process is genuinely
-        # dead, not be handed back on a blip (BOU-2389: fail open on runtime,
-        # fail closed on the claim).
-        #
-        # Probing AFTER the failure rather than before is deliberate: the
-        # `check` subprocess above has just made several gh calls and returns
-        # rc 2 on gh-unavailable, so a pre-dispatch probe milliseconds later
-        # would be redundant. The accepted gap is an outage that starts and
-        # ends INSIDE a long dispatch — that reads as reachable post-hoc and
-        # counts as a failure, i.e. degrades to the old behavior. Conservative
-        # in the safe direction: it can never mask a genuine executor defect.
-        print(
-            f"[agentic-pr-dash] network unreachable after dispatch for PR #{pr}; "
-            "tick is inconclusive — streak, escalation and claim left untouched",
-            file=sys.stderr,
-        )
+    if not serviced and _dispatch_was_inconclusive(exec_errors, exec_output, pr):
+        # BOU-2417: this dispatch tells us nothing about the executor, so treat
+        # it as INCONCLUSIVE exactly like the BOU-2040 decision path above: no
+        # streak, no escalation, no viability downgrade — and critically, do NOT
+        # release the claim. The claim store is local, so an outage never
+        # threatened ownership; the loop was giving it away and re-acquiring on
+        # the next tick. Ownership must lapse via the coordinator lease if this
+        # process is genuinely dead, not be handed back on a blip (BOU-2389:
+        # fail open on runtime, fail closed on the claim).
         return
     if not serviced:
         # Primary (and fallback, if any) failed. Record the failure streak,
