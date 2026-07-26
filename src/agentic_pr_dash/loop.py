@@ -837,7 +837,71 @@ def _head_sha(cwd: str) -> str:
     return out.stdout.strip()
 
 
-def _decision_requested_during_dispatch(cwd: str, pr: int | None) -> bool:
+def _resolve_repo_slug(cwd: str) -> str | None:
+    """Resolve ``owner/name`` once per tick, before any executor runs.
+
+    Auto-detection may shell out; doing it HERE keeps that cost off the
+    per-failure probe, which runs on the dispatch failure path.
+    """
+    try:
+        from .config import load as _load_config  # noqa: PLC0415
+
+        return _load_config(cwd).resolved_repo(Path(cwd))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _append_resolved_direction(
+    prompt: str, cwd: str, pr: int | None, repo_slug: str | None, session: str
+) -> str:
+    """Tell a redispatched executor what the human decided, and record the resume.
+
+    Consuming ``resolved_decision_for_pr`` here is what closes the loop: a
+    resolution stops blocking dispatch, so without this the replacement executor
+    receives the original prompt, reaches the same boundary, and requests the
+    decision again. Recording ``task_resumed`` also satisfies the coordinator's
+    resume protocol so the completed work can cite its direction.
+
+    Best-effort throughout: a failure here must not stop the dispatch that was
+    already going to happen.
+    """
+    if pr is None or not repo_slug:
+        return prompt
+    try:
+        from . import coordinator as _coordinator_mod  # noqa: PLC0415
+        from .models import PRData  # noqa: PLC0415
+
+        probe = PRData(
+            number=pr, title="", branch="",
+            url=f"https://github.com/{repo_slug}/pull/{pr}",
+        )
+        record = _coordinator_mod.resolved_decision_for_pr(probe)
+        if record is None or record.resolution is None:
+            return prompt
+        resolution = record.resolution
+        chosen = resolution.selected_option_id or resolution.direction or ""
+        direction = (
+            "\n\n## Human decision (already answered — do not ask again)\n"
+            f"decision_id: {record.request.decision_id}\n"
+            f"question: {record.request.question}\n"
+            f"answer: {chosen}\n"
+            f"decided_by: {resolution.human_actor}\n"
+        )
+        if resolution.rationale:
+            direction += f"rationale: {resolution.rationale}\n"
+        direction += (
+            "\nImplement this decision. Do not re-request it; the boundary is "
+            "settled.\n"
+        )
+        _coordinator_mod.record_task_resume(probe, record, session)
+        return prompt + direction
+    except Exception:  # noqa: BLE001
+        return prompt
+
+
+def _decision_requested_during_dispatch(
+    cwd: str, pr: int | None, *, repo_slug: str | None = None
+) -> bool:
     """Whether the executor left an unresolved human decision for this PR.
 
     BOU-2040 / BOU-2038: an executor that reaches a boundary it does not own
@@ -846,24 +910,29 @@ def _decision_requested_during_dispatch(cwd: str, pr: int | None) -> bool:
     ledger is the authority — deliberately not a stdout phrase, which an agent
     could emit accidentally or a log could swallow.
 
-    The probe carries ``worktree_path`` and no url on purpose:
-    ``_repo_slug_for_pr`` then resolves the slug from this worktree's config,
-    with no subprocess and no network. Shelling out to ``gh repo view`` here
-    would put a timeout-bounded child process on the failure path of every loop
-    tick.
+    ``repo_slug`` must be supplied by the caller, which already resolved it
+    before dispatch. A url-less, slug-less probe would fall through
+    ``_repo_slug_for_pr`` to ``Config.resolved_repo`` and — whenever
+    ``[project].repo`` is unset, the documented auto-detection default — into
+    ``_detect_repo``, which runs ``gh repo view`` with a 15s timeout and may then
+    run ``git remote get-url``. That would put a network-bound subprocess on the
+    failure path of every loop tick, which is exactly what this probe must not
+    do (PR #109 review). Without a slug we cannot key the task identity, so we
+    return False rather than guess.
 
     Best-effort: any lookup error means we cannot prove a decision is pending,
     so the caller falls through to normal failure handling. Suppressing a real
     failure on a bad read would be the more dangerous mistake.
     """
-    if pr is None:
+    if pr is None or not repo_slug:
         return False
     try:
         from . import coordinator as _coordinator_mod  # noqa: PLC0415
         from .models import PRData  # noqa: PLC0415
 
         probe = PRData(
-            number=pr, title="", branch="", url="", worktree_path=cwd,
+            number=pr, title="", branch="",
+            url=f"https://github.com/{repo_slug}/pull/{pr}",
         )
         return _coordinator_mod.pending_decision_for_pr(probe) is not None
     except Exception:  # noqa: BLE001
@@ -983,7 +1052,8 @@ def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
 
 
 def _dispatch_with_fallback(
-    primary: str, fallback: str, prompt: str, cwd: str, pr: int | None
+    primary: str, fallback: str, prompt: str, cwd: str, pr: int | None,
+    repo_slug: str | None = None,
 ) -> tuple[bool, dict[str, str]]:
     """Dispatch the fix to the primary executor, falling back on any failure.
 
@@ -993,11 +1063,23 @@ def _dispatch_with_fallback(
     PR. Returns ``(serviced, errors)``: ``serviced`` is True when some executor
     serviced the PR (exit 0); ``errors`` maps ``"primary"``/``"fallback"`` to the
     concrete per-executor failure text (BOU-2086) — empty when serviced.
+
+    BOU-2040 (PR #109 review): the chain STOPS when a failed executor left a
+    pending human decision. Otherwise the fallback runs against the same
+    unresolved boundary, and — worse — if the fallback happens to exit 0 the
+    caller sees ``serviced=True``, never probes the ledger, and proceeds to
+    completion with the question still unanswered.
     """
     rc, err = _try_run(primary, prompt, cwd)
     if rc == 0:
         return True, {}
     errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
+    if _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
+        print(
+            f"[agentic-pr-dash] primary executor recorded a human decision for PR #{pr}; "
+            "not falling back", file=sys.stderr,
+        )
+        return False, errors
     if not fallback:
         # Legacy single-executor behavior: leave the PR for the next tick.
         print(f"[agentic-pr-dash] executor exited {rc}; leaving PR #{pr} for next tick", file=sys.stderr)
@@ -1151,13 +1233,23 @@ def _service_cwd(
     baseline = _baseline_sha(cwd, pr)
     print(f"[agentic-pr-dash] PR #{pr} in {cwd} needs work — dispatching executor", file=sys.stderr)
     session = args.session_id or f"pid:{_loop_pid()}"
+    # Resolve the slug ONCE, here, where a subprocess is already acceptable —
+    # rather than inside the per-failure probe, which must stay allocation-only
+    # (PR #109 review).
+    repo_slug = _resolve_repo_slug(cwd)
+    # BOU-2040 (PR #109 review): if a human has answered, the redispatched
+    # executor must be TOLD what was decided. Without this the replacement runs
+    # the same prompt, reaches the same boundary, and asks again — the loop the
+    # decision protocol exists to end.
+    prompt = _append_resolved_direction(prompt, cwd, pr, repo_slug, session)
     if claim_handle:
         try:
             coordinator.heartbeat_claim(claim_handle, session)
         except StaleClaimError:
             return
-    serviced, exec_errors = _dispatch_with_fallback(executor, fallback, prompt, cwd, pr)
-    if not serviced and _decision_requested_during_dispatch(cwd, pr):
+    serviced, exec_errors = _dispatch_with_fallback(
+        executor, fallback, prompt, cwd, pr, repo_slug=repo_slug)
+    if not serviced and _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
         # BOU-2040: the executor stopped because it owes a human an answer, not
         # because it failed. The coordinator ledger — not an exit code or a
         # stdout phrase — is the source of truth here (BOU-2038). Recording a

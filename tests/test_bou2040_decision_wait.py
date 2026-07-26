@@ -300,46 +300,59 @@ def test_loop_treats_a_recorded_decision_as_not_a_failure(store, monkeypatch):
 
     pr = _pr()
     _ask(store, pr)
-    # The probe resolves the slug from the worktree; make it agree with the
-    # slug the decision was recorded under.
-    monkeypatch.setattr(
-        coordinator, "_repo_slug_for_pr", lambda p: "Boundless-Studios/gaia-free"
+
+    assert (
+        loop._decision_requested_during_dispatch(
+            ".", 123, repo_slug="Boundless-Studios/gaia-free"
+        )
+        is True
     )
 
-    assert loop._decision_requested_during_dispatch(".", 123) is True
 
-
-def test_loop_sees_no_decision_when_none_was_recorded(store, monkeypatch):
+def test_loop_sees_no_decision_when_none_was_recorded(store):
     from agentic_pr_dash import loop
 
-    monkeypatch.setattr(
-        coordinator, "_repo_slug_for_pr", lambda p: "Boundless-Studios/gaia-free"
+    assert (
+        loop._decision_requested_during_dispatch(
+            ".", 123, repo_slug="Boundless-Studios/gaia-free"
+        )
+        is False
     )
-    assert loop._decision_requested_during_dispatch(".", 123) is False
 
 
-def test_probe_misses_the_decision_if_the_repo_slug_disagrees(store, monkeypatch):
-    """Documents a real constraint: the probe must resolve the SAME repo slug.
+def test_probe_without_a_slug_returns_false_rather_than_guessing(store):
+    """No slug means we cannot key the task identity — do not guess.
 
-    ``task_identity_for_pr`` keys on ``github:<owner>/<repo>#<n>``, so a probe
-    that resolved a different slug than the executor recorded under would find
-    nothing and the run would be misfiled as a failure. Safe for the loop, which
-    ticks per-worktree against that worktree's own PR — pinned here so a future
-    change that widens the probe's input cannot break it silently.
+    Guessing via auto-detection is what put a subprocess on this path.
     """
     from agentic_pr_dash import loop
 
     _ask(store, _pr())
-    monkeypatch.setattr(coordinator, "_repo_slug_for_pr", lambda p: "other/repo")
     assert loop._decision_requested_during_dispatch(".", 123) is False
+    assert loop._decision_requested_during_dispatch(".", 123, repo_slug="") is False
+
+
+def test_probe_misses_the_decision_if_the_repo_slug_disagrees(store):
+    """``task_identity_for_pr`` keys on github:<owner>/<repo>#<n>."""
+    from agentic_pr_dash import loop
+
+    _ask(store, _pr())
+    assert (
+        loop._decision_requested_during_dispatch(".", 123, repo_slug="other/repo")
+        is False
+    )
 
 
 def test_decision_probe_makes_no_subprocess_call(store, monkeypatch):
-    """The probe sits on the failure path of every loop tick — keep it cheap.
+    """The probe runs on every failed dispatch — it must not shell out.
 
-    An earlier cut shelled out to `gh repo view` here, putting a
-    timeout-bounded child process on that path and turning a 107s suite into a
-    >600s one.
+    PR #109 review caught the real hole here: an earlier cut passed a url-less
+    probe, which falls through ``_repo_slug_for_pr`` to ``Config.resolved_repo``
+    and, when ``[project].repo`` is unset (the documented default), into
+    ``_detect_repo`` -> ``gh repo view`` with a 15s timeout. The previous version
+    of this test monkeypatched ``_repo_slug_for_pr`` and so never exercised that
+    path — it masked exactly the defect it claimed to guard. Now the slug is
+    passed in and NOTHING is stubbed except the forbidden call itself.
     """
     import subprocess as _sp
 
@@ -349,12 +362,145 @@ def test_decision_probe_makes_no_subprocess_call(store, monkeypatch):
         raise AssertionError("decision probe must not spawn a subprocess")
 
     monkeypatch.setattr(_sp, "run", _forbidden)
-    monkeypatch.setattr(
-        coordinator, "_repo_slug_for_pr", lambda p: "Boundless-Studios/gaia-free"
-    )
     _ask(store, _pr())
 
-    assert loop._decision_requested_during_dispatch(".", 123) is True
+    assert (
+        loop._decision_requested_during_dispatch(
+            ".", 123, repo_slug="Boundless-Studios/gaia-free"
+        )
+        is True
+    )
+
+
+def test_fallback_is_not_run_when_the_primary_recorded_a_decision(store, monkeypatch):
+    """PR #109 review: the fallback would attack the same unresolved boundary.
+
+    Worse, a fallback that exits 0 makes ``serviced`` true, so the caller never
+    probes the ledger and proceeds to completion with the question unanswered.
+    """
+    from agentic_pr_dash import loop
+
+    _ask(store, _pr())
+    ran: list[str] = []
+
+    def _try(executor, prompt, cwd):
+        ran.append(executor)
+        return (1, "exit 1") if executor == "primary" else (0, "")
+
+    monkeypatch.setattr(loop, "_try_run", _try)
+
+    serviced, errors = loop._dispatch_with_fallback(
+        "primary", "fallback", "p", ".", 123,
+        repo_slug="Boundless-Studios/gaia-free",
+    )
+
+    assert ran == ["primary"], "fallback must not run after a recorded decision"
+    assert serviced is False
+    assert "primary" in errors
+
+
+def test_fallback_still_runs_on_an_ordinary_primary_failure(store, monkeypatch):
+    """The decision check must not break the normal fallback chain."""
+    from agentic_pr_dash import loop
+
+    ran: list[str] = []
+
+    def _try(executor, prompt, cwd):
+        ran.append(executor)
+        return (1, "exit 1") if executor == "primary" else (0, "")
+
+    monkeypatch.setattr(loop, "_try_run", _try)
+
+    serviced, _ = loop._dispatch_with_fallback(
+        "primary", "fallback", "p", ".", 123,
+        repo_slug="Boundless-Studios/gaia-free",
+    )
+
+    assert ran == ["primary", "fallback"]
+    assert serviced is True
+
+
+def test_resolved_direction_is_appended_to_the_redispatched_prompt(store, monkeypatch):
+    """PR #109 review: a redispatched executor must be told what was decided.
+
+    Otherwise it runs the original prompt, reaches the same boundary, and asks
+    the same question again — the loop the protocol exists to end.
+    """
+    from agentic_pr_dash import loop
+
+    pr = _pr()
+    record = _ask(store, pr)
+    _raw(store).resolve_decision(
+        record.request.decision_id,
+        request_fingerprint="evidence:v1",
+        human_actor="ilya",
+        selected_option_id="split-service",
+        rationale="the boundary is load-bearing now",
+        now=BASE_TIME,
+    )
+
+    out = loop._append_resolved_direction(
+        "ORIGINAL", ".", 123, "Boundless-Studios/gaia-free", "s-loop"
+    )
+
+    assert out.startswith("ORIGINAL")
+    assert record.request.decision_id in out
+    assert "split-service" in out
+    assert "ilya" in out
+    assert "load-bearing" in out
+    assert "do not ask again" in out.lower()
+
+
+def test_no_direction_is_appended_when_nothing_was_decided(store):
+    from agentic_pr_dash import loop
+
+    _ask(store, _pr())  # still waiting, not resolved
+    assert (
+        loop._append_resolved_direction(
+            "ORIGINAL", ".", 123, "Boundless-Studios/gaia-free", "s-loop"
+        )
+        == "ORIGINAL"
+    )
+
+
+def test_resume_is_recorded_when_the_direction_is_consumed(store, monkeypatch):
+    """Closing the coordinator's resume protocol, not just reading it."""
+    from agent_coordinator.models import DecisionState
+    from agentic_pr_dash import loop
+
+    pr = _pr()
+    record = _ask(store, pr)
+    _raw(store).resolve_decision(
+        record.request.decision_id,
+        request_fingerprint="evidence:v1",
+        human_actor="ilya",
+        selected_option_id="split-service",
+        now=BASE_TIME,
+    )
+
+    loop._append_resolved_direction(
+        "ORIGINAL", ".", 123, "Boundless-Studios/gaia-free", "s-loop"
+    )
+
+    assert (
+        coordinator.decision_by_id_for_pr(pr, record.request.decision_id).state
+        is DecisionState.RESUMED
+    )
+
+
+def test_decision_block_reason_gates_the_shared_dispatch_path(store):
+    """PR #109 review: manual dashboard actions must honour the wait too."""
+    pr = _pr()
+    record = _ask(store, pr)
+
+    reason = coordinator.decision_block_reason(pr)
+    assert reason is not None
+    assert record.request.decision_id in reason
+
+    _raw(store).cancel_decision(
+        record.request.decision_id, actor="ilya", reason="moot", now=BASE_TIME
+    )
+    assert coordinator.decision_block_reason(pr) is None
 
 
 def test_loop_decision_probe_is_false_on_lookup_error(store, monkeypatch):

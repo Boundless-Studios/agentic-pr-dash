@@ -675,6 +675,23 @@ class Orchestrator:
 
     async def dispatch_pr_maintenance(self, pr: PRData, guidance: str | None = None) -> None:
         """Queue PR maintenance for the local worktree agent."""
+        # BOU-2040 (PR #109 review): the pending-decision gate lives HERE, in the
+        # shared method, not only at the poll site. The dashboard's
+        # /api/fix-comments and /api/retry-ci handlers reach this via
+        # dispatch_comment_fix / dispatch_ci_fix without consulting
+        # dispatch_decision_for_pr, so gating only the poll path would let a
+        # button click queue an executor against an unresolved boundary.
+        blocked = coordinator.decision_block_reason(pr)
+        if blocked:
+            pr.activity_message = blocked
+            pr.activity_source = "agent-coordinator"
+            self.log(blocked, pr_number=pr.number, level="warn")
+            self._emit(
+                "decision_wait",
+                pr_number=pr.number,
+                details={"reason": blocked, "source": "dispatch_pr_maintenance"},
+            )
+            return
         if not self._reserve_pr(pr.number):
             return
         try:
