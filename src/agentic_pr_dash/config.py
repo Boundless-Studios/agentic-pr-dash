@@ -204,6 +204,33 @@ class Config:
     ``reclaim_no_progress_threshold`` > 3.
     """
 
+    live_owner_takeover_seconds: int = 1800
+    """Wall-clock seconds a LIVE, WAKE-CAPABLE owner must show no progress before
+    the loop may reclaim its PR (BOU-2475).
+
+    A hard time floor underneath :attr:`reclaim_no_progress_threshold`. Tick counts
+    alone are a poor proxy for elapsed time: the loop's ``--interval`` is
+    configurable, and every dashboard-triggered ``--once`` run burns a tick too, so
+    a 3-tick threshold can elapse in seconds rather than the half hour it reads
+    like. Reclaiming a live session's PR is the expensive mistake -- the dispatched
+    executor lacks the session's design intent, what was already tried, and why a
+    reviewer's suggestion was rejected -- so both the streak AND this duration must
+    be satisfied. Resolved from ``AGENTIC_PR_DASH_LIVE_OWNER_TAKEOVER_SECONDS`` env
+    > toml ``live_owner_takeover_seconds`` > 1800 (30 minutes).
+    """
+
+    wakeless_takeover_seconds: int = 600
+    """Wall-clock seconds a live but WAKE-LESS owner keeps its PR before takeover
+    (BOU-2475).
+
+    Shorter than :attr:`live_owner_takeover_seconds` because a wake-less owner (no
+    live feedback waiter -- e.g. codex, which has no wake channel) cannot be
+    notified that its PR needs work, so deferring to it indefinitely strands the PR.
+    Replaces the previous ONE-tick grace, which took over almost immediately.
+    Resolved from ``AGENTIC_PR_DASH_WAKELESS_TAKEOVER_SECONDS`` env > toml
+    ``wakeless_takeover_seconds`` > 600 (10 minutes).
+    """
+
     maintenance_repo_roots: tuple[str, ...] = ()
     """Additional repo MAIN-CHECKOUT paths this (super-)repo services PR
     maintenance for, beyond its own checkout (BOU-1546). The stop-gate /
@@ -436,6 +463,25 @@ def load(cwd: str | None = None) -> Config:
     if reclaim_threshold < 1:
         reclaim_threshold = 3
 
+    # BOU-2475 takeover floors: env > toml > default, same clamp discipline. A
+    # non-positive value would disable the floor entirely and restore the
+    # take-over-a-live-session behaviour this exists to stop, so clamp to the
+    # default rather than honouring it.
+    def _positive_seconds(env_key: str, toml_key: str, default: int) -> int:
+        raw = os.environ.get(f"AGENTIC_PR_DASH_{env_key}") or proj.get(toml_key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return default
+        return value if value > 0 else default
+
+    live_owner_takeover = _positive_seconds(
+        "LIVE_OWNER_TAKEOVER_SECONDS", "live_owner_takeover_seconds", 1800
+    )
+    wakeless_takeover = _positive_seconds(
+        "WAKELESS_TAKEOVER_SECONDS", "wakeless_takeover_seconds", 600
+    )
+
     return Config(
         repo=_env("REPO") or proj.get("repo"),
         state_dir=_resolve_state_dir(proj, root),
@@ -449,6 +495,8 @@ def load(cwd: str | None = None) -> Config:
         maintenance_repo_roots=tuple(maintenance_repo_roots),
         escalation_failure_threshold=esc_threshold,
         reclaim_no_progress_threshold=reclaim_threshold,
+        live_owner_takeover_seconds=live_owner_takeover,
+        wakeless_takeover_seconds=wakeless_takeover,
         discovery_names=discovery_names,
         runner_label=_env("RUNNER_LABEL") or proj.get("runner_label") or None,
         lease_seconds=int(lease) if lease else DEFAULT_LEASE_SECONDS,

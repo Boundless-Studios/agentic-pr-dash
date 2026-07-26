@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 
 from agentic_pr_dash import observability
 from agentic_pr_dash.config import load as load_config
@@ -61,14 +62,35 @@ def _write_wakeless_defer(cwd: str, data: dict) -> None:
 
 
 def _wakeless_grace_exhausted(cwd: str, owner: str) -> bool:
-    """True if we've ALREADY deferred to this wake-less owner once (grace used up →
-    take over). Records the first grace tick; keyed by cwd so sibling worktrees don't
-    interfere, and reset implicitly when the owner changes."""
+    """True once this wake-less owner has held the PR for ``wakeless_takeover_seconds``.
+
+    BOU-2475: this used to grant exactly ONE tick of grace, which in practice meant
+    "take over almost immediately" — the loop's ``--interval`` is configurable and
+    every dashboard-triggered ``--once`` run burns a tick too, so the grace could be
+    spent in seconds. It is now a wall-clock duration, because what we actually want
+    to express is "give the owner a real chance to finish", and that is a time, not a
+    tick count.
+
+    Still bounded rather than absolute: a wake-less owner (no live feedback waiter —
+    e.g. codex, which has no wake channel) cannot be told its PR needs work, so
+    deferring forever would strand the PR with nobody servicing it (BOU-1879).
+
+    Keyed by cwd so sibling worktrees don't interfere, and reset implicitly when the
+    owner changes. A record whose timestamp is unreadable or in the future is
+    rewritten from now — a corrupt record must not grant instant takeover.
+    """
+    now = time.time()
+    horizon = load_config(cwd).wakeless_takeover_seconds
     data = _read_wakeless_defer(cwd)
     entry = data.get(cwd) if isinstance(data.get(cwd), dict) else {}
-    if entry.get("owner") == owner and int(entry.get("count", 0)) >= 1:
-        return True
-    data[cwd] = {"owner": owner, "count": 1}
+    if entry.get("owner") == owner:
+        try:
+            first_seen = float(entry["first_seen"])
+        except (KeyError, TypeError, ValueError):
+            first_seen = None
+        if first_seen is not None and first_seen <= now:
+            return (now - first_seen) >= horizon
+    data[cwd] = {"owner": owner, "first_seen": now}
     _write_wakeless_defer(cwd, data)
     return False
 
@@ -161,14 +183,50 @@ def _record_no_progress_tick(
     except (TypeError, ValueError):
         prior = 0
     count = (prior + 1) if same else 1
+    # BOU-2475: carry the streak's START time so takeover can require real elapsed
+    # time, not just a tick count. Preserved across same-streak ticks; reset with
+    # the count whenever the streak resets.
+    now = time.time()
+    first_seen = now
+    if same:
+        try:
+            prior_first = float(entry["first_seen"])
+        except (KeyError, TypeError, ValueError):
+            prior_first = None
+        if prior_first is not None and prior_first <= now:
+            first_seen = prior_first
     data[cwd] = {
         "owner": owner,
         "pr": pr_number,
         "fingerprint": fingerprint,
         "count": count,
+        "first_seen": first_seen,
     }
     _write_no_progress(cwd, data)
     return count
+
+
+def _no_progress_elapsed(cwd: str, *, owner: str, pr_number: int) -> float | None:
+    """Seconds since the current no-progress streak began, or None if unknown.
+
+    None means "no usable timestamp" — a record written by a pre-BOU-2475 install,
+    or a corrupt/future one. Callers treat None as "the time floor cannot be
+    evaluated" and fall back to the tick threshold alone, so an upgrade mid-streak
+    degrades to the old behaviour rather than deferring forever.
+    """
+    entry = _read_no_progress(cwd).get(cwd)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("owner") != owner or str(entry.get("pr", "")) != str(pr_number):
+        return None
+    try:
+        first_seen = float(entry["first_seen"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    now = time.time()
+    if first_seen > now:
+        return None
+    return now - first_seen
 
 
 def _clear_no_progress(cwd: str) -> None:
@@ -288,10 +346,20 @@ def _should_reclaim_stuck_owner(
     count = _record_no_progress_tick(
         cwd, owner=owner, pr_number=pr.number, fingerprint=fingerprint
     )
-    if count >= _reclaim_no_progress_threshold(cwd):
-        _clear_no_progress(cwd)
-        return True
-    return False
+    if count < _reclaim_no_progress_threshold(cwd):
+        return False
+    # BOU-2475: the streak is necessary but NOT sufficient. Reclaiming a live,
+    # wake-capable session's PR is the expensive mistake: the executor we dispatch
+    # instead has none of that session's context — the design intent, what was
+    # already tried and rejected, why a reviewer's suggestion does not apply. It has
+    # produced confidently wrong changes that then merged. So require real elapsed
+    # time on top of the tick count, since ticks are a poor clock (configurable
+    # --interval, plus every dashboard `--once` run burns one).
+    elapsed = _no_progress_elapsed(cwd, owner=owner, pr_number=pr.number)
+    if elapsed is not None and elapsed < load_config(cwd).live_owner_takeover_seconds:
+        return False
+    _clear_no_progress(cwd)
+    return True
 
 
 def _decision_wait_marker_path(cwd: str):
