@@ -24,6 +24,7 @@ import math
 import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -1033,6 +1034,67 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
 _SPAWN_FAILED_PREFIX = "spawn failed: "
 
 
+# ---------------------------------------------------------------------------
+# Reachability probe: distinguish "unknown" from "failed" (BOU-2417)
+# ---------------------------------------------------------------------------
+#
+# `github_api` is careful to keep a transient outage from being read as a real
+# result — `list_open_prs` returns None rather than [] so "a transient outage
+# can't prune every tracked PR" (BOU-1921/BOU-1923). That discipline stopped at
+# the module boundary: every non-serviced dispatch here counted as one
+# undifferentiated executor failure, so an unreachable model API burned the
+# per-PR escalation streak (BOU-1789) and handed the coordinator claim back —
+# repeatedly, which is the BOU-2412 release/re-acquire churn signature.
+#
+# We classify by PROBING, not by matching error text. `_run_executor` runs the
+# executor WITHOUT capture (deliberately — the daemon log streams live
+# codex/claude output), so `_try_run` can only ever report `f"exit {rc}"`; there
+# is no stderr for `_is_transient_connectivity_failure` to match on, and a
+# coding agent's exit code does not distinguish "my API was unreachable" from
+# "I failed the task" anyway.
+_PROBE_HOSTS_DEFAULT = "api.github.com:443"
+_PROBE_TIMEOUT_DEFAULT = 3.0
+
+
+def _probe_targets() -> list[tuple[str, int]]:
+    """Parse ``APD_LOOP_PROBE_HOSTS`` into ``(host, port)`` pairs."""
+    raw = os.environ.get("APD_LOOP_PROBE_HOSTS", "") or _PROBE_HOSTS_DEFAULT
+    targets: list[tuple[str, int]] = []
+    for entry in raw.split(","):
+        host, _, port = entry.strip().rpartition(":")
+        targets.append((host, int(port)))
+    return targets
+
+
+def _network_reachable() -> bool:
+    """True when at least one probe host accepts a TCP connection.
+
+    Deliberately FAILS OPEN: any unexpected internal error returns True, so a
+    bug in the probe degrades to the pre-BOU-2417 behavior (count the failure)
+    rather than silently suppressing genuine executor defects forever.
+    """
+    try:
+        timeout = float(
+            os.environ.get("APD_LOOP_PROBE_TIMEOUT_S", "") or _PROBE_TIMEOUT_DEFAULT
+        )
+        targets = _probe_targets()
+        if not targets:
+            return True
+        for host, port in targets:
+            try:
+                sock = socket.create_connection((host, port), timeout=timeout)
+            except OSError:
+                continue
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return True
+        return False
+    except Exception:  # noqa: BLE001 — a broken probe must never suppress a failure
+        return True
+
+
 def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
     """Run an executor; return ``(exit code | None, concrete error text)``.
 
@@ -1265,6 +1327,30 @@ def _service_cwd(
                 coordinator.release_claim(claim_handle, session, "waiting_human")
             except StaleClaimError:
                 pass
+        return
+    if not serviced and not _network_reachable():
+        # BOU-2417: the network is unreachable RIGHT NOW, so this dispatch tells
+        # us nothing about the executor. Treat it as INCONCLUSIVE, exactly like
+        # the BOU-2040 decision path above: no streak, no escalation, no
+        # viability downgrade — and critically, do NOT release the claim. The
+        # claim store is local, so the outage never threatened ownership; the
+        # loop was giving it away and re-acquiring on the next tick. Ownership
+        # must lapse via the coordinator lease if this process is genuinely
+        # dead, not be handed back on a blip (BOU-2389: fail open on runtime,
+        # fail closed on the claim).
+        #
+        # Probing AFTER the failure rather than before is deliberate: the
+        # `check` subprocess above has just made several gh calls and returns
+        # rc 2 on gh-unavailable, so a pre-dispatch probe milliseconds later
+        # would be redundant. The accepted gap is an outage that starts and
+        # ends INSIDE a long dispatch — that reads as reachable post-hoc and
+        # counts as a failure, i.e. degrades to the old behavior. Conservative
+        # in the safe direction: it can never mask a genuine executor defect.
+        print(
+            f"[agentic-pr-dash] network unreachable after dispatch for PR #{pr}; "
+            "tick is inconclusive — streak, escalation and claim left untouched",
+            file=sys.stderr,
+        )
         return
     if not serviced:
         # Primary (and fallback, if any) failed. Record the failure streak,
