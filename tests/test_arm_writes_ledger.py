@@ -68,8 +68,11 @@ def test_cmd_arm_pr_on_matching_branch_arms(tmp_path, monkeypatch):
     wt.mkdir()
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
-    monkeypatch.setattr(mc, "_pr_draft_status", lambda cwd, pr: False)
-    monkeypatch.setattr(mc, "_pr_head_branch", lambda cwd, pr: "feature")
+    # BOU-2406: _cmd_arm reads the *_detailed variants so an indeterminate gh
+    # result carries its cause. Patch the seam the code actually uses -- patching
+    # only the thin wrappers would let the real gh run and fail on auth.
+    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr: (False, ""))
+    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr: ("feature", ""))
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature")
 
     args = argparse.Namespace(
@@ -86,16 +89,46 @@ def test_cmd_arm_pr_wrong_branch_skips(tmp_path, monkeypatch):
     wt.mkdir()
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
-    monkeypatch.setattr(mc, "_pr_draft_status", lambda cwd, pr: False)
-    monkeypatch.setattr(mc, "_pr_head_branch", lambda cwd, pr: "feature")
+    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr: (False, ""))
+    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr: ("feature", ""))
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "some-other-branch")
 
     args = argparse.Namespace(
         cwd=str(wt), session_id="sess-Z", pid=99, pr=777, branch=None
     )
     # PR 777's head branch isn't checked out here → skip, no ledger entry.
+    # Still 0: "not applicable" is a genuine quiet path, unlike the
+    # "could not determine" path BOU-2406 made non-zero.
     assert mc._cmd_arm(args) == 0
     assert sl.read("sess-Z") == []
+
+
+def test_cmd_arm_indeterminate_gh_is_loud_and_nonzero(tmp_path, monkeypatch, capsys):
+    """BOU-2406: 'we could not find out' must not read as a successful arm.
+
+    Previously this printed "gh unavailable" and returned 0, so the caller
+    believed the PR was armed while no ledger entry existed -- which then left
+    the feedback waiter with no anchor to discover and no PR to watch.
+    """
+    import argparse
+
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+
+    monkeypatch.setattr(
+        mc,
+        "_pr_draft_status_detailed",
+        lambda cwd, pr: (None, "attempt 3: gh exited 1: HTTP 502"),
+    )
+    monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature")
+
+    args = argparse.Namespace(
+        cwd=str(wt), session_id="sess-Z", pid=99, pr=777, branch=None
+    )
+    assert mc._cmd_arm(args) == 1, "an indeterminate result must be non-zero"
+    assert sl.read("sess-Z") == [], "nothing may be recorded as armed"
+    assert "HTTP 502" in capsys.readouterr().err, "the cause must reach the operator"
 
 
 def test_ledger_append_failure_is_nonfatal(tmp_path, monkeypatch):

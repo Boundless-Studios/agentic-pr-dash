@@ -284,61 +284,93 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
     )
 
 
-def _pr_draft_status(cwd: str, pr_number: int):
-    """Optional[bool]: True=draft, False=non-draft, None=could-not-determine."""
+# BOU-2406: a `gh pr view` issued seconds after `gh pr create` can fail while
+# GitHub is still settling, and a single failed probe used to permanently decline
+# to arm. Retry a bounded number of times before giving up. Kept small: arm runs
+# inside a Stop hook with a ~10s preflight budget, so the total must stay well
+# under it.
+_PR_VIEW_ATTEMPTS = 3
+_PR_VIEW_BACKOFF_SECONDS = 0.75
+
+
+def _gh_pr_view_field(cwd: str, pr_number: int, field: str) -> tuple[object, str]:
+    """Read one ``gh pr view --json <field>`` value, with bounded retries.
+
+    Returns ``(value, diagnostic)``. ``value`` is ``_GH_UNAVAILABLE`` when the
+    field could not be determined, in which case ``diagnostic`` explains why --
+    the captured stderr, not an assertion that gh is missing. Previously every
+    failure mode collapsed to a bare ``None`` and the stderr was discarded, so
+    "gh unavailable" was printed for rate limits, 404s and transient blips alike
+    (BOU-2406).
+    """
     import json  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "isDraft"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=github_api.automation_subprocess_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout or "")
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or "isDraft" not in data:
-        return None
-    return bool(data["isDraft"])
+    last = "no attempt was made"
+    for attempt in range(1, _PR_VIEW_ATTEMPTS + 1):
+        try:
+            result = subprocess.run(
+                ["gh", "pr", "view", str(pr_number), "--json", field],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=github_api.automation_subprocess_env(),
+            )
+        except FileNotFoundError:
+            # The only failure that genuinely means "gh unavailable". Not
+            # retryable, and worth saying plainly.
+            return _GH_UNAVAILABLE, "the `gh` executable was not found on PATH"
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            last = f"attempt {attempt}: {type(exc).__name__}: {exc}"
+        else:
+            if result.returncode == 0:
+                try:
+                    data = json.loads(result.stdout or "")
+                except ValueError:
+                    last = f"attempt {attempt}: gh returned non-JSON: {(result.stdout or '')[:200]!r}"
+                else:
+                    if isinstance(data, dict) and field in data:
+                        return data[field], ""
+                    last = f"attempt {attempt}: gh JSON has no {field!r}: {data!r}"
+            else:
+                last = (
+                    f"attempt {attempt}: gh exited {result.returncode}: "
+                    f"{(result.stderr or '').strip()[:300] or '<no stderr>'}"
+                )
+        if attempt < _PR_VIEW_ATTEMPTS:
+            time.sleep(_PR_VIEW_BACKOFF_SECONDS)
+    return _GH_UNAVAILABLE, last
+
+
+def _pr_draft_status_detailed(cwd: str, pr_number: int) -> tuple[bool | None, str]:
+    """``(is_draft, diagnostic)``; ``is_draft`` is None when undeterminable."""
+    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "isDraft")
+    if value is _GH_UNAVAILABLE:
+        return None, diagnostic
+    return bool(value), ""
+
+
+def _pr_draft_status(cwd: str, pr_number: int):
+    """Optional[bool]: True=draft, False=non-draft, None=could-not-determine."""
+    return _pr_draft_status_detailed(cwd, pr_number)[0]
+
+
+def _pr_head_branch_detailed(cwd: str, pr_number: int) -> tuple[str | None, str]:
+    """``(head_branch, diagnostic)``; branch is None when undeterminable."""
+    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "headRefName")
+    if value is _GH_UNAVAILABLE:
+        return None, diagnostic
+    if isinstance(value, str) and value:
+        return value, ""
+    return None, f"gh reported an empty headRefName: {value!r}"
 
 
 def _pr_head_branch(cwd: str, pr_number: int):
     """The PR's head branch name (``headRefName``), or ``None`` if gh can't say."""
-    import json  # noqa: PLC0415
-
-    from agentic_pr_dash import github_api  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--json", "headRefName"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=15,
-            env=github_api.automation_subprocess_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode != 0:
-        return None
-    try:
-        data = json.loads(result.stdout or "")
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    head = data.get("headRefName")
-    return head if isinstance(head, str) and head else None
+    return _pr_head_branch_detailed(cwd, pr_number)[0]
 
 
 def _gh_pr_list_json(
