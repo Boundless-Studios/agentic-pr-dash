@@ -205,8 +205,12 @@ def test_the_tab_renders_each_worktree() -> None:
 def test_the_empty_tab_says_so_rather_than_rendering_blank() -> None:
     html = _render_worktrees([])
 
-    assert "Every worktree has an open PR." in html
+    assert "No idle worktrees." in html
     assert "0 worktrees" in html
+    # An empty tab does NOT mean every worktree has a PR: PR-less worktrees with
+    # a live agent stay on the board, and agent-prefixed ones may be filtered
+    # out entirely. Claiming otherwise is a lie the viewer can act on.
+    assert "Every worktree has an open PR" not in html
 
 
 def test_the_tab_advertises_only_affordances_that_work() -> None:

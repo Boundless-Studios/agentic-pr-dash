@@ -1336,20 +1336,24 @@ header h1 {
 /* Five columns only fit if the SIDEBAR is budgeted for. It is a fixed 300px
    with flex-shrink: 0, so a 1440px laptop leaves 1140px for the board while
    5 x 272px + 4 x 10px gaps + 32px padding needs 1432px — still scrolling,
-   which was the whole complaint (PR #114 review). Step the column floor down
-   with the viewport instead of picking one number: wide monitors keep roomy
-   columns, laptops get columns that fit. Widths below are (viewport - 300px
-   sidebar - 32px board padding - 40px gaps) / 5, rounded down. */
-@media (max-width: 1600px) {
-    .kanban-column { min-width: 240px; }
-}
+   which was the whole complaint (PR #114 review).
 
-@media (max-width: 1440px) {
-    .kanban-column { min-width: 208px; }
-}
+   Solved continuously rather than with breakpoints. A stepped rule left a hole
+   at 1601-1731px, where the floor snapped back to 272px but the board still
+   only had 1301-1431px — so 1680px displays scrolled again (PR #114 review,
+   round 2). Any fixed set of breakpoints has such holes; a formula does not.
 
-@media (max-width: 1280px) {
-    .kanban-column { min-width: 176px; }
+   372px = 300 sidebar + 32 board padding + 40 gaps (4 x 10). Above 1732px the
+   clamp yields the roomy 272px default; below it columns shrink exactly as
+   fast as the board does. The 160px floor is where a card stops being legible
+   — narrower than that, scrolling really is the better answer.
+
+   Scoped above 960px because the layout stacks below that and the sidebar no
+   longer takes horizontal space, which would make the 372px subtraction wrong. */
+@media (min-width: 961px) {
+    .kanban-column {
+        min-width: clamp(160px, calc((100vw - 372px) / 5), 272px);
+    }
 }
 
 @media (max-width: 960px) {

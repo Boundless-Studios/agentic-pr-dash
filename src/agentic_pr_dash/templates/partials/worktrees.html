@@ -68,5 +68,9 @@
     {% endfor %}
 </div>
 {% else %}
-<div class="runner-issues-empty">Every worktree has an open PR.</div>
+{# Not "every worktree has an open PR" — that is false whenever a PR-less
+   worktree is on the board as AGENT_WORKING / AGENT_WAITING / READY_CLEANUP,
+   or when agent-prefixed worktrees are hidden by the default filter. Report
+   what this tab actually holds (PR #114 review). #}
+<div class="runner-issues-empty">No idle worktrees.</div>
 {% endif %}
