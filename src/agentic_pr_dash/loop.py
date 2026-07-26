@@ -14,6 +14,27 @@ and uses ``{prompt}`` as the substitution point, e.g.::
 
 This replaces the original project-specific ``pr-maintenance-loop.sh`` and hard
 dependence on ``claude``/``codex``.
+
+**Reachability probe targets (BOU-2417).** When a dispatch fails, the loop probes
+``APD_LOOP_PROBE_URLS`` (default ``https://api.github.com``) to decide whether
+the failure is informative. **Every** listed target must be reachable; if any
+one fails, the tick is inconclusive.
+
+The single default cannot detect a provider-specific outage. **Deployments whose
+executor talks to a provider that can fail independently of GitHub should add
+that endpoint**, e.g.::
+
+    APD_LOOP_PROBE_URLS="https://api.github.com,https://api.anthropic.com"
+
+with the corollary that a target you add is a target whose flakiness will
+suppress escalation — list only endpoints a dispatch genuinely depends on.
+
+The conservative default is deliberate. Inferring the outage from the executor's
+own output was tried and reverted (PR #113 review): a coding agent's output is a
+whole run — test output, tool commands, prose — so a genuine task failure that
+merely PRINTS a transport-shaped string would be misread as an outage and
+silently never escalate. Over-counting a failure during a provider outage is a
+recoverable annoyance; never escalating a broken PR is not.
 """
 
 from __future__ import annotations
@@ -1018,7 +1039,24 @@ def _validate_executor(executor: str) -> str | None:
 
 
 def _run_executor(executor: str, prompt: str, cwd: str) -> int:
-    """Run the configured executor with the prompt, in the worktree dir."""
+    """Run the configured executor with the prompt, in the worktree dir.
+
+    The streams are INHERITED, not piped. PR #113 review round 2 killed the
+    tee that briefly lived here: reading the executor's output to classify its
+    failure cost more than it bought.
+
+    - An executor that spawns a background process inheriting its stdout keeps
+      the pipe's write end open after it exits, so waiting for EOF could hang
+      the maintenance loop indefinitely.
+    - The captured text is the whole coding-agent run — test output, tool
+      commands, agent prose — so a genuine task failure that merely PRINTS
+      ``connection refused`` (entirely likely in a repo whose subject matter is
+      networking) would be misread as a provider outage and silently never
+      escalate.
+
+    Both are worse than the case the tee was meant to fix, which
+    :func:`_network_reachable` now covers via configurable probe targets.
+    """
     if "{prompt}" in executor:
         # Split the template, then inject the prompt as a single argv element so
         # it is never re-split by the shell.
@@ -1031,6 +1069,116 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
 
 
 _SPAWN_FAILED_PREFIX = "spawn failed: "
+
+
+# ---------------------------------------------------------------------------
+# Reachability probe: distinguish "unknown" from "failed" (BOU-2417)
+# ---------------------------------------------------------------------------
+#
+# `github_api` is careful to keep a transient outage from being read as a real
+# result — `list_open_prs` returns None rather than [] so "a transient outage
+# can't prune every tracked PR" (BOU-1921/BOU-1923). That discipline stopped at
+# the module boundary: every non-serviced dispatch here counted as one
+# undifferentiated executor failure, so an unreachable model API burned the
+# per-PR escalation streak (BOU-1789) and handed the coordinator claim back —
+# repeatedly, which is the BOU-2412 release/re-acquire churn signature.
+#
+# We classify by PROBING, not by matching error text. `_run_executor` runs the
+# executor WITHOUT capture (deliberately — the daemon log streams live
+# codex/claude output), so `_try_run` can only ever report `f"exit {rc}"`; there
+# is no stderr for `_is_transient_connectivity_failure` to match on, and a
+# coding agent's exit code does not distinguish "my API was unreachable" from
+# "I failed the task" anyway.
+_PROBE_URLS_DEFAULT = "https://api.github.com"
+_PROBE_TIMEOUT_DEFAULT = 3.0
+
+# Executed as `python -c` so the probe is a KILLABLE subprocess (PR #113 review
+# round 2). A thread cannot be cancelled out of a wedged `getaddrinfo`, so the
+# previous thread-with-deadline version abandoned one thread per failed dispatch
+# and a sustained resolver outage leaked them without bound in a long-lived
+# daemon. `urllib` also honors HTTP_PROXY/HTTPS_PROXY/NO_PROXY, which a raw
+# `socket.create_connection` bypasses — in a proxy-only deployment the direct
+# connect fails while the executor works fine, which would have masked genuine
+# failures as inconclusive.
+#
+# Exit 0 only when EVERY target is reachable. OR semantics would defeat the whole
+# point of configuring more than one target (PR #113 review round 3): with
+# `github,anthropic`, a provider-specific Anthropic outage would still exit 0 on
+# GitHub's response, so the documented remedy for provider outages was a no-op.
+# Any target failing means something the dispatch may have depended on is down.
+_PROBE_SCRIPT = """
+import sys, urllib.error, urllib.request
+timeout = float(sys.argv[1])
+for url in sys.argv[2:]:
+    try:
+        urllib.request.urlopen(url, timeout=timeout).close()
+    except urllib.error.HTTPError:
+        continue  # reached the server; its status code is irrelevant
+    except Exception:
+        sys.exit(1)
+sys.exit(0)
+"""
+
+
+def _probe_urls() -> list[str]:
+    """Parse ``APD_LOOP_PROBE_URLS`` into a list of URLs."""
+    raw = os.environ.get("APD_LOOP_PROBE_URLS", "") or _PROBE_URLS_DEFAULT
+    return [u.strip() for u in raw.split(",") if u.strip()]
+
+
+def _network_reachable() -> bool:
+    """True when at least one probe URL is reachable.
+
+    Runs as a killable subprocess with a hard timeout, so a wedged resolver can
+    neither block the loop nor leak an uncancellable thread per failed dispatch.
+    The probe goes through ``urllib``, which honors the proxy environment, so a
+    proxy-only deployment is not misread as an outage.
+
+    Deliberately FAILS OPEN — an internal error, a missing interpreter, or a
+    probe timeout all return True. Suppressing escalation forever is a far worse
+    failure than counting one extra failure during a real outage, so anything we
+    cannot positively establish as "the network is down" degrades to the
+    pre-BOU-2417 behavior.
+
+    A target that fails makes the network unreachable — see ``_PROBE_SCRIPT`` for
+    why that is not OR across targets.
+    """
+    try:
+        timeout = float(
+            os.environ.get("APD_LOOP_PROBE_TIMEOUT_S", "") or _PROBE_TIMEOUT_DEFAULT
+        )
+        # A zero/negative/NaN timeout makes every urlopen fail instantly, so the
+        # child would exit 1 and report a healthy network as down — suppressing
+        # escalation indefinitely (PR #113 review round 3). Honor the fail-open
+        # promise instead of trusting a nonsensical configured value.
+        if not (timeout > 0) or timeout == float("inf"):
+            print(
+                f"[agentic-pr-dash] ignoring non-positive APD_LOOP_PROBE_TIMEOUT_S "
+                f"({timeout!r}); treating reachability as unknown",
+                file=sys.stderr,
+            )
+            return True
+        urls = _probe_urls()
+        if not urls:
+            return True
+        deadline = timeout * len(urls) + 2.0
+        try:
+            probe = subprocess.run(
+                [sys.executable, "-c", _PROBE_SCRIPT, str(timeout), *urls],
+                capture_output=True, timeout=deadline,
+            )
+        except subprocess.TimeoutExpired:
+            # The subprocess is killed by `run` on timeout — nothing leaks. We
+            # still cannot prove the network is down, so fail open.
+            print(
+                "[agentic-pr-dash] reachability probe timed out (stalled DNS or "
+                "connect); treating the result as inconclusive-unknown",
+                file=sys.stderr,
+            )
+            return True
+        return probe.returncode == 0
+    except Exception:  # noqa: BLE001 — a broken probe must never suppress a failure
+        return True
 
 
 def _try_run(executor: str, prompt: str, cwd: str) -> tuple[int | None, str]:
@@ -1069,6 +1217,7 @@ def _dispatch_with_fallback(
     unresolved boundary, and — worse — if the fallback happens to exit 0 the
     caller sees ``serviced=True``, never probes the ledger, and proceeds to
     completion with the question still unanswered.
+
     """
     rc, err = _try_run(primary, prompt, cwd)
     if rc == 0:
@@ -1095,6 +1244,34 @@ def _dispatch_with_fallback(
         file=sys.stderr,
     )
     return False, errors
+
+
+def _dispatch_was_inconclusive(exec_errors: dict[str, str], pr: int | None) -> bool:
+    """True when a failed dispatch carries no information about the executor.
+
+    **Spawn failures are checked FIRST and always win** (PR #113 review). If
+    every attempted executor failed to even launch, that is a LOCAL defect — a
+    binary removed or chmod'd after startup validation, or process creation
+    raising ``OSError``. It must stay actionable (streak, viability downgrade,
+    claim release) no matter what the network is doing concurrently, so it never
+    reaches the outage shortcut.
+
+    Otherwise the reachability probe is the sole classifier. Reading the
+    executor's own output was tried and reverted in review round 2: the text is
+    an entire coding-agent run, so a genuine task failure that merely prints a
+    transport-shaped string would be misread as an outage and silently never
+    escalate. See :func:`_run_executor`.
+    """
+    if exec_errors and all(_SPAWN_FAILED_PREFIX in v for v in exec_errors.values()):
+        return False
+    if not _network_reachable():
+        print(
+            f"[agentic-pr-dash] network unreachable after dispatch for PR #{pr}; "
+            "tick is inconclusive — streak, escalation and claim left untouched",
+            file=sys.stderr,
+        )
+        return True
+    return False
 
 
 def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
@@ -1265,6 +1442,16 @@ def _service_cwd(
                 coordinator.release_claim(claim_handle, session, "waiting_human")
             except StaleClaimError:
                 pass
+        return
+    if not serviced and _dispatch_was_inconclusive(exec_errors, pr):
+        # BOU-2417: this dispatch tells us nothing about the executor, so treat
+        # it as INCONCLUSIVE exactly like the BOU-2040 decision path above: no
+        # streak, no escalation, no viability downgrade — and critically, do NOT
+        # release the claim. The claim store is local, so an outage never
+        # threatened ownership; the loop was giving it away and re-acquiring on
+        # the next tick. Ownership must lapse via the coordinator lease if this
+        # process is genuinely dead, not be handed back on a blip (BOU-2389:
+        # fail open on runtime, fail closed on the claim).
         return
     if not serviced:
         # Primary (and fallback, if any) failed. Record the failure streak,

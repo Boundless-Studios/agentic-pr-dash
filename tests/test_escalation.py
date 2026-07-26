@@ -96,6 +96,10 @@ def test_tick_escalates_at_threshold(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: 1)  # fail
+    # BOU-2417: escalation requires a GENUINE failure, i.e. a reachable network.
+    # This test stubs loop.subprocess.run wholesale, which the reachability
+    # probe would otherwise pick up as its own (fake) result.
+    monkeypatch.setattr(loop, "_network_reachable", lambda: True)
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     # Record failure returns threshold

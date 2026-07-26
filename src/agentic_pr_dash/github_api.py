@@ -1369,7 +1369,7 @@ def get_new_pr_commits(
     cwd: str | None = None,
     pr_branch: str | None = None,
     api_head_sha: str = "",
-) -> list[tuple[str, str]]:
+) -> list[tuple[str, str]] | None:
     """Return commits added to a PR after a known baseline SHA.
 
     Prefers the local git range scoped to the PR branch's remote-tracking ref
@@ -1379,6 +1379,13 @@ def get_new_pr_commits(
     ``api_head_sha`` is the GitHub API's view of the PR head: when it is set but
     absent from the local ``origin/<branch>`` ref, that ref is stale and the
     local range is rejected in favor of the API (see ``_local_new_commits``).
+
+    Returns ``None`` when the range could not be determined — a failed ``gh``
+    call or an unusable payload. This is deliberately distinct from ``[]``
+    ("the range is genuinely empty"), matching the discipline
+    :func:`list_open_prs` already applies one function over: during an outage,
+    ``[]`` would let ``complete`` conclude that a fix never landed and leave
+    genuinely-fixed threads open (BOU-2417 / BOU-2200).
     """
     upper_ref = f"origin/{pr_branch}" if pr_branch else "HEAD"
     local = _local_new_commits(baseline_sha, cwd, upper_ref, must_contain_sha=api_head_sha)
@@ -1391,14 +1398,22 @@ def get_new_pr_commits(
         timeout_s=30,
     )
     if r.returncode != 0:
-        return []
+        return None
+
+    # BOU-2417 (PR #113 review): blank stdout on a zero exit is an UNUSABLE
+    # payload — truncated or lost output — not an empty range. Defaulting it to
+    # "[]" would route it down the success path and hand `complete` an empty
+    # commit set it never actually obtained. A real empty range is the literal
+    # JSON `[]`, which parses fine below.
+    if not (r.stdout or "").strip():
+        return None
 
     try:
-        raw = json.loads(r.stdout or "[]")
+        raw = json.loads(r.stdout)
     except json.JSONDecodeError:
-        return []
+        return None
     if not isinstance(raw, list):
-        return []
+        return None
 
     commits: list[tuple[str, str]] = []
     seen_baseline = not baseline_sha

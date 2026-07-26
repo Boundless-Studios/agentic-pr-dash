@@ -407,6 +407,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     new_commits = github_api.get_new_pr_commits(
         resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch,
         api_head_sha=api_head_sha)
+    # BOU-2417: None means the commit range could not be determined (gh outage /
+    # unusable payload), NOT "no commits landed since the baseline". Treating
+    # the two alike is how an outage gets to look like a fix that never landed,
+    # so every thread reads unaddressed and `complete` closes the bead on
+    # evidence it never actually had. Fail closed: gather no file evidence, and
+    # keep the bead open under the existing "unknown" blocker idiom below.
+    commit_range_unknown = new_commits is None
+    if commit_range_unknown:
+        new_commits = []
+        print(
+            "warning: could not determine commits since baseline "
+            f"{baseline or '(none)'} for PR #{resolved_pr_number}; treating the "
+            "range as UNKNOWN rather than empty",
+            file=sys.stderr,
+        )
     touched: set[str] = set()
     commits_by_file: dict[str, list[tuple[str, str]]] = {}
     for sha, msg in new_commits:
@@ -586,6 +601,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # ones the evidence gate above deliberately leaves open on pure line drift.
     # Without this, `complete` reports "no blockers remain" and closes the bead
     # while intentionally-kept-open feedback still needs manual confirmation.
+    # BOU-2417: an indeterminate commit range means the addressed-evidence above
+    # was gathered against nothing. Never close the bead on it.
+    if commit_range_unknown and "unknown" not in remaining:
+        remaining.append("unknown")
+        print(
+            "info: commit range since baseline was indeterminate; keeping the "
+            "bead open under the 'unknown' blocker",
+            file=sys.stderr,
+        )
+
     if left_unresolved and "review_comments" not in remaining:
         remaining.append("review_comments")
         print(
