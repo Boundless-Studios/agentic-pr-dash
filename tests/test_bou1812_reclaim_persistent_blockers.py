@@ -20,9 +20,12 @@ ownership marker; only the PR-resolve and process boundaries are stubbed.
 """
 from __future__ import annotations
 
+import contextlib
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -35,6 +38,20 @@ from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import worktree_check as _wc
+
+
+@contextlib.contextmanager
+def _past_takeover_horizon(cwd: str):
+    """Run the block with the clock past ``live_owner_takeover_seconds`` (BOU-2475).
+
+    Reclaim now requires the no-progress STREAK *and* real elapsed wall-clock time.
+    These tests drive the streak synthetically in a tight loop, so without moving
+    the clock they would assert the pre-BOU-2475 contract (streak alone reclaims) —
+    exactly the behaviour that let the loop seize a live session's PR in seconds.
+    """
+    horizon = config.load(cwd).live_owner_takeover_seconds
+    with patch.object(_wc.time, "time", return_value=time.time() + horizon + 1):
+        yield
 
 SID = "sess-loop"           # the detached loop / checker
 OWNER = "sess-live-owner"   # the live in-session owner we may reclaim from
@@ -137,8 +154,15 @@ def test_stuck_idle_owner_is_reclaimed_after_threshold(monkeypatch, tmp_path):
         assert _wc.WARN_ONLY_MARKER in text, text
         assert OWNER in text
 
-    # Tick 3 — streak reaches threshold: RECLAIM and service the PR.
+    # Tick 3 — streak reaches threshold. BOU-2475: the streak alone is no longer
+    # enough; an immediate tick must still defer.
     code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code == 0, f"streak met but time floor unmet — must defer: {text}"
+
+    # Past the horizon as well: RECLAIM and service the PR. The BOU-1812 guarantee
+    # (a demonstrably-stuck owner never blocks its PR forever) is preserved.
+    with _past_takeover_horizon(str(worktree)):
+        code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 10, text
     assert "PR_NUMBER=42" in text
 
@@ -255,7 +279,8 @@ def test_streak_resets_when_owner_starts_fixing(monkeypatch, tmp_path):
     for i in (1, 2):
         code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
         assert code == 0, f"post-reset tick {i}: {text}"
-    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    with _past_takeover_horizon(str(worktree)):
+        code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 10, text
     assert "PR_NUMBER=42" in text
 
@@ -321,7 +346,8 @@ def test_new_unresolved_thread_on_ci_pr_resets_streak(monkeypatch, tmp_path):
     # Tick 3 — same thread persists (fingerprint stable): streak = 2 → reclaim,
     # proving the reset only cost one tick and legitimate reclaim still fires.
     state["i"] = 2
-    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    with _past_takeover_horizon(str(worktree)):
+        code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 10, text
     assert "PR_NUMBER=43" in text
 
@@ -392,6 +418,7 @@ def test_ledger_owner_marker_for_same_pr_still_reclaims(monkeypatch, tmp_path):
     code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 0, text
     assert _wc.WARN_ONLY_MARKER in text
-    code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    with _past_takeover_horizon(str(worktree)):
+        code, text = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code == 10, text
     assert "PR_NUMBER=43" in text

@@ -1,14 +1,24 @@
-"""BOU-1879: the loop never defers to a WAKE-LESS owner beyond one grace tick.
+"""BOU-1879 + BOU-2475: the loop bounds — but no longer rushes — takeover from a
+WAKE-LESS owner.
 
 A "live foreign owner" holds ownership while its marker pid is alive / heartbeat
 fresh. But a wake-less owner — a session with no live feedback waiter (e.g. codex,
 no wake channel) — can't be woken to service the PR, so deferring to it every tick
 strands the PR (the observed "deferring … NOT clean (no fix dispatched)" loop).
-Policy: defer ONCE (grace), then take over. A wake-CAPABLE owner still keeps it.
+
+BOU-1879 made that grace exactly ONE tick. BOU-2475 replaced the tick with a
+wall-clock horizon (``wakeless_takeover_seconds``): ticks are a poor clock because
+``--interval`` is configurable and every dashboard ``--once`` run burns one, so
+"one tick" meant takeover could land seconds after the owner was first seen. The
+bound is preserved — a wake-less owner is still taken over — it is just measured in
+time now. A wake-CAPABLE owner still keeps its PR.
 """
 from __future__ import annotations
 
+import contextlib
+import time
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -17,7 +27,15 @@ from agentic_pr_dash.models import PRData, PRStatus, ReviewComment
 from agentic_pr_dash._maintenance import markers as _markers_mod
 from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
+from agentic_pr_dash._maintenance import worktree_check as _wc
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+
+
+@contextlib.contextmanager
+def _advance_clock(seconds: float):
+    """Run the block with worktree_check's clock moved forward by ``seconds``."""
+    with patch.object(_wc.time, "time", return_value=time.time() + seconds):
+        yield
 
 SID = "sess-self"
 OWNER = "sess-wakeless-owner"
@@ -59,21 +77,28 @@ def _stub(monkeypatch: pytest.MonkeyPatch, pr: PRData, *, await_alive: bool) -> 
     monkeypatch.setattr(github_api, "required_checks_pending", lambda n, cwd: False)
 
 
-def test_wakeless_owner_defers_once_then_takes_over(monkeypatch, tmp_path):
+def test_wakeless_owner_defers_until_the_horizon_then_takes_over(monkeypatch, tmp_path):
     worktree = tmp_path / "wt"
     worktree.mkdir()
     pr = _review_pr(worktree)
     _stub(monkeypatch, pr, await_alive=False)  # owner has NO live waiter → wake-less
 
-    # Tick 1 — grace: still defers (warn-only, no dispatch).
+    # Tick 1 — within the horizon: defers (warn-only, no dispatch).
     code1, text1 = maintenance_check._check_worktree(str(worktree), SID, claim=True)
     assert code1 == 0, text1
     assert "NOT clean" in text1 and OWNER in text1
 
-    # Tick 2 — grace exhausted: take over and SERVICE the blocked PR.
+    # Tick 2, immediately after — BOU-2475: still defers. Under the old one-tick
+    # grace this took over, which is how a live owner lost its PR within seconds.
     code2, text2 = maintenance_check._check_worktree(str(worktree), SID, claim=True)
-    assert code2 == 10, text2
-    assert "PR_NUMBER=42" in text2
+    assert code2 == 0, f"immediate retry must still defer, got {code2}: {text2}"
+
+    # Past the horizon — take over and SERVICE the blocked PR. The BOU-1879
+    # guarantee (a wake-less owner never strands its PR forever) is preserved.
+    with _advance_clock(_wc.load_config(str(worktree)).wakeless_takeover_seconds + 1):
+        code3, text3 = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code3 == 10, text3
+    assert "PR_NUMBER=42" in text3
 
 
 def test_wake_capable_owner_keeps_deferring(monkeypatch, tmp_path):
@@ -119,9 +144,18 @@ def test_independent_owner_without_waiter_defers_once_then_takes_over(
     assert code1 == 0, text1
     assert "live independent owner" in text1
 
+    # BOU-2475: the grace is now a wall-clock horizon, not one tick. An immediate
+    # retry must still defer — this is the regression that let the loop seize a
+    # live owner's PR seconds after first seeing it.
     code2, text2 = maintenance_check._check_worktree(str(worktree), SID, claim=True)
-    assert code2 == 10, text2
-    assert "PR_NUMBER=42" in text2
+    assert code2 == 0, f"immediate retry must still defer, got {code2}: {text2}"
+
+    # Past the horizon, takeover still happens — a wake-less owner cannot be told
+    # to act, so the PR must not be stranded forever (BOU-1879 intent preserved).
+    with _advance_clock(_wc.load_config(str(worktree)).wakeless_takeover_seconds + 1):
+        code3, text3 = maintenance_check._check_worktree(str(worktree), SID, claim=True)
+    assert code3 == 10, text3
+    assert "PR_NUMBER=42" in text3
 
 
 def test_independent_owner_with_waiter_keeps_deferring(monkeypatch, tmp_path):
