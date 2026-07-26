@@ -105,6 +105,51 @@ def test_probe_subprocess_is_given_a_hard_timeout(monkeypatch):
     assert seen.get("timeout"), "probe must pass a timeout so the child is killable"
 
 
+def test_nonpositive_probe_timeout_fails_open(monkeypatch):
+    """PR #113 review: a 0/negative timeout makes every urlopen fail instantly.
+
+    The child would exit 1 and a healthy network would read as unreachable,
+    suppressing escalation indefinitely. Honor the fail-open promise instead.
+    """
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://api.github.com")
+
+    def _never(*a, **k):
+        raise AssertionError("must not spawn a probe with a nonsensical timeout")
+
+    monkeypatch.setattr(loop.subprocess, "run", _never)
+    for bad in ("0", "-5", "-0.1"):
+        monkeypatch.setenv("APD_LOOP_PROBE_TIMEOUT_S", bad)
+        assert loop._network_reachable() is True, f"timeout {bad} must fail open"
+
+
+def test_probe_requires_every_target_to_be_reachable():
+    """PR #113 review: OR semantics defeated the documented multi-target remedy.
+
+    With `github,anthropic` and an Anthropic-only outage, an OR probe exits 0 on
+    GitHub's response and the provider outage is misread as a genuine failure —
+    making the documented config a no-op for the case it was meant to cover.
+    """
+    import subprocess as _sp
+    import sys as _sys
+
+    # Reachable target = a data: URL urlopen can always serve without network.
+    ok = "data:text/plain,ok"
+    bad = "http://127.0.0.1:9/unreachable"  # discard port, refuses instantly
+
+    def _run(urls):
+        return _sp.run(
+            [_sys.executable, "-c", loop._PROBE_SCRIPT, "2", *urls],
+            capture_output=True, timeout=30,
+        ).returncode
+
+    assert _run([ok]) == 0, "a single reachable target is reachable"
+    assert _run([ok, ok]) == 0, "all-reachable is reachable"
+    assert _run([ok, bad]) == 1, (
+        "one unreachable target must make the probe report unreachable"
+    )
+    assert _run([bad]) == 1
+
+
 def test_probe_script_uses_urllib_so_proxies_are_honored():
     """PR #113 review: a raw socket connect bypasses HTTP(S)_PROXY.
 
@@ -356,6 +401,24 @@ def test_get_new_pr_commits_returns_empty_list_on_genuinely_empty_range(monkeypa
     )
     result = github_api.get_new_pr_commits(7, "", "", str(tmp_path))
     assert result == [], "an empty range must stay distinguishable from an outage"
+
+
+def test_get_new_pr_commits_returns_none_on_blank_stdout(monkeypatch, tmp_path):
+    """PR #113 review: a zero exit with empty stdout is an unusable payload.
+
+    `r.stdout or "[]"` turned truncated/lost output into a genuinely empty
+    range, so the None path was never reached and `complete` proceeded on
+    evidence it never obtained. A real empty range is the literal JSON `[]`.
+    """
+    monkeypatch.setattr(github_api, "_local_new_commits", lambda *a, **k: [])
+    for blank in ("", "   \n"):
+        monkeypatch.setattr(
+            github_api, "_run",
+            lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=blank, stderr=""),
+        )
+        assert github_api.get_new_pr_commits(7, "", "", str(tmp_path)) is None, (
+            f"blank stdout {blank!r} must be unknown, not an empty range"
+        )
 
 
 def test_get_new_pr_commits_returns_none_on_malformed_payload(monkeypatch, tmp_path):

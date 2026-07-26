@@ -1400,8 +1400,16 @@ def get_new_pr_commits(
     if r.returncode != 0:
         return None
 
+    # BOU-2417 (PR #113 review): blank stdout on a zero exit is an UNUSABLE
+    # payload — truncated or lost output — not an empty range. Defaulting it to
+    # "[]" would route it down the success path and hand `complete` an empty
+    # commit set it never actually obtained. A real empty range is the literal
+    # JSON `[]`, which parses fine below.
+    if not (r.stdout or "").strip():
+        return None
+
     try:
-        raw = json.loads(r.stdout or "[]")
+        raw = json.loads(r.stdout)
     except json.JSONDecodeError:
         return None
     if not isinstance(raw, list):

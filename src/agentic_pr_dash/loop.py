@@ -17,15 +17,17 @@ dependence on ``claude``/``codex``.
 
 **Reachability probe targets (BOU-2417).** When a dispatch fails, the loop probes
 ``APD_LOOP_PROBE_URLS`` (default ``https://api.github.com``) to decide whether
-the failure is informative. Reachability is OR across targets: only when EVERY
-target is unreachable is the tick treated as inconclusive.
+the failure is informative. **Every** listed target must be reachable; if any
+one fails, the tick is inconclusive.
 
-That default cannot detect a provider-specific outage — if the executor's model
-endpoint is down while GitHub is up, the dispatch still counts as a real
-failure. **Deployments whose executor talks to a provider that can fail
-independently of GitHub should add that endpoint**, e.g.::
+The single default cannot detect a provider-specific outage. **Deployments whose
+executor talks to a provider that can fail independently of GitHub should add
+that endpoint**, e.g.::
 
     APD_LOOP_PROBE_URLS="https://api.github.com,https://api.anthropic.com"
+
+with the corollary that a target you add is a target whose flakiness will
+suppress escalation — list only endpoints a dispatch genuinely depends on.
 
 The conservative default is deliberate. Inferring the outage from the executor's
 own output was tried and reverted (PR #113 review): a coding agent's output is a
@@ -1098,17 +1100,23 @@ _PROBE_TIMEOUT_DEFAULT = 3.0
 # `socket.create_connection` bypasses — in a proxy-only deployment the direct
 # connect fails while the executor works fine, which would have masked genuine
 # failures as inconclusive.
+#
+# Exit 0 only when EVERY target is reachable. OR semantics would defeat the whole
+# point of configuring more than one target (PR #113 review round 3): with
+# `github,anthropic`, a provider-specific Anthropic outage would still exit 0 on
+# GitHub's response, so the documented remedy for provider outages was a no-op.
+# Any target failing means something the dispatch may have depended on is down.
 _PROBE_SCRIPT = """
-import sys, urllib.request
+import sys, urllib.error, urllib.request
+timeout = float(sys.argv[1])
 for url in sys.argv[2:]:
     try:
-        urllib.request.urlopen(url, timeout=float(sys.argv[1])).close()
-        sys.exit(0)
+        urllib.request.urlopen(url, timeout=timeout).close()
     except urllib.error.HTTPError:
-        sys.exit(0)  # reached the server; its status is irrelevant
+        continue  # reached the server; its status code is irrelevant
     except Exception:
-        continue
-sys.exit(1)
+        sys.exit(1)
+sys.exit(0)
 """
 
 
@@ -1132,15 +1140,24 @@ def _network_reachable() -> bool:
     cannot positively establish as "the network is down" degrades to the
     pre-BOU-2417 behavior.
 
-    Reachability is OR across targets: only when EVERY configured target is
-    unreachable do we call the network down. Deployments whose executor talks to
-    a provider that can fail independently of GitHub should add that provider's
-    endpoint to ``APD_LOOP_PROBE_URLS`` — see the module docstring note.
+    A target that fails makes the network unreachable — see ``_PROBE_SCRIPT`` for
+    why that is not OR across targets.
     """
     try:
         timeout = float(
             os.environ.get("APD_LOOP_PROBE_TIMEOUT_S", "") or _PROBE_TIMEOUT_DEFAULT
         )
+        # A zero/negative/NaN timeout makes every urlopen fail instantly, so the
+        # child would exit 1 and report a healthy network as down — suppressing
+        # escalation indefinitely (PR #113 review round 3). Honor the fail-open
+        # promise instead of trusting a nonsensical configured value.
+        if not (timeout > 0) or timeout == float("inf"):
+            print(
+                f"[agentic-pr-dash] ignoring non-positive APD_LOOP_PROBE_TIMEOUT_S "
+                f"({timeout!r}); treating reachability as unknown",
+                file=sys.stderr,
+            )
+            return True
         urls = _probe_urls()
         if not urls:
             return True
