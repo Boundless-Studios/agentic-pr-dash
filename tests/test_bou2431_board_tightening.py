@@ -128,6 +128,53 @@ def test_the_worktrees_tab_is_reachable() -> None:
     assert _canonical_dashboard_tab("worktrees") == "worktrees"
 
 
+def test_the_proof_fixture_serves_the_tab_itself() -> None:
+    """Otherwise the tab's poll falls back to the PRODUCTION route, which does
+    real repository discovery and overwrites a no-network fixture with live
+    data seconds after load (PR #114 review)."""
+    from agentic_pr_dash.app import _proof_fixture_context
+
+    context = _proof_fixture_context("baseline", active_tab="worktrees")
+
+    assert context["active_tab"] == "worktrees"
+    assert context["worktrees_partial_url"] == "/proof/pr-dashboard-fixture/baseline/worktrees"
+    assert "no_pr_cards" in context
+
+
+def test_the_agent_toggle_keeps_you_on_the_tab() -> None:
+    """The toggle is the only way to reveal agent worktrees; dropping `tab`
+    bounced the viewer back to the board every time they used it."""
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader
+
+    import agentic_pr_dash
+
+    templates_dir = Path(agentic_pr_dash.__file__).parent / "templates"
+    env = Environment(loader=FileSystemLoader(str(templates_dir)), autoescape=True)
+    source = (templates_dir / "dashboard.html").read_text(encoding="utf-8")
+
+    rendered = env.from_string(source).render(
+        active_tab="worktrees",
+        no_pr_cards=[],
+        columns=[],
+        events=[],
+        runner_issues=[],
+        running_github_jobs=[],
+        desktop_docker_instances=[],
+        desktop_docker_container_count=0,
+        escalated_prs=[],
+        pr_count=0,
+        worktree_count=0,
+        hidden_agent_worktree_count=0,
+        bug_bash_ready_count=0,
+        show_agent_worktrees=False,
+        asset_version="test",
+    )
+
+    assert '<input type="hidden" name="tab" value="worktrees">' in rendered
+
+
 def test_an_unknown_tab_still_falls_back_to_the_board() -> None:
     assert _canonical_dashboard_tab("nonsense") == "board"
 
@@ -160,3 +207,45 @@ def test_the_empty_tab_says_so_rather_than_rendering_blank() -> None:
 
     assert "Every worktree has an open PR." in html
     assert "0 worktrees" in html
+
+
+def test_the_tab_advertises_only_affordances_that_work() -> None:
+    """PR #114 review: markup that promises an action it can never render.
+
+    A reclaimable worktree is READY_CLEANUP, never NO_PR, so a cleanup form on
+    this tab is unreachable by construction — the board's Ready / Cleanup
+    column is where that action lives.
+    """
+    html = _render_worktrees([_card(PRStatus.NO_PR, "idle")])
+
+    assert "cleanup-worktree" not in html
+    # The rows the search box and click-to-focus hook onto by class.
+    assert "worktree-row" in html
+    assert "worktrees-count" in html
+
+
+# ---------------------------------------------------------------------------
+# Board membership is deliberate, not incidental
+# ---------------------------------------------------------------------------
+
+def test_a_pr_less_worktree_with_a_live_agent_stays_on_the_board() -> None:
+    """Selecting the tab on `pr_number is None` would drag live work off it.
+
+    `_card_status` routes a PR-less worktree by ACTIVITY: working -> a live
+    agent, waiting -> an idle one, reclaimable -> READY_CLEANUP, and NO_PR only
+    when none of those apply. The board is where in-flight agent work belongs,
+    so only the last group moves to the tab (PR #114 review).
+    """
+    working = _card(PRStatus.AGENT_WORKING, "agent-busy")
+    reclaimable = _card(PRStatus.READY_CLEANUP, "spent")
+    idle = _card(PRStatus.NO_PR, "idle")
+    cards = [working, reclaimable, idle]
+
+    on_board = {
+        card.worktree_name for column in build_columns(cards) for card in column["cards"]
+    }
+    on_tab = {card.worktree_name for card in no_pr_cards(cards)}
+
+    assert on_board == {"agent-busy", "spent"}
+    assert on_tab == {"idle"}
+    assert not on_board & on_tab, "a card must not render in both places"

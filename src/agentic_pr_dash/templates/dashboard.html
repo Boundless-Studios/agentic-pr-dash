@@ -55,6 +55,12 @@
                 <input id="pr-card-filter" type="search" placeholder="PR, branch, worktree">
             </label>
             <form method="get" action="/" class="filter-form">
+                {# Without this the toggle drops `tab` and bounces the viewer back to
+                   the board — worst on the Worktrees tab, where agent worktrees are
+                   hidden by default and this toggle is the only way to reveal them. #}
+                {% if active_tab and active_tab != 'board' %}
+                <input type="hidden" name="tab" value="{{ active_tab }}">
+                {% endif %}
                 <label class="toggle-filter">
                     <input type="checkbox"
                            name="show_agents"

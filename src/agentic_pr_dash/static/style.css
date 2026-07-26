@@ -1332,6 +1332,26 @@ header h1 {
 }
 
 /* ─── Responsive ─────────────────────────────────────────────────────────── */
+
+/* Five columns only fit if the SIDEBAR is budgeted for. It is a fixed 300px
+   with flex-shrink: 0, so a 1440px laptop leaves 1140px for the board while
+   5 x 272px + 4 x 10px gaps + 32px padding needs 1432px — still scrolling,
+   which was the whole complaint (PR #114 review). Step the column floor down
+   with the viewport instead of picking one number: wide monitors keep roomy
+   columns, laptops get columns that fit. Widths below are (viewport - 300px
+   sidebar - 32px board padding - 40px gaps) / 5, rounded down. */
+@media (max-width: 1600px) {
+    .kanban-column { min-width: 240px; }
+}
+
+@media (max-width: 1440px) {
+    .kanban-column { min-width: 208px; }
+}
+
+@media (max-width: 1280px) {
+    .kanban-column { min-width: 176px; }
+}
+
 @media (max-width: 960px) {
     .layout {
         flex-direction: column;

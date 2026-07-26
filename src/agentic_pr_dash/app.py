@@ -1580,6 +1580,12 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
         "worktrees_tab_url": f"/proof/pr-dashboard-fixture/{scenario}?tab=worktrees",
         "board_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/board",
         "runner_issues_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/runner-issues",
+        # Without a fixture-scoped partial url the tab's 5s poll would fall back
+        # to the PRODUCTION /partials/worktrees route, which performs real
+        # repository discovery — replacing a deterministic, no-network fixture
+        # with live data seconds after it loads (PR #114 review).
+        "worktrees_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/worktrees",
+        "no_pr_cards": no_pr_cards(cards),
         "asset_version": _asset_version(),
     }
 
@@ -1654,6 +1660,17 @@ async def pr_dashboard_proof_fixture_runner_issues(request: Request, scenario: s
         request=request,
         name="partials/runner_issues.html",
         context=_proof_fixture_context(scenario, active_tab="runner_issues"),
+    )
+
+
+@app.get("/proof/pr-dashboard-fixture/{scenario}/worktrees", response_class=HTMLResponse)
+async def pr_dashboard_proof_fixture_worktrees(request: Request, scenario: str):
+    if scenario not in {"baseline", "diagnostic"}:
+        return Response("Unknown PR-dashboard proof fixture", status_code=404)
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/worktrees.html",
+        context=_proof_fixture_context(scenario, active_tab="worktrees"),
     )
 
 
