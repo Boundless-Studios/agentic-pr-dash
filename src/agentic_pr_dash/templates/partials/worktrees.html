@@ -1,0 +1,76 @@
+{# Idle worktrees (BOU-2431). These used to hold a board column, which crowded
+   out the columns that are actually about PR state.
+
+   Membership is PRStatus.NO_PR, which `_card_status` assigns only when there is
+   no PR AND no active agent AND the worktree is not reclaimable — a PR-less
+   worktree with a live agent is AGENT_WORKING and a reclaimable one is
+   READY_CLEANUP, and both deliberately stay on the board where that work is
+   visible. Selecting on `pr_number is None` instead would drag live agent work
+   off the board, which is the opposite of useful (PR #114 review). The heading
+   says "idle" rather than "no PR" so it describes what is actually here. #}
+<div class="runner-issues-header">
+    <div>
+        <h2>Worktrees</h2>
+        <p>Idle worktrees — no open PR and no agent working in them.</p>
+    </div>
+    <span class="worktrees-count">{{ no_pr_cards | length }} worktree{{ 's' if no_pr_cards | length != 1 }}</span>
+</div>
+
+<div class="worktrees-empty-search runner-issues-empty" hidden>No matching worktrees</div>
+
+{% if no_pr_cards %}
+<div class="runner-issues-list">
+    {% for card in no_pr_cards %}
+    <article class="runner-issue worktree-row{% if card.worktree_path %} card-navigable{% endif %}"
+             data-search-text="{{ card.search_text }}"
+             {% if card.worktree_path %}data-worktree-path="{{ card.worktree_path }}"{% endif %}
+             {% if card.worktree_path %}tabindex="0" role="button" aria-label="Focus {{ card.worktree_name }} in iTerm"{% endif %}>
+        <div class="card-top">
+            <div class="card-identity">
+                <div class="card-worktree-name">{{ card.worktree_name }}</div>
+                {% if card.branch != card.worktree_name %}
+                <div class="card-branch">{{ card.branch }}</div>
+                {% endif %}
+                {% if card.agent_name %}
+                <div class="card-agent-name" title="Agent session name">🤖 {{ card.agent_name }}</div>
+                {% endif %}
+            </div>
+            <span class="card-state state-{{ card.agent_state }}"
+                  title="{{ card.state_chip_label }}">{{ card.state_chip_label }}</span>
+        </div>
+
+        {% if card.owner_session_id %}
+        <div class="card-ownership">
+            <span class="owner-session">{{ card.owner_session_id[:8] }}</span>
+            {% if card.owner_pid is not none %}
+            <span class="owner-pid {% if card.owner_pid_alive %}owner-pid-alive{% else %}owner-pid-dead{% endif %}">
+                pid {{ card.owner_pid }} · {% if card.owner_pid_alive %}alive{% else %}dead{% endif %}
+            </span>
+            {% endif %}
+        </div>
+        {% endif %}
+
+        {% if card.last_updated_label %}
+        <div class="card-updated">Updated {{ card.last_updated_label }}</div>
+        {% endif %}
+
+        <div class="card-meta">
+            {% if card.environment_name %}<span>{{ card.environment_name }}</span>{% endif %}
+            {% if card.frontend_port %}<code>fe:{{ card.frontend_port }}</code>{% endif %}
+            {% if card.backend_port %}<code>be:{{ card.backend_port }}</code>{% endif %}
+            {% if card.slot %}<code>slot:{{ card.slot }}</code>{% endif %}
+        </div>
+
+        {# No cleanup form here on purpose: a reclaimable worktree is
+           READY_CLEANUP, never NO_PR, so it never reaches this template. The
+           board's Ready / Cleanup column is where that action lives. #}
+    </article>
+    {% endfor %}
+</div>
+{% else %}
+{# Not "every worktree has an open PR" — that is false whenever a PR-less
+   worktree is on the board as AGENT_WORKING / AGENT_WAITING / READY_CLEANUP,
+   or when agent-prefixed worktrees are hidden by the default filter. Report
+   what this tab actually holds (PR #114 review). #}
+<div class="runner-issues-empty">No idle worktrees.</div>
+{% endif %}

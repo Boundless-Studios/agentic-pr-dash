@@ -8,15 +8,44 @@ function searchableCardText(card) {
     return normalizeSearchText(`${card.dataset.searchText || ''} ${card.textContent || ''}`);
 }
 
+// Everything the search box filters and a click can focus. The Worktrees tab
+// (BOU-2431) renders rows rather than board cards, and they carry the same
+// data-search-text / data-worktree-path affordances — matching only `.card`
+// left the search box and the click-to-focus silently dead on that tab.
+const FILTERABLE_SELECTOR = '.board .card, .worktrees-panel .worktree-row';
+const FOCUSABLE_SELECTOR = '.card[data-worktree-path], .worktree-row[data-worktree-path]';
+
 function applyCardFilter() {
     const input = document.getElementById('pr-card-filter');
     const query = normalizeSearchText(input ? input.value : '');
 
-    // Filter every card in the board, regardless of column.
-    document.querySelectorAll('.board .card').forEach(function(card) {
+    // Filter every card in the board and every row on the Worktrees tab.
+    document.querySelectorAll(FILTERABLE_SELECTOR).forEach(function(card) {
         const hidden = query !== '' && !searchableCardText(card).includes(query);
         card.classList.toggle('card-hidden', hidden);
     });
+
+    // Worktrees tab: mirror the board's visible/total behaviour in its header.
+    const worktreeRows = document.querySelectorAll('.worktrees-panel .worktree-row');
+    const worktreeCount = document.querySelector('.worktrees-panel .worktrees-count');
+    if (worktreeCount) {
+        const total = worktreeRows.length;
+        let visible = 0;
+        worktreeRows.forEach(function(row) {
+            if (!row.classList.contains('card-hidden')) {
+                visible += 1;
+            }
+        });
+        const noun = total === 1 ? 'worktree' : 'worktrees';
+        worktreeCount.textContent = query === ''
+            ? `${total} ${noun}`
+            : `${visible}/${total} ${noun}`;
+
+        const emptySearch = document.querySelector('.worktrees-panel .worktrees-empty-search');
+        if (emptySearch) {
+            emptySearch.hidden = query === '' || visible > 0 || total === 0;
+        }
+    }
 
     // Update per-column count + empty-state after filtering.
     document.querySelectorAll('.kanban-column').forEach(function(column) {
@@ -197,6 +226,10 @@ document.addEventListener('htmx:afterSwap', function(event) {
             card.offsetHeight; // trigger reflow
             card.style.animation = '';
         });
+    } else if (target.classList.contains('worktrees-panel')) {
+        // The tab's 5s poll replaces every row; without this the search box
+        // stops filtering the moment the first swap lands.
+        applyCardFilter();
     } else if (target.classList.contains('event-list')) {
         const top = scrollSnapshots.eventList;
         requestAnimationFrame(function() {
@@ -239,7 +272,7 @@ async function focusWorktree(card) {
 }
 
 document.addEventListener('click', function(event) {
-    const card = event.target.closest('.card[data-worktree-path]');
+    const card = event.target.closest(FOCUSABLE_SELECTOR);
     if (!card || isInteractiveTarget(event.target)) {
         return;
     }
@@ -252,7 +285,7 @@ document.addEventListener('keydown', function(event) {
         return;
     }
 
-    const card = event.target.closest('.card[data-worktree-path]');
+    const card = event.target.closest(FOCUSABLE_SELECTOR);
     if (!card || isInteractiveTarget(event.target)) {
         return;
     }
