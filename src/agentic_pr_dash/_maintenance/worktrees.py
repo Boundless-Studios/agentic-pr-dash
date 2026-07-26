@@ -20,7 +20,25 @@ class IndependentOwnerIdentity:
 
 
 def _iter_worktrees_with_branch(cwd: str):
-    """Yield (path, branch) for non-bare, non-locked worktrees from `git worktree list`."""
+    """Yield ``(path, branch)`` for non-bare worktrees from ``git worktree list``.
+
+    LOCKED worktrees are included (BOU-2514). `git worktree lock` means "do not
+    prune or remove me" -- an administrative protection, not an absence. Skipping
+    them conflated "protected" with "unavailable" and made the most actively-used
+    worktrees invisible to ownership enumeration.
+
+    That is not hypothetical: gaia's `_agent/`-namespaced worktrees lock
+    themselves (`locked active-agent`) so the start-worktree sweep cannot delete
+    them mid-session (BOU-2232). Every one of them therefore dropped out of
+    `_collect_owned_worktrees`, so `list-owned` returned empty and the `await`
+    waiter answered "watched NOTHING" for a PR whose ownership claim was
+    perfectly valid -- 7 of 28 worktrees on the reporting machine. A session
+    could `arm` successfully, hold an active claim naming its PR, and still never
+    be woken by review feedback or a red check.
+
+    Bare worktrees stay excluded: a bare repo genuinely has no checked-out branch
+    to resolve a PR against.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "worktree", "list", "--porcelain"],
@@ -36,28 +54,23 @@ def _iter_worktrees_with_branch(cwd: str):
     path: str | None = None
     branch = ""
     bare = False
-    locked = False
     for line in result.stdout.splitlines():
         if line.startswith("worktree "):
             path = line[len("worktree "):]
             branch = ""
             bare = False
-            locked = False
         elif line.startswith("branch "):
             ref = line[len("branch "):]
             branch = ref[len("refs/heads/"):] if ref.startswith("refs/heads/") else ref
         elif line == "bare":
             bare = True
-        elif line == "locked" or line.startswith("locked "):
-            locked = True
         elif line == "":
-            if path and not bare and not locked:
+            if path and not bare:
                 yield path, branch
             path = None
             branch = ""
             bare = False
-            locked = False
-    if path and not bare and not locked:
+    if path and not bare:
         yield path, branch
 
 
