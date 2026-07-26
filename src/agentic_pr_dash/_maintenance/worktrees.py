@@ -20,7 +20,35 @@ class IndependentOwnerIdentity:
 
 
 def _iter_worktrees_with_branch(cwd: str):
-    """Yield (path, branch) for non-bare, non-locked worktrees from `git worktree list`."""
+    """Yield ``(path, branch)`` for non-bare worktrees from ``git worktree list``.
+
+    LOCKED worktrees are included (BOU-2514). `git worktree lock` means "do not
+    prune or remove me" -- an administrative protection, not an absence. Skipping
+    them conflated "protected" with "unavailable" and made the most actively-used
+    worktrees invisible to ownership enumeration.
+
+    That is not hypothetical: gaia's `_agent/`-namespaced worktrees lock
+    themselves (`locked active-agent`) so the start-worktree sweep cannot delete
+    them mid-session (BOU-2232). Every one of them therefore dropped out of
+    `_collect_owned_worktrees`, so `list-owned` returned empty and the `await`
+    waiter answered "watched NOTHING" for a PR whose ownership claim was
+    perfectly valid -- 7 of 28 worktrees on the reporting machine. A session
+    could `arm` successfully, hold an active claim naming its PR, and still never
+    be woken by review feedback or a red check.
+
+    A locked worktree is only yielded when its path is currently a DIRECTORY.
+    Git's documented reason for locking is a worktree "stored on a portable
+    device or network share which is not always mounted", and it deliberately
+    keeps those in `worktree list --porcelain` while the path is absent. Yielding
+    a missing path is not merely useless: `_collect_owned_worktrees` would match
+    its recorded branch to an open PR and call `_write_arm_marker`, whose
+    `os.makedirs(..., exist_ok=True)` RECREATES the absent mount point and adopts
+    a phantom worktree (PR #118 review). The directory check keeps active locks
+    visible without resurrecting unavailable ones.
+
+    Bare worktrees stay excluded: a bare repo genuinely has no checked-out branch
+    to resolve a PR against.
+    """
     try:
         result = subprocess.run(
             ["git", "-C", cwd, "worktree", "list", "--porcelain"],
@@ -32,6 +60,14 @@ def _iter_worktrees_with_branch(cwd: str):
         return
     if result.returncode != 0:
         return
+
+    def _yieldable(path: str | None, bare: bool, locked: bool) -> bool:
+        if not path or bare:
+            return False
+        # A locked path that is not currently a directory is an unmounted
+        # device/share, not an active worktree. `os.path.isdir` is only paid for
+        # locked entries, which are the rare case.
+        return not locked or os.path.isdir(path)
 
     path: str | None = None
     branch = ""
@@ -51,13 +87,13 @@ def _iter_worktrees_with_branch(cwd: str):
         elif line == "locked" or line.startswith("locked "):
             locked = True
         elif line == "":
-            if path and not bare and not locked:
+            if _yieldable(path, bare, locked):
                 yield path, branch
             path = None
             branch = ""
             bare = False
             locked = False
-    if path and not bare and not locked:
+    if _yieldable(path, bare, locked):
         yield path, branch
 
 
