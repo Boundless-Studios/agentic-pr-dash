@@ -45,7 +45,9 @@ from ._maintenance.pr_state import (  # noqa: F401, E402
     _resolve_pr_for_branch,
     _resolve_pr_by_number,
     _pr_draft_status,
+    _pr_draft_status_detailed,
     _pr_head_branch,
+    _pr_head_branch_detailed,
     _gh_pr_list_json,
     _resolve_open_pr_for_branch,
     _list_my_open_prs,
@@ -298,17 +300,36 @@ def _cmd_arm(args: argparse.Namespace) -> int:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
     else:
-        status = _pr_draft_status(cwd, int(pr_number))
+        # BOU-2406: an INDETERMINATE gh result is not the same as "there is
+        # nothing to arm". This used to print "gh unavailable" and return 0, so
+        # the caller was told arming succeeded while no arm marker and no
+        # session-ledger entry were written. That silence then propagates: with
+        # no ledger entry, `_await_anchors` cannot discover the worktree, and the
+        # feedback waiter exits `unbound` having watched nothing — a PR left with
+        # zero coverage behind two successful-looking steps.
+        #
+        # The quiet paths below ("no open PR", "is a draft") are genuine
+        # not-applicable cases and still return 0. Only "we could not find out"
+        # is now loud and non-zero.
+        status, why = _pr_draft_status_detailed(cwd, int(pr_number))
         if status is None:
-            print(f"could not verify PR #{pr_number} is non-draft (gh unavailable); not arming")
-            return 0
+            print(
+                f"could not determine whether PR #{pr_number} is a draft; not arming.\n"
+                f"  cause: {why}",
+                file=sys.stderr,
+            )
+            return 1
         if status:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
-        head_branch = _pr_head_branch(cwd, int(pr_number))
+        head_branch, why = _pr_head_branch_detailed(cwd, int(pr_number))
         if head_branch is None:
-            print(f"could not verify PR #{pr_number}'s head branch (gh unavailable); not arming")
-            return 0
+            print(
+                f"could not determine PR #{pr_number}'s head branch; not arming.\n"
+                f"  cause: {why}",
+                file=sys.stderr,
+            )
+            return 1
         if head_branch != _current_branch(cwd):
             print(
                 f"PR #{pr_number} (head {head_branch}) is not checked out in {cwd}; not arming"
