@@ -384,13 +384,12 @@ def test_fallback_is_not_run_when_the_primary_recorded_a_decision(store, monkeyp
     ran: list[str] = []
 
     def _try(executor, prompt, cwd):
-        # BOU-2417: _try_run now also returns the executor's output tail.
         ran.append(executor)
-        return (1, "exit 1", "") if executor == "primary" else (0, "", "")
+        return (1, "exit 1") if executor == "primary" else (0, "")
 
     monkeypatch.setattr(loop, "_try_run", _try)
 
-    serviced, errors, _output = loop._dispatch_with_fallback(
+    serviced, errors = loop._dispatch_with_fallback(
         "primary", "fallback", "p", ".", 123,
         repo_slug="Boundless-Studios/gaia-free",
     )
@@ -407,13 +406,12 @@ def test_fallback_still_runs_on_an_ordinary_primary_failure(store, monkeypatch):
     ran: list[str] = []
 
     def _try(executor, prompt, cwd):
-        # BOU-2417: _try_run now also returns the executor's output tail.
         ran.append(executor)
-        return (1, "exit 1", "") if executor == "primary" else (0, "", "")
+        return (1, "exit 1") if executor == "primary" else (0, "")
 
     monkeypatch.setattr(loop, "_try_run", _try)
 
-    serviced, _, _output = loop._dispatch_with_fallback(
+    serviced, _ = loop._dispatch_with_fallback(
         "primary", "fallback", "p", ".", 123,
         repo_slug="Boundless-Studios/gaia-free",
     )

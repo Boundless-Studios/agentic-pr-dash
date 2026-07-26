@@ -136,7 +136,11 @@ def test_tick_increments_streak_on_nonzero_exit(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
-    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: (1, ""))  # non-zero
+    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: 1)  # non-zero
+    # BOU-2417: a non-zero exit only counts as a genuine failure when the
+    # network is up. This test stubs loop.subprocess.run wholesale, which the
+    # reachability probe would otherwise pick up as its own (fake) result.
+    monkeypatch.setattr(loop, "_network_reachable", lambda: True)
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop, "record_executor_failure",
@@ -175,7 +179,7 @@ def test_tick_resets_streak_on_success(monkeypatch, tmp_path):
     monkeypatch.setattr(loop, "_cleanup_stale_no_pr_worktree", lambda cwd, session_id="": False)
     monkeypatch.setattr(loop, "_baseline_sha", lambda cwd, pr: "sha")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
-    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: (0, ""))  # success
+    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: 0)  # success
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop.coordinator, "release_claim", lambda *a, **k: None)
     monkeypatch.setattr(loop, "reset_executor_failure",

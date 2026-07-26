@@ -54,8 +54,7 @@ def _wire(monkeypatch, worktree, *, run_executor):
     monkeypatch.setattr(loop, "_repo_slug", lambda cwd: "testrepo")
     monkeypatch.setattr(loop.subprocess, "run", fake_run)
     monkeypatch.setattr(loop, "_run_executor",
-                        # BOU-2417: _run_executor now returns (rc, output tail).
-                        lambda executor, prompt, cwd: (run_executor(executor, calls), ""))
+                        lambda executor, prompt, cwd: run_executor(executor, calls))
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim",
                         lambda handle, session_id: None)
     monkeypatch.setattr(loop.coordinator, "release_claim",

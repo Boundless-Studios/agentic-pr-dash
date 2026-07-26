@@ -7,16 +7,16 @@ therefore indistinguishable from a genuinely broken executor — three outage
 ticks escalated a PR that was never broken, and ownership churned
 (release -> re-acquire) on every tick (the BOU-2412 churn signature).
 
-The classifier is a direct reachability probe rather than error-text matching:
-`_run_executor` runs the executor WITHOUT capture (the daemon log streams live
-codex/claude output), so `_try_run` only ever yields ``f"exit {rc}"`` — there is
-no stderr for `_is_transient_connectivity_failure` to match on.
+Classification is a reachability probe, NOT the executor's output. Reading the
+executor's output was tried in PR #113 review round 1 and reverted in round 2:
+the text is an entire coding-agent run, so a genuine task failure that merely
+prints a transport-shaped string would be misread as an outage and silently
+never escalate — and teeing it risked hanging the loop on a pipe held open by a
+descendant of the executor.
 """
 from __future__ import annotations
 
 import json
-import socket
-import threading
 import time
 import types
 
@@ -36,48 +36,83 @@ def _isolate_state(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------
-# _network_reachable
+# _network_reachable — bounded, killable, proxy-aware
 # --------------------------------------------------------------------------
 
-def test_network_reachable_true_when_a_host_connects(monkeypatch):
-    """Any single probe host accepting a TCP connect means the network is up."""
-    monkeypatch.setenv("APD_LOOP_PROBE_HOSTS", "unreachable.invalid:443,api.github.com:443")
-
-    attempted: list[tuple[str, int]] = []
-
-    class _Sock:
-        def close(self):
-            pass
-
-    def _connect(addr, timeout=None):
-        attempted.append(addr)
-        if addr[0] == "api.github.com":
-            return _Sock()
-        raise OSError("no route to host")
-
-    monkeypatch.setattr(socket, "create_connection", _connect)
-    assert loop._network_reachable() is True
-    assert ("api.github.com", 443) in attempted
-
-
-def test_network_reachable_false_when_no_host_connects(monkeypatch):
-    """Every configured host failing to connect means the network is down."""
-    monkeypatch.setenv("APD_LOOP_PROBE_HOSTS", "a.invalid:443,b.invalid:443")
+def test_network_reachable_true_when_a_url_answers(monkeypatch):
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://api.github.com")
     monkeypatch.setattr(
-        socket, "create_connection",
-        lambda addr, timeout=None: (_ for _ in ()).throw(OSError("unreachable")),
+        loop.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=b"", stderr=b""),
+    )
+    assert loop._network_reachable() is True
+
+
+def test_network_reachable_false_when_no_url_answers(monkeypatch):
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://a.invalid,https://b.invalid")
+    monkeypatch.setattr(
+        loop.subprocess, "run",
+        lambda *a, **k: types.SimpleNamespace(returncode=1, stdout=b"", stderr=b""),
     )
     assert loop._network_reachable() is False
 
 
 def test_network_reachable_fails_open_on_unexpected_error(monkeypatch):
-    """A broken probe must degrade to today's behavior, never suppress a real failure."""
-    monkeypatch.setenv("APD_LOOP_PROBE_HOSTS", "garbage-without-a-port")
+    """A broken probe must degrade to today's behavior, never suppress a failure."""
     monkeypatch.setattr(
-        socket, "create_connection",
-        lambda addr, timeout=None: (_ for _ in ()).throw(RuntimeError("probe bug")),
+        loop.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("probe bug")),
     )
     assert loop._network_reachable() is True
+
+
+def test_probe_timeout_fails_open_and_leaks_nothing(monkeypatch):
+    """PR #113 review: a wedged resolver must neither block nor leak a thread.
+
+    The probe is a killable subprocess, so `run` kills it on timeout. We cannot
+    prove the network is down from a timeout, so it fails OPEN — suppressing
+    escalation forever is worse than counting one extra failure.
+    """
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://stalled.invalid")
+
+    def _timeout(*a, **k):
+        raise loop.subprocess.TimeoutExpired(cmd="probe", timeout=k.get("timeout", 1))
+
+    monkeypatch.setattr(loop.subprocess, "run", _timeout)
+    assert loop._network_reachable() is True
+
+
+def test_probe_is_actually_bounded_end_to_end(monkeypatch):
+    """The real subprocess path returns quickly against an unroutable target."""
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://192.0.2.1")  # TEST-NET-1
+    monkeypatch.setenv("APD_LOOP_PROBE_TIMEOUT_S", "1")
+    started = time.monotonic()
+    loop._network_reachable()
+    assert time.monotonic() - started < 20, "probe must be bounded"
+
+
+def test_probe_subprocess_is_given_a_hard_timeout(monkeypatch):
+    """The bound is passed to subprocess.run, which is what kills the child."""
+    seen: dict = {}
+
+    def _spy(cmd, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setenv("APD_LOOP_PROBE_URLS", "https://api.github.com")
+    monkeypatch.setattr(loop.subprocess, "run", _spy)
+    loop._network_reachable()
+    assert seen.get("timeout"), "probe must pass a timeout so the child is killable"
+
+
+def test_probe_script_uses_urllib_so_proxies_are_honored():
+    """PR #113 review: a raw socket connect bypasses HTTP(S)_PROXY.
+
+    In a proxy-only deployment the direct connect fails while the executor works
+    fine, which would mask genuine failures as inconclusive.
+    """
+    assert "urllib" in loop._PROBE_SCRIPT
+    assert "socket" not in loop._PROBE_SCRIPT
 
 
 # --------------------------------------------------------------------------
@@ -91,11 +126,15 @@ _CHECK_STDOUT = (
     "COORDINATOR_LEASE_EPOCH=1\n"
 )
 
+# Deliberately NOT a real binary. `_run_executor` is monkeypatched in every test
+# here, so this name only ever feeds `_validate_executor`. Hardcoding a real one
+# ("codex") made these tests depend on the dev box's PATH — tick-level viability
+# resolved True locally and False in CI, which is a property of the machine, not
+# of the behavior under test.
+_EXECUTOR = "apd-test-executor-does-not-exist-2417 {prompt}"
 
-def _wire_loop(
-    monkeypatch, wt, *, reachable: bool, released: list, exit_code: int = 1,
-    executor_output: str = "",
-):
+
+def _wire_loop(monkeypatch, wt, *, reachable: bool, released: list, exit_code: int = 1):
     """Wire a tick that finds work for PR #4242 and whose executor exits non-zero.
 
     NOTE the executor EXITS non-zero rather than failing to spawn: that is what a
@@ -114,22 +153,13 @@ def _wire_loop(
         lambda cmd, *a, **k: types.SimpleNamespace(
             returncode=loop.CHECK_WORK_FOUND, stdout=_CHECK_STDOUT, stderr=""),
     )
-    monkeypatch.setattr(
-        loop, "_run_executor", lambda executor, prompt, cwd: (exit_code, executor_output))
+    monkeypatch.setattr(loop, "_run_executor", lambda executor, prompt, cwd: exit_code)
     monkeypatch.setattr(loop.coordinator, "heartbeat_claim", lambda *a, **k: None)
     monkeypatch.setattr(
         loop.coordinator, "release_claim",
         lambda handle, session, reason: released.append((handle.claim_id, session, reason)),
     )
     monkeypatch.setattr(loop, "_network_reachable", lambda: reachable)
-
-
-# Deliberately NOT a real binary. `_run_executor` is monkeypatched in every test
-# here, so this name only ever feeds `_validate_executor`. Hardcoding a real one
-# ("codex") made these tests depend on the dev box's PATH — tick-level viability
-# resolved True locally and False in CI, which is a property of the machine, not
-# of the behavior under test.
-_EXECUTOR = "apd-test-executor-does-not-exist-2417 {prompt}"
 
 
 def _args(tmp_path):
@@ -252,46 +282,13 @@ def test_genuine_executor_failure_still_escalates(monkeypatch, tmp_path):
     assert released, "a genuine failure must still release the claim"
 
 
-# --------------------------------------------------------------------------
-# PR #113 review findings
-# --------------------------------------------------------------------------
-
-def test_executor_transport_error_is_inconclusive_even_when_github_is_up(
-    monkeypatch, tmp_path
-):
-    """P1: a provider-specific outage leaves GitHub reachable.
-
-    The executor's OWN output is the primary evidence — probing api.github.com
-    would classify the very scenario this change targets as a real failure.
-    """
-    monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "2")
-    config.load.cache_clear()
-    wt = tmp_path / "wt"
-    wt.mkdir()
-    released: list = []
-    _wire_loop(
-        monkeypatch, wt, reachable=True, released=released,  # GitHub is fine
-        executor_output="stream error: connection reset by peer\n",
-    )
-    monkeypatch.setattr(loop, "_tick_executor_viability", lambda e, f: (True, {}))
-
-    for _ in range(3):
-        loop._tick(_args(tmp_path), _EXECUTOR)
-
-    assert loop.executor_failure_streak(str(wt), 4242) == 0, (
-        "an unreachable model endpoint must not burn the streak just because "
-        "GitHub happens to be reachable"
-    )
-    assert released == [], "the claim must be held through a provider outage"
-
-
 def test_all_spawn_failures_still_counted_during_a_concurrent_outage(
     monkeypatch, tmp_path
 ):
-    """P2: a local executor defect stays actionable regardless of network state.
+    """PR #113 review: a local executor defect stays actionable regardless of network.
 
     A binary removed or chmod'd after startup validation must still burn the
-    streak and downgrade viability even if the network is down at the same time.
+    streak and release the claim even if the network is down at the same time.
     """
     monkeypatch.setenv("AGENTIC_PR_DASH_ESCALATION_THRESHOLD", "2")
     config.load.cache_clear()
@@ -314,46 +311,23 @@ def test_all_spawn_failures_still_counted_during_a_concurrent_outage(
     assert released, "a local executor defect must still release the claim"
 
 
-def test_probe_is_bounded_when_dns_stalls(monkeypatch):
-    """P2: a wedged resolver must not block the loop.
+def test_run_executor_does_not_pipe_the_executor(monkeypatch, tmp_path):
+    """PR #113 review round 2: the streams stay INHERITED.
 
-    `socket.create_connection` resolves via a synchronous getaddrinfo BEFORE the
-    socket timeout applies, so the probe needs its own overall deadline.
+    Piping risks hanging the loop forever when a descendant of the executor
+    holds the pipe's write end open after the executor itself exits.
     """
-    monkeypatch.setenv("APD_LOOP_PROBE_HOSTS", "stalled.invalid:443")
-    monkeypatch.setenv("APD_LOOP_PROBE_TIMEOUT_S", "0.2")
+    seen: dict = {}
 
-    release = threading.Event()
+    def _spy(parts, **kw):
+        seen.update(kw)
+        return types.SimpleNamespace(returncode=0)
 
-    def _hang(addr, timeout=None):
-        release.wait(30)  # emulate a stuck resolver
-        raise OSError("never gets here in time")
-
-    monkeypatch.setattr(socket, "create_connection", _hang)
-
-    started = time.monotonic()
-    try:
-        assert loop._network_reachable() is False, (
-            "a probe that cannot complete is evidence of a network problem"
-        )
-        elapsed = time.monotonic() - started
-        assert elapsed < 10, f"probe was not bounded; took {elapsed:.1f}s"
-    finally:
-        release.set()
-
-
-def test_run_executor_tees_output_and_returns_tail(monkeypatch, tmp_path, capfd):
-    """The tee must preserve the live stream AND retain a tail for classification."""
-    rc, tail = loop._run_executor(
-        "sh -c 'echo hello-from-executor; echo could not resolve host >&2; exit 3'",
-        "unused-prompt", str(tmp_path),
+    monkeypatch.setattr(loop.subprocess, "run", _spy)
+    assert loop._run_executor("some-exec {prompt}", "p", str(tmp_path)) == 0
+    assert "stdout" not in seen and "stderr" not in seen, (
+        "the executor's streams must be inherited, not piped"
     )
-    captured = capfd.readouterr()
-    assert rc == 3
-    assert "hello-from-executor" in tail
-    assert "could not resolve host" in tail
-    assert "hello-from-executor" in captured.err, "output must still stream through"
-    assert github_api.is_transient_connectivity_text(tail)
 
 
 # --------------------------------------------------------------------------
