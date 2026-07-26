@@ -14,7 +14,15 @@ from datetime import datetime, timezone
 from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
 from .maintenance_check import _resolve_maintenance_roots
-from .models import CICheck, EventEntry, MaintenanceStatus, PRData, PRStatus, RunnerExecutionSummary
+from .models import (
+    CICheck,
+    EventEntry,
+    MaintenanceActor,
+    MaintenanceStatus,
+    PRData,
+    PRStatus,
+    RunnerExecutionSummary,
+)
 from .observability import ObservabilityEvent, get_event_store
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
@@ -59,7 +67,11 @@ ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SI
 # hands maintenance off to the local agent. The claim suppresses the dashboard
 # from re-queuing the same maintenance every poll cycle (the old queued-state
 # guard was removed; suppression now rides entirely on coordinator claims).
-DASHBOARD_OWNER_SESSION_ID = "agentic-pr-dash-dashboard"
+# Derived from the actor vocabulary (BOU-2490) rather than spelled independently,
+# so "who is the dashboard" has exactly one definition. The literal value is
+# unchanged ("agentic-pr-dash-dashboard"), which matters: it is persisted in live
+# coordinator claims and matched by existing tests and log-scraping.
+DASHBOARD_OWNER_SESSION_ID = f"agentic-pr-dash-{MaintenanceActor.DASHBOARD_QUEUE.value.removesuffix('-queue')}"
 # Each poll enriches every open PR with several REST + GraphQL calls. At 15s
 # this comfortably exceeded GitHub's hourly API limit for even a handful of
 # PRs, starving the API to zero and causing refresh failures. 60s keeps the
@@ -167,8 +179,16 @@ class Orchestrator:
         pr_number: int | None = None,
         repo: str | None = None,
         details: dict | None = None,
+        actor: MaintenanceActor = MaintenanceActor.DASHBOARD_QUEUE,
     ) -> None:
-        """Best-effort observability event emission. Never raises."""
+        """Best-effort observability event emission. Never raises.
+
+        ``actor`` defaults to :attr:`MaintenanceActor.DASHBOARD_QUEUE` because every
+        emit site in this module *is* the dashboard — it polls, enriches and queues,
+        and never runs an executor. Keeping the default here (rather than forcing
+        each call to repeat it) means a new dashboard emit site is correctly
+        attributed by construction; the loop has its own emitter with its own actor.
+        """
         try:
             cwd = repo if repo is not None else self.repo_cwd
             event = ObservabilityEvent(
@@ -176,7 +196,8 @@ class Orchestrator:
                 repo=cwd,
                 pr_number=pr_number,
                 kind=kind,
-                session_id=None,
+                actor=actor.value,
+                session_id=DASHBOARD_OWNER_SESSION_ID,
                 details=details or {},
             )
             get_event_store(cwd).append(event)
@@ -803,8 +824,11 @@ class Orchestrator:
                 pr,
                 session_id=DASHBOARD_OWNER_SESSION_ID,
                 pid=None,
-                agent="agentic-pr-dash-dashboard",
+                agent=DASHBOARD_OWNER_SESSION_ID,
                 lease_seconds=load_config(pr.worktree_path).lease_seconds,
+                # Advisory: this claim suppresses re-queuing, it does NOT mean the
+                # PR is being fixed. The dashboard has no executor (BOU-2491).
+                actor=MaintenanceActor.DASHBOARD_QUEUE,
             )
             pr.coordinator_claim = claim
             self.log(

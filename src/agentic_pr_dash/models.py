@@ -49,6 +49,58 @@ class MaintenanceStatus(str, Enum):
     FAILED = "failed"
 
 
+class MaintenanceActor(str, Enum):
+    """Who acted on a PR — and, via :data:`EXECUTING_ACTORS`, with what authority.
+
+    Five surfaces in this package are all called "PR maintenance", but they differ
+    on the one axis that matters to a reader trying to explain a commit they did
+    not write: *can this component write code and push?* Before BOU-2490 that axis
+    was represented nowhere — the dashboard's "queued a work order" and the loop's
+    "ran ``codex --full-auto`` and pushed" both emitted ``kind="dispatch"`` with a
+    null ``session_id``, under the same log prefix, against the same ownership
+    ledger. A session that found unexplained commits had to guess, and guessed
+    that a daemon had taken over its work.
+
+    This enum is the single definition of that vocabulary. Everything downstream
+    (event log, ownership claim metadata, log prefixes) reads it rather than
+    re-deriving capability from an ad-hoc string.
+    """
+
+    #: Blocks the session's Stop and asks *it* to fix. Writes nothing itself.
+    STOP_GATE = "stop-gate"
+    #: The in-session agent (``/pr-maintenance-check``). Writes code.
+    SESSION = "session"
+    #: Detached per-session feedback waiter. Wakes the session; writes nothing.
+    WAITER = "waiter"
+    #: Dashboard poll/button. Queues a handoff and claims the PR; writes no code.
+    DASHBOARD_QUEUE = "dashboard-queue"
+    #: The detached maintenance loop. Runs the configured executor: writes code,
+    #: commits, merges main, pushes.
+    LOOP_EXECUTOR = "loop-executor"
+
+
+#: Actors that can produce commits. Everything else is advisory, and an advisory
+#: owner must never be mistaken for coverage (see BOU-2491).
+EXECUTING_ACTORS = frozenset({MaintenanceActor.SESSION, MaintenanceActor.LOOP_EXECUTOR})
+
+
+def can_execute(actor: "MaintenanceActor | str | None") -> bool:
+    """True when ``actor`` is capable of writing code and pushing.
+
+    Accepts the raw string form too, since claim metadata round-trips through
+    ``dict[str, str]`` and event rows through JSON. An unknown or missing actor
+    is treated as **non-executing**: the conservative answer, because the caller
+    asking this question is deciding whether someone else has the PR covered, and
+    wrongly assuming coverage strands a red PR (BOU-1789).
+    """
+    if actor is None:
+        return False
+    try:
+        return MaintenanceActor(actor) in EXECUTING_ACTORS
+    except ValueError:
+        return False
+
+
 class ClaimHandle(BaseModel):
     """Fenced coordinator ownership required for every claim mutation."""
 
