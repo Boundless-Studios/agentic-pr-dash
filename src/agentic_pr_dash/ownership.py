@@ -450,6 +450,12 @@ class ClaimOutcome:
     claim_id: str | None = None
     lease_epoch: int | None = None
     conflict_session_id: str | None = None
+    #: The refused claim's holder pid/provenance/lease (BOU-2409) — populated
+    #: alongside ``conflict_session_id`` so a caller (``arm``'s CLI) can name
+    #: the actual refusal instead of a generic "could not write" message.
+    conflict_pid: int | None = None
+    conflict_provenance: str | None = None
+    conflict_lease_expires_at: datetime | None = None
 
 
 def record_ownership(
@@ -483,6 +489,15 @@ def record_ownership(
     before claiming rather than relying on ``claim_task`` to refuse. Stage 1 is
     unaffected: the only callers are marker writes, already gated upstream by
     ``_live_foreign_owner``.
+
+    BOU-2409: an ``armed`` attempt outranks a foreign session's ``adopted``
+    claim. Adoption is a best-effort backstop for a PR nobody else was
+    servicing — it must never fence out the session that actually owns the
+    branch/worktree and is doing the real work, which is exactly what an
+    explicit ``armed`` attempt represents. On conflict with a foreign
+    ``adopted`` claim, this releases it and retries ONCE. A foreign ``armed``
+    claim (or an ``adopted`` attempt against anything) is never overridden —
+    only ``armed`` outranks ``adopted``, nothing outranks ``armed``.
     """
     if not session_id:
         return ClaimOutcome(False, "no session_id")
@@ -496,20 +511,58 @@ def record_ownership(
         worktree_path=worktree_path,
         metadata=metadata,
     )
+    resolved_lease_seconds = (
+        _lease_seconds_for(worktree_path, work_found)
+        if lease_seconds is None
+        else lease_seconds
+    )
+
+    def _conflict_outcome(exc: ClaimConflictError) -> ClaimOutcome:
+        claim = exc.decision.claim
+        holder = claim.owner if claim is not None else None
+        return ClaimOutcome(
+            False,
+            "claim held by another session",
+            conflict_session_id=holder.session_id if holder is not None else None,
+            conflict_pid=holder.pid if holder is not None else None,
+            conflict_provenance=(
+                (holder.metadata or {}).get("provenance") if holder is not None else None
+            ),
+            conflict_lease_expires_at=claim.lease_expires_at if claim is not None else None,
+        )
+
     try:
         record = _coordinator().claim_task(
-            ownership_task(repo, pr_number),
-            owner,
-            lease_seconds=(
-                _lease_seconds_for(worktree_path, work_found)
-                if lease_seconds is None
-                else lease_seconds
-            ),
-            now=now,
+            ownership_task(repo, pr_number), owner,
+            lease_seconds=resolved_lease_seconds, now=now,
         )
     except ClaimConflictError as exc:
-        holder = exc.decision.claim.owner.session_id if exc.decision.claim else None
-        return ClaimOutcome(False, "claim held by another session", conflict_session_id=holder)
+        holder_claim = exc.decision.claim
+        holder = holder_claim.owner if holder_claim is not None else None
+        holder_provenance = (holder.metadata or {}).get("provenance") if holder is not None else None
+        can_reclaim = (
+            (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED
+            and holder is not None
+            and holder.session_id != session_id
+            and holder_provenance == PROVENANCE_ADOPTED
+        )
+        if not can_reclaim:
+            return _conflict_outcome(exc)
+        release_ownership(
+            repo=repo, pr_number=pr_number, session_id=holder.session_id,
+            reason="reclaimed_by_armed_session", now=now,
+        )
+        try:
+            record = _coordinator().claim_task(
+                ownership_task(repo, pr_number), owner,
+                lease_seconds=resolved_lease_seconds, now=now,
+            )
+        except ClaimConflictError as exc2:
+            # Someone else won the race between the release and the retry —
+            # report THAT holder, not the one we already released.
+            return _conflict_outcome(exc2)
+        except Exception as exc2:  # noqa: BLE001 — never break the marker write
+            return ClaimOutcome(False, f"claim store error: {type(exc2).__name__}: {exc2}")
     except Exception as exc:  # noqa: BLE001 — never break the marker write
         return ClaimOutcome(False, f"claim store error: {type(exc).__name__}: {exc}")
     return ClaimOutcome(True, "claimed", record.claim_id, record.lease_epoch)

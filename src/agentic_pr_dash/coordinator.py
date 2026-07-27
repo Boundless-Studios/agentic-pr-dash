@@ -293,7 +293,9 @@ def decision_block_reason(pr: PRData) -> str | None:
     )
 
 
-def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> DispatchDecision:
+def dispatch_decision_for_pr(
+    pr: PRData, *, now: datetime | None = None, caller_can_execute: bool = False,
+) -> DispatchDecision:
     # BOU-2040: a question owed to a human outranks every claim consideration
     # below. Checking it first keeps the loop from reading "reclaimable" and
     # re-dispatching an executor that will hit the same boundary and stop again.
@@ -317,6 +319,49 @@ def dispatch_decision_for_pr(pr: PRData, *, now: datetime | None = None) -> Disp
 
     decision = _coordinator().status(task_identity_for_pr(pr), now=now)
     claim = decision.claim
+    # BOU-2491: an ADVISORY claim (explicitly stamped ``can_execute=false`` —
+    # currently only the dashboard's queue-and-claim, BOU-2490) must never
+    # suppress a genuinely EXECUTING caller's dispatch. The coordinator's own
+    # reclaimability is purely time/pid-based and has no notion of "this
+    # owner cannot run an executor at all" — a live, unexpired, pid-less
+    # dashboard claim reads exactly like a real in-progress fix and would
+    # defer to it for the whole lease window, during which nothing executes.
+    #
+    # Gated on ``caller_can_execute`` (the caller's OWN capability, e.g.
+    # `worktree_check._check_worktree`'s loop/session precursor passes True):
+    # the orchestrator's OWN poll loop calls this SAME function to decide
+    # whether to re-queue (a NON-executing question — it just decides
+    # whether to call `dispatch_pr_maintenance` again) and must keep
+    # respecting its own advisory claim to avoid re-queuing the same handoff
+    # every tick (the duplicate-dispatch guard this function exists for in
+    # the first place). Only a caller that can actually run an executor may
+    # override an advisory claim; a non-executing caller re-asking the same
+    # question is not evidence anyone is now covering the work.
+    #
+    # The claim-side check is an EXPLICIT opt-in (``metadata.get(
+    # "can_execute") == "false"``), not ``models.can_execute()``'s "unknown
+    # actor is non-executing" default: that default is right for a NEW claim
+    # that positively declares an actor, but applying it HERE to every claim
+    # lacking the metadata key at all would reclassify every claim written
+    # before BOU-2490 (or through any path that never passes ``actor=``) as
+    # advisory too — the opposite of conservative. Only a claim that SAYS
+    # "I cannot execute" loses its blocking power; silence keeps blocking,
+    # exactly as before BOU-2490 ever existed.
+    if not decision.reclaimable and claim is not None and caller_can_execute:
+        if (claim.owner.metadata or {}).get("can_execute") == "false":
+            holder_actor = (claim.owner.metadata or {}).get("actor")
+            return DispatchDecision(
+                should_dispatch=True,
+                state="advisory_only",
+                reason=(
+                    f"claim held by {claim.owner.session_id} is advisory "
+                    f"(actor={holder_actor!r}, cannot execute) — not a real "
+                    "in-progress fix, so dispatch proceeds"
+                ),
+                claim_id=claim.claim_id,
+                owner_session_id=claim.owner.session_id,
+                owner_pid=claim.owner.pid,
+            )
     if decision.reclaimable and claim and claim.owner.worktree_path:
         if worktree_has_dirty_or_unpushed_changes(claim.owner.worktree_path):
             comment_count = len(getattr(pr, "review_comments", []) or [])

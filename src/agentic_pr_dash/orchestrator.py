@@ -9,6 +9,7 @@ a standalone background subprocess.
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import datetime, timezone
 
 from . import agents, coordinator, github_api, maintenance, session_registry
@@ -841,11 +842,21 @@ class Orchestrator:
             claim = coordinator.claim_pr(
                 pr,
                 session_id=DASHBOARD_OWNER_SESSION_ID,
-                pid=None,
+                # BOU-2491: carry THIS `serve` process's own pid, not None.
+                # `agent_coordinator.default_pid_is_live` treats pid=None as
+                # unconditionally "live" — a claim with no pid can never be
+                # pid-liveness-reaped, so a crashed dashboard's claim would
+                # sit until lease expiry only, however long that is. The
+                # dashboard process is the real liveness handle for its own
+                # claim: once `serve` dies, this pid check reaps it promptly.
+                pid=os.getpid(),
                 agent=DASHBOARD_OWNER_SESSION_ID,
                 lease_seconds=load_config(pr.worktree_path).lease_seconds,
                 # Advisory: this claim suppresses re-queuing, it does NOT mean the
                 # PR is being fixed. The dashboard has no executor (BOU-2491).
+                # `dispatch_decision_for_pr` additionally reads `can_execute`
+                # from this actor to make sure this claim never suppresses the
+                # LOOP's real dispatch either.
                 actor=MaintenanceActor.DASHBOARD_QUEUE,
             )
             pr.coordinator_claim = claim

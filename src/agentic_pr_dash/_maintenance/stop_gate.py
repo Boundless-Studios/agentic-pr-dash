@@ -463,6 +463,15 @@ def _stop_gate_impl(args) -> int:
     from .worktree_check import DRAFT_PR_MARKER, WARN_ONLY_MARKER  # noqa: PLC0415
     adopted_pending: list[tuple[str, str]] = []
     draft_worktrees: set[str] = set()
+    # BOU-2450: `pr_for` (below, from `resolve_owned`) is a claim-derived
+    # snapshot taken ONCE at the top of this call — before this very loop runs
+    # and can PRUNE a worktree's marker/claim on discovering (via a fresh
+    # per-worktree probe) that its recorded PR already merged/closed. Without
+    # tracking what got pruned THIS tick, the waiter-demand block further down
+    # still finds the stale PR number in `pr_for` and reports "you own open PR
+    # #N" (or demands a waiter for it) for a PR this same tick just confirmed
+    # is no longer open.
+    pruned_pr_numbers: set[int] = set()
     for worktree in owned:
         local_sha = _local_head_sha(worktree)
         cached_entry = pr_head_cache.get(worktree)
@@ -519,9 +528,16 @@ def _stop_gate_impl(args) -> int:
                 worktree, kind="prune_divergence", snap=resolution_snapshot
             )
             if pruned.pr_number is not None:
-                _prune_stale_marker(
+                actually_pruned = _prune_stale_marker(
                     worktree, {"pr": str(pruned.pr_number)}, session_id
                 )
+                # Only when `_prune_stale_marker` ACTUALLY pruned (it no-ops
+                # unless its own fresh `_pr_open_state` probe confirms
+                # merged/closed) does this tick know the PR is dead — a
+                # still-open PR must never be excluded from the waiter-demand
+                # set below.
+                if actually_pruned:
+                    pruned_pr_numbers.add(pruned.pr_number)
 
     if pr_head_cache_dirty:
         _save_pr_head_cache(cwd, pr_head_cache)
@@ -608,7 +624,9 @@ def _stop_gate_impl(args) -> int:
             marker_open_pr_numbers = (
                 _owned_open_pr_numbers(owned) - exclusively_draft_pr_numbers
             )
-            owned_pr_numbers = marker_open_pr_numbers | claim_open_pr_numbers
+            owned_pr_numbers = (
+                marker_open_pr_numbers | claim_open_pr_numbers
+            ) - pruned_pr_numbers
             worktree_prs = {
                 n for n in owned_pr_numbers
                 if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))

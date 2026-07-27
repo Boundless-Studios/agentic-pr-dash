@@ -653,18 +653,24 @@ def _read_session_marker(cwd: str) -> str:
         return ""
 
 
-def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
-    """Remove stale ownership artifacts when a marker's PR is authoritatively closed/merged."""
+def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> bool:
+    """Remove stale ownership artifacts when a marker's PR is authoritatively
+    closed/merged. Returns True iff it actually pruned something — the caller
+    needs to know this, not merely that it was called with a candidate PR
+    number, so a still-open PR (the common no-op case) can be told apart from
+    one this call just confirmed dead (BOU-2450: a caller that assumed every
+    call pruned let a merged PR's stale number keep feeding a waiter-demand
+    set computed before this prune ran)."""
     from .pr_state import _pr_open_state  # noqa: PLC0415
     from .stop_gate import _stop_state_path  # noqa: PLC0415
     pr_raw = marker.get("pr", "")
     if not str(pr_raw).isdigit():
-        return
+        return False
     pr_number = int(pr_raw)
 
     state, *_ = _pr_open_state(pr_number, cwd)
     if state not in ("merged", "closed"):
-        return
+        return False
 
     try:
         os.remove(_marker_path(cwd))
@@ -690,6 +696,7 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> None:
         pass
 
     release_ownership_claims(cwd, {pr_number}, session_id)
+    return True
 
 
 def release_ownership_claims(

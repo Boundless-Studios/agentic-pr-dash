@@ -270,6 +270,25 @@ def _cmd_check(args: argparse.Namespace) -> int:
     return code
 
 
+def _arm_gh_probe_budget_seconds() -> float:
+    """Wall-clock budget (BOU-2477) shared by BOTH of `arm`'s gh probes.
+
+    Default keeps real headroom under arm's documented ~10s Stop-hook
+    preflight budget. ``AGENTIC_PR_DASH_ARM_GH_PROBE_BUDGET_SECONDS``
+    overrides for tests/tuning; a non-positive or unparseable value disables
+    the shared deadline (falls back to `_gh_pr_view_field`'s own
+    attempt-count bound, matching pre-BOU-2477 behavior).
+    """
+    raw = os.environ.get("AGENTIC_PR_DASH_ARM_GH_PROBE_BUDGET_SECONDS", "").strip()
+    if not raw:
+        return 8.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 8.0
+    return value if value > 0 else 0.0
+
+
 def _cmd_arm(args: argparse.Namespace) -> int:
     """Explicitly register a worktree's open non-draft PR under a session."""
     cwd = os.path.abspath(args.cwd)
@@ -311,7 +330,11 @@ def _cmd_arm(args: argparse.Namespace) -> int:
         # The quiet paths below ("no open PR", "is a draft") are genuine
         # not-applicable cases and still return 0. Only "we could not find out"
         # is now loud and non-zero.
-        status, why = _pr_draft_status_detailed(cwd, int(pr_number))
+        # BOU-2477: ONE shared deadline for both probes below, so the total —
+        # not each probe independently — stays inside the Stop-hook budget.
+        _budget = _arm_gh_probe_budget_seconds()
+        _deadline = time.monotonic() + _budget if _budget > 0 else None
+        status, why = _pr_draft_status_detailed(cwd, int(pr_number), deadline=_deadline)
         if status is None:
             print(
                 f"could not determine whether PR #{pr_number} is a draft; not arming.\n"
@@ -322,7 +345,7 @@ def _cmd_arm(args: argparse.Namespace) -> int:
         if status:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
-        head_branch, why = _pr_head_branch_detailed(cwd, int(pr_number))
+        head_branch, why = _pr_head_branch_detailed(cwd, int(pr_number), deadline=_deadline)
         if head_branch is None:
             print(
                 f"could not determine PR #{pr_number}'s head branch; not arming.\n"
@@ -339,8 +362,39 @@ def _cmd_arm(args: argparse.Namespace) -> int:
     if _write_arm_marker(cwd, session_id, int(pid), int(pr_number)):
         print(f"armed PR #{pr_number} for session {session_id} in {cwd}")
         return 0
-    print(f"could not write arm marker in {cwd}", file=sys.stderr)
+    # BOU-2409: "could not write arm marker" reads as a filesystem problem —
+    # the real cause (once marker writes are retired, BOU-2223 Stage 4) is
+    # almost always a fenced ownership claim a DIFFERENT, live session holds.
+    # Name that holder instead of the generic message, so the operator does
+    # not go chasing a disk/permissions issue that does not exist.
+    print(_arm_refusal_message(cwd, int(pr_number)), file=sys.stderr)
     return 1
+
+
+def _arm_refusal_message(cwd: str, pr_number: int) -> str:
+    """Explain why `arm` could not write, naming the current claim holder when
+    one is resolvable (BOU-2409). Falls back to the generic message when the
+    claim store can't be read or holds no claim for this PR — a write failure
+    for some OTHER reason (e.g. a genuinely unwritable state dir) still needs
+    to say something, and a stale/absent claim is not evidence of what the
+    real cause was.
+    """
+    try:
+        from agentic_pr_dash import ownership  # noqa: PLC0415
+        repo = _repo_slug(cwd)
+        snap = ownership.snapshot()
+        claim = snap.claim_for(repo, pr_number) if snap.known() else None
+        if claim is not None:
+            provenance = (claim.owner.metadata or {}).get("provenance", "unknown")
+            return (
+                f"PR #{pr_number} is claimed by session {claim.owner.session_id} "
+                f"(pid {claim.owner.pid}, provenance={provenance}, "
+                f"lease expires {claim.lease_expires_at.isoformat()}); not arming "
+                f"in {cwd}"
+            )
+    except Exception:  # noqa: BLE001 — a diagnostic must never crash the CLI
+        pass
+    return f"could not write arm marker in {cwd}"
 
 
 def _cmd_list_owned(args: argparse.Namespace) -> int:
@@ -867,10 +921,38 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             pending: list[tuple[str, str]] = []
             gh_unobservable = False
             warn_only_deferral = False
+            # BOU-2430: an ADOPTED worktree is one auto-adoption handed this
+            # session — it never armed the PR and the maintenance loop, not
+            # this session, is responsible for it. The stop gate already
+            # excludes adopted worktrees from its blocking set and tells the
+            # operator so ("NOT blocking your stop"); the waiter it then
+            # prescribes must honor the SAME exclusion, or the gate's own
+            # message is unsatisfiable — it demands a waiter whose very first
+            # tick reports "feedback arrived, address it now" on the PR it
+            # just called non-blocking. One scope, both places.
+            from ._maintenance.ownership_resolution import (  # noqa: PLC0415
+                resolve_worktree as _resolve_worktree_ownership,
+            )
+            from agentic_pr_dash import ownership as _ownership_mod  # noqa: PLC0415
+            _await_snap = _ownership_mod.snapshot()
             for worktree in owned:
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
-                    pending.append((worktree, text))
+                    provenance = _resolve_worktree_ownership(
+                        worktree, kind="await_adopted_scope", snap=_await_snap
+                    ).provenance
+                    if provenance == "adopted":
+                        # Reported via the same adopted-work FYI as the stop
+                        # gate, never as blocking feedback for THIS waiter.
+                        print(
+                            f"[pr-watch] FYI: adopted worktree {worktree} has "
+                            "pending work — auto-adopted, not armed by this "
+                            "session, so the maintenance loop owns it and it "
+                            "does not wake this waiter.",
+                            file=sys.stderr,
+                        )
+                    else:
+                        pending.append((worktree, text))
                 elif code == 2:
                     # gh could not resolve this worktree's PR this tick — its
                     # state is UNOBSERVABLE, so this tick must not conclude
@@ -1257,6 +1339,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         default=False,
         help=argparse.SUPPRESS,
+    )
+    await_p.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Accepted for symmetry with `arm --pr N` and ignored: `await` "
+        "always resolves the PR(s) it watches from the state dir at --cwd, "
+        "never from a single --pr value (BOU-2538).",
     )
 
     args = parser.parse_args(argv)

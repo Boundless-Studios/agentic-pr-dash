@@ -685,7 +685,12 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     active_owner = coordinator.active_claim_owner_for_pr(pr)
     self_owned = active_owner is not None and active_owner.session_id == owner_session_id
 
-    coord_decision = coordinator.dispatch_decision_for_pr(pr)
+    # BOU-2491: this checker (the loop's dispatch precursor, or a session's
+    # own passive probe) IS a genuinely executing/servicing caller — it must
+    # never idle behind a dashboard's advisory (can_execute=false) claim, the
+    # bug where "the component that cannot run an executor holds a claim
+    # against the component that can."
+    coord_decision = coordinator.dispatch_decision_for_pr(pr, caller_can_execute=True)
 
     # BOU-2040: a pending human decision defers UNCONDITIONALLY — it must
     # outrank both `new_feedback` and `self_owned`, unlike a foreign claim.
