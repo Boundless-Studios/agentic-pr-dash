@@ -776,6 +776,7 @@ class Orchestrator:
             # other guard on this path (BOU-2223 Stage 4).
             from ._maintenance.ownership_resolution import (  # noqa: PLC0415
                 live_foreign_claim,
+                ownership_unknown,
             )
 
             if markers._marker_live_foreign_pid(
@@ -788,6 +789,23 @@ class Orchestrator:
                 self.log(
                     f"Skipping headless maintenance for #{pr.number} — a live "
                     f"in-session owner holds the worktree",
+                    pr_number=pr.number,
+                )
+                return
+            # Fail closed (P1 adoption-theft defect): neither check above found
+            # an owner, but that can mean "both sources agree unowned" (safe)
+            # or "the claim store could not be read this tick" (NOT safe — we
+            # simply don't know). Dispatching headless maintenance on the
+            # latter risks editing a live session's worktree out from under it,
+            # the exact failure this whole gate exists to prevent. See
+            # ownership_resolution.ownership_unknown.
+            if ownership_unknown(
+                pr.worktree_path, kind="dashboard_dispatch_divergence"
+            ):
+                self.log(
+                    f"Skipping headless maintenance for #{pr.number} — "
+                    f"ownership state unresolvable (claim store unreadable, "
+                    f"no local marker)",
                     pr_number=pr.number,
                 )
                 return

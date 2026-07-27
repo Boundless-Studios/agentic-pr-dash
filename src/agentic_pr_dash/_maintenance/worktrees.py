@@ -435,6 +435,17 @@ def _collect_owned_worktrees(
         if abs_path in independent:
             continue
         owned = _own(worktree_path)
+        if owned.unknown:
+            # Fail closed (P1 adoption-theft defect): the claim store could not
+            # be read this tick and no local marker exists, so we genuinely do
+            # not know whether this worktree is already owned — NOT "unmarked
+            # and safe to adopt". Treating an unreadable store as "unowned"
+            # would let this session take over a PR a live session actually
+            # holds whose claim we simply failed to read (e.g. a lock-
+            # contention race on the shared store). Skip the candidate
+            # entirely; a later tick with a healthy store resolves it
+            # correctly from either side.
+            continue
         if owned.owned_by(session_id):
             # Already ours — but if the recorded PR is stale (the branch's open
             # PR changed since we armed), rewrite the marker so the Stop-gate
