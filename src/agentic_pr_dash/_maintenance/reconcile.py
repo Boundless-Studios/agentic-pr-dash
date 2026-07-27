@@ -54,6 +54,14 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
                 owned = resolve_worktree(
                     abs_wt, kind="reconcile_divergence", snap=snap
                 )
+                if owned.unknown:
+                    # Fail closed (P1 adoption-theft defect): the claim store
+                    # could not be read this tick and no local marker exists —
+                    # we genuinely do not know whether a live session covers
+                    # this worktree, so this entry must NOT be treated as a
+                    # dead session's orphan. Skip it; a later tick with a
+                    # healthy store resolves ownership correctly.
+                    continue
                 marker_sid = _marker_session_id(abs_wt)
                 # Union (BOU-2223 Stage 3): ours by EITHER source means covered.
                 if marker_sid == session_id or owned.owned_by(session_id):

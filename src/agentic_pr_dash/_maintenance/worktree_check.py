@@ -484,6 +484,27 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         owner = live_foreign_claim_owner(
             cwd, self_session_id, kind="worktree_check_divergence"
         )
+        if owner is None:
+            # Fail closed (P1 adoption-theft defect): neither the marker nor a
+            # live claim named an owner, but that can mean two very different
+            # things — "both sources agree nobody owns this" (safe to proceed)
+            # or "the claim store could not be read this tick, so we simply
+            # could not tell" (NOT safe). ``ownership_unknown`` distinguishes
+            # them; collapsing the two here would let this session dispatch or
+            # take over a PR a live session actually holds, whose claim we
+            # just failed to read (e.g. a lock-contention race on the shared
+            # store). Report unobservable — the same convention as a `gh`
+            # outage (code 2) — so neither the active `check`/claim path nor
+            # the passive stop-gate concludes clean or dispatches; a later
+            # tick with a healthy store resolves it correctly from either
+            # side.
+            from .ownership_resolution import ownership_unknown  # noqa: PLC0415
+            if ownership_unknown(cwd, kind="worktree_check_divergence"):
+                return 2, (
+                    "[pr-watch] ownership state unresolvable for this worktree "
+                    "(claim store unreadable, no local marker) — deferring "
+                    "this tick rather than risk taking over a live session's PR"
+                )
     if owner is not None:
         # BOU-1879: a wake-capable owner (live feedback waiter) keeps ownership; a
         # WAKE-LESS owner gets exactly one grace tick, then we take over (fall through

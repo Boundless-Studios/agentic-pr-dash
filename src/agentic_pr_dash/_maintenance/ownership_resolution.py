@@ -334,6 +334,18 @@ class WorktreeOwnership:
     claim_session_ids: tuple[str, ...] = ()
     marker_session_id: str | None = None
     divergences: list[dict] = field(default_factory=list)
+    #: True when ownership is genuinely UNRESOLVABLE this call — the claim store
+    #: could not be read (a lock timeout or corrupt log) AND no marker exists to
+    #: fall back on. Distinct from ``source == "none"``, which means BOTH sources
+    #: were actually consulted and agree nobody owns this worktree. Collapsing the
+    #: two let a transient claim-store hiccup read as "unowned" and let a sibling
+    #: session (or the detached loop) adopt or dispatch against a PR someone else
+    #: actually holds. Callers that gate ADOPTION or TAKEOVER must check this
+    #: first and fail closed (decline) rather than fall through to a "none" path;
+    #: callers that only answer the stop gate's "which worktrees do I own" question
+    #: already fail closed via ``resolve_owned``'s marker-only fallback and do not
+    #: need this flag.
+    unknown: bool = False
 
     def owned_by(self, session_id: str) -> bool:
         """Union rule: ``session_id`` owns this worktree if EITHER source says so.
@@ -371,7 +383,9 @@ def resolve_worktree(
     marker_pr, marker_prov = _marker_pr_and_provenance(path)
     marker_session = _marker_session_id(path)
 
-    def _marker_only(source: str, divergences: list[dict] | None = None) -> WorktreeOwnership:
+    def _marker_only(
+        source: str, divergences: list[dict] | None = None, *, unknown: bool = False,
+    ) -> WorktreeOwnership:
         return WorktreeOwnership(
             worktree=path,
             session_id=marker_session,
@@ -380,6 +394,7 @@ def resolve_worktree(
             source=source,
             marker_session_id=marker_session,
             divergences=divergences or [],
+            unknown=unknown,
         )
 
     if not claim_reads_enabled():
@@ -397,9 +412,23 @@ def resolve_worktree(
     if not snapshot.known():
         # "Could not look", NOT "no claims" — fall back entirely to the marker,
         # exactly as the kill-switch-off shape, and say why once.
+        #
+        # When a marker DOES exist it is still a trustworthy, store-independent
+        # answer, so this stays "marker" exactly as before. When it does NOT,
+        # the honest answer is "we do not know" — NOT "none" (genuinely unowned,
+        # both sources consulted and agree). Reading an unreadable store as
+        # "none" is precisely the P1 adoption-theft defect this fixes: a
+        # transient lock timeout on the shared claim store would otherwise look
+        # identical to a real absence of ownership, and a sibling
+        # session/the detached loop would adopt or dispatch against a PR someone
+        # else actually holds. ``unknown=True`` lets adoption/takeover callers
+        # fail closed on exactly this case (see the field docstring); callers
+        # that don't check it keep today's fallback behavior unchanged.
+        no_marker = not marker_session and marker_pr is None
         return _marker_only(
             "marker" if marker_session or marker_pr else "none",
             [_log({"reason": "claim_store_unreadable", "marker_pr": marker_pr})],
+            unknown=no_marker,
         )
 
     views = snapshot.live_claims_for_worktree(path)
@@ -530,3 +559,29 @@ def live_foreign_claim_owner(
         if sid != self_session_id:
             return sid
     return None
+
+
+def ownership_unknown(worktree_path: str, *, kind: str, snap=None) -> bool:
+    """True when ownership of ``worktree_path`` is genuinely UNRESOLVABLE.
+
+    The claim store could not be read (a lock timeout or corrupt log) AND no
+    marker exists to fall back on — see :attr:`WorktreeOwnership.unknown`. This
+    is a THIRD answer, distinct from both "a live foreign claim/marker owns it"
+    (``live_foreign_claim`` / ``_live_foreign_owner``, True) and "nobody owns
+    it" (both return False/None because both sources were actually consulted
+    and agree). A caller that only checks the first two would read this case as
+    the second — "no owner, safe to service/dispatch/adopt" — which is exactly
+    the P1 adoption-theft defect this exists to close. Callers that gate
+    adoption or takeover must check this alongside the marker/claim checks and
+    fail closed (defer/decline) when it is True, the same way
+    ``reconcile._unknown_gh_state_record`` fails closed on an unresolvable `gh`
+    probe rather than reporting a PR clean.
+
+    Fail-open on an unexpected exception, matching every other helper in this
+    module: a coordination-layer bug must not wedge maintenance broadly, and the
+    caller's existing marker-based gate stays in force regardless.
+    """
+    try:
+        return resolve_worktree(worktree_path, kind=kind, snap=snap).unknown
+    except Exception:  # noqa: BLE001 — never break a coordination check
+        return False
