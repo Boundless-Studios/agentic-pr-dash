@@ -1148,13 +1148,23 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             from agentic_pr_dash import ownership as _ownership_mod  # noqa: PLC0415
             _await_snap = _ownership_mod.snapshot()
             for worktree in owned:
+                # Provenance is resolved for EVERY owned worktree, not just the
+                # code==10 ones. Deciding it inside a single branch left adopted
+                # worktrees in the waiter's effective scope on every other
+                # outcome: a code-2 adopted worktree would raise the global
+                # `gh_unobservable` flag and block a clean exit for unrelated
+                # armed PRs, and a code-0 adopted PR with running CI would stay
+                # in `watched_owned` and keep the waiter alive indefinitely —
+                # for work the maintenance loop, not this session, owns.
+                provenance = _resolve_worktree_ownership(
+                    worktree, kind="await_adopted_scope", snap=_await_snap
+                ).provenance
+                is_adopted = provenance == "adopted"
+                if is_adopted:
+                    adopted_worktrees.add(worktree)
                 code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
-                    provenance = _resolve_worktree_ownership(
-                        worktree, kind="await_adopted_scope", snap=_await_snap
-                    ).provenance
-                    if provenance == "adopted":
-                        adopted_worktrees.add(worktree)
+                    if is_adopted:
                         # Reported via the same adopted-work FYI as the stop
                         # gate, never as blocking feedback for THIS waiter.
                         print(
@@ -1166,12 +1176,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         )
                     else:
                         pending.append((worktree, text))
-                elif code == 2:
+                elif code == 2 and not is_adopted:
                     # gh could not resolve this worktree's PR this tick — its
                     # state is UNOBSERVABLE, so this tick must not conclude
                     # "clean" (suppresses the BOU-1962 early exit below).
                     gh_unobservable = True
-                elif code == 0 and text.rstrip().endswith(WARN_ONLY_MARKER):
+                elif code == 0 and not is_adopted and text.rstrip().endswith(
+                    WARN_ONLY_MARKER
+                ):
                     # Warn-only deferral: the PR HAS blockers but a live foreign
                     # owner / active coordinator claim is responsible, so no fix
                     # is dispatched here. The PR is explicitly NOT clean — this

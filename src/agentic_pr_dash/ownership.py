@@ -563,28 +563,39 @@ def record_ownership(
                 conflict_provenance=holder_provenance,
                 conflict_lease_expires_at=holder_claim.lease_expires_at,
             )
-        try:
-            from . import session_ledger  # noqa: PLC0415
-            session_ledger.prune(
-                holder.session_id, {pr_number}, repo=repo, include_legacy=True,
-            )
-            if holder.worktree_path:
-                marker_path = load_config(holder.worktree_path).watch_marker_for(
-                    holder.worktree_path
+        # Fence the durable cleanup the same way the release above is fenced.
+        # Releasing the adopted claim opens a window in which the adopter can
+        # re-arm this PR — appending a FRESH ledger entry and taking a new
+        # coordinator claim carrying `armed` provenance. An unconditional prune
+        # would delete that new entry, so the adopter would go on to win the
+        # claim retry below (correctly) but be left without the durable
+        # ledger/marker artifacts a session-wide waiter needs to find the
+        # worktree after a restart or from another maintenance root. Re-read the
+        # store and only retire durable state while the PR is still unclaimed.
+        _recheck = snapshot(now=now).claim_for(repo, pr_number)
+        if _recheck is None or _recheck.status != "active":
+            try:
+                from . import session_ledger  # noqa: PLC0415
+                session_ledger.prune(
+                    holder.session_id, {pr_number}, repo=repo, include_legacy=True,
                 )
-                fields: dict[str, str] = {}
-                with open(marker_path, encoding="utf-8") as fh:
-                    for line in fh:
-                        key, _, value = line.strip().partition("=")
-                        fields[key] = value
-                if (
-                    fields.get("session_id") == holder.session_id
-                    and fields.get("pr") == str(pr_number)
-                    and fields.get("provenance") == PROVENANCE_ADOPTED
-                ):
-                    os.remove(marker_path)
-        except (OSError, ValueError):
-            pass
+                if holder.worktree_path:
+                    marker_path = load_config(holder.worktree_path).watch_marker_for(
+                        holder.worktree_path
+                    )
+                    fields: dict[str, str] = {}
+                    with open(marker_path, encoding="utf-8") as fh:
+                        for line in fh:
+                            key, _, value = line.strip().partition("=")
+                            fields[key] = value
+                    if (
+                        fields.get("session_id") == holder.session_id
+                        and fields.get("pr") == str(pr_number)
+                        and fields.get("provenance") == PROVENANCE_ADOPTED
+                    ):
+                        os.remove(marker_path)
+            except (OSError, ValueError):
+                pass
         try:
             record = _coordinator().claim_task(
                 ownership_task(repo, pr_number), owner,

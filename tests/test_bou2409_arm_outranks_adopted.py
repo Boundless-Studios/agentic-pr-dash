@@ -190,3 +190,78 @@ def test_arm_cli_names_the_foreign_holder_instead_of_a_generic_message(
         f"the generic write-failure text (BOU-2409). Got: {err!r}"
     )
     assert "foreign-armer-2" in err, f"expected the holder's session id in the message. Got: {err!r}"
+
+
+def test_durable_cleanup_is_skipped_when_the_adopter_rearms(isolated_store, monkeypatch):
+    """Retiring the adopter's durable state must be fenced like the release is.
+
+    Releasing the adopted claim opens a window. If the adopter re-arms inside it,
+    it has already appended a FRESH ledger entry and holds a new claim with
+    `armed` provenance. An unconditional prune would delete that entry, so the
+    adopter would win the claim retry (correctly) but be left with no durable
+    ledger/marker artifacts — and a session-wide waiter would then miss the
+    worktree after a restart or when launched from another maintenance root.
+    """
+    wt = _mk(isolated_store, "wt")
+    ownership.record_ownership(
+        repo=REPO, pr_number=564, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+
+    from agentic_pr_dash import session_ledger
+
+    pruned: list[tuple] = []
+    monkeypatch.setattr(
+        session_ledger, "prune", lambda *a, **k: pruned.append((a, k))
+    )
+
+    original = ownership.release_ownership
+
+    def rearm_inside_the_window(**kwargs):
+        released = original(**kwargs)
+        assert released.ok, "setup: the fenced release itself must succeed"
+        # The adopter re-arms between the release and the durable cleanup.
+        assert ownership.record_ownership(
+            repo=REPO, pr_number=564, session_id="adopter", pid=LIVE_PID,
+            worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+        ).ok
+        return released
+
+    monkeypatch.setattr(ownership, "release_ownership", rearm_inside_the_window)
+    ownership.record_ownership(
+        repo=REPO, pr_number=564, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    )
+
+    assert pruned == [], (
+        "the adopter re-armed inside the release window, so its ledger entry "
+        "belongs to a live ARMED claim — the durable cleanup must re-check the "
+        "store and leave it alone"
+    )
+
+
+def test_durable_cleanup_still_runs_when_nobody_reclaims(isolated_store, monkeypatch):
+    """Control: with no racing re-arm, the adopter's durable state IS retired."""
+    wt = _mk(isolated_store, "wt")
+    ownership.record_ownership(
+        repo=REPO, pr_number=566, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+
+    from agentic_pr_dash import session_ledger
+
+    pruned: list[tuple] = []
+    monkeypatch.setattr(
+        session_ledger, "prune", lambda *a, **k: pruned.append((a, k))
+    )
+
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=566, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    ).ok
+
+    assert pruned, (
+        "with no concurrent re-arm the reclaiming session must still retire the "
+        "adopter's ledger row, or the successful armer falls through to a stale "
+        "adopter record"
+    )

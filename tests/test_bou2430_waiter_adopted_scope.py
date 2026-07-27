@@ -139,3 +139,64 @@ def test_waiter_still_blocks_on_an_armed_worktrees_blockers(tmp_path, monkeypatc
     ])
 
     assert rc == 10, "an ARMED worktree's real blockers must still wake the waiter"
+
+
+@pytest.mark.parametrize(
+    ("code", "text"),
+    [
+        (2, "gh could not resolve the PR for this worktree"),
+        (0, "PR #999: clean\nPR_NUMBER=999"),
+    ],
+    ids=["gh-unobservable", "clean-with-running-ci"],
+)
+def test_adopted_worktree_is_excluded_on_every_outcome(tmp_path, monkeypatch, code, text):
+    """Provenance must be resolved for EVERY owned worktree, not only code==10.
+
+    The first version of the adopted-scope exclusion recorded `adopted_worktrees`
+    inside the `code == 10` branch only. An adopted worktree returning anything
+    else therefore stayed in the waiter's effective scope:
+
+      * code 2 raised the GLOBAL `gh_unobservable` flag, which suppresses the
+        clean exit for unrelated ARMED PRs that were perfectly fine;
+      * code 0 with running CI stayed in `watched_owned`, so the waiter kept
+        itself alive indefinitely watching work the maintenance loop owns.
+
+    Both are the same bug as BOU-2430 itself, just on a different exit code.
+    """
+    adopted_wt = tmp_path / "adopted"
+    adopted_wt.mkdir()
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(adopted_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(
+        _ownres_mod, "resolve_worktree", _fake_ownership({str(adopted_wt): "adopted"})
+    )
+    monkeypatch.setattr(
+        mc, "_check_worktree", lambda path, session_id, *, claim=True: (code, text)
+    )
+    watched = []
+    monkeypatch.setattr(
+        mc, "_await_watch_pending_this_tick",
+        lambda owned, detached, cwd, sid: watched.extend(owned) or False,
+    )
+
+    mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "1",
+        "--max-wait", "0",
+    ])
+
+    assert watched == [], (
+        f"an ADOPTED worktree returning code {code} must be excluded from the "
+        "waiter's watch probes too — provenance has to be resolved for every "
+        "owned worktree, not just the code==10 ones"
+    )
