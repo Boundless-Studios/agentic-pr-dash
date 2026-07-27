@@ -622,4 +622,9 @@ def _record_has_blockers(record: dict) -> bool:
         or record["ci_failing"]
         or record.get("changes_requested")
         or record.get("merge_conflict")
+        # A gh probe failure must fail CLOSED, not silently read as clean
+        # (P1: reconcile-prs used to report every PR as blocker-free during a
+        # transient gh outage). `_unknown_gh_state_record` sets this whenever
+        # the PR-state probe could not be resolved at all.
+        or record.get("gh_state_unknown")
     )

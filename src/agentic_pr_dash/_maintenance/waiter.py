@@ -274,6 +274,8 @@ def _detached_loop_alive(cwd: str) -> bool:
 def _detached_pending_entry(r: dict) -> tuple[str, str]:
     """Build the (label, text) pending entry for a detached PR record."""
     why = []
+    if r.get("gh_state_unknown"):
+        why.append("gh could not verify this PR's state (treated as pending)")
     if r["unresolved_threads"]:
         why.append(f"{r['unresolved_threads']} unresolved review thread(s)")
     if r["ci_failing"]:
@@ -287,6 +289,8 @@ def _detached_pending_entry(r: dict) -> tuple[str, str]:
     # build_maintenance_summary; the verbose `why` list above keeps its
     # existing "thread(s)" wording untouched (BOU-1947).
     summary_why = []
+    if r.get("gh_state_unknown"):
+        summary_why.append("gh state unknown")
     if r["unresolved_threads"]:
         summary_why.append(f"{r['unresolved_threads']} unresolved review comment(s)")
     if r["ci_failing"]:
