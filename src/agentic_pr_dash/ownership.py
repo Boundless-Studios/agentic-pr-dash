@@ -532,6 +532,36 @@ def record_ownership(
             conflict_lease_expires_at=claim.lease_expires_at if claim is not None else None,
         )
 
+    # Promote this session's OWN adopted claim before claiming. `claim_task`
+    # treats an active same-session claim as an idempotent heartbeat and keeps
+    # the original owner metadata, so it raises no ClaimConflictError and the
+    # reclaim branch below never runs. A session that auto-adopted a PR and
+    # later explicitly ARMS it would therefore be told it succeeded while the
+    # authoritative claim still said `provenance=adopted` — and with marker
+    # writes off by default (Stage 4) nothing else records the arm. The stop
+    # gate and the await loop both exclude adopted worktrees as
+    # maintenance-loop-owned, so the explicit arm bought no coverage at all.
+    # Releasing first makes the subsequent claim_task mint a fresh claim
+    # carrying `armed`.
+    if (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED and session_id:
+        try:
+            _self = snapshot(now=now)
+            _own = _self.claim_for(repo, pr_number) if _self.known() else None
+            if (
+                _own is not None
+                and _own.status == "active"
+                and _own.owner.session_id == session_id
+                and (_own.owner.metadata or {}).get("provenance") == PROVENANCE_ADOPTED
+            ):
+                release_ownership(
+                    repo=repo, pr_number=pr_number, session_id=session_id,
+                    reason="promoted_adopted_to_armed", now=now,
+                    claim_id=_own.claim_id, lease_epoch=_own.lease_epoch,
+                    expected_provenance=PROVENANCE_ADOPTED,
+                )
+        except Exception:  # noqa: BLE001 — promotion is best-effort; never break the claim
+            pass
+
     try:
         record = _coordinator().claim_task(
             ownership_task(repo, pr_number), owner,

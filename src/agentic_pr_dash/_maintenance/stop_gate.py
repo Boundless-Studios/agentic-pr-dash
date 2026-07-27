@@ -694,9 +694,25 @@ def _stop_gate_impl(args) -> int:
                 if keys and keys <= pruned_pr_keys
             }
             owned_pr_numbers -= fully_pruned_numbers
+
+            def _live_wts_for(n: int) -> list[str]:
+                """Worktrees for PR ``n`` that were NOT pruned this tick.
+
+                A number is only dropped above when EVERY repo carrying it was
+                pruned. For a partially-pruned number — repo A's #N closed while
+                repo B's #N is still open — the stale repo-A worktree survives in
+                `_wts_for(n)`, is naturally uncovered by any loop, and so makes
+                `all(...)` false and demands a waiter for an already-closed PR.
+                Coverage must be judged only on the worktrees still in play.
+                """
+                return [
+                    wt for wt in _wts_for(n)
+                    if (_slug(wt), n) not in pruned_pr_keys
+                ]
+
             worktree_prs = {
                 n for n in owned_pr_numbers
-                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))
+                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _live_wts_for(n))
             }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):

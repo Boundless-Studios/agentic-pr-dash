@@ -193,6 +193,36 @@ def test_arm_cli_names_the_foreign_holder_instead_of_a_generic_message(
     assert "foreign-armer-2" in err, f"expected the holder's session id in the message. Got: {err!r}"
 
 
+def test_same_session_adopted_claim_is_promoted_to_armed(isolated_store):
+    """Arming a PR this session previously ADOPTED must actually take it armed.
+
+    `claim_task` treats an active same-session claim as an idempotent heartbeat
+    and preserves the original owner metadata, so it raises no conflict and the
+    foreign-reclaim branch never runs. With marker writes off by default nothing
+    else records the arm, so the authoritative claim keeps `provenance=adopted`
+    — and BOTH the stop gate and the await loop exclude adopted worktrees as
+    maintenance-loop-owned. The explicit arm would buy no coverage whatsoever.
+    """
+    wt = _mk(isolated_store, "wt")
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=572, session_id="same-session", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    ).ok
+
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=572, session_id="same-session", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    ).ok
+
+    claim = ownership.snapshot().claim_for(REPO, 572)
+    assert claim is not None
+    assert (claim.owner.metadata or {}).get("provenance") == ownership.PROVENANCE_ARMED, (
+        "arming a PR this session had adopted must promote the claim to armed; "
+        "leaving it 'adopted' makes the stop gate and waiter keep excluding the "
+        "PR as maintenance-loop-owned even though the session explicitly armed it"
+    )
+
+
 def test_arm_refusal_ignores_a_released_claim(isolated_store):
     """A RELEASED claim must not be reported as the current holder.
 
