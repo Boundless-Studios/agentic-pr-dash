@@ -387,8 +387,15 @@ def _arm_refusal_message(cwd: str, pr_number: int) -> str:
         from agentic_pr_dash import ownership  # noqa: PLC0415
         repo = _repo_slug(cwd)
         snap = ownership.snapshot()
+        # `claim_for` returns the recorded claim regardless of status or
+        # liveness, so a released or dead-owner claim would otherwise be
+        # reported as the CURRENT holder — hiding the real cause when the arm
+        # failed for an unrelated reason (an unwritable state dir, say).
+        # `live_owner_for` applies the marker-parity liveness rule, so a stale
+        # claim falls through to the generic message instead.
         claim = snap.claim_for(repo, pr_number) if snap.known() else None
-        if claim is not None:
+        live = snap.live_owner_for(repo, pr_number) if snap.known() else None
+        if claim is not None and live is not None:
             provenance = (claim.owner.metadata or {}).get("provenance", "unknown")
             return (
                 f"PR #{pr_number} is claimed by session {claim.owner.session_id} "

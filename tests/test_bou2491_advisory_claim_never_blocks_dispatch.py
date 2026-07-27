@@ -152,3 +152,45 @@ def test_executing_claim_still_suppresses_dispatch(tmp_path, monkeypatch):
     assert decision.should_dispatch is False, (
         "a genuinely executing claim must still suppress duplicate dispatch"
     )
+
+
+def test_advisory_release_refuses_a_claim_the_decision_was_not_made_from(
+    tmp_path, monkeypatch
+):
+    """The release must be fenced to the DISPATCH DECISION's claim identity.
+
+    Blockers change concurrently, so active advisory claims for several
+    fingerprints can coexist. `_best_active_claim_for_pr` is fingerprint-
+    agnostic, so it can surface a NEWER claim for unrelated blockers. Releasing
+    that one is doubly wrong: the decision's own advisory claim survives (so
+    `claim_pr` still conflicts and the executor defers anyway) while an
+    unrelated dashboard claim loses its duplicate-dispatch guard.
+    """
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+    pr = _pr()
+    TaskCoordinator(JsonlClaimStore(store)).claim_task(
+        coordinator.task_identity_for_pr(pr),
+        OwnerIdentity(
+            session_id="dashboard", pid=None, worktree_path=pr.worktree_path,
+            metadata={"actor": MaintenanceActor.DASHBOARD_QUEUE.value, "can_execute": "false"},
+        ),
+        lease_seconds=300,
+        now=BASE_TIME,
+    )
+
+    assert coordinator.release_advisory_claim_for_pr(
+        pr, claim_id="some-other-fingerprints-claim", now=BASE_TIME
+    ) is False, (
+        "a claim_id that does not match the decision's must refuse the release, "
+        "not fall back to releasing whichever claim looks 'best'"
+    )
+
+    # ...and the real claim is untouched, so the guard it provides survives.
+    still_there = coordinator._best_active_claim_for_pr(pr, now=BASE_TIME)
+    assert still_there is not None and still_there.status == "active"
+
+    # Control: passing the matching identity still releases.
+    assert coordinator.release_advisory_claim_for_pr(
+        pr, claim_id=still_there.claim_id, now=BASE_TIME
+    ) is True

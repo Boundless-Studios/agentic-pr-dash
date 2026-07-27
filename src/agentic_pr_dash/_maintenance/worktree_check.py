@@ -776,7 +776,9 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         # and suppress the very work it surfaced). Only the active `check` path
         # claims + heartbeats here.
         if coord_decision.state == "advisory_only":
-            coordinator.release_advisory_claim_for_pr(pr)
+            coordinator.release_advisory_claim_for_pr(
+                pr, claim_id=coord_decision.claim_id
+            )
         claimed = coordinator.claim_pr(
             pr,
             session_id=owner_session_id,

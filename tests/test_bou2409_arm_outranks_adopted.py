@@ -192,6 +192,30 @@ def test_arm_cli_names_the_foreign_holder_instead_of_a_generic_message(
     assert "foreign-armer-2" in err, f"expected the holder's session id in the message. Got: {err!r}"
 
 
+def test_arm_refusal_ignores_a_released_claim(isolated_store):
+    """A RELEASED claim must not be reported as the current holder.
+
+    `claim_for` returns the recorded claim regardless of status or liveness. If
+    `arm` fails to write for an unrelated reason — an unwritable state dir, say
+    — naming a long-released session as the claimant actively hides the real
+    cause. The diagnostic must fall back to the generic message instead.
+    """
+    wt = _mk(isolated_store, "wt")
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=568, session_id="gone", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    ).ok
+    assert ownership.release_ownership(
+        repo=REPO, pr_number=568, session_id="gone",
+    ).ok
+
+    msg = mc._arm_refusal_message(wt, 568)
+    assert "claimed by session gone" not in msg, (
+        f"a released claim must not be presented as the current holder — it "
+        f"masks whatever actually made the arm write fail. Got: {msg!r}"
+    )
+
+
 def test_durable_cleanup_is_skipped_when_the_adopter_rearms(isolated_store, monkeypatch):
     """Retiring the adopter's durable state must be fenced like the release is.
 

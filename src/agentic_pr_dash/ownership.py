@@ -576,8 +576,16 @@ def record_ownership(
         if _recheck is None or _recheck.status != "active":
             try:
                 from . import session_ledger  # noqa: PLC0415
+                # include_legacy=False deliberately: this reclaim is scoped to
+                # ONE repo, and legacy rows are repo-less, so PR numbers collide
+                # across repos. `include_legacy=True` would drop every repo-less
+                # #N row while reclaiming repo A's #N — including one that
+                # represents repo B's still-open #N — and a restarted or
+                # cross-root waiter would silently lose coverage for repo B.
+                # This is the same hazard session_ledger.prune's own docstring
+                # cites for non-anchor roots (codex PR #30).
                 session_ledger.prune(
-                    holder.session_id, {pr_number}, repo=repo, include_legacy=True,
+                    holder.session_id, {pr_number}, repo=repo, include_legacy=False,
                 )
                 if holder.worktree_path:
                     marker_path = load_config(holder.worktree_path).watch_marker_for(

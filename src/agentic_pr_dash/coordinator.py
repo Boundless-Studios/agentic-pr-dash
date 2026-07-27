@@ -441,11 +441,23 @@ def active_claim_owner_for_pr(pr: PRData, *, now: datetime | None = None) -> Own
 
 
 def release_advisory_claim_for_pr(
-    pr: PRData, *, now: datetime | None = None,
+    pr: PRData, *, claim_id: str | None = None, now: datetime | None = None,
 ) -> bool:
-    """Release the exact active non-executing claim, fenced against races."""
+    """Release the exact active non-executing claim, fenced against races.
+
+    ``claim_id`` must be the identity the DISPATCH DECISION was made from.
+    Blockers can change concurrently, so several active advisory claims for
+    different fingerprints can coexist; ``_best_active_claim_for_pr`` is
+    fingerprint-agnostic and can therefore pick a NEWER claim for unrelated
+    blockers. Releasing that one would leave the decision's own advisory claim
+    in place (so ``claim_pr`` still conflicts and the executor defers anyway)
+    while stripping an unrelated dashboard claim of its duplicate-dispatch
+    guard. Refusing the mismatch is the safe outcome.
+    """
     claim = _best_active_claim_for_pr(pr, now=now)
     if claim is None or (claim.owner.metadata or {}).get("can_execute") != "false":
+        return False
+    if claim_id is not None and claim.claim_id != claim_id:
         return False
     try:
         _coordinator().release_claim(
