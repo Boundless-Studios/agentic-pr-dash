@@ -656,6 +656,21 @@ def record_ownership(
             return ClaimOutcome(False, f"claim store error: {type(exc2).__name__}: {exc2}")
     except Exception as exc:  # noqa: BLE001 — never break the marker write
         return ClaimOutcome(False, f"claim store error: {type(exc).__name__}: {exc}")
+    # Postcondition: an ARMED request must leave an ARMED claim. The promotion
+    # above is best-effort, and `release_ownership` deliberately reports success
+    # for "no claim to release" — which is also what an unreadable snapshot
+    # produces. So the release can silently no-op, after which the same-session
+    # `claim_task` is an idempotent heartbeat that PRESERVES `provenance=adopted`
+    # and we would return "claimed" for an arm that never took. Since both the
+    # stop gate and the await loop exclude adopted worktrees, that success would
+    # be a lie about coverage. Verify the result rather than trusting the path.
+    _got = (record.owner.metadata or {}).get("provenance")
+    if (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED and _got != PROVENANCE_ARMED:
+        return ClaimOutcome(
+            False,
+            f"claim still records provenance={_got!r} after an armed request; "
+            "the adopted->armed promotion did not take",
+        )
     return ClaimOutcome(True, "claimed", record.claim_id, record.lease_epoch)
 
 

@@ -223,6 +223,42 @@ def test_same_session_adopted_claim_is_promoted_to_armed(isolated_store):
     )
 
 
+def test_arm_fails_loudly_when_the_promotion_release_does_not_take(
+    isolated_store, monkeypatch
+):
+    """A failed promotion must not report success.
+
+    `release_ownership` deliberately returns ok for "no claim to release", which
+    is also what an unreadable snapshot yields. So the promotion release can
+    silently no-op, after which the same-session `claim_task` is an idempotent
+    heartbeat preserving `provenance=adopted`. Returning "claimed" there would be
+    a lie about coverage: both the stop gate and the await loop exclude adopted
+    worktrees, so the caller believes it armed the PR and nothing watches it.
+    """
+    wt = _mk(isolated_store, "wt")
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=574, session_id="same-session", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    ).ok
+
+    # The release reports success without releasing anything.
+    monkeypatch.setattr(
+        ownership, "release_ownership",
+        lambda **kwargs: ownership.ClaimOutcome(True, "no claim to release"),
+    )
+
+    outcome = ownership.record_ownership(
+        repo=REPO, pr_number=574, session_id="same-session", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    )
+
+    assert not outcome.ok, (
+        "the claim still reads provenance=adopted, so arm must NOT report "
+        f"success — the caller would believe it had coverage it does not have. "
+        f"Got: {outcome!r}"
+    )
+
+
 def test_arm_refusal_ignores_a_released_claim(isolated_store):
     """A RELEASED claim must not be reported as the current holder.
 
