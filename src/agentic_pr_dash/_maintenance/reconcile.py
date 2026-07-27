@@ -26,6 +26,40 @@ from .worktrees import (
 )
 
 
+def _unknown_gh_state_record(
+    pr: int, url: str, branch: str, *, worktree_present: bool, repo: str | None = None,
+) -> dict:
+    """A forced-pending record for a PR whose gh state could not be resolved.
+
+    ``_pr_open_state`` returns its ``unavailable`` sentinel — ``state="unknown"``,
+    every other field falsy/empty — whenever the ``gh pr view`` probe fails for
+    ANY reason (auth lapse, secondary rate limit, timeout, network blip). Before
+    this fix, that sentinel flowed straight into a JSON record and was
+    INDISTINGUISHABLE, field-for-field, from "verified: this PR has no
+    blockers" (``unresolved_threads: 0``, ``ci_failing: false``,
+    ``changes_requested: false``, ``merge_conflict: false``) — a transient gh
+    outage silently reported every affected PR as clean while GitHub showed
+    real unresolved threads. Fail closed instead: mark the record unmistakably
+    unknown (``gh_state_unknown: True``) and force ``p1: True`` so no consumer —
+    human operator or the stop gate's ``_record_has_blockers`` — can mistake it
+    for a resolved PR. Deliberately skips the review-threads/CI-watch probes:
+    the PR-state probe already failed, so a second gh call's result (success or
+    coincidental empty-on-failure) must not be trusted to build a clean-looking
+    record around this one.
+    """
+    record = {
+        "pr": pr, "url": url or f"(pr {pr})", "branch": branch,
+        "worktree_present": worktree_present, "unresolved_threads": 0,
+        "ci_failing": False, "failing_checks": [], "ci_watch_pending": False,
+        "changes_requested": False, "review_decision": "",
+        "merge_conflict": False, "merge_state": "", "mergeable": "",
+        "p1": True, "state": "unknown", "gh_state_unknown": True,
+    }
+    if repo is not None:
+        record["repo"] = repo
+    return record
+
+
 def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
     """Claim PRs orphaned by DEAD sessions and adopt them into THIS session's ledger."""
     from agentic_pr_dash import session_ledger, github_api  # noqa: PLC0415
@@ -153,6 +187,12 @@ def _detached_pr_records(session_id: str, cwd: str,
             continue
         if state == "draft":
             continue
+        if state == "unknown":
+            records.append(_unknown_gh_state_record(
+                e.pr, url, e.branch, worktree_present=False,
+                repo=e.repo or target_repo,
+            ))
+            continue
         threads = github_api.get_review_threads(e.pr, cwd)
         unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
         changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
@@ -244,6 +284,11 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
             _unpack_pr_open_state(_pr_open_state(pr, wt))
         )
         if state in ("merged", "closed"):
+            continue
+        if state == "unknown":
+            records[pr] = _unknown_gh_state_record(
+                pr, url, _current_branch(wt), worktree_present=True,
+            )
             continue
         threads = github_api.get_review_threads(pr, wt)
         unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]

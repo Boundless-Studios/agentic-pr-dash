@@ -125,12 +125,24 @@ def test_check_subcommand_prunes_stale_marker_via_stop_gate(tmp_path, monkeypatc
     monkeypatch.setattr(mc, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     # No open PR found for the branch (it was merged)
     monkeypatch.setattr(mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "no open PR for this branch"))
-    monkeypatch.setattr(mc, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    # NOTE: `_detached_records_across_roots` (worktrees.py) resolves
+    # `_detached_pr_records` via a lazy `from .reconcile import ...` at call
+    # time, and `reconcile._pr_open_state` is its own module-level binding
+    # from `.pr_state` — neither is the `mc` facade's separate re-export, so
+    # patching `mc.X` here was a no-op. The REAL `_detached_pr_records` used to
+    # run against this throwaway PR 99, hit a REAL (failing) `gh` call, and got
+    # the `unavailable` sentinel (state="unknown") — which the P1 fail-open bug
+    # silently treated as clean, coincidentally making this assertion pass for
+    # the wrong reason. Now "unknown" is correctly surfaced as pending, so an
+    # ineffective mock here breaks the "exit 0, no pending work" assertion.
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records",
+                        lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(mc, "_owned_open_pr_numbers", lambda owned: set())
 
     # Also stub _read_marker to return the marker data and _pr_open_state to merged
     real_read_marker = mc._read_marker
-    monkeypatch.setattr(mc, "_pr_open_state", lambda pr, cwd: ("merged", "https://x/pull/99", False, [], "", "", ""))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state",
+                        lambda pr, cwd: ("merged", "https://x/pull/99", False, [], "", "", ""))
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     # stop-gate should exit 0 (no pending work)

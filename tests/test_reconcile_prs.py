@@ -175,3 +175,75 @@ def test_p1_sorts_first(tmp_path, monkeypatch, capsys):
     mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
     records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
     assert [r["pr"] for r in records] == [2, 1]  # P1 PR first
+
+
+# BOU (P1, reconcile-prs fail-open): a `gh pr view` failure (auth lapse,
+# secondary rate limit, network blip) makes `_pr_open_state` return its
+# `unavailable` sentinel — state="unknown", url="", every other field falsy.
+# That is INDISTINGUISHABLE, field-for-field, from "verified: this PR has no
+# blockers" once it reaches a JSON record, so a transient gh outage used to
+# make `reconcile-prs` report every affected PR as clean. Live GitHub
+# disagreed (real unresolved threads existed) while gh was unavailable to
+# this process. The fix must surface an explicit unknown/error marker and
+# treat it as a forced blocker (fail closed), never silence.
+def test_detached_pr_with_unknown_gh_state_is_not_reported_clean(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    sl.append("sess-X", pr=911, branch="bou-gh-down", worktree=str(tmp_path / "gone"))
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    # Mirrors _pr_state._pr_open_state's real `unavailable` sentinel exactly:
+    # ("unknown", "", False, [], "", "", "").
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
+        "unknown", "", False, [], "", "", ""))
+    # Even if the review-threads probe happens to succeed independently, the
+    # PR-state probe already failed — the record must not be built as clean
+    # off the back of a coincidentally-empty thread list.
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    r = records[0]
+    assert r["pr"] == 911
+    # The old bug: this record used to be indistinguishable from a genuinely
+    # clean PR (unresolved_threads=0, ci_failing=False, changes_requested=False,
+    # merge_conflict=False, state="unknown" silently ignored). Assert the fix's
+    # explicit contract instead: an unmistakable unknown marker, and NOT a
+    # placeholder url masquerading as a resolved one.
+    assert r.get("gh_state_unknown") is True
+    assert r["state"] == "unknown"
+    assert r["url"] == "(pr 911)"
+
+
+def test_owned_worktree_pr_with_unknown_gh_state_is_not_reported_clean(
+    tmp_path, monkeypatch, capsys
+):
+    """Same failure mode, but through the LIVE-worktree walk (`worktree_present:
+    true`) — the exact shape of the originally reported P1 records."""
+    wt = tmp_path / "owned-wt"
+    wt.mkdir()
+    monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
+                         lambda sid, cwd, pid: [str(wt)])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([str(wt)]))
+    monkeypatch.setattr(_reconcile_mod, "_read_marker", lambda path: {"pr": "922"})
+    monkeypatch.setattr(_reconcile_mod, "_current_branch", lambda path: "bou-gh-down-2")
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", lambda pr, cwd: (
+        "unknown", "", False, [], "", "", ""))
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [])
+
+    rc = mc.main(["reconcile-prs", "--session-id", "sess-X", "--cwd", str(tmp_path)])
+
+    assert rc == 0
+    records = [json.loads(l) for l in capsys.readouterr().out.splitlines() if l.strip()]
+    assert len(records) == 1
+    r = records[0]
+    assert r["pr"] == 922
+    assert r["worktree_present"] is True
+    assert r.get("gh_state_unknown") is True
+    assert r["state"] == "unknown"
+    assert r["url"] == "(pr 922)"

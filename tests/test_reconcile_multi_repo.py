@@ -82,13 +82,19 @@ def test_reconcile_surfaces_prs_across_two_repos(tmp_path, monkeypatch, capsys):
     sl.append("sess-X", pr=22, branch="b-sib", worktree=str(tmp_path / "gone-b"),
               repo=repo_sib)
 
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
+    # See the NOTE in test_reconcile_p1_first_across_roots: these must patch
+    # `_reconcile_mod`, not the `mc` facade, or the REAL `_pr_open_state` runs
+    # against these throwaway local git repos instead of the stub. `**kw`
+    # absorbs the `adopt_unmarked`/`adopt_dead_markered` kwargs passed for
+    # non-anchor (sibling) roots.
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
+                        lambda sid, cwd, pid, **kw: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
     monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
 
     def open_state(pr, cwd):
         return ("open", f"https://github.com/o/r/pull/{pr}", False, [])
-    monkeypatch.setattr(mc, "_pr_open_state", open_state)
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state", open_state)
 
     records = _run_reconcile(anchor, capsys)
     by_pr = {r["pr"]: r for r in records}
@@ -210,9 +216,25 @@ def test_reconcile_p1_first_across_roots(tmp_path, monkeypatch, capsys):
     sl.append("sess-X", pr=2, branch="b-sib", worktree=str(tmp_path / "g2"),
               repo=repo_sib)
 
-    monkeypatch.setattr(mc, "_collect_owned_worktrees", lambda sid, cwd, pid: [])
-    monkeypatch.setattr(mc, "_iter_worktree_paths", lambda cwd: iter([]))
-    monkeypatch.setattr(mc, "_pr_open_state",
+    # NOTE: these must patch `_reconcile_mod` (the module reconcile.py's own
+    # `_pr_open_state`/etc. name bindings actually live in), not the `mc`
+    # facade — `maintenance_check` re-exports its OWN separate binding of the
+    # same functions ("keeps mc.X patchable by tests"), but reconcile.py never
+    # looks values up through `mc`, so patching `mc.X` here was a no-op: the
+    # REAL `_pr_open_state` ran against these throwaway local git repos (no
+    # real PR, no `gh` access) and returned the genuine `state="unknown"`
+    # sentinel for both PRs. That went unnoticed before the P1 fail-open fix
+    # because the old code silently treated "unknown" as fine and fell through
+    # to the (correctly, module-qualified) mocked `get_review_threads` for the
+    # P1 designation this assertion actually checks. Now that "unknown" is
+    # surfaced/forced pending instead, an ineffective mock here would make
+    # BOTH records `p1: True` (since the real gh probe fails for both PRs) and
+    # break the P1-sorts-first assertion below. `**kw` absorbs the
+    # `adopt_unmarked`/`adopt_dead_markered` kwargs passed for sibling roots.
+    monkeypatch.setattr(_reconcile_mod, "_collect_owned_worktrees",
+                        lambda sid, cwd, pid, **kw: [])
+    monkeypatch.setattr(_reconcile_mod, "_iter_worktree_paths", lambda cwd: iter([]))
+    monkeypatch.setattr(_reconcile_mod, "_pr_open_state",
                         lambda pr, cwd: ("open", f"https://x/pull/{pr}", False, []))
 
     def threads(pr, cwd=None):
