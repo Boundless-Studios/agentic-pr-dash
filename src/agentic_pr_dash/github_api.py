@@ -3141,6 +3141,25 @@ def scan_review_threads(
             ))
             continue
 
+        # BOU-2567: a deliberately-deferred thread (verified genuine, out of
+        # scope, tracked by its own follow-up ticket) is a first-class state,
+        # never encoded as resolved and never as plain unresolved. Checked
+        # BEFORE is_outdated/marker-state so a deferred thread is never picked
+        # regardless of its drift or claim-reply state — the deferral decision
+        # is authoritative, not one signal among several.
+        from ._maintenance import deferred_review as _deferred_review  # noqa: PLC0415
+        if _deferred_review.is_thread_deferred(cwd or ".", pr_number, thread.node_id):
+            decisions.append(ThreadDecision(
+                thread_id=thread.node_id,
+                author=top.author,
+                created_at=top.created_at,
+                age_seconds=age_seconds,
+                decision="SKIP_DEFERRED",
+                marker_state=None,
+                claim_age_seconds=None,
+            ))
+            continue
+
         if thread.is_outdated:
             decisions.append(ThreadDecision(
                 thread_id=thread.node_id,

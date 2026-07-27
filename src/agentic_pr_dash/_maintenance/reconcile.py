@@ -5,6 +5,7 @@ import os
 
 from ._common import _resolve_owner_pid, _repo_slug, _current_branch
 from .pr_state import _pr_open_state, _unpack_pr_open_state, _thread_is_p1
+from . import deferred_review
 from agentic_pr_dash import ownership
 from .markers import (
     _claim_pr,
@@ -50,6 +51,7 @@ def _unknown_gh_state_record(
     record = {
         "pr": pr, "url": url or f"(pr {pr})", "branch": branch,
         "worktree_present": worktree_present, "unresolved_threads": 0,
+        "deferred_threads": 0,
         "ci_failing": False, "failing_checks": [], "ci_watch_pending": False,
         "changes_requested": False, "review_decision": "",
         "merge_conflict": False, "merge_state": "", "mergeable": "",
@@ -126,7 +128,20 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
             if state in ("merged", "closed", "unknown", "draft"):
                 continue
             threads = github_api.get_review_threads(e.pr, cwd)
-            unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+            # BOU-2567: a deliberately-deferred thread is excluded from
+            # `unresolved` (the blocker-feeding count) and reported separately
+            # via `deferred_threads` — never silently dropped, never counted
+            # as unaddressed work.
+            unresolved = [
+                t for t in threads
+                if not t.is_resolved and not t.is_outdated
+                and not deferred_review.is_thread_deferred(cwd, e.pr, t.node_id)
+            ]
+            deferred = [
+                t for t in threads
+                if not t.is_resolved
+                and deferred_review.is_thread_deferred(cwd, e.pr, t.node_id)
+            ]
             changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
             merge_conflict = (
                 str(merge_state).upper() == "DIRTY"
@@ -146,6 +161,7 @@ def _adopt_orphan_prs(session_id: str, cwd: str, pid: int | None):
             adopted.append({
                 "pr": e.pr, "url": url or f"(pr {e.pr})", "branch": e.branch,
                 "worktree_present": wt_present, "unresolved_threads": len(unresolved),
+                "deferred_threads": len(deferred),
                 "ci_failing": has_fail, "failing_checks": failing,
                 "changes_requested": changes_requested,
                 "review_decision": review_decision,
@@ -202,7 +218,19 @@ def _detached_pr_records(session_id: str, cwd: str,
             ))
             continue
         threads = github_api.get_review_threads(e.pr, cwd)
-        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        # BOU-2567: exclude deferred threads from the blocker-feeding count;
+        # report them separately (never silently drop, never count as
+        # unaddressed).
+        unresolved = [
+            t for t in threads
+            if not t.is_resolved and not t.is_outdated
+            and not deferred_review.is_thread_deferred(cwd, e.pr, t.node_id)
+        ]
+        deferred = [
+            t for t in threads
+            if not t.is_resolved
+            and deferred_review.is_thread_deferred(cwd, e.pr, t.node_id)
+        ]
         changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
         merge_conflict = (
             str(merge_state).upper() == "DIRTY"
@@ -217,6 +245,7 @@ def _detached_pr_records(session_id: str, cwd: str,
             # fall back to the anchor's repo.
             "repo": e.repo or target_repo,
             "worktree_present": False, "unresolved_threads": len(unresolved),
+            "deferred_threads": len(deferred),
             "ci_failing": has_fail, "failing_checks": failing,
             # BOU-1789: required CI still running on a detached (no-worktree) PR
             # is a watch condition the await waiter must honour, since `owned`
@@ -299,7 +328,17 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
             )
             continue
         threads = github_api.get_review_threads(pr, wt)
-        unresolved = [t for t in threads if not t.is_resolved and not t.is_outdated]
+        # BOU-2567: exclude deferred threads from the blocker-feeding count;
+        # report them separately.
+        unresolved = [
+            t for t in threads
+            if not t.is_resolved and not t.is_outdated
+            and not deferred_review.is_thread_deferred(wt, pr, t.node_id)
+        ]
+        deferred = [
+            t for t in threads
+            if not t.is_resolved and deferred_review.is_thread_deferred(wt, pr, t.node_id)
+        ]
         changes_requested = str(review_decision).upper() == "CHANGES_REQUESTED"
         merge_conflict = (
             str(merge_state).upper() == "DIRTY"
@@ -308,6 +347,7 @@ def _owned_pr_records(session_id: str, cwd: str, pid: int | None, adopt_orphans:
         records[pr] = {
             "pr": pr, "url": url or f"(pr {pr})", "branch": _current_branch(wt),
             "worktree_present": True, "unresolved_threads": len(unresolved),
+            "deferred_threads": len(deferred),
             "ci_failing": has_fail, "failing_checks": failing,
             "changes_requested": changes_requested,
             "review_decision": review_decision,

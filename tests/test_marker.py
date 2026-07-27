@@ -607,7 +607,7 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
         _worktrees_mod, "_live_independent_owner_sessions", lambda paths, sid: {}
     )
     monkeypatch.setattr(_maint, "build_maintenance_prompt", lambda pr, failed_logs=None: "PROMPT")
-    monkeypatch.setattr(_maint, "build_maintenance_summary", lambda pr: "SUMMARY")
+    monkeypatch.setattr(_maint, "build_maintenance_summary", lambda pr, **kw: "SUMMARY")
     code2, text2 = mc._check_worktree(str(tmp_path), "sess-self")
     assert code2 == 10
     assert "PR_NUMBER=7" in text2

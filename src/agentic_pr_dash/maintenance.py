@@ -273,8 +273,13 @@ def discover_active_primary_claude(worktree_path: str) -> list[AgentProcess]:
     return discover_active_primary_feature_pipeline_agents(worktree_path)
 
 
-def build_maintenance_summary(pr: PRData) -> str:
-    """One-line summary of a PR's pending maintenance work (BOU-1947 concise stop gate)."""
+def build_maintenance_summary(pr: PRData, *, deferred_count: int = 0) -> str:
+    """One-line summary of a PR's pending maintenance work (BOU-1947 concise stop gate).
+
+    ``deferred_count`` (BOU-2567) is reported as its own part, distinct from
+    the unresolved-review-comment count — a deferred thread must never be
+    silently folded into (or silently vanish from) the "unresolved" number.
+    """
     parts: list[str] = []
     unresolved = len(pr.review_comments)
     if unresolved:
@@ -287,6 +292,8 @@ def build_maintenance_summary(pr: PRData) -> str:
         parts.append("merge conflict")
     if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
         parts.append("changes requested")
+    if deferred_count:
+        parts.append(f"{deferred_count} deferred (tracked)")
     return f"PR #{pr.number} ({pr.branch}): {', '.join(parts)}"
 
 

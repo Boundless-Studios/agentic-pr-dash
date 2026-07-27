@@ -500,7 +500,8 @@ def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, boo
 
 
 def _unresolved_review_threads(pr_number: int, cwd: str):
-    """Unresolved review threads for a PR — INCLUDING outdated ones.
+    """Unresolved review threads for a PR — INCLUDING outdated ones, EXCLUDING
+    deliberately-deferred ones.
 
     BOU-2095 (PR #78 review): the completion evidence gate deliberately leaves
     a thread open when GitHub marks it outdated by pure line drift but its
@@ -508,15 +509,47 @@ def _unresolved_review_threads(pr_number: int, cwd: str):
     those threads invisible to the pending/blocker path — the stop gate idled
     and `complete` closed the bead while intentionally-kept-open feedback sat
     unresolved. Unresolved means unaddressed; drift is not resolution.
+
+    BOU-2567: a thread carrying a persisted deferral record (see
+    ``_maintenance.deferred_review``) is a THIRD state, distinct from both
+    resolved and unresolved — it is a verified, tracked, deliberate exclusion,
+    not silence. Use :func:`_deferred_review_threads` to report those
+    separately; they must never simply vanish from every count.
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
+    from . import deferred_review  # noqa: PLC0415
 
     threads = github_api.get_review_threads(pr_number, cwd)
-    return [t for t in threads if not t.is_resolved]
+    return [
+        t for t in threads
+        if not t.is_resolved
+        and not deferred_review.is_thread_deferred(cwd, pr_number, t.node_id)
+    ]
+
+
+def _deferred_review_threads(pr_number: int, cwd: str):
+    """Unresolved-on-GitHub review threads that carry a deferral record.
+
+    The counterpart to :func:`_unresolved_review_threads`: together the two
+    partition a PR's non-resolved threads into "still unaddressed" and
+    "deliberately deferred, tracked by a follow-up ticket" — the three-state
+    split BOU-2567 requires (a thread is never both, and neither state may be
+    inferred from the other's absence).
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    from . import deferred_review  # noqa: PLC0415
+
+    threads = github_api.get_review_threads(pr_number, cwd)
+    return [
+        t for t in threads
+        if not t.is_resolved
+        and deferred_review.is_thread_deferred(cwd, pr_number, t.node_id)
+    ]
 
 
 def pr_has_unresolved_review_threads(pr_number: int, cwd: str) -> bool:
-    """True if the PR has at least one unresolved review thread (outdated included)."""
+    """True if the PR has at least one unresolved review thread (outdated
+    included, deferred excluded)."""
     return bool(_unresolved_review_threads(pr_number, cwd))
 
 

@@ -214,7 +214,7 @@ class ThreadDecision(BaseModel):
     author: str
     created_at: str
     age_seconds: float | None = None
-    decision: str  # one of: PICKED, SKIP_RESOLVED, SKIP_OUTDATED, SKIP_ADDRESSED, SKIP_CLAIMED_ACTIVE, SKIP_DATE_FILTER, SKIP_HUMAN_RESOLVED
+    decision: str  # one of: PICKED, SKIP_RESOLVED, SKIP_DEFERRED, SKIP_OUTDATED, SKIP_ADDRESSED, SKIP_CLAIMED_ACTIVE, SKIP_DATE_FILTER, SKIP_HUMAN_RESOLVED
     marker_state: str | None = None
     claim_age_seconds: float | None = None
 
