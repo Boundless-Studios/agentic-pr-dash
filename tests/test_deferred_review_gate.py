@@ -191,3 +191,48 @@ def test_stop_gate_does_not_block_on_a_deferred_only_pr(
     )
 
     assert rc == 0, "a PR whose only unresolved threads are deferred must not block the stop"
+
+
+def test_stop_gate_surfaces_deferred_count_on_an_otherwise_clean_pass(
+    tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """BOU-2567 PR #122 review, P1 #3 (elevated from P2): `check` returns
+    'nothing pending (deferred: N)' for a deferred-only PR, but `_stop_gate_impl`
+    discarded ordinary code==0 text while walking owned worktrees, so the
+    stop-gate surface itself emitted NO deferred count at all -- a stated
+    behavior ("the gate distinguishes deferred from unresolved in its output")
+    that did not actually hold at the stop-gate layer specifically."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "0")
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_LOOP_THRESHOLD", "3")
+    config.load.cache_clear()
+
+    _patch_check_env(monkeypatch)
+    monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(
+        _worktrees_mod, "_owned_worktrees_across_roots",
+        lambda session_id, anchor: [str(tmp_path)],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_reconcile_owned_across_roots",
+        lambda session_id, anchor, pid, deadline=None: ([str(tmp_path)], []),
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_detached_records_across_roots",
+        lambda session_id, anchor: [],
+    )
+    dr.defer_thread(
+        str(tmp_path), PR_NUMBER, thread_id="T1", comment_id=42, severity="P2",
+        ticket="BOU-1000",
+    )
+
+    rc = mc.main(
+        ["stop-gate", "--cwd", str(tmp_path), "--session-id", SID, "--no-waiter"]
+    )
+
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "1" in err and "deferred" in err.lower(), (
+        f"stop-gate must surface the deferred count on an otherwise-clean "
+        f"pass, not go silent; stderr was: {err!r}"
+    )

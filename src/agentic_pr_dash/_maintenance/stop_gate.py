@@ -4,11 +4,26 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time as _time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _env_int
 from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance
+
+# BOU-2567 PR #122 review, P1 #3: `_check_worktree`'s clean-check text ends in
+# "(deferred: N)" (see worktree_check._check_worktree) whenever a PR has
+# deferred-but-not-yet-resolved threads. `_stop_gate_impl` otherwise discards
+# ordinary code==0 text while walking owned worktrees, so the stop-gate
+# surface itself emitted no deferred count at all -- a stated behavior
+# ("the gate distinguishes deferred from unresolved in its output") that did
+# not hold at THIS layer specifically, even though `check` already reported it.
+_DEFERRED_COUNT_RE = re.compile(r"\(deferred:\s*(\d+)\)")
+
+
+def _extract_deferred_count(text: str) -> int:
+    match = _DEFERRED_COUNT_RE.search(text)
+    return int(match.group(1)) if match else 0
 
 
 def _stop_state_path(cwd: str) -> str:
@@ -463,6 +478,10 @@ def _stop_gate_impl(args) -> int:
     from .worktree_check import DRAFT_PR_MARKER, WARN_ONLY_MARKER  # noqa: PLC0415
     adopted_pending: list[tuple[str, str]] = []
     draft_worktrees: set[str] = set()
+    # BOU-2567: accumulated separately from `pending` -- a deferred thread is
+    # never a blocker (see `_extract_deferred_count`'s docstring above), but
+    # the count must still be visible at this surface, not merely at `check`'s.
+    total_deferred = 0
     for worktree in owned:
         local_sha = _local_head_sha(worktree)
         cached_entry = pr_head_cache.get(worktree)
@@ -480,6 +499,17 @@ def _stop_gate_impl(args) -> int:
             # UNCHECKED this tick, not confirmed clean. Recorded distinctly so
             # the blocking message can say "checked K of M, budget exhausted"
             # instead of silently treating an unexamined PR as fine.
+            #
+            # BOU-2567 (PR #122 review round 4): deliberately does NOT touch
+            # `total_deferred` here, and `continue`s before the extraction
+            # below ever runs. A budget-unknown PR's deferred count is
+            # genuinely UNKNOWN this tick — we never called `_check_worktree`
+            # for it — not zero and not "whatever it was last time". Deferred
+            # (a real finding, tracked, non-blocking) and budget-unknown (we
+            # never looked, fail closed) are different facts with OPPOSITE
+            # gate policies; folding one into the other here would be exactly
+            # the "unknown collapsing into a definite answer" class of bug
+            # this package has already shipped four fixes for.
             unknown_worktrees.append(worktree)
             continue
         else:
@@ -489,6 +519,14 @@ def _stop_gate_impl(args) -> int:
                 "head_sha": local_sha, "checked_at": now, "code": code, "text": text,
             }
             pr_head_cache_dirty = True
+        # BOU-2567: accumulate from WHICHEVER branch above produced `text` —
+        # the cached-clean short-circuit's `text` is the SAME string
+        # `_check_worktree` returned when it was first computed (the cache
+        # entry stores the full text, deferred suffix included), so a
+        # deferred-only PR's count correctly survives being served from the
+        # BOU-2556 head-sha cache. The budget-exhausted branch above
+        # `continue`s before this line, so it never contributes one.
+        total_deferred += _extract_deferred_count(text)
         if code == 10:
             # An ADOPTED worktree is one auto-adoption handed us: this session
             # never armed it and has no context on the work. Its blockers are
@@ -582,6 +620,25 @@ def _stop_gate_impl(args) -> int:
         )
 
     if not pending and not unknown_worktrees:
+        # BOU-2567: surface the deferred count on every otherwise-clean path
+        # through this branch (idle, escalation, waiter-demand, clean-exit) —
+        # `check`'s own text already carries it (worktree_check._check_worktree),
+        # but this surface silently dropped it. Non-blocking: printed, not
+        # counted toward any of the return-2 paths below.
+        #
+        # Gated on `not unknown_worktrees` too (BOU-2556, PR #122 review round
+        # 4): a deferred thread and a budget-unknown PR are different facts
+        # with opposite gate policies. This print only runs once the gate has
+        # decided the tick is ACTUALLY clean — never merged into, or printed
+        # alongside, the budget-unknown blocking path below, which is reached
+        # instead whenever unknown_worktrees is non-empty regardless of
+        # total_deferred.
+        if total_deferred:
+            print(
+                f"[pr-watch] {total_deferred} review thread(s) deferred "
+                "(tracked by follow-up ticket(s)) — not blocking.",
+                file=sys.stderr,
+            )
         if (not getattr(args, "no_waiter", False)) and session_id:
             from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
             # A PR is loop-covered only if covered in EVERY repo that owns it; if

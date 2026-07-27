@@ -25,9 +25,28 @@ separately; ``check``/``reconcile-prs``: excluded from blockers; the
 pr-maintenance loop: never dispatched against; ``complete``: never
 auto-resolved) — this module does not encode any consumer's policy, only the
 fact.
+
+Storage (BOU-2567 PR #122 review, P1 #1): a deferral is a fact about
+``(repo, pr_number, thread_id)`` — GitHub identities, not about whichever
+worktree happened to run ``complete --defer``. It must therefore live
+somewhere every consumer can read regardless of which worktree performed the
+deferral, including the orchestrator's dashboard (which calls
+``scan_review_threads`` against the repository root, not a feature worktree)
+and detached reconciliation (whose worktree may already be gone). Storing it
+under ``state_dir_for(cwd)`` — this repo's convention for WORKTREE-scoped facts
+like ``pr-watch.armed`` — made it invisible to those consumers and, worse,
+deletable by removing the worktree that recorded it. This mirrors the two
+existing repo-shared, cross-worktree durable stores in this codebase:
+``coordinator.store_path()`` (``~/.agent-coordinator/claims.jsonl``, keyed by
+``(repo_slug, pr_number)`` — see ``ownership.py``'s own "the PR itself is the
+claimed task; worktrees are incidental" framing) and
+``session_ledger._DEFAULT_DIR`` (``~/.gaia/pr-watch/ledger``). One shared file,
+keyed internally by repo slug + PR number, resolved from ``cwd`` only to
+identify WHICH repo/PR a call is about — never to locate the store itself.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -35,9 +54,13 @@ import tempfile
 import time
 from dataclasses import dataclass
 
-from agentic_pr_dash.config import load as load_config
+_STATE_FILENAME = "deferred-reviews.json"
 
-_STATE_FILENAME = "pr-watch.deferred.json"
+# Overridable for tests/alternate installs, matching the naming convention of
+# the other repo-shared stores (AGENTIC_PR_DASH_COORDINATOR_STORE / the legacy
+# GAIA_ prefix honored elsewhere in this package).
+_ENV_STORE_PATH = "AGENTIC_PR_DASH_DEFERRED_STORE"
+_LEGACY_ENV_STORE_PATH = "GAIA_DEFERRED_STORE"
 
 # A well-formed tracker reference (e.g. ``BOU-2559``). This repo has no live
 # Linear client, so "requires a ticket ID that resolves" is enforced as "is a
@@ -78,30 +101,70 @@ def is_valid_ticket(ticket: str | None) -> bool:
     return bool(ticket) and bool(_TICKET_RE.match(ticket.strip()))
 
 
-def _state_path(cwd: str) -> str:
-    return str(load_config(cwd).state_dir_for(cwd) / _STATE_FILENAME)
+def _default_store_path() -> str:
+    """The shared, cross-worktree, cross-session default location.
+
+    Deliberately a plain function, NOT a module-level constant: a
+    module-level ``os.path.expanduser("~/...")`` is evaluated once at import
+    time and would freeze to whatever ``HOME`` happened to be at that moment
+    (this bit ``session_ledger._DEFAULT_DIR`` — see conftest.py's isolation
+    note, which has to explicitly redirect it via an env var per test because
+    of exactly this). Calling ``expanduser`` lazily here means every test
+    already gets a hermetic store for free from the existing per-test ``HOME``
+    fixture (``conftest._isolate_config``), no additional test-only env
+    plumbing required.
+    """
+    return os.path.expanduser(os.path.join("~", ".gaia", "pr-watch", _STATE_FILENAME))
 
 
-def _load(cwd: str) -> dict:
+def _store_path() -> str:
+    return (
+        os.environ.get(_ENV_STORE_PATH)
+        or os.environ.get(_LEGACY_ENV_STORE_PATH)
+        or _default_store_path()
+    )
+
+
+@functools.lru_cache(maxsize=256)
+def _cached_repo_slug(cwd: str) -> str:
+    """Memoized ``(owner/name)`` for ``cwd`` — a git-remote shell-out per call
+    would otherwise fire once per THREAD (every ``is_thread_deferred`` call in
+    a list comprehension over a PR's threads), not once per PR. Safe to cache
+    for a CLI-process lifetime: the repo a given worktree path belongs to does
+    not change mid-process. Bounded (not unbounded) so a long-lived process
+    (the dashboard, the loop) touching many worktrees over time cannot grow
+    this without limit; eviction only costs a re-shell-out, never a wrong
+    answer.
+    """
+    from ._common import _repo_slug  # noqa: PLC0415
+
+    return _repo_slug(cwd)
+
+
+def _load() -> dict:
     try:
-        with open(_state_path(cwd), encoding="utf-8") as fh:
+        with open(_store_path(), encoding="utf-8") as fh:
             data = json.load(fh)
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def _save(cwd: str, state: dict) -> None:
+def _save(state: dict) -> None:
     """Best-effort atomic write — mirrors the other ``pr-watch.*.json`` stores.
 
     A failed write must not raise into a caller mid-CLI-command; the caller's
     own return code communicates success/failure of the overall operation.
+    (Propagating that failure signal out of ``_save`` itself — so a full disk
+    or read-only filesystem can't make ``defer_thread`` silently report success
+    with nothing persisted — is BOU-2567 PR #122 review P2 #1, tracked in the
+    follow-up ticket rather than fixed here.)
     """
-    path = _state_path(cwd)
+    path = _store_path()
     try:
         parent = os.path.dirname(path)
         os.makedirs(parent, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".pr-watch.deferred.")
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".deferred-reviews.")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(state, fh)
@@ -119,21 +182,29 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def _pr_key(pr_number: int) -> str:
-    return str(pr_number)
+def _pr_key(cwd: str, pr_number: int) -> str:
+    """The record key: ``(repo_slug, pr_number)`` — a PR identity, never a
+    worktree identity. Two different worktrees of the SAME repo (or the
+    repository root, or a torn-down worktree's last-known path) all resolve to
+    the same key, which is the whole point (BOU-2567 PR #122 review, P1 #1).
+    An undetectable repo (e.g. a bare non-git ``cwd``) falls back to an empty
+    slug rather than raising — callers that can't resolve a repo still get a
+    consistent (if unscoped) bucket instead of an exception.
+    """
+    repo_slug = _cached_repo_slug(cwd)
+    return f"{repo_slug}#{pr_number}"
 
 
-def _pr_record(state: dict, pr_number: int) -> dict:
+def _pr_record(state: dict, key: str, pr_number: int) -> dict:
     prs = state.setdefault("prs", {})
-    return prs.setdefault(
-        _pr_key(pr_number), {"pr": pr_number, "deferred": [], "followup_ticket": None}
-    )
+    return prs.setdefault(key, {"pr": pr_number, "deferred": [], "followup_ticket": None})
 
 
 def deferred_threads_for_pr(cwd: str, pr_number: int) -> dict[str, dict]:
     """``thread_id -> deferral record`` for every thread deferred on this PR."""
-    state = _load(cwd)
-    record = state.get("prs", {}).get(_pr_key(pr_number), {})
+    state = _load()
+    key = _pr_key(cwd, pr_number)
+    record = state.get("prs", {}).get(key, {})
     return {
         d["thread_id"]: d for d in record.get("deferred", []) if d.get("thread_id")
     }
@@ -164,17 +235,19 @@ def thread_state(cwd: str, pr_number: int, thread) -> str:
 
 
 def followup_ticket_for_pr(cwd: str, pr_number: int) -> str | None:
-    state = _load(cwd)
-    record = state.get("prs", {}).get(_pr_key(pr_number), {})
+    state = _load()
+    key = _pr_key(cwd, pr_number)
+    record = state.get("prs", {}).get(key, {})
     return record.get("followup_ticket") or None
 
 
 def set_followup_ticket(cwd: str, pr_number: int, ticket: str) -> None:
     if not is_valid_ticket(ticket):
         raise DeferralError(f"invalid follow-up ticket {ticket!r}")
-    state = _load(cwd)
-    _pr_record(state, pr_number)["followup_ticket"] = ticket.strip()
-    _save(cwd, state)
+    state = _load()
+    key = _pr_key(cwd, pr_number)
+    _pr_record(state, key, pr_number)["followup_ticket"] = ticket.strip()
+    _save(state)
 
 
 def defer_thread(
@@ -198,6 +271,9 @@ def defer_thread(
         exception, never a silent one.
       * re-deferring the same ``thread_id`` is idempotent (the record is
         replaced) rather than an error — a retried CLI call must succeed.
+
+    ``cwd`` identifies WHICH repo/PR this call is about (via the repo slug);
+    it does not affect where the record is stored — see the module docstring.
     """
     severity = (severity or "").strip().upper()
     if severity not in _VALID_SEVERITIES:
@@ -226,10 +302,11 @@ def defer_thread(
         deferred_at=_now_iso(),
         deferred_by=deferred_by or "",
     )
-    state = _load(cwd)
-    pr_rec = _pr_record(state, pr_number)
+    state = _load()
+    key = _pr_key(cwd, pr_number)
+    pr_rec = _pr_record(state, key, pr_number)
     pr_rec["deferred"] = [
         d for d in pr_rec["deferred"] if d.get("thread_id") != thread_id
     ] + [record.to_dict()]
-    _save(cwd, state)
+    _save(state)
     return record

@@ -121,6 +121,74 @@ def test_defer_p2_without_reason_succeeds(tmp_path, monkeypatch) -> None:
     assert dr.is_thread_deferred(str(tmp_path), PR_NUMBER, "T1") is True
 
 
+# --- BOU-2567 PR #122 review, P1 #2: severity is verified, not merely trusted ---
+
+
+def test_defer_refuses_a_detected_p1_thread_labeled_p2(tmp_path, monkeypatch) -> None:
+    """`_thread_is_p1` recognizes the thread's own body as P1; an operator
+    passing --severity P2 must be refused, not silently honored — a P1
+    mislabeled P2 skips the P1-only --reason requirement entirely, which is
+    exactly the mute-button abuse the anti-abuse rule exists to stop."""
+    thread = _thread(body="P1: this null pointer will crash in production")
+    resolved, replied = _wire(monkeypatch, [thread])
+
+    rc = mc._cmd_complete(_args(
+        cwd=str(tmp_path), defer="T1", severity="P2", ticket="BOU-1",
+    ))
+
+    assert rc == 1
+    assert dr.is_thread_deferred(str(tmp_path), PR_NUMBER, "T1") is False
+    assert resolved == []
+    assert replied == []
+
+
+def test_defer_does_not_silently_upgrade_severity(tmp_path, monkeypatch) -> None:
+    """The mismatch must be a hard refusal, not a silent rewrite to P1 — an
+    operator's mismatched input is a trust problem either way it's resolved
+    silently."""
+    thread = _thread(body="P1: this null pointer will crash in production")
+    _wire(monkeypatch, [thread])
+
+    rc = mc._cmd_complete(_args(
+        cwd=str(tmp_path), defer="T1", severity="P2", ticket="BOU-1",
+    ))
+
+    assert rc == 1
+    # Not persisted under EITHER severity — a clean refusal, no silent rewrite.
+    assert dr.deferred_count_for_pr(str(tmp_path), PR_NUMBER) == 0
+
+
+def test_defer_accepts_a_detected_p1_thread_labeled_p1_with_reason(tmp_path, monkeypatch) -> None:
+    """Control: the matching-severity path still works end-to-end."""
+    thread = _thread(body="P1: this null pointer will crash in production")
+    _wire(monkeypatch, [thread])
+
+    rc = mc._cmd_complete(_args(
+        cwd=str(tmp_path), defer="T1", severity="P1", ticket="BOU-1",
+        reason="out of scope: requires files this PR does not own",
+    ))
+
+    assert rc == 0
+    assert dr.is_thread_deferred(str(tmp_path), PR_NUMBER, "T1") is True
+
+
+def test_defer_allows_a_non_p1_thread_labeled_p1_deliberately(tmp_path, monkeypatch) -> None:
+    """A thread `_thread_is_p1` does NOT recognize as P1 may still be
+    deferred AS P1 deliberately (an operator's own more-cautious judgment
+    call) — the mismatch check only refuses a DOWNGRADE of a detected P1,
+    never an upgrade."""
+    thread = _thread(body="just a minor nit, nothing urgent")
+    _wire(monkeypatch, [thread])
+
+    rc = mc._cmd_complete(_args(
+        cwd=str(tmp_path), defer="T1", severity="P1", ticket="BOU-1",
+        reason="operator judgment: treat as P1 anyway",
+    ))
+
+    assert rc == 0
+    assert dr.deferred_threads_for_pr(str(tmp_path), PR_NUMBER)["T1"]["severity"] == "P1"
+
+
 def test_defer_unknown_thread_id_fails(tmp_path, monkeypatch) -> None:
     _wire(monkeypatch, [_thread(node_id="OTHER")])
 

@@ -434,6 +434,26 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         )
         return 1
 
+    # BOU-2567 PR #122 review, P1 #2: a supplied --severity is verified
+    # against the thread's own content, not merely trusted. A thread
+    # `_thread_is_p1` recognizes as P1 downgraded to --severity P2 would skip
+    # the P1-only --reason requirement entirely — precisely the mute-button
+    # abuse the anti-abuse rule exists to stop. Refuse loudly rather than
+    # silently rewrite the operator's input (a silent upgrade is its own
+    # trust problem: the operator asked for one thing and got another). Only
+    # a DOWNGRADE of a detected P1 is refused — deliberately labeling a
+    # non-P1 thread P1 is a valid, more-cautious operator judgment call.
+    supplied_severity = (args.severity or "").strip().upper()
+    if _thread_is_p1(thread) and supplied_severity != "P1":
+        print(
+            f"error: thread {thread_id!r} is recognized as P1 by its own "
+            f"content but --severity {args.severity!r} was given; a detected "
+            "P1 cannot be deferred as anything but P1 (pass --severity P1 "
+            "--reason \"...\" if this deferral is deliberate)",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         record = deferred_review.defer_thread(
             cwd, pr.number,

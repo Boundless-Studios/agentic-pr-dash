@@ -162,6 +162,88 @@ def test_thread_state_resolved_wins_over_a_stale_deferral_record(tmp_path: Path)
     assert dr.thread_state(cwd, 1, _Thread("T1", True)) == "resolved"
 
 
+# --- BOU-2567 PR #122 review, P1 #1: cross-worktree / cross-consumer visibility ---
+#
+# A deferral is a fact about (repo, PR, thread) -- not about whichever
+# worktree happened to run `complete --defer`. The dashboard's orchestrator
+# calls scan_review_threads against the repository root; detached
+# reconciliation runs after a worktree is torn down. Both must see a
+# deferral recorded from a DIFFERENT worktree of the same repo.
+
+
+def test_deferral_visible_from_a_different_worktree_of_the_same_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    feature_worktree = tmp_path / "feature-wt"
+    repo_root = tmp_path / "repo-root"
+    feature_worktree.mkdir()
+    repo_root.mkdir()
+
+    # Both paths are checkouts of the SAME repo -> same slug in reality (two
+    # worktrees, or a worktree + the repository root, share one git remote).
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: "Boundless-Studios/agentic-pr-dash",
+    )
+
+    dr.defer_thread(
+        str(feature_worktree), 122, thread_id="T1", comment_id=1,
+        severity="P2", ticket="BOU-1",
+    )
+
+    # A DIFFERENT directory (simulating the repo root / a sibling worktree /
+    # the dashboard's own cwd) must see the SAME deferral.
+    assert dr.is_thread_deferred(str(repo_root), 122, "T1") is True
+
+
+def test_deferral_survives_the_deferring_worktree_being_torn_down(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Detached reconciliation runs from an ANCHOR cwd after the worktree that
+    recorded the deferral is gone. The record must not have lived inside that
+    now-deleted worktree's own directory."""
+    import shutil
+
+    feature_worktree = tmp_path / "feature-wt"
+    anchor = tmp_path / "anchor"
+    feature_worktree.mkdir()
+    anchor.mkdir()
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: "Boundless-Studios/agentic-pr-dash",
+    )
+
+    dr.defer_thread(
+        str(feature_worktree), 999, thread_id="T9", comment_id=9,
+        severity="P2", ticket="BOU-9",
+    )
+    shutil.rmtree(feature_worktree)  # the deferring worktree is torn down
+
+    assert dr.is_thread_deferred(str(anchor), 999, "T9") is True
+
+
+def test_different_repos_do_not_collide_on_the_same_pr_number(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store is now shared across the whole machine (like the coordinator
+    claim store and the session ledger it mirrors), so two DIFFERENT repos
+    reusing the same PR number must not bleed into each other."""
+    wt_a = tmp_path / "a"
+    wt_b = tmp_path / "b"
+    wt_a.mkdir()
+    wt_b.mkdir()
+    slugs = {str(wt_a): "org/repo-a", str(wt_b): "org/repo-b"}
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: slugs[str(cwd)],
+    )
+
+    dr.defer_thread(str(wt_a), 1, thread_id="T1", comment_id=1, severity="P2", ticket="BOU-1")
+
+    assert dr.is_thread_deferred(str(wt_a), 1, "T1") is True
+    assert dr.is_thread_deferred(str(wt_b), 1, "T1") is False
+
+
 def test_is_valid_ticket_accepts_common_formats() -> None:
     assert dr.is_valid_ticket("BOU-2559") is True
     assert dr.is_valid_ticket("ABC-1") is True
