@@ -665,7 +665,26 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
     try:
         return _stop_gate_impl(args)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        # BOU-2556 (item 4): a genuine internal crash is fail-OPEN by design
+        # (a buggy gate must not wedge every session that hits it) — but that
+        # used to be completely SILENT, indistinguishable from a real clean
+        # pass. `_stop_gate_impl` now carries its own wall-clock budget (see
+        # STOP_GATE_BUDGET), so a Stop-hook wrapper's "subprocess timed out"
+        # failure should no longer happen for a healthy owned set; if this
+        # except DOES fire, it means the gate itself broke, not that it ran
+        # out of time — say so explicitly rather than returning 0 with zero
+        # information, so the operator isn't left guessing which of the two
+        # actually happened.
+        import sys  # noqa: PLC0415
+        print(
+            f"[pr-watch] stop-gate CRASHED internally ({type(exc).__name__}: {exc}) "
+            f"— this is a bug in the gate itself, NOT a per-PR budget shortfall (a "
+            f"budget shortfall blocks with its own distinct partial-completion "
+            f"summary instead). Failing OPEN (exit 0) so a broken gate cannot wedge "
+            f"every session, but this should be reported.",
+            file=sys.stderr,
+        )
         return 0
 
 
