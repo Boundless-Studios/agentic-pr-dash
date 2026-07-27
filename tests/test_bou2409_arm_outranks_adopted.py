@@ -92,6 +92,39 @@ def test_reclaim_releases_the_exact_conflicting_epoch(isolated_store, monkeypatc
     assert observed["lease_epoch"] is not None
 
 
+def test_reclaim_does_not_release_new_armed_epoch(isolated_store, monkeypatch):
+    wt = _mk(isolated_store, "wt")
+    ownership.record_ownership(
+        repo=REPO, pr_number=560, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+    original = ownership.release_ownership
+
+    def replace_with_armed_before_release_returns(**kwargs):
+        released = original(**kwargs)
+        assert released.ok
+        refreshed = ownership.record_ownership(
+            repo=REPO, pr_number=560, session_id="adopter", pid=LIVE_PID,
+            worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+        )
+        assert refreshed.ok
+        return original(**kwargs)
+
+    monkeypatch.setattr(
+        ownership, "release_ownership", replace_with_armed_before_release_returns
+    )
+    outcome = ownership.record_ownership(
+        repo=REPO, pr_number=560, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    )
+
+    assert not outcome.ok
+    holder = ownership.snapshot().owner_for(REPO, 560)
+    assert holder is not None
+    assert holder.session_id == "adopter"
+    assert holder.provenance == ownership.PROVENANCE_ARMED
+
+
 def test_reclaim_retires_adopters_session_ledger(isolated_store):
     from agentic_pr_dash import session_ledger
 

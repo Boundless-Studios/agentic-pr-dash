@@ -553,6 +553,7 @@ def record_ownership(
             repo=repo, pr_number=pr_number, session_id=holder.session_id,
             reason="reclaimed_by_armed_session", now=now,
             claim_id=holder_claim.claim_id, lease_epoch=holder_claim.lease_epoch,
+            expected_provenance=PROVENANCE_ADOPTED,
         )
         if not released.ok:
             return ClaimOutcome(
@@ -609,6 +610,7 @@ def release_ownership(
     now: datetime | None = None,
     claim_id: str | None = None,
     lease_epoch: int | None = None,
+    expected_provenance: str | None = None,
 ) -> ClaimOutcome:
     """Release this session's ownership claim on ``(repo, pr)``.
 
@@ -636,6 +638,10 @@ def release_ownership(
         claim.claim_id != claim_id or claim.lease_epoch != lease_epoch
     ):
         return ClaimOutcome(False, "claim changed before release")
+    if expected_provenance is not None and (
+        (claim.owner.metadata or {}).get("provenance") != expected_provenance
+    ):
+        return ClaimOutcome(False, "claim provenance changed before release")
     if claim.status != "active":
         # Already released under some reason — releasing again would raise.
         return ClaimOutcome(True, "already released", claim.claim_id, claim.lease_epoch)
