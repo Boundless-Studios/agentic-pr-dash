@@ -622,6 +622,14 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         ):
             return 0, "stale stolen marker; deferring to live independent owner"
         markers._touch_owner_heartbeat(cwd, self_session_id, False)
+        # BOU-2567: "nothing pending" must not go silent about deferred threads
+        # still sitting open on GitHub — a deferral is a tracked exclusion, not
+        # an erased one, and the gate must distinguish `deferred: N` from
+        # `unresolved: N` in its output rather than let the two collapse to the
+        # same clean-looking text.
+        deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
+        if deferred_n:
+            return 0, f"nothing pending (deferred: {deferred_n})"
         return 0, "nothing pending"
 
     # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
@@ -796,7 +804,12 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         logs = github_api.get_failed_logs(pr.latest_commit_sha, pr.failing_checks, cwd)
 
     prompt = maintenance.build_maintenance_prompt(pr, failed_logs=logs)
-    summary = maintenance.build_maintenance_summary(pr)
+    # BOU-2567: report deferred threads distinctly even on a dispatch tick —
+    # some OTHER blocker (CI, a different thread) may coexist with deferred
+    # ones, and the summary must not let those go uncounted just because
+    # something else is also pending.
+    deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
+    summary = maintenance.build_maintenance_summary(pr, deferred_count=deferred_n)
     text = f"{prompt}\nSUMMARY={summary}\nPR_NUMBER={pr.number}"
     if coordinator_claim is not None:
         text += (
