@@ -1447,6 +1447,77 @@ def get_new_pr_commits(
     return []
 
 
+def _parse_review_thread_comment(c: dict) -> ReviewThreadComment:
+    return ReviewThreadComment(
+        database_id=int(c.get("databaseId") or 0),
+        path=c.get("path"),
+        line=c.get("line"),
+        body=str(c.get("body") or ""),
+        author=str((c.get("author") or {}).get("login") or "unknown"),
+        created_at=str(c.get("createdAt") or ""),
+        original_line=c.get("originalLine"),
+    )
+
+
+def _parse_review_thread_nodes(nodes: list) -> list[ReviewThread]:
+    """Shared node->``ReviewThread`` parsing for both the paginated single-PR
+    query (:func:`get_review_threads`) and the multi-PR batch query
+    (:func:`batch_fetch_pr_review_and_ci`, BOU-2556) — one parsing path so a fix
+    to comment/thread field handling can't drift between the two callers."""
+    threads: list[ReviewThread] = []
+    for node in nodes:
+        try:
+            comment_nodes = node["comments"]["nodes"]
+            if not comment_nodes:
+                continue
+            top = _parse_review_thread_comment(comment_nodes[0])
+            replies = [_parse_review_thread_comment(c) for c in comment_nodes[1:]]
+            threads.append(ReviewThread(
+                node_id=str(node["id"]),
+                is_resolved=bool(node.get("isResolved")),
+                is_outdated=bool(node.get("isOutdated")),
+                top=top,
+                replies=replies,
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return threads
+
+
+# ---------------------------------------------------------------------------
+# Per-process, per-PR prefetch cache (BOU-2556).
+#
+# The stop gate used to pay a serial "review-thread query + CI-rollup query"
+# for EVERY owned PR — fine at 1 PR, a ~108s Stop-hook timeout at 7. Rather
+# than rewire every call site, ``_stop_gate_impl`` primes this cache with ONE
+# batched, aliased GraphQL round trip per repo (see
+# :func:`batch_fetch_pr_review_and_ci`) BEFORE its per-worktree loop runs;
+# :func:`get_review_threads` and :func:`required_checks_pending` below consult
+# it first. A cache miss (batching skipped, PR not in the batch, pagination
+# overflow) falls through to the original per-PR `gh` call unchanged — this is
+# purely a speed optimization with a correctness-preserving fallback, never a
+# second source of truth. Keyed by ``"owner/name"`` (never a bare PR number —
+# the same number can exist in two different maintenance repos, BOU-1801/#50).
+# ---------------------------------------------------------------------------
+_PR_BATCH_CACHE: dict[tuple[str, int], dict] = {}
+
+
+def clear_pr_batch_cache() -> None:
+    """Drop every primed batch entry (call at the top of each stop-gate tick —
+    this is a plain module global and would otherwise leak across ticks in a
+    long-lived process, e.g. across pytest cases in the same interpreter)."""
+    _PR_BATCH_CACHE.clear()
+
+
+def prime_pr_batch_cache(repo_slug: str, entries: dict[int, dict]) -> None:
+    """Populate the cache for ``repo_slug`` with one entry per PR number.
+
+    Each entry is ``{"threads": list[ReviewThread], "required_pending": bool}``.
+    """
+    for pr_number, data in entries.items():
+        _PR_BATCH_CACHE[(repo_slug, pr_number)] = data
+
+
 def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThread]:
     """Return all review threads for a PR via GraphQL.
 
@@ -1464,10 +1535,17 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
     meant to eliminate. A malformed page that reports ``hasNextPage=true`` but
     omits/empties ``endCursor`` is treated the same way (we cannot advance, so
     raising beats truncating).
+
+    BOU-2556: a hit in the batch-prefetch cache (see ``prime_pr_batch_cache``)
+    short-circuits this whole call — no `gh` invocation at all.
     """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
         return []
+
+    cached = _PR_BATCH_CACHE.get((f"{owner}/{repo}", pr_number))
+    if cached is not None and "threads" in cached:
+        return list(cached["threads"])
 
     threads: list[ReviewThread] = []
     cursor: str | None = None
@@ -1504,34 +1582,7 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
                 ) from exc
             break
 
-        for node in nodes:
-            try:
-                comment_nodes = node["comments"]["nodes"]
-                if not comment_nodes:
-                    continue
-
-                def _parse_comment(c: dict) -> ReviewThreadComment:
-                    return ReviewThreadComment(
-                        database_id=int(c.get("databaseId") or 0),
-                        path=c.get("path"),
-                        line=c.get("line"),
-                        body=str(c.get("body") or ""),
-                        author=str((c.get("author") or {}).get("login") or "unknown"),
-                        created_at=str(c.get("createdAt") or ""),
-                        original_line=c.get("originalLine"),
-                    )
-
-                top = _parse_comment(comment_nodes[0])
-                replies = [_parse_comment(c) for c in comment_nodes[1:]]
-                threads.append(ReviewThread(
-                    node_id=str(node["id"]),
-                    is_resolved=bool(node.get("isResolved")),
-                    is_outdated=bool(node.get("isOutdated")),
-                    top=top,
-                    replies=replies,
-                ))
-            except (KeyError, TypeError, ValueError):
-                continue
+        threads.extend(_parse_review_thread_nodes(nodes))
 
         if not page_info.get("hasNextPage"):
             break
@@ -2045,6 +2096,18 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     if not repo or "/" not in repo:
         return False
     owner, name = repo.split("/", 1)
+
+    # ``repo`` ("owner/name") is the SAME string shape ``get_review_threads``'s
+    # cache check uses (``f"{owner}/{repo}"`` from ``get_repo_info``) — both
+    # resolve to the repo's GitHub identity and agree in the overwhelming
+    # common case, so priming under one hits the other. Deliberately reuses the
+    # ALREADY-COMPUTED ``repo`` above rather than calling a second resolver: a
+    # miss just falls through to the unchanged live query below (lost
+    # optimization, never a wrong answer), so it costs nothing to be wrong.
+    cached = _PR_BATCH_CACHE.get((repo, pr_number))
+    if cached is not None and "required_pending" in cached:
+        return bool(cached["required_pending"])
+
     after: str | None = None
     # Accumulated across pages: the "no required contexts anywhere" fallback can
     # only be decided once every page has been seen.
@@ -2093,6 +2156,158 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     # (codex PR #75 review, round 2).
     _note_checks_probe_failure()
     return False
+
+
+# A batch call covering too many PRs at once risks a pathologically expensive
+# GraphQL query (node-count limits) for no real benefit — a session owning
+# dozens of PRs is not the case this exists for. Chunk conservatively; each
+# chunk is still exactly ONE round trip.
+_BATCH_CHUNK_SIZE = 15
+
+
+def repo_slug_for_prefetch(cwd: str | None) -> str:
+    """``"owner/name"`` for ``cwd``, resolved the SAME way ``required_checks_pending``
+    resolves it (``_repo_for_cwd``) — the canonical grouping/priming key for the
+    stop-gate's batch prefetch (BOU-2556). Public so orchestration outside this
+    module (``_maintenance.stop_gate``) can group owned worktrees by repo
+    without duplicating (or drifting from) the resolution logic."""
+    return _repo_for_cwd(cwd) or ""
+
+
+def batch_fetch_pr_review_and_ci(
+    owner: str, repo: str, pr_numbers: list[int], cwd: str | None = None,
+) -> dict[int, dict]:
+    """Fetch review threads + the required-checks rollup for MANY PRs in as few
+    round trips as possible (BOU-2556).
+
+    One aliased GraphQL query per chunk of ``pr_numbers`` (see
+    ``_BATCH_CHUNK_SIZE``) fetches, for each PR, its first page of review
+    threads and the required-checks rollup off its latest commit — the same
+    two queries :func:`get_review_threads` and :func:`required_checks_pending`
+    would otherwise each make PER PR. A session owning N PRs in one repo used
+    to cost >= 2N round trips serially; this costs ``ceil(N / _BATCH_CHUNK_SIZE)``.
+
+    Returns ``{pr_number: {"threads": [...], "required_pending": bool}}`` — only
+    for PRs this call could fully resolve. A PR is DELIBERATELY OMITTED (never
+    given a wrong/partial answer) when:
+      * the whole chunk's `gh` call failed or returned malformed JSON,
+      * the PR wasn't found under this repo (bad number, wrong repo), or
+      * either its review-thread page or its rollup-context page reports
+        ``hasNextPage`` (more than 100 threads/contexts) — the batch query only
+        fetches page one, so a truncated read here would silently narrow what
+        :func:`get_review_threads` promises callers (no dropped pages, ever).
+    Callers (``_stop_gate_impl``'s prefetch) treat an omitted PR exactly like a
+    cache miss: :func:`get_review_threads` / :func:`required_checks_pending`
+    fall through to their normal, correctness-preserving per-PR `gh` call for
+    it. This function itself never raises — any failure just means fewer PRs
+    got batched, not a wrong answer for any of them.
+    """
+    if not owner or not repo or not pr_numbers:
+        return {}
+
+    results: dict[int, dict] = {}
+    numbers = sorted(set(pr_numbers))
+    for start in range(0, len(numbers), _BATCH_CHUNK_SIZE):
+        chunk = numbers[start:start + _BATCH_CHUNK_SIZE]
+        fields = []
+        for n in chunk:
+            fields.append(
+                f'pr_{n}: pullRequest(number: {n}) {{'
+                f'  reviewThreads(first: 100) {{'
+                f'    pageInfo {{ hasNextPage }}'
+                f'    nodes {{'
+                f'      id isResolved isOutdated'
+                f'      comments(first: 100) {{'
+                f'        nodes {{ databaseId path line originalLine body author {{ login }} createdAt }}'
+                f'      }}'
+                f'    }}'
+                f'  }}'
+                f'  commits(last: 1) {{'
+                f'    nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{'
+                f'      pageInfo {{ hasNextPage }}'
+                f'      nodes {{'
+                f'        __typename'
+                f'        ... on CheckRun {{ status isRequired(pullRequestNumber: {n}) }}'
+                f'        ... on StatusContext {{ state isRequired(pullRequestNumber: {n}) }}'
+                f'      }}'
+                f'    }} }} }} }}'
+                f'  }}'
+                f'}}'
+            )
+        query = (
+            "query($owner: String!, $repo: String!) { "
+            "repository(owner: $owner, name: $repo) { "
+            + " ".join(fields) +
+            " } }"
+        )
+        cmd = [
+            "gh", "api", "graphql",
+            "-f", f"query={query}",
+            "-F", f"owner={owner}",
+            "-F", f"repo={repo}",
+        ]
+        r = _run(cmd, cwd=cwd, timeout_s=45)
+        if r.returncode != 0:
+            continue
+        try:
+            data = json.loads(r.stdout)
+            repo_node = data["data"]["repository"]
+        except (json.JSONDecodeError, KeyError, TypeError):
+            continue
+        if not isinstance(repo_node, dict):
+            continue
+        for n in chunk:
+            pr_node = repo_node.get(f"pr_{n}")
+            if not isinstance(pr_node, dict):
+                continue
+            try:
+                review_threads = pr_node["reviewThreads"]
+                thread_nodes = review_threads["nodes"]
+                threads_truncated = bool(
+                    (review_threads.get("pageInfo") or {}).get("hasNextPage")
+                )
+            except (KeyError, TypeError):
+                continue
+            if threads_truncated:
+                continue
+            threads = _parse_review_thread_nodes(thread_nodes)
+
+            required_pending = False
+            try:
+                commit_nodes = pr_node["commits"]["nodes"]
+                rollup = (
+                    commit_nodes[0]["commit"]["statusCheckRollup"]
+                    if commit_nodes else None
+                )
+            except (KeyError, TypeError, IndexError):
+                continue
+            if rollup is not None:
+                try:
+                    contexts = rollup["contexts"]
+                    ctx_truncated = bool(
+                        (contexts.get("pageInfo") or {}).get("hasNextPage")
+                    )
+                except (KeyError, TypeError):
+                    continue
+                if ctx_truncated:
+                    continue
+                saw_required = False
+                unrequired_pending = False
+                for ctx in contexts.get("nodes", []):
+                    if not isinstance(ctx, dict):
+                        continue
+                    if ctx.get("isRequired"):
+                        saw_required = True
+                        if _ctx_is_pending(ctx):
+                            required_pending = True
+                            break
+                    elif _ctx_is_nonterminal(ctx):
+                        unrequired_pending = True
+                if not required_pending:
+                    required_pending = unrequired_pending and not saw_required
+
+            results[n] = {"threads": threads, "required_pending": required_pending}
+    return results
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:

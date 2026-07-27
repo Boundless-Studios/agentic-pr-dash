@@ -34,6 +34,51 @@ def _save_stop_state(cwd: str, state: dict) -> None:
         pass
 
 
+def _pr_head_cache_path(cwd: str) -> str:
+    return str(load_config(cwd).state_dir_for(cwd) / "pr-watch.pr-head-cache.json")
+
+
+def _load_pr_head_cache(cwd: str) -> dict:
+    try:
+        with open(_pr_head_cache_path(cwd), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_pr_head_cache(cwd: str, data: dict) -> None:
+    try:
+        path = _pr_head_cache_path(cwd)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+    except OSError:
+        pass
+
+
+def _local_head_sha(cwd: str) -> str:
+    """Local HEAD commit sha for the checkout at ``cwd``, or "" on failure.
+
+    Purely local ``git`` — no network — so it is cheap enough to call every
+    tick for every owned worktree, and is the cache key BOU-2556's
+    across-firings per-PR cache uses: an owned worktree's local head IS the
+    PR's head once pushed, so an unchanged local head is strong (if not
+    airtight — an unpushed local commit changes it too, which only ever
+    causes an unnecessary-but-safe re-check) evidence nothing changed
+    remotely either.
+    """
+    import subprocess  # noqa: PLC0415
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
 def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
     """Stable hash of the pending (worktree, prompt) set."""
     h = hashlib.sha256()
@@ -181,6 +226,78 @@ def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[
     return pairs
 
 
+def _prefetch_owned_pr_state(pairs: list[tuple[str, int]]) -> None:
+    """Batch-fetch review-thread + CI-rollup data for every owned PR in as few
+    GraphQL round trips as possible (BOU-2556), priming
+    ``github_api``'s per-process cache before the per-worktree loop runs.
+
+    Grouped by repo — almost always exactly ONE for a single session's owned
+    set — so N owned PRs in the same repo cost roughly one round trip instead
+    of N serial "review threads + CI rollup" pairs. A repo with only one owned
+    PR is skipped (no batching win over the plain per-PR call). Best-effort:
+    any failure here just leaves the cache unprimed for that repo, and the
+    per-worktree loop falls through to its normal (slower, serial, and
+    independently correct) per-PR calls — this is purely a speed optimization,
+    never a second source of truth for PR state.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    by_repo: dict[str, set[int]] = {}
+    repo_cwd: dict[str, str] = {}
+    for wt, pr in pairs:
+        try:
+            repo = github_api.repo_slug_for_prefetch(wt)
+        except Exception:  # noqa: BLE001 - optimization only, never fail the gate
+            repo = ""
+        if not repo or "/" not in repo:
+            continue
+        by_repo.setdefault(repo, set()).add(pr)
+        repo_cwd.setdefault(repo, wt)
+
+    for repo, pr_numbers in by_repo.items():
+        if len(pr_numbers) < 2:
+            continue  # no batching win for a single PR in this repo
+        try:
+            owner, name = repo.split("/", 1)
+            entries = github_api.batch_fetch_pr_review_and_ci(
+                owner, name, sorted(pr_numbers), cwd=repo_cwd[repo],
+            )
+            if entries:
+                github_api.prime_pr_batch_cache(repo, entries)
+        except Exception:  # noqa: BLE001 - optimization only, never fail the gate
+            pass
+
+
+def _build_budget_block(
+    unknown_worktrees: list[str], *, checked_count: int, total: int,
+    pr_for: dict[str, int],
+) -> str:
+    """Render the distinct "budget exhausted, N unchecked" block (BOU-2556).
+
+    Deliberately separate from :func:`_build_stop_block`'s "fix + commit +
+    push" framing — there is nothing confirmed broken here, only PRs this tick
+    did not get to. Lets the operator (or the wrapping Stop-hook message) tell
+    "the gate crashed" apart from "the gate ran out of time with N of M
+    checked", which a bare subprocess-timeout failure cannot distinguish.
+    """
+    lines = [
+        f"[pr-watch] BUDGET-UNKNOWN: stop-gate wall-clock budget exhausted "
+        f"(checked {checked_count} of {total} owned PRs). The remaining "
+        f"{len(unknown_worktrees)} PR(s) below are UNKNOWN this tick — NOT "
+        f"confirmed clean, NOT a crash — just not yet examined:\n",
+    ]
+    for wt in unknown_worktrees:
+        pr = pr_for.get(wt)
+        pr_desc = f"#{pr}" if pr is not None else "(unresolved)"
+        lines.append(f"  - {wt}: PR {pr_desc} not checked this tick")
+    lines.append(
+        "\nNo action needed for these specifically — re-stop shortly (or let "
+        "the background waiter / maintenance loop catch them) rather than "
+        "assuming they are clean."
+    )
+    return "\n".join(lines)
+
+
 def _build_waiter_block(open_prs: set[int], cwd: str, session_id: str) -> str:
     """Render the spawn-waiter prompt."""
     pr_list = ", ".join(f"#{n}" for n in sorted(open_prs))
@@ -286,6 +403,55 @@ def _stop_gate_impl(args) -> int:
     pr_for = resolution.pr_for if resolution is not None else {}
     provenance_for = resolution.provenance_for if resolution is not None else {}
 
+    # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
+    # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
+    # Stop-hook timeout at seven (the incident this fixes). Prefetch all of
+    # them in as few round trips as possible BEFORE the loop runs, grouped by
+    # repo (almost always exactly one for a single session's owned set), and
+    # prime `github_api`'s per-process cache with the results; the loop below
+    # is UNCHANGED — `_check_worktree`'s internal calls to
+    # `get_review_threads`/`required_checks_pending` transparently become cache
+    # hits. Best-effort: a prefetch failure just leaves the cache unprimed and
+    # the loop falls back to its original per-PR calls (never a wrong answer,
+    # only a slower one).
+    github_api.clear_pr_batch_cache()
+    effective_pr_pairs = _effective_pr_pairs(owned, pr_for)
+    _prefetch_owned_pr_state(effective_pr_pairs)
+
+    # BOU-2556: give the per-worktree loop below a wall-clock budget so a
+    # session owning many PRs degrades gracefully instead of blowing the
+    # Stop-hook's own ~108s hard timeout wholesale (which reads to the caller
+    # as a bare "subprocess failed" with ZERO detail on what was actually
+    # checked). Once exceeded, every REMAINING owned worktree is left UNCHECKED
+    # this tick — reported as unknown, not silently dropped and never folded
+    # into "clean" (the same "unknown is not clean" invariant as
+    # `gh_state_unknown` / `WorktreeOwnership.unknown` elsewhere in this
+    # package). Default (60s) is chosen with real headroom under the observed
+    # ~108s external timeout so this budget — not that outer one — is what
+    # actually governs completion.
+    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
+    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
+    checked_count = 0
+    unknown_worktrees: list[str] = []
+
+    # BOU-2556: per-PR cache across FIRINGS (separate stop-gate subprocesses),
+    # keyed on each owned worktree's local head sha — distinct from, and
+    # deliberately reusing, `interval` (STOP_INTERVAL) above rather than
+    # inventing a second cache-lifetime knob. STOP_INTERVAL already skips the
+    # WHOLE gate for up to `interval` seconds when the LAST tick found nothing
+    # pending; this cache extends that exact tolerance to the per-PR case,
+    # which STOP_INTERVAL cannot help with once ANY owned PR is pending (the
+    # whole-gate skip is disabled the moment `last_pending` is true, so a
+    # session with one blocked PR among many re-pays every OTHER PR's query on
+    # every single stop without this). Only ever short-circuits a CLEAN (code
+    # 0) verdict for an UNCHANGED head sha within `interval` seconds — a cached
+    # PENDING or unobservable result is never trusted stale, so real work
+    # always keeps re-surfacing and an outage is never papered over.
+    pr_head_cache = {
+        wt: entry for wt, entry in _load_pr_head_cache(cwd).items() if wt in owned
+    }
+    pr_head_cache_dirty = False
+
     pending: list[tuple[str, str]] = []
     # An owned PR whose check was UNOBSERVABLE (code 2: gh could not resolve
     # the PR / its blockers) or warn-only-deferred (exit 0 but the PR HAS
@@ -298,7 +464,31 @@ def _stop_gate_impl(args) -> int:
     adopted_pending: list[tuple[str, str]] = []
     draft_worktrees: set[str] = set()
     for worktree in owned:
-        code, text = _check_worktree(worktree, session_id, claim=False)
+        local_sha = _local_head_sha(worktree)
+        cached_entry = pr_head_cache.get(worktree)
+        if (
+            cached_entry
+            and local_sha
+            and cached_entry.get("head_sha") == local_sha
+            and cached_entry.get("code") == 0
+            and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+        ):
+            code, text = 0, cached_entry.get("text", "nothing pending")
+            checked_count += 1
+        elif gate_deadline is not None and time.monotonic() >= gate_deadline:
+            # BOU-2556: budget exhausted — every worktree from here on is
+            # UNCHECKED this tick, not confirmed clean. Recorded distinctly so
+            # the blocking message can say "checked K of M, budget exhausted"
+            # instead of silently treating an unexamined PR as fine.
+            unknown_worktrees.append(worktree)
+            continue
+        else:
+            code, text = _check_worktree(worktree, session_id, claim=False)
+            checked_count += 1
+            pr_head_cache[worktree] = {
+                "head_sha": local_sha, "checked_at": now, "code": code, "text": text,
+            }
+            pr_head_cache_dirty = True
         if code == 10:
             # An ADOPTED worktree is one auto-adoption handed us: this session
             # never armed it and has no context on the work. Its blockers are
@@ -333,6 +523,9 @@ def _stop_gate_impl(args) -> int:
                     worktree, {"pr": str(pruned.pr_number)}, session_id
                 )
 
+    if pr_head_cache_dirty:
+        _save_pr_head_cache(cwd, pr_head_cache)
+
     if session_id:
         # Stop gate: fail closed. An unresolvable gh probe counts as a blocker
         # exactly like a real one — see _record_has_blockers.
@@ -351,7 +544,8 @@ def _stop_gate_impl(args) -> int:
     # (codex PR #50 review). Falls back to the anchor cwd for PRs with no
     # resolvable worktree (e.g. mocked/detached).
     pr_to_wts: dict[int, list[str]] = {}
-    effective_pr_pairs = _effective_pr_pairs(owned, pr_for)
+    # `effective_pr_pairs` was already computed above (BOU-2556 prefetch seed);
+    # reused here unchanged rather than recomputed.
     for wt, pr in effective_pr_pairs:
         if wt in draft_worktrees:
             continue
@@ -387,7 +581,7 @@ def _stop_gate_impl(args) -> int:
             file=sys.stderr,
         )
 
-    if not pending:
+    if not pending and not unknown_worktrees:
         if (not getattr(args, "no_waiter", False)) and session_id:
             from agentic_pr_dash import loop as _loop_mod  # noqa: PLC0415
             # A PR is loop-covered only if covered in EVERY repo that owns it; if
@@ -529,7 +723,15 @@ def _stop_gate_impl(args) -> int:
         _save_stop_state(cwd, {"ts": now})
         return 0
 
+    # BOU-2556: an unknown (budget-unchecked) worktree folds into the SAME
+    # fingerprint/retry-count/threshold machinery as a confirmed pending one —
+    # a persistent budget shortfall on the SAME owned set should also release
+    # the gate after STOP_LOOP_THRESHOLD reps, exactly like persistent real
+    # pending work. Sorted so the fingerprint is stable regardless of dict/set
+    # iteration order.
     fingerprint = _stop_fingerprint(pending)
+    if unknown_worktrees:
+        fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
     count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
     _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
 
@@ -539,7 +741,20 @@ def _stop_gate_impl(args) -> int:
     if escalated_owned:
         print(_build_escalation_block(escalated_owned), file=sys.stderr)
 
-    verbose_text = _build_stop_block(pending)
+    # BOU-2556: pending (confirmed blockers) and unknown_worktrees (budget
+    # ran out before they were even examined) are DELIBERATELY rendered as two
+    # separate blocks, never merged into one "fix this" instruction set — an
+    # unknown PR has nothing confirmed to fix, so telling the operator to
+    # "commit + push" it would be actively misleading (item 4 of BOU-2556:
+    # a bare subprocess-timeout failure could not make this distinction at
+    # all; this gate now can, every time it runs to completion).
+    verbose_text = _build_stop_block(pending) if pending else ""
+    if unknown_worktrees:
+        budget_text = _build_budget_block(
+            unknown_worktrees, checked_count=checked_count,
+            total=len(owned), pr_for=pr_for,
+        )
+        verbose_text = f"{verbose_text}\n\n{budget_text}" if verbose_text else budget_text
     # Write the full prompt (comment bodies, baseline-capture boilerplate, and
     # per-PR complete commands) to a payload file instead of stderr, and print
     # only a concise per-PR summary there — a stop-blocked agent otherwise reads
@@ -550,35 +765,58 @@ def _stop_gate_impl(args) -> int:
     except OSError:
         payload_path = None
     if payload_path is not None:
-        print(_build_concise_stop_block(pending, payload_path), file=sys.stderr)
+        if pending:
+            concise = _build_concise_stop_block(pending, payload_path)
+            if unknown_worktrees:
+                concise += (
+                    f"\n[pr-watch] BUDGET-UNKNOWN: {len(unknown_worktrees)} additional "
+                    f"owned PR(s) were NOT checked this tick (checked {checked_count} "
+                    f"of {len(owned)}) — see {payload_path}."
+                )
+        else:
+            concise = (
+                f"[pr-watch] BUDGET-UNKNOWN: stop-gate budget exhausted — checked "
+                f"{checked_count} of {len(owned)} owned PRs; {len(unknown_worktrees)} "
+                f"PR(s) UNKNOWN this tick (not confirmed clean). Full detail: "
+                f"{payload_path}."
+            )
+        print(concise, file=sys.stderr)
     else:
         print(verbose_text, file=sys.stderr)
 
     threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
     if count >= threshold:
         print(
-            f"[pr-watch] Same pending PR state seen {count}× with no progress — "
-            f"releasing the stop gate so you can ask the user or take a safe "
-            f"action. A later stop will re-enforce it.",
+            f"[pr-watch] Same pending/unknown PR state seen {count}× with no "
+            f"progress — releasing the stop gate so you can ask the user or "
+            f"take a safe action. A later stop will re-enforce it.",
             file=sys.stderr,
         )
         _save_stop_state(cwd, {"ts": now})
         return 0
 
-    if payload_path is not None:
-        print(
-            "[pr-watch] Read the payload file for full instructions, address the "
-            "items (commit + push to each EXISTING branch), run the per-worktree "
-            "`complete` command it shows, then try stopping again. If you cannot "
-            "resolve an item yourself, tell the user.",
-            file=sys.stderr,
-        )
+    if pending:
+        if payload_path is not None:
+            print(
+                "[pr-watch] Read the payload file for full instructions, address the "
+                "items (commit + push to each EXISTING branch), run the per-worktree "
+                "`complete` command it shows, then try stopping again. If you cannot "
+                "resolve an item yourself, tell the user.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                "[pr-watch] Address the items above (commit + push to each EXISTING "
+                "branch), run the per-worktree `complete` command shown in that section, "
+                "then try stopping again. If you cannot resolve an item yourself, tell "
+                "the user.",
+                file=sys.stderr,
+            )
     else:
         print(
-            "[pr-watch] Address the items above (commit + push to each EXISTING "
-            "branch), run the per-worktree `complete` command shown in that section, "
-            "then try stopping again. If you cannot resolve an item yourself, tell "
-            "the user.",
+            "[pr-watch] Nothing confirmed broken — the PR(s) above are simply "
+            "unchecked this tick. Try stopping again shortly so the gate can "
+            "examine them within its budget.",
             file=sys.stderr,
         )
     return 2
