@@ -876,7 +876,13 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         _seen_d.add(key)
                         _detached_this_tick.append(r)
                 for r in _detached_this_tick:
-                    if _record_has_blockers(r):
+                    # Waiter: an unresolvable gh probe is NOT actionable
+                    # feedback — it must not exit 10 ("Feedback arrived") on a
+                    # transient outage. `unknown_detached` below already keeps
+                    # this tick from concluding "clean" for the same record;
+                    # this just stops it from being wrongly treated as
+                    # CONFIRMED feedback (PR #119 review).
+                    if _record_has_blockers(r, unknown_state_blocks=False):
                         pending.append(_detached_pending_entry(r))
 
             if pending:

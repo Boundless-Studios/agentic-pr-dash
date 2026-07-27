@@ -311,7 +311,7 @@ def test_detached_ledger_pr_still_gets_waiter_when_loop_live(tmp_path, monkeypat
         "_detached_pr_records",
         lambda sid, cwd, include_legacy=True, prune_legacy=True: [{"pr": 99, "state": "open", "p1": False, "unresolved_threads": 0}],
     )
-    monkeypatch.setattr(_stop_gate_mod, "_record_has_blockers", lambda r: False)
+    monkeypatch.setattr(_stop_gate_mod, "_record_has_blockers", lambda r, **kw: False)
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
     monkeypatch.setattr(_waiter_mod, "_detached_loop_alive", lambda cwd: True)

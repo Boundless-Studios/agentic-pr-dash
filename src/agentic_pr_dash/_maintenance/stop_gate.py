@@ -334,8 +334,10 @@ def _stop_gate_impl(args) -> int:
                 )
 
     if session_id:
+        # Stop gate: fail closed. An unresolvable gh probe counts as a blocker
+        # exactly like a real one — see _record_has_blockers.
         detached = [r for r in _detached_records_across_roots(session_id, cwd)
-                    if _record_has_blockers(r)]
+                    if _record_has_blockers(r, unknown_state_blocks=True)]
         detached.sort(key=lambda r: (0 if r["p1"] else 1, -r["unresolved_threads"], r["pr"]))
         for r in detached:
             pending.append(_detached_pending_entry(r))
@@ -616,15 +618,37 @@ def _build_escalation_block(escalated_prs: dict[int, dict]) -> str:
     return "\n".join(lines)
 
 
-def _record_has_blockers(record: dict) -> bool:
+def _record_has_blockers(record: dict, *, unknown_state_blocks: bool) -> bool:
+    """Does this detached-PR record represent work the CALLER must act on?
+
+    ``record["gh_state_unknown"]`` (set by ``reconcile._unknown_gh_state_record``
+    whenever a `gh` probe could not resolve the PR's state at all) is a single
+    FACT — "we could not determine this PR's state" — but the two callers of
+    this shared predicate mean genuinely different things by "has blockers", so
+    one boolean cannot answer both correctly. ``unknown_state_blocks`` is a
+    required, explicit policy parameter (no default) precisely so neither call
+    site can silently inherit the wrong one:
+
+    * The stop gate (``unknown_state_blocks=True``) must fail CLOSED (P1,
+      reconcile-prs used to report every PR as blocker-free during a transient
+      gh outage): a session must not idle on a PR whose state could not be
+      verified, so an unresolvable probe counts as a blocker exactly like a
+      real one.
+    * The `await` waiter (``unknown_state_blocks=False``) must NOT treat an
+      unresolvable probe as actionable feedback. Before this parameter existed,
+      an unknown-state record reached this predicate, returned True, and made
+      the waiter ``return 10`` ("Feedback arrived on PR(s) you own — address it
+      now") on a transient `gh` outage for a condition that was never actually
+      observed — instead of recovering on a later tick once `gh` responds
+      again, which is what the waiter's OWN ``unknown_detached`` guard
+      (``maintenance_check._cmd_await``) already exists to do. Routing the
+      record through this predicate as if it were confirmed feedback bypassed
+      that guard entirely (PR #119 review, https://github.com/Boundless-Studios/agentic-pr-dash/pull/119#discussion_r3654167852).
+    """
     return bool(
         record["unresolved_threads"]
         or record["ci_failing"]
         or record.get("changes_requested")
         or record.get("merge_conflict")
-        # A gh probe failure must fail CLOSED, not silently read as clean
-        # (P1: reconcile-prs used to report every PR as blocker-free during a
-        # transient gh outage). `_unknown_gh_state_record` sets this whenever
-        # the PR-state probe could not be resolved at all.
-        or record.get("gh_state_unknown")
+        or (unknown_state_blocks and record.get("gh_state_unknown"))
     )
