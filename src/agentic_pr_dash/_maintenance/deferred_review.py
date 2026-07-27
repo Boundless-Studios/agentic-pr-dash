@@ -46,12 +46,14 @@ identify WHICH repo/PR a call is about — never to locate the store itself.
 """
 from __future__ import annotations
 
+import fcntl
 import functools
 import json
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 _STATE_FILENAME = "deferred-reviews.json"
@@ -61,6 +63,15 @@ _STATE_FILENAME = "deferred-reviews.json"
 # GAIA_ prefix honored elsewhere in this package).
 _ENV_STORE_PATH = "AGENTIC_PR_DASH_DEFERRED_STORE"
 _LEGACY_ENV_STORE_PATH = "GAIA_DEFERRED_STORE"
+
+# BOU-2567 PR #122 review, round 3, P1: relocating the store to a single
+# machine-wide file (round 2) made it genuinely shared -- several sessions'
+# `complete --defer`/`--sweep-p2` calls can now race on the SAME file, and a
+# shared read-modify-write store needs serialization or a later writer's
+# atomic replace silently discards an earlier writer's still-unsaved update.
+_ENV_LOCK_TIMEOUT_SECONDS = "AGENTIC_PR_DASH_DEFERRED_LOCK_TIMEOUT_SECONDS"
+_DEFAULT_LOCK_TIMEOUT_SECONDS = 5.0
+_LOCK_POLL_SECONDS = 0.01
 
 # A well-formed tracker reference (e.g. ``BOU-2559``). This repo has no live
 # Linear client, so "requires a ticket ID that resolves" is enforced as "is a
@@ -123,6 +134,85 @@ def _store_path() -> str:
         or os.environ.get(_LEGACY_ENV_STORE_PATH)
         or _default_store_path()
     )
+
+
+def _lock_path() -> str:
+    return _store_path() + ".lock"
+
+
+def _lock_timeout_seconds() -> float:
+    raw = os.environ.get(_ENV_LOCK_TIMEOUT_SECONDS, "").strip()
+    try:
+        value = float(raw) if raw else _DEFAULT_LOCK_TIMEOUT_SECONDS
+    except ValueError:
+        return _DEFAULT_LOCK_TIMEOUT_SECONDS
+    return value if value > 0 else _DEFAULT_LOCK_TIMEOUT_SECONDS
+
+
+class DeferredStoreLockTimeout(DeferralError):
+    """The shared store's lock could not be acquired within its deadline.
+
+    Raised, never swallowed: a write that could not be serialized against
+    concurrent writers is not a write that happened. This repo's own
+    postmortem (BOU-2567) is four bugs that each came from an "unknown" or
+    "could not determine" collapsing into a definite, wrong answer -- a
+    timed-out lock acquisition must not become "proceeded anyway".
+    """
+
+
+@contextmanager
+def _locked():
+    """Hold an exclusive, non-blocking-polled, TIME-BOUNDED lock around a
+    read-modify-write transaction on the shared store.
+
+    Mirrors ``ownership.BoundedLockClaimStore._bounded_lock``: an unbounded
+    ``fcntl.flock(LOCK_EX)`` (``session_ledger``'s writer lock, and the
+    coordinator's own ``JsonlClaimStore``) blocks forever behind a stale or
+    abandoned holder — acceptable for a long-lived daemon, but NOT for an
+    interactive CLI command (``complete --defer``/``--sweep-p2``), which must
+    fail loudly within a bounded time rather than hang. So this polls a
+    non-blocking ``flock`` attempt against a wall-clock deadline and raises
+    :class:`DeferredStoreLockTimeout` instead of waiting past it.
+
+    Deliberately NOT used by any read path (:func:`_load` and its callers —
+    ``deferred_threads_for_pr``, ``is_thread_deferred``, ``thread_state``,
+    ``followup_ticket_for_pr``): :func:`_save` writes via ``mkstemp`` +
+    ``os.replace`` (atomic rename), so a concurrent reader always sees either
+    the pre- or post-write state, never a torn one — the same precedent as
+    ``session_ledger.read``, which is also lock-free while its writers
+    (``append``/``prune``) take the lock. Only the load-mutate-save
+    transaction needs serializing; adding lock contention to reads would cost
+    every ``check``/``stop-gate`` tick for no correctness benefit.
+    """
+    path = _lock_path()
+    parent = os.path.dirname(path)
+    os.makedirs(parent, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        timeout = _lock_timeout_seconds()
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise DeferredStoreLockTimeout(
+                        f"could not acquire the deferred-review store lock "
+                        f"within {timeout}s ({path}); another process is "
+                        "holding it. The deferral was NOT recorded — retry "
+                        "once the contending process releases it."
+                    ) from None
+                time.sleep(_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
 
 
 @functools.lru_cache(maxsize=256)
@@ -244,10 +334,14 @@ def followup_ticket_for_pr(cwd: str, pr_number: int) -> str | None:
 def set_followup_ticket(cwd: str, pr_number: int, ticket: str) -> None:
     if not is_valid_ticket(ticket):
         raise DeferralError(f"invalid follow-up ticket {ticket!r}")
-    state = _load()
-    key = _pr_key(cwd, pr_number)
-    _pr_record(state, key, pr_number)["followup_ticket"] = ticket.strip()
-    _save(state)
+    # Locked (BOU-2567 PR #122 review round 3): the load-mutate-save
+    # transaction must be serialized against concurrent writers the same as
+    # defer_thread's — see _locked()'s docstring.
+    with _locked():
+        state = _load()
+        key = _pr_key(cwd, pr_number)
+        _pr_record(state, key, pr_number)["followup_ticket"] = ticket.strip()
+        _save(state)
 
 
 def defer_thread(
@@ -302,11 +396,19 @@ def defer_thread(
         deferred_at=_now_iso(),
         deferred_by=deferred_by or "",
     )
-    state = _load()
-    key = _pr_key(cwd, pr_number)
-    pr_rec = _pr_record(state, key, pr_number)
-    pr_rec["deferred"] = [
-        d for d in pr_rec["deferred"] if d.get("thread_id") != thread_id
-    ] + [record.to_dict()]
-    _save(state)
+    # Locked (BOU-2567 PR #122 review round 3, P1): the whole load-mutate-save
+    # transaction is the critical section, not just the save — two concurrent
+    # callers must never both load the same pre-mutation snapshot. Raises
+    # DeferredStoreLockTimeout (a DeferralError) on a stale/abandoned lock
+    # rather than hang or silently proceed unlocked; propagates straight to
+    # the CLI, which must treat it exactly like any other DeferralError
+    # (nonzero exit, no false "deferred thread ..." success message).
+    with _locked():
+        state = _load()
+        key = _pr_key(cwd, pr_number)
+        pr_rec = _pr_record(state, key, pr_number)
+        pr_rec["deferred"] = [
+            d for d in pr_rec["deferred"] if d.get("thread_id") != thread_id
+        ] + [record.to_dict()]
+        _save(state)
     return record

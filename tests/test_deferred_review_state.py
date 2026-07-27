@@ -8,6 +8,10 @@ test_deferred_review_complete.py); this file is the state store in isolation.
 """
 from __future__ import annotations
 
+import fcntl
+import os
+import threading
+import time as _time_mod
 from pathlib import Path
 
 import pytest
@@ -251,3 +255,149 @@ def test_is_valid_ticket_accepts_common_formats() -> None:
     assert dr.is_valid_ticket(None) is False
     assert dr.is_valid_ticket("random text") is False
     assert dr.is_valid_ticket("BOU") is False
+
+
+# --- BOU-2567 PR #122 review, round 3, P1: serialize shared-store updates ---
+#
+# Moving the store to a single machine-wide file (round 2, P1 #1) made it a
+# genuinely shared read-modify-write target: several sessions/worktrees can
+# now run `complete --defer` / `--sweep-p2` concurrently against the SAME
+# file. Without serialization, two concurrent load->mutate->atomic-replace
+# cycles can each read the same pre-mutation snapshot and the LATER replace
+# silently discards the EARLIER writer's update in full.
+
+
+def test_concurrent_defers_on_different_threads_never_lose_an_update(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two threads defer DIFFERENT thread_ids on the SAME PR at (as close to)
+    the same instant; both records must survive.
+
+    Forces the race deterministically rather than relying on OS scheduling
+    luck: a barrier releases both "writers" together, and the very first
+    call through `_save` is slowed down (well past how long an unlocked
+    concurrent load+save takes) so that -- WITHOUT a lock -- the second
+    writer's whole load->mutate->save cycle races ahead and finishes first,
+    and the first writer's later (slow) save then clobbers it outright. WITH
+    the lock, the second writer's lock acquisition simply blocks until the
+    first writer's entire critical section (including the slow save)
+    completes, so no interleave -- and no lost update -- is possible.
+
+    Run against pre-lock code first to confirm this reproduces the loss
+    (RED), then against the fix (GREEN).
+    """
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_DEFERRED_STORE", str(tmp_path / "shared-store.json")
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: "org/repo",
+    )
+
+    barrier = threading.Barrier(2)
+    slow_once = threading.Event()
+    real_save = dr._save
+
+    def _slow_save(state):
+        if not slow_once.is_set():
+            slow_once.set()
+            _time_mod.sleep(0.3)
+        real_save(state)
+
+    monkeypatch.setattr(dr, "_save", _slow_save)
+
+    errors: list[BaseException] = []
+
+    def _writer(thread_id: str, ticket: str) -> None:
+        try:
+            barrier.wait(timeout=5)
+            dr.defer_thread(
+                str(tmp_path), 1, thread_id=thread_id, comment_id=1,
+                severity="P2", ticket=ticket,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_writer, args=("A", "BOU-1"))
+    t2 = threading.Thread(target=_writer, args=("B", "BOU-2"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors, errors
+    records = dr.deferred_threads_for_pr(str(tmp_path), 1)
+    assert set(records) == {"A", "B"}, (
+        f"a concurrent writer's update was lost -- expected both A and B "
+        f"to survive, got {set(records)!r}"
+    )
+
+
+def test_lock_acquisition_failure_is_loud_not_silent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale/abandoned lock (held by some OTHER process/fd, never
+    released) must make `defer_thread` fail LOUDLY and QUICKLY -- never
+    hang forever, and never silently proceed as though it wrote the record.
+    A write that could not be serialized is not a write that happened."""
+    store = tmp_path / "shared-store.json"
+    monkeypatch.setenv("AGENTIC_PR_DASH_DEFERRED_STORE", str(store))
+    monkeypatch.setenv("AGENTIC_PR_DASH_DEFERRED_LOCK_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: "org/repo",
+    )
+
+    lock_path = dr._lock_path()
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    holder_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(holder_fd, fcntl.LOCK_EX)  # simulate a stale/abandoned holder
+    try:
+        start = _time_mod.monotonic()
+        with pytest.raises(dr.DeferredStoreLockTimeout):
+            dr.defer_thread(
+                str(tmp_path), 1, thread_id="A", comment_id=1,
+                severity="P2", ticket="BOU-1",
+            )
+        elapsed = _time_mod.monotonic() - start
+        assert elapsed < 3.0, f"must fail fast, not hang; took {elapsed}s"
+    finally:
+        fcntl.flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
+
+    # Not silently "succeeded" -- nothing was persisted.
+    assert dr.is_thread_deferred(str(tmp_path), 1, "A") is False
+
+
+def test_lock_released_after_timeout_lets_a_later_call_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the stale holder releases, a subsequent call must succeed
+    normally -- the timeout path must not leave the lock file itself wedged."""
+    store = tmp_path / "shared-store.json"
+    monkeypatch.setenv("AGENTIC_PR_DASH_DEFERRED_STORE", str(store))
+    monkeypatch.setenv("AGENTIC_PR_DASH_DEFERRED_LOCK_TIMEOUT_SECONDS", "0.2")
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance._common._repo_slug",
+        lambda cwd: "org/repo",
+    )
+
+    lock_path = dr._lock_path()
+    os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+    holder_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(holder_fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(dr.DeferredStoreLockTimeout):
+            dr.defer_thread(
+                str(tmp_path), 1, thread_id="A", comment_id=1,
+                severity="P2", ticket="BOU-1",
+            )
+    finally:
+        fcntl.flock(holder_fd, fcntl.LOCK_UN)
+        os.close(holder_fd)
+
+    dr.defer_thread(
+        str(tmp_path), 1, thread_id="A", comment_id=1,
+        severity="P2", ticket="BOU-1",
+    )
+    assert dr.is_thread_deferred(str(tmp_path), 1, "A") is True
