@@ -16,6 +16,7 @@ mention of who holds it or why. Two defects:
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 
@@ -261,6 +262,52 @@ def test_durable_cleanup_is_skipped_when_the_adopter_rearms(isolated_store, monk
         "the adopter re-armed inside the release window, so its ledger entry "
         "belongs to a live ARMED claim — the durable cleanup must re-check the "
         "store and leave it alone"
+    )
+
+
+def test_durable_cleanup_is_skipped_when_the_snapshot_is_unknown(isolated_store, monkeypatch):
+    """An unreadable claim store must NOT read as "unclaimed".
+
+    `snapshot()` answers `known() is False` when the bounded read fails (a lock
+    timeout during a concurrent re-arm, say), but its `claim_for` still returns
+    None. Gating the cleanup on `claim_for` alone therefore prunes the holder's
+    durable state on precisely the evidence this module promises to fail closed
+    on — and if the preceding `release_ownership` read failed the same way, the
+    original claim was never released, so the retry loses to a live owner whose
+    ledger and marker were just deleted.
+    """
+    wt = _mk(isolated_store, "wt")
+    ownership.record_ownership(
+        repo=REPO, pr_number=570, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+
+    from agentic_pr_dash import session_ledger
+
+    pruned: list[tuple] = []
+    monkeypatch.setattr(session_ledger, "prune", lambda *a, **k: pruned.append((a, k)))
+
+    original_snapshot = ownership.snapshot
+    calls = {"n": 0}
+
+    def snapshot_that_goes_unreadable(*args, **kwargs):
+        # Let the release path read normally; fail the RECHECK read only.
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            return ownership._unknown_snapshot(
+                kwargs.get("now") or datetime.now(timezone.utc)
+            )
+        return original_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(ownership, "snapshot", snapshot_that_goes_unreadable)
+    ownership.record_ownership(
+        repo=REPO, pr_number=570, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    )
+
+    assert pruned == [], (
+        "the claim store was unreadable, so ownership is UNKNOWN, not absent — "
+        "the durable cleanup must fail closed and skip rather than prune"
     )
 
 

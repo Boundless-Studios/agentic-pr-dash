@@ -572,8 +572,17 @@ def record_ownership(
         # ledger/marker artifacts a session-wide waiter needs to find the
         # worktree after a restart or from another maintenance root. Re-read the
         # store and only retire durable state while the PR is still unclaimed.
-        _recheck = snapshot(now=now).claim_for(repo, pr_number)
-        if _recheck is None or _recheck.status != "active":
+        # The recheck must gate on `known()`, not on `claim_for()` alone: a
+        # bounded-read failure (lock timeout during a concurrent re-arm) yields
+        # an UNKNOWN snapshot whose `claim_for` still answers None. Treating
+        # that as "unclaimed" would prune the holder's durable state on exactly
+        # the evidence this module promises to fail closed on — and if the
+        # preceding release_ownership read failed the same way, the original
+        # claim was never released either, so the retry then loses to a live
+        # owner whose ledger/marker we just deleted.
+        _snap = snapshot(now=now)
+        _recheck = _snap.claim_for(repo, pr_number) if _snap.known() else None
+        if _snap.known() and (_recheck is None or _recheck.status != "active"):
             try:
                 from . import session_ledger  # noqa: PLC0415
                 # include_legacy=False deliberately: this reclaim is scoped to
