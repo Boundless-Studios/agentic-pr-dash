@@ -471,7 +471,7 @@ def _stop_gate_impl(args) -> int:
     # still finds the stale PR number in `pr_for` and reports "you own open PR
     # #N" (or demands a waiter for it) for a PR this same tick just confirmed
     # is no longer open.
-    pruned_pr_numbers: set[int] = set()
+    pruned_pr_keys: set[tuple[str, int]] = set()
     for worktree in owned:
         local_sha = _local_head_sha(worktree)
         cached_entry = pr_head_cache.get(worktree)
@@ -537,7 +537,8 @@ def _stop_gate_impl(args) -> int:
                 # still-open PR must never be excluded from the waiter-demand
                 # set below.
                 if actually_pruned:
-                    pruned_pr_numbers.add(pruned.pr_number)
+                    from ._common import _repo_slug as _slug  # noqa: PLC0415
+                    pruned_pr_keys.add((_slug(worktree), pruned.pr_number))
 
     if pr_head_cache_dirty:
         _save_pr_head_cache(cwd, pr_head_cache)
@@ -626,7 +627,16 @@ def _stop_gate_impl(args) -> int:
             )
             owned_pr_numbers = (
                 marker_open_pr_numbers | claim_open_pr_numbers
-            ) - pruned_pr_numbers
+            )
+            pairs_by_number: dict[int, set[tuple[str, int]]] = {}
+            from ._common import _repo_slug as _slug  # noqa: PLC0415
+            for wt, pr in effective_pr_pairs:
+                pairs_by_number.setdefault(pr, set()).add((_slug(wt), pr))
+            fully_pruned_numbers = {
+                pr for pr, keys in pairs_by_number.items()
+                if keys and keys <= pruned_pr_keys
+            }
+            owned_pr_numbers -= fully_pruned_numbers
             worktree_prs = {
                 n for n in owned_pr_numbers
                 if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))

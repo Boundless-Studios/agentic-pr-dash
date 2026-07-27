@@ -67,6 +67,26 @@ def test_gh_pr_view_field_honors_a_caller_supplied_deadline(monkeypatch):
     )
 
 
+def test_retry_backoff_is_clamped_to_remaining_deadline(monkeypatch):
+    clock = {"now": 10.0}
+    sleeps: list[float] = []
+
+    class _Result:
+        returncode = 1
+        stderr = "error connecting to api.github.com"
+        stdout = ""
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(
+        time, "sleep",
+        lambda seconds: (sleeps.append(seconds), clock.__setitem__("now", clock["now"] + seconds)),
+    )
+    monkeypatch.setattr(pr_state.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(pr_state, "_PR_VIEW_BACKOFF_SECONDS", 0.75)
+    pr_state._gh_pr_view_field("/repo", 1, "isDraft", deadline=10.1)
+    assert sleeps == pytest.approx([0.1])
+
+
 def test_full_arm_stays_inside_a_shared_budget_across_both_probes(monkeypatch, tmp_path):
     """`arm`'s two probes (isDraft, headRefName) must draw down ONE shared
     budget, not each get a fresh one — the documented failure mode is ~93s

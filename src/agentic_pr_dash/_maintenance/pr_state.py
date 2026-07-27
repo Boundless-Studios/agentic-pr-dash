@@ -374,12 +374,16 @@ def _gh_pr_view_field(
                     f"{(result.stderr or '').strip()[:300] or '<no stderr>'}"
                 )
         if attempt < _PR_VIEW_ATTEMPTS:
-            if deadline is not None and deadline - time.monotonic() <= 0:
-                return _GH_UNAVAILABLE, (
-                    f"budget exhausted after attempt {attempt} of "
-                    f"{_PR_VIEW_ATTEMPTS} ({last})"
-                )
-            time.sleep(_PR_VIEW_BACKOFF_SECONDS)
+            sleep_for = _PR_VIEW_BACKOFF_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _GH_UNAVAILABLE, (
+                        f"budget exhausted after attempt {attempt} of "
+                        f"{_PR_VIEW_ATTEMPTS} ({last})"
+                    )
+                sleep_for = min(sleep_for, remaining)
+            time.sleep(sleep_for)
     return _GH_UNAVAILABLE, last
 
 
@@ -443,15 +447,17 @@ def _gh_pr_list_json(
     failure.
     """
     import json  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
     if timeout <= 0:
         return None
+    deadline = time.monotonic() + timeout
     result = github_api._run(
         ["gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open", *extra_args, "--json", fields],
-        timeout_s=timeout,
+        timeout_s=timeout, deadline=deadline,
         cwd=cwd,
     )
     if result.returncode != 0:

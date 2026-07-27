@@ -45,6 +45,7 @@ from agent_coordinator.service import (
 from agent_coordinator.store import JsonlClaimStore
 
 from ._maintenance._common import _fix_lease_seconds
+from .config import load as load_config
 
 # Ownership claims share the coordinator store with ``coordinator.py``'s dispatch
 # claims but never collide with them: dispatch keys on the PR's *blocker*
@@ -548,10 +549,41 @@ def record_ownership(
         )
         if not can_reclaim:
             return _conflict_outcome(exc)
-        release_ownership(
+        released = release_ownership(
             repo=repo, pr_number=pr_number, session_id=holder.session_id,
             reason="reclaimed_by_armed_session", now=now,
+            claim_id=holder_claim.claim_id, lease_epoch=holder_claim.lease_epoch,
         )
+        if not released.ok:
+            return ClaimOutcome(
+                False, released.reason,
+                conflict_session_id=holder.session_id,
+                conflict_pid=holder.pid,
+                conflict_provenance=holder_provenance,
+                conflict_lease_expires_at=holder_claim.lease_expires_at,
+            )
+        try:
+            from . import session_ledger  # noqa: PLC0415
+            session_ledger.prune(
+                holder.session_id, {pr_number}, repo=repo, include_legacy=True,
+            )
+            if holder.worktree_path:
+                marker_path = load_config(holder.worktree_path).watch_marker_for(
+                    holder.worktree_path
+                )
+                fields: dict[str, str] = {}
+                with open(marker_path, encoding="utf-8") as fh:
+                    for line in fh:
+                        key, _, value = line.strip().partition("=")
+                        fields[key] = value
+                if (
+                    fields.get("session_id") == holder.session_id
+                    and fields.get("pr") == str(pr_number)
+                    and fields.get("provenance") == PROVENANCE_ADOPTED
+                ):
+                    os.remove(marker_path)
+        except (OSError, ValueError):
+            pass
         try:
             record = _coordinator().claim_task(
                 ownership_task(repo, pr_number), owner,
@@ -575,6 +607,8 @@ def release_ownership(
     session_id: str,
     reason: str = "released",
     now: datetime | None = None,
+    claim_id: str | None = None,
+    lease_epoch: int | None = None,
 ) -> ClaimOutcome:
     """Release this session's ownership claim on ``(repo, pr)``.
 
@@ -598,6 +632,10 @@ def release_ownership(
             "claim owned by another session",
             conflict_session_id=claim.owner.session_id,
         )
+    if claim_id is not None and (
+        claim.claim_id != claim_id or claim.lease_epoch != lease_epoch
+    ):
+        return ClaimOutcome(False, "claim changed before release")
     if claim.status != "active":
         # Already released under some reason — releasing again would raise.
         return ClaimOutcome(True, "already released", claim.claim_id, claim.lease_epoch)

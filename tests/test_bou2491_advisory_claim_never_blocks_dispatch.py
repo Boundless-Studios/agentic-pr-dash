@@ -75,6 +75,28 @@ def test_advisory_dashboard_claim_does_not_block_dispatch(tmp_path, monkeypatch)
     )
 
 
+def test_executing_caller_replaces_advisory_claim_before_claiming(tmp_path, monkeypatch):
+    store = tmp_path / "claims.jsonl"
+    monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
+    pr = _pr()
+    TaskCoordinator(JsonlClaimStore(store)).claim_task(
+        coordinator.task_identity_for_pr(pr),
+        OwnerIdentity(
+            session_id="dashboard", pid=None, worktree_path=pr.worktree_path,
+            metadata={"actor": MaintenanceActor.DASHBOARD_QUEUE.value, "can_execute": "false"},
+        ),
+        lease_seconds=300,
+        now=BASE_TIME,
+    )
+
+    assert coordinator.release_advisory_claim_for_pr(pr, now=BASE_TIME) is True
+    handle = coordinator.claim_pr(
+        pr, session_id="loop", pid=os.getpid(), agent="loop", lease_seconds=300,
+        actor=MaintenanceActor.LOOP_EXECUTOR,
+    )
+    assert handle is not None
+
+
 def test_advisory_claim_still_suppresses_a_non_executing_callers_requeue(
     tmp_path, monkeypatch,
 ):

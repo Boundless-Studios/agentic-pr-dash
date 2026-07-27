@@ -79,6 +79,11 @@ def test_waiter_does_not_block_on_an_adopted_worktrees_blockers(tmp_path, monkey
         )
 
     monkeypatch.setattr(mc, "_check_worktree", _fake_check)
+    watched = []
+    monkeypatch.setattr(
+        mc, "_await_watch_pending_this_tick",
+        lambda owned, detached, cwd, sid: watched.extend(owned) or False,
+    )
 
     rc = mc.main([
         "await",
@@ -95,6 +100,7 @@ def test_waiter_does_not_block_on_an_adopted_worktrees_blockers(tmp_path, monkey
         "this is not the session's responsibility, so the waiter must not "
         "treat it as actionable feedback either (BOU-2430 scope mismatch)"
     )
+    assert watched == [], "adopted worktrees must not feed clean-exit watch evidence"
 
 
 def test_waiter_still_blocks_on_an_armed_worktrees_blockers(tmp_path, monkeypatch):

@@ -70,6 +70,44 @@ def test_armed_claim_reclaims_a_foreign_adopted_claim(isolated_store, monkeypatc
     )
 
 
+def test_reclaim_releases_the_exact_conflicting_epoch(isolated_store, monkeypatch):
+    wt = _mk(isolated_store, "wt")
+    ownership.record_ownership(
+        repo=REPO, pr_number=558, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+    observed = {}
+    original = ownership.release_ownership
+
+    def fenced_release(**kwargs):
+        observed.update(kwargs)
+        return original(**kwargs)
+
+    monkeypatch.setattr(ownership, "release_ownership", fenced_release)
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=558, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    ).ok
+    assert observed["claim_id"]
+    assert observed["lease_epoch"] is not None
+
+
+def test_reclaim_retires_adopters_session_ledger(isolated_store):
+    from agentic_pr_dash import session_ledger
+
+    wt = _mk(isolated_store, "wt")
+    session_ledger.append("adopter", 559, "old", wt, repo=REPO)
+    ownership.record_ownership(
+        repo=REPO, pr_number=559, session_id="adopter", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ADOPTED,
+    )
+    assert ownership.record_ownership(
+        repo=REPO, pr_number=559, session_id="armer", pid=LIVE_PID,
+        worktree_path=wt, provenance=ownership.PROVENANCE_ARMED,
+    ).ok
+    assert all(entry.pr != 559 for entry in session_ledger.read("adopter", repo=REPO))
+
+
 def test_arm_never_reclaims_a_foreign_armed_claim(isolated_store, monkeypatch):
     """Control: a foreign session's genuine ARMED claim must still fail closed
     — only ADOPTED claims are reclaimable this way."""

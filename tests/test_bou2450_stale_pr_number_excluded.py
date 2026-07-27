@@ -15,6 +15,8 @@ finding, no longer open. This is the same defect class as BOU-2450's repro
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from agentic_pr_dash import config
@@ -97,3 +99,45 @@ def test_pruned_pr_does_not_linger_in_the_waiter_demand_set(tmp_path, monkeypatc
         f"set (BOU-2450). stderr={err!r} stdout={out!r}"
     )
     assert rc == 0, "no genuinely open owned PR remains, so the gate must exit clean"
+
+
+def test_pruned_number_in_one_repo_does_not_hide_same_number_elsewhere(
+    tmp_path, monkeypatch, capsys,
+):
+    wt_a = tmp_path / "repo-a"; wt_a.mkdir()
+    wt_b = tmp_path / "repo-b"; wt_b.mkdir()
+    worktrees = [str(wt_a), str(wt_b)]
+    resolution = _ownres_mod.OwnedResolution(
+        worktrees=worktrees,
+        pr_for={str(wt_a): 101, str(wt_b): 101},
+        provenance_for={wt: "armed" for wt in worktrees},
+        source_for={wt: "both" for wt in worktrees},
+    )
+    monkeypatch.setattr(_ownres_mod, "resolve_owned", lambda *a, **k: resolution)
+    monkeypatch.setattr(
+        _worktree_check_mod, "_check_worktree",
+        lambda path, session_id, *, claim=True: (0, "nothing pending"),
+    )
+    monkeypatch.setattr(
+        _ownres_mod, "resolve_worktree",
+        lambda path, *, kind, snap=None: _ownres_mod.WorktreeOwnership(
+            worktree=path, session_id=SID, pr_number=101,
+            provenance="armed", source="both",
+        ),
+    )
+    monkeypatch.setattr(
+        _stop_gate_mod, "_prune_stale_marker",
+        lambda cwd, marker, session_id: cwd == str(wt_a),
+    )
+    from agentic_pr_dash._maintenance import _common
+    monkeypatch.setattr(_common, "_repo_slug", lambda wt: Path(wt).name)
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {101})
+    monkeypatch.setattr(_worktrees_mod, "_detached_records_across_roots", lambda *a: [])
+    monkeypatch.setattr(
+        _worktrees_mod, "_reconcile_owned_across_roots",
+        lambda *a, **k: (worktrees, []),
+    )
+
+    rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert rc == 2
+    assert "101" in capsys.readouterr().err

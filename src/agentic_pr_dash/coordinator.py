@@ -19,7 +19,7 @@ import subprocess
 from urllib.parse import urlparse
 
 from agent_coordinator.models import ClaimRecord, OwnerIdentity, TaskIdentity
-from agent_coordinator.service import ClaimConflictError, TaskCoordinator
+from agent_coordinator.service import ClaimConflictError, StaleClaimError, TaskCoordinator
 from agent_coordinator.store import JsonlClaimStore
 
 from .config import load as load_config
@@ -438,6 +438,26 @@ def active_claim_owner_for_pr(pr: PRData, *, now: datetime | None = None) -> Own
     (warn-only defer). None when there is no claim to defer to."""
     best = _best_active_claim_for_pr(pr, now=now)
     return best.owner if best is not None else None
+
+
+def release_advisory_claim_for_pr(
+    pr: PRData, *, now: datetime | None = None,
+) -> bool:
+    """Release the exact active non-executing claim, fenced against races."""
+    claim = _best_active_claim_for_pr(pr, now=now)
+    if claim is None or (claim.owner.metadata or {}).get("can_execute") != "false":
+        return False
+    try:
+        _coordinator().release_claim(
+            claim.claim_id,
+            owner_session_id=claim.owner.session_id,
+            lease_epoch=claim.lease_epoch,
+            reason="replaced_by_executing_caller",
+            now=now,
+        )
+    except (PermissionError, StaleClaimError):
+        return False
+    return True
 
 
 def claim_pr(

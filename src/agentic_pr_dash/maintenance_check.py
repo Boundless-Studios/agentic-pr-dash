@@ -919,6 +919,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
+            adopted_worktrees: set[str] = set()
             gh_unobservable = False
             warn_only_deferral = False
             # BOU-2430: an ADOPTED worktree is one auto-adoption handed this
@@ -942,6 +943,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         worktree, kind="await_adopted_scope", snap=_await_snap
                     ).provenance
                     if provenance == "adopted":
+                        adopted_worktrees.add(worktree)
                         # Reported via the same adopted-work FYI as the stop
                         # gate, never as blocking feedback for THIS waiter.
                         print(
@@ -1048,9 +1050,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             )
 
             watch_pending: bool | None = None
+            watched_owned = [wt for wt in owned if wt not in adopted_worktrees]
             if not getattr(args, "keep_alive_without_prs", False):
                 watch_pending = _await_watch_pending_this_tick(
-                    owned, _detached_this_tick, cwd, session_id
+                    watched_owned, _detached_this_tick, cwd, session_id
                 )
                 if (
                     not watch_pending
@@ -1073,7 +1076,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # verified (round 5).
                     verified = {
                         _clean_exit_key(_repo_slug(wt), n)
-                        for wt, n in _owned_pr_pairs_for_await(owned)
+                        for wt, n in _owned_pr_pairs_for_await(watched_owned)
                         if _marker_pr_still_current(wt, n)
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
@@ -1102,7 +1105,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 # compute it here otherwise (keep_alive_without_prs sessions).
                 if watch_pending is None:
                     watch_pending = _await_watch_pending_this_tick(
-                        owned, _detached_this_tick, cwd, session_id
+                        watched_owned, _detached_this_tick, cwd, session_id
                     )
                 # Read the flag AFTER the watch-pending probe so a quota wall hit
                 # by THAT call is captured too (a PR with running CI must not lose
