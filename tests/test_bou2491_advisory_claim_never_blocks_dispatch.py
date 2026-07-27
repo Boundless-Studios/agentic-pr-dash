@@ -154,22 +154,23 @@ def test_executing_claim_still_suppresses_dispatch(tmp_path, monkeypatch):
     )
 
 
-def test_advisory_release_refuses_a_claim_the_decision_was_not_made_from(
-    tmp_path, monkeypatch
-):
-    """The release must be fenced to the DISPATCH DECISION's claim identity.
+def test_advisory_release_targets_the_decisions_own_claim(tmp_path, monkeypatch):
+    """The release must resolve the DISPATCH DECISION's claim_id directly.
 
     Blockers change concurrently, so active advisory claims for several
-    fingerprints can coexist. `_best_active_claim_for_pr` is fingerprint-
-    agnostic, so it can surface a NEWER claim for unrelated blockers. Releasing
-    that one is doubly wrong: the decision's own advisory claim survives (so
-    `claim_pr` still conflicts and the executor defers anyway) while an
-    unrelated dashboard claim loses its duplicate-dispatch guard.
+    fingerprints can coexist, and `_best_active_claim_for_pr` is fingerprint-
+    agnostic — it can surface a NEWER claim for unrelated blockers. Releasing
+    that one is wrong. But merely REFUSING is also wrong: the decision's own
+    advisory claim stays active, `claim_pr` conflicts, and `_check_worktree`
+    falls through anyway once the newer fingerprint sets `new_feedback` — so the
+    PR gets serviced with no coordinator handle and several sessions can pile
+    onto it. Look the exact claim up and release that.
     """
     store = tmp_path / "claims.jsonl"
     monkeypatch.setenv("AGENTIC_PR_DASH_COORDINATOR_STORE", str(store))
     pr = _pr()
-    TaskCoordinator(JsonlClaimStore(store)).claim_task(
+    coord = TaskCoordinator(JsonlClaimStore(store))
+    decision_claim = coord.claim_task(
         coordinator.task_identity_for_pr(pr),
         OwnerIdentity(
             session_id="dashboard", pid=None, worktree_path=pr.worktree_path,
@@ -179,18 +180,25 @@ def test_advisory_release_refuses_a_claim_the_decision_was_not_made_from(
         now=BASE_TIME,
     )
 
+    # An unknown id releases nothing — we never guess.
     assert coordinator.release_advisory_claim_for_pr(
-        pr, claim_id="some-other-fingerprints-claim", now=BASE_TIME
-    ) is False, (
-        "a claim_id that does not match the decision's must refuse the release, "
-        "not fall back to releasing whichever claim looks 'best'"
+        pr, claim_id="not-a-real-claim-id", now=BASE_TIME
+    ) is False
+    assert coordinator._best_active_claim_for_pr(pr, now=BASE_TIME) is not None, (
+        "an unknown claim_id must not cause some other claim to be released"
     )
 
-    # ...and the real claim is untouched, so the guard it provides survives.
-    still_there = coordinator._best_active_claim_for_pr(pr, now=BASE_TIME)
-    assert still_there is not None and still_there.status == "active"
-
-    # Control: passing the matching identity still releases.
+    # The decision's own id releases exactly that claim, so the executor's
+    # subsequent claim_pr can succeed instead of falling through unclaimed.
     assert coordinator.release_advisory_claim_for_pr(
-        pr, claim_id=still_there.claim_id, now=BASE_TIME
+        pr, claim_id=decision_claim.claim_id, now=BASE_TIME
     ) is True
+    handle = coordinator.claim_pr(
+        pr, session_id="loop", pid=os.getpid(), agent="loop", lease_seconds=300,
+        actor=MaintenanceActor.LOOP_EXECUTOR,
+    )
+    assert handle is not None, (
+        "after releasing the decision's advisory claim the executor must be able "
+        "to take a real coordinator handle — otherwise worktree_check dispatches "
+        "unclaimed whenever new_feedback is set"
+    )

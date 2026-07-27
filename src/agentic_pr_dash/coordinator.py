@@ -445,20 +445,35 @@ def release_advisory_claim_for_pr(
 ) -> bool:
     """Release the exact active non-executing claim, fenced against races.
 
-    ``claim_id`` must be the identity the DISPATCH DECISION was made from.
-    Blockers can change concurrently, so several active advisory claims for
-    different fingerprints can coexist; ``_best_active_claim_for_pr`` is
-    fingerprint-agnostic and can therefore pick a NEWER claim for unrelated
-    blockers. Releasing that one would leave the decision's own advisory claim
-    in place (so ``claim_pr`` still conflicts and the executor defers anyway)
-    while stripping an unrelated dashboard claim of its duplicate-dispatch
-    guard. Refusing the mismatch is the safe outcome.
+    ``claim_id`` must be the identity the DISPATCH DECISION was made from, and
+    is looked up DIRECTLY rather than re-derived. Blockers can change
+    concurrently, so several active advisory claims for different fingerprints
+    can coexist, and ``_best_active_claim_for_pr`` is fingerprint-agnostic — it
+    can pick a NEWER claim for unrelated blockers.
+
+    Releasing that newer one is wrong, but so is merely refusing: the decision's
+    own advisory claim stays active, ``claim_pr`` conflicts, and
+    ``_check_worktree`` then falls through anyway when the newer fingerprint has
+    set ``new_feedback`` (see worktree_check.py's ``claimed is None and not
+    new_feedback`` guard) — dispatching with NO coordinator handle, which lets
+    several sessions service the same PR at once. So resolve the exact claim and
+    release that, re-verifying it still belongs to this PR and is still active
+    and advisory before doing so.
     """
-    claim = _best_active_claim_for_pr(pr, now=now)
-    if claim is None or (claim.owner.metadata or {}).get("can_execute") != "false":
-        return False
-    if claim_id is not None and claim.claim_id != claim_id:
-        return False
+    coord = _coordinator()
+    if claim_id is not None:
+        claim = coord._claims_by_id().get(claim_id)  # noqa: SLF001 — same package contract
+        if (
+            claim is None
+            or claim.task.task_id != task_identity_for_pr(pr).task_id
+            or claim.status != "active"
+            or (claim.owner.metadata or {}).get("can_execute") != "false"
+        ):
+            return False
+    else:
+        claim = _best_active_claim_for_pr(pr, now=now)
+        if claim is None or (claim.owner.metadata or {}).get("can_execute") != "false":
+            return False
     try:
         _coordinator().release_claim(
             claim.claim_id,
