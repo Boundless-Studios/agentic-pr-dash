@@ -876,7 +876,13 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         _seen_d.add(key)
                         _detached_this_tick.append(r)
                 for r in _detached_this_tick:
-                    if _record_has_blockers(r):
+                    # Waiter: an unresolvable gh probe is NOT actionable
+                    # feedback — it must not exit 10 ("Feedback arrived") on a
+                    # transient outage. `unknown_detached` below already keeps
+                    # this tick from concluding "clean" for the same record;
+                    # this just stops it from being wrongly treated as
+                    # CONFIRMED feedback (PR #119 review).
+                    if _record_has_blockers(r, unknown_state_blocks=False):
                         pending.append(_detached_pending_entry(r))
 
             if pending:
@@ -890,13 +896,28 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 )
                 return 10
 
-            has_open_detached = any(
-                r.get("state") not in ("merged", "closed", "draft", "unknown")
-                for r in _detached_this_tick
-            )
+            # "Is there anything at all for this tick to watch" is a THIRD
+            # question, distinct from both "is it actionable feedback" (the
+            # `pending` check above) and "is it confirmed clean" (the
+            # verified-set filter below). `_detached_pr_records` already prunes
+            # merged/closed/draft records before they ever reach
+            # `_detached_this_tick`, so every survivor is either a confirmed
+            # "open" PR or one whose `gh` probe returned "unknown" this tick —
+            # BOTH represent real, still-tracked work the session owns, so
+            # BOTH must count as "something to watch" here. Excluding
+            # "unknown" from this specific check (as a marker record it once
+            # shared with the "confirmed clean" question) let a session that
+            # owns ONLY a detached, currently-unresolvable PR fall through to
+            # `_unbound_exit` before ever reaching the `unknown_detached` guard
+            # a few lines down that exists specifically to keep the waiter
+            # alive through exactly this case (P1, PR #121 review — the same
+            # "unknown collapsed into a falsy default" defect this whole
+            # branch is about, this time on the "nothing owned" exit instead
+            # of the "feedback" or "clean" ones).
+            has_any_detached = bool(_detached_this_tick)
             if (
                 not owned
-                and not has_open_detached
+                and not has_any_detached
                 and not github_api.rate_limit_seen()
                 and not getattr(args, "keep_alive_without_prs", False)
             ):
