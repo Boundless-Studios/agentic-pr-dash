@@ -16,6 +16,8 @@ asked this session to service (BOU-2430).
 """
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pytest
@@ -24,6 +26,7 @@ from agentic_pr_dash import config
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import ownership_resolution as _ownres_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 SID = "sess-bou2430"
@@ -174,6 +177,157 @@ def test_waiter_does_not_publish_or_refresh_adopted_worktree_coverage(
     assert str(armed_wt) in published[-1]
     assert str(adopted_wt) not in heartbeats
     assert str(armed_wt) in heartbeats
+
+
+def test_waiter_never_publishes_an_adopted_anchor(tmp_path, monkeypatch):
+    """`_await_anchors` is NOT a safe coverage list.
+
+    It appends every worktree the session ledger references — adopted ones
+    included — so publishing `[*anchors, *watched_owned]` (or bare `anchors`
+    earlier in the tick) puts the adopted path straight back into
+    `covered_roots`, which is the exact thing filtering `owned` was meant to
+    stop. `_update_await_coverage` REPLACES `covered_roots`, so an adopted
+    anchor published at any point in the tick is enough for `_await_alive` to
+    make the machine-wide loop defer a PR this waiter deliberately ignores.
+    """
+    adopted_wt = tmp_path / "adopted"
+    armed_wt = tmp_path / "armed"
+    adopted_wt.mkdir()
+    armed_wt.mkdir()
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    # The adopted worktree reaches coverage as a ledger ANCHOR, not via `owned`.
+    monkeypatch.setattr(
+        mc,
+        "_await_anchors",
+        lambda sid, cwd: [str(tmp_path), str(adopted_wt)],
+    )
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(armed_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(
+        _ownres_mod,
+        "resolve_worktree",
+        _fake_ownership({
+            str(adopted_wt): "adopted",
+            str(armed_wt): "armed",
+        }),
+    )
+    monkeypatch.setattr(
+        mc,
+        "_check_worktree",
+        lambda path, session_id, *, claim=True: (0, "PR clean\nPR_NUMBER=999"),
+    )
+    monkeypatch.setattr(
+        mc,
+        "_await_watch_pending_this_tick",
+        lambda owned, detached, cwd, sid: False,
+    )
+    monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda wt, sid, pending: None)
+
+    published = []
+    monkeypatch.setattr(
+        mc,
+        "_update_await_coverage",
+        lambda cwd, sid, roots: published.append(list(roots)),
+    )
+
+    mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "1",
+        "--max-wait", "0",
+    ])
+
+    assert published, "the waiter must publish its coverage at least once"
+    for roots in published:
+        assert str(adopted_wt) not in roots, (
+            "an adopted worktree reached covered_roots via the anchor list — "
+            "the loop will defer to this waiter for a PR it ignores"
+        )
+    assert str(armed_wt) in published[-1], "armed coverage must still be published"
+
+
+def _owning_fake(provenance_by_wt: dict[str, str]):
+    """Like `_fake_ownership`, but the session genuinely OWNS the worktree.
+
+    `owned_by` reads `marker_session_id`/`claim_session_ids`, not `session_id`,
+    so a fake that leaves those unset makes `_request_waiter_coverage` return
+    False before it reaches the logic under test — a vacuous pass.
+    """
+    def _resolve(worktree_path, *, kind, snap=None):
+        wt = str(Path(worktree_path))
+        return _ownres_mod.WorktreeOwnership(
+            worktree=wt,
+            session_id=SID,
+            pr_number=999,
+            provenance=provenance_by_wt.get(wt, "armed"),
+            source="marker",
+            marker_session_id=SID,
+        )
+    return _resolve
+
+
+def _stub_pidfile(tmp_path, monkeypatch):
+    pidfile = tmp_path / "await.json"
+    pidfile.write_text(
+        json.dumps({"pid": os.getpid(), "session_id": SID, "covered_roots": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_waiter_mod, "_await_pidfile", lambda cwd, sid: str(pidfile))
+    monkeypatch.setattr(
+        _waiter_mod, "_write_await_pidfile", lambda cwd, data, sid: None
+    )
+
+
+def test_coverage_request_is_refused_for_an_adopted_worktree(tmp_path, monkeypatch):
+    """Filtering the published list is not enough on its own.
+
+    `_await_alive` falls back to `_request_waiter_coverage` whenever the path
+    is absent from `covered_roots` — and that helper only asks `owned_by`,
+    which an ADOPTED worktree satisfies. So the adopted path would be appended
+    to `requested_roots`, `_await_alive` would return True anyway, and the
+    machine-wide loop would defer exactly as before. `_update_await_coverage`
+    keeps any requested root that is not covered, so this leak is permanent
+    rather than transient.
+    """
+    adopted_wt = tmp_path / "adopted"
+    adopted_wt.mkdir()
+
+    monkeypatch.setattr(
+        _ownres_mod,
+        "resolve_worktree",
+        _owning_fake({str(adopted_wt): "adopted"}),
+    )
+    _stub_pidfile(tmp_path, monkeypatch)
+
+    assert _waiter_mod._request_waiter_coverage(str(adopted_wt), SID) is False, (
+        "an adopted worktree must not be granted waiter coverage on request"
+    )
+
+
+def test_coverage_request_still_granted_for_an_armed_worktree(tmp_path, monkeypatch):
+    """Control: the armed path must still be able to request coverage."""
+    armed_wt = tmp_path / "armed"
+    armed_wt.mkdir()
+
+    monkeypatch.setattr(
+        _ownres_mod,
+        "resolve_worktree",
+        _owning_fake({str(armed_wt): "armed"}),
+    )
+    _stub_pidfile(tmp_path, monkeypatch)
+
+    assert _waiter_mod._request_waiter_coverage(str(armed_wt), SID) is True
 
 
 def test_waiter_still_blocks_on_an_armed_worktrees_blockers(tmp_path, monkeypatch):

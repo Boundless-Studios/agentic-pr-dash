@@ -167,7 +167,18 @@ def _request_waiter_coverage(cwd: str, session_id: str) -> bool:
         # is enough even if the marker hasn't caught up, and vice versa — asking
         # for coverage we don't need is harmless, dropping coverage we do need
         # strands an owned PR.
-        if not resolve_worktree(cwd, kind="waiter_divergence").owned_by(session_id):
+        res = resolve_worktree(cwd, kind="waiter_divergence")
+        if not res.owned_by(session_id):
+            return False
+        if res.provenance == "adopted":
+            # Filtering the PUBLISHED list is not enough on its own: every path
+            # absent from `covered_roots` falls through to here, and adoption
+            # satisfies `owned_by`. Granting the request would put the adopted
+            # path in `requested_roots`, `_await_alive` would answer True again,
+            # and the machine-wide loop would keep deferring a PR whose blockers
+            # this waiter deliberately ignores (BOU-2430). `_update_await_coverage`
+            # preserves any requested root that is not covered, so the leak would
+            # be permanent rather than transient.
             return False
         path = _await_pidfile("", session_id)
         with open(path, encoding="utf-8") as fh:
