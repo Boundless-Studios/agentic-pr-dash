@@ -999,6 +999,45 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
     return anchors
 
 
+def _publishable_anchors(anchors: list[str], cwd: str, snap=None) -> list[str]:
+    """Anchors minus the adopted worktrees this waiter will never service.
+
+    ``_await_anchors`` is a POLL list: it deliberately spans every worktree the
+    session ledger references so the single waiter visits every repo it owns a
+    PR in. It is NOT a coverage list. Publishing it verbatim re-advertises the
+    adopted paths that ``watched_owned`` was filtered to exclude — and since
+    ``_update_await_coverage`` REPLACES ``covered_roots``, one unfiltered
+    publication anywhere in the tick is enough for ``_await_alive`` to tell the
+    machine-wide loop "a wake-capable waiter covers this", for a PR whose
+    blockers this waiter intentionally ignores (BOU-2430). The loop then defers
+    forever and nobody services it.
+
+    ``cwd`` is kept unconditionally, even when it resolves as adopted: the
+    waiter's own launch root is what the single-instance guard in
+    ``_run_await_loop`` probes through ``_await_alive``, so dropping it would
+    let a second poller start for the same session on every tick. The loop's
+    per-PR probes pass the PR's own worktree path, not this cwd, so the
+    adopted-deferral hole this closes stays closed for them.
+    """
+    from ._maintenance.ownership_resolution import (  # noqa: PLC0415
+        resolve_worktree,
+    )
+    keep = os.path.abspath(cwd)
+    out: list[str] = []
+    for path in anchors:
+        if os.path.abspath(path) != keep:
+            try:
+                provenance = resolve_worktree(
+                    path, kind="await_adopted_scope", snap=snap
+                ).provenance
+            except Exception:  # noqa: BLE001 - never let coverage crash the waiter
+                provenance = None
+            if provenance == "adopted":
+                continue
+        out.append(path)
+    return out
+
+
 # Exit code -> (machine-readable outcome, human reason) (BOU-1877). An exit code
 # alone can't distinguish "another waiter/loop is actively covering this session"
 # (3) from "idle: nothing pending, nothing to watch" (0) — so supervising
@@ -1093,7 +1132,11 @@ def _run_await_loop(args: argparse.Namespace) -> int:
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
 
-    _update_await_coverage(cwd, session_id, _await_anchors(session_id, cwd))
+    _update_await_coverage(
+        cwd,
+        session_id,
+        _publishable_anchors(_await_anchors(session_id, cwd), cwd),
+    )
     now = time.time()
     if args.max_wait == 0:
         deadline: float | None = now
@@ -1123,7 +1166,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # covers all owned PRs (PR #61 review, P1). Dedup owned worktrees and
             # detached records across anchors.
             anchors = _await_anchors(session_id, cwd)
-            _update_await_coverage(cwd, session_id, anchors)
+            # ONE ownership snapshot per tick, shared by the anchor filter and
+            # the per-worktree provenance loop below — resolving per worktree is
+            # a full store read each time and the Stop hook's ~108s budget is
+            # fail-closed.
+            from agentic_pr_dash import ownership as _ownership_mod  # noqa: PLC0415
+            _await_snap = _ownership_mod.snapshot()
+            covered_anchors = _publishable_anchors(anchors, cwd, _await_snap)
+            _update_await_coverage(cwd, session_id, covered_anchors)
             owned: list[str] = []
             if session_id:
                 _seen_wt: set[str] = set()
@@ -1151,8 +1201,6 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             from ._maintenance.ownership_resolution import (  # noqa: PLC0415
                 resolve_worktree as _resolve_worktree_ownership,
             )
-            from agentic_pr_dash import ownership as _ownership_mod  # noqa: PLC0415
-            _await_snap = _ownership_mod.snapshot()
             for worktree in owned:
                 # Provenance is resolved for EVERY owned worktree, not just the
                 # code==10 ones. Deciding it inside a single branch left adopted
@@ -1204,7 +1252,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # though the waiter intentionally ignores that worktree's blockers.
             watched_owned = [wt for wt in owned if wt not in adopted_worktrees]
             _update_await_coverage(
-                cwd, session_id, [*anchors, *watched_owned]
+                cwd, session_id, [*covered_anchors, *watched_owned]
             )
 
             _detached_this_tick: list[dict] = []
