@@ -291,9 +291,19 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
 # under it.
 _PR_VIEW_ATTEMPTS = 3
 _PR_VIEW_BACKOFF_SECONDS = 0.75
+# BOU-2477: the per-attempt subprocess timeout, independent of any caller
+# deadline. 15s x 3 attempts = 45s worst case for ONE field when `gh` hangs
+# rather than fails fast — and `arm` probes two fields with independently
+# fresh budgets, ~93s total, against the ~10s budget the module is meant to
+# respect. Callers with a shared deadline (see `deadline=` below) already cap
+# each attempt tighter via `min(this, remaining)`; this constant is only the
+# ceiling for a caller that passes no deadline at all.
+_PR_VIEW_PER_ATTEMPT_TIMEOUT_SECONDS = 3
 
 
-def _gh_pr_view_field(cwd: str, pr_number: int, field: str) -> tuple[object, str]:
+def _gh_pr_view_field(
+    cwd: str, pr_number: int, field: str, *, deadline: float | None = None,
+) -> tuple[object, str]:
     """Read one ``gh pr view --json <field>`` value, with bounded retries.
 
     Returns ``(value, diagnostic)``. ``value`` is ``_GH_UNAVAILABLE`` when the
@@ -302,6 +312,19 @@ def _gh_pr_view_field(cwd: str, pr_number: int, field: str) -> tuple[object, str
     failure mode collapsed to a bare ``None`` and the stderr was discarded, so
     "gh unavailable" was printed for rate limits, 404s and transient blips alike
     (BOU-2406).
+
+    ``deadline`` (BOU-2477), a ``time.monotonic()`` timestamp, bounds the WHOLE
+    call by wall clock, not merely by attempt count — a caller probing several
+    fields (``arm``'s isDraft + headRefName) passes the SAME deadline to both so
+    one shared budget governs the total, not two independently-fresh ones. Each
+    attempt's subprocess timeout is ``min(per-attempt cap, remaining budget)``,
+    honoring a sub-second remaining budget verbatim (no floor) so a
+    nearly-exhausted budget can't overrun. Once the budget is gone before an
+    attempt starts, remaining attempts are skipped and the sentinel is returned
+    with a diagnostic that says so explicitly — distinguishable from "gh
+    unavailable", a rate limit, or a 404, so a Stop-hook caller can tell
+    "we ran out of time" from "gh actually failed" (the exact conflation
+    BOU-2406 was filed about, one layer up).
     """
     import json  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -310,13 +333,23 @@ def _gh_pr_view_field(cwd: str, pr_number: int, field: str) -> tuple[object, str
 
     last = "no attempt was made"
     for attempt in range(1, _PR_VIEW_ATTEMPTS + 1):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return _GH_UNAVAILABLE, (
+                    f"budget exhausted before attempt {attempt} of "
+                    f"{_PR_VIEW_ATTEMPTS} ({last})"
+                )
+            attempt_timeout = min(_PR_VIEW_PER_ATTEMPT_TIMEOUT_SECONDS, remaining)
+        else:
+            attempt_timeout = _PR_VIEW_PER_ATTEMPT_TIMEOUT_SECONDS
         try:
             result = subprocess.run(
                 ["gh", "pr", "view", str(pr_number), "--json", field],
                 cwd=cwd,
                 capture_output=True,
                 text=True,
-                timeout=15,
+                timeout=attempt_timeout,
                 env=github_api.automation_subprocess_env(),
             )
         except FileNotFoundError:
@@ -341,13 +374,24 @@ def _gh_pr_view_field(cwd: str, pr_number: int, field: str) -> tuple[object, str
                     f"{(result.stderr or '').strip()[:300] or '<no stderr>'}"
                 )
         if attempt < _PR_VIEW_ATTEMPTS:
-            time.sleep(_PR_VIEW_BACKOFF_SECONDS)
+            sleep_for = _PR_VIEW_BACKOFF_SECONDS
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return _GH_UNAVAILABLE, (
+                        f"budget exhausted after attempt {attempt} of "
+                        f"{_PR_VIEW_ATTEMPTS} ({last})"
+                    )
+                sleep_for = min(sleep_for, remaining)
+            time.sleep(sleep_for)
     return _GH_UNAVAILABLE, last
 
 
-def _pr_draft_status_detailed(cwd: str, pr_number: int) -> tuple[bool | None, str]:
+def _pr_draft_status_detailed(
+    cwd: str, pr_number: int, *, deadline: float | None = None,
+) -> tuple[bool | None, str]:
     """``(is_draft, diagnostic)``; ``is_draft`` is None when undeterminable."""
-    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "isDraft")
+    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "isDraft", deadline=deadline)
     if value is _GH_UNAVAILABLE:
         return None, diagnostic
     return bool(value), ""
@@ -358,9 +402,11 @@ def _pr_draft_status(cwd: str, pr_number: int):
     return _pr_draft_status_detailed(cwd, pr_number)[0]
 
 
-def _pr_head_branch_detailed(cwd: str, pr_number: int) -> tuple[str | None, str]:
+def _pr_head_branch_detailed(
+    cwd: str, pr_number: int, *, deadline: float | None = None,
+) -> tuple[str | None, str]:
     """``(head_branch, diagnostic)``; branch is None when undeterminable."""
-    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "headRefName")
+    value, diagnostic = _gh_pr_view_field(cwd, pr_number, "headRefName", deadline=deadline)
     if value is _GH_UNAVAILABLE:
         return None, diagnostic
     if isinstance(value, str) and value:
@@ -389,25 +435,31 @@ def _gh_pr_list_json(
     floor — so a nearly-exhausted budget times out at the actual remaining time
     instead of overrunning the deadline. A non-positive budget means "no time
     left": skip the call entirely (PR #54 review round 2).
+
+    BOU-2535: routed through ``github_api._run`` (not a bare ``subprocess.run``)
+    so this call gets the SAME bounded connectivity-retry-with-backoff and
+    rate-limit classification ``list_open_prs`` already has. This is the
+    `gh pr list` this package's `check`/`arm` path resolves branches through —
+    the loop's own "could not list PRs (gh unavailable)" / "error connecting to
+    api.github.com" failures were on exactly this uncovered call site: a
+    transient connection blip failed the whole probe with no retry, distinct
+    from (and previously indistinguishable from) an auth or rate-limit
+    failure.
     """
     import json  # noqa: PLC0415
+    import time  # noqa: PLC0415
 
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
     if timeout <= 0:
         return None
-    try:
-        result = subprocess.run(
-            ["gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open", *extra_args, "--json", fields],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=github_api.automation_subprocess_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
+    deadline = time.monotonic() + timeout
+    result = github_api._run(
+        ["gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open", *extra_args, "--json", fields],
+        timeout_s=timeout, deadline=deadline,
+        cwd=cwd,
+    )
     if result.returncode != 0:
         return None
     try:

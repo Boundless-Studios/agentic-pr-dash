@@ -11,15 +11,16 @@ the same invocation.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from agentic_pr_dash import config, maintenance_check
-from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
-from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 
 SID = "sess-1787"
@@ -368,6 +369,26 @@ def test_gh_pr_list_skips_subprocess_when_no_budget(
 
     assert calls == [], "no gh subprocess should spawn when the budget is gone"
     assert out == {}
+
+
+def test_list_open_prs_retries_share_one_deadline(monkeypatch):
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import pr_state as _pr_state
+
+    clock = {"now": 100.0}
+    timeouts: list[float] = []
+
+    def _once(cmd, timeout_s=20, cwd=None, env=None):
+        timeouts.append(timeout_s)
+        clock["now"] += timeout_s
+        return subprocess.CompletedProcess(cmd, 1, "", "error connecting to api.github.com")
+
+    monkeypatch.setattr(github_api, "_run_once", _once)
+    monkeypatch.setattr(github_api.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(github_api.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(github_api, "_GH_RETRY_BASE_DELAY_S", 0)
+    _pr_state._list_my_open_prs("/tmp/x", timeout=0.3)
+    assert sum(timeouts) == pytest.approx(0.3)
 
 
 def test_stop_gate_exposes_reconcile_capability_sentinel() -> None:

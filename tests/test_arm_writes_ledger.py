@@ -71,8 +71,8 @@ def test_cmd_arm_pr_on_matching_branch_arms(tmp_path, monkeypatch):
     # BOU-2406: _cmd_arm reads the *_detailed variants so an indeterminate gh
     # result carries its cause. Patch the seam the code actually uses -- patching
     # only the thin wrappers would let the real gh run and fail on auth.
-    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr: (False, ""))
-    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr: ("feature", ""))
+    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr, deadline=None: (False, ""))
+    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr, deadline=None: ("feature", ""))
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature")
 
     args = argparse.Namespace(
@@ -89,8 +89,8 @@ def test_cmd_arm_pr_wrong_branch_skips(tmp_path, monkeypatch):
     wt.mkdir()
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
 
-    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr: (False, ""))
-    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr: ("feature", ""))
+    monkeypatch.setattr(mc, "_pr_draft_status_detailed", lambda cwd, pr, deadline=None: (False, ""))
+    monkeypatch.setattr(mc, "_pr_head_branch_detailed", lambda cwd, pr, deadline=None: ("feature", ""))
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "some-other-branch")
 
     args = argparse.Namespace(
@@ -119,7 +119,7 @@ def test_cmd_arm_indeterminate_gh_is_loud_and_nonzero(tmp_path, monkeypatch, cap
     monkeypatch.setattr(
         mc,
         "_pr_draft_status_detailed",
-        lambda cwd, pr: (None, "attempt 3: gh exited 1: HTTP 502"),
+        lambda cwd, pr, deadline=None: (None, "attempt 3: gh exited 1: HTTP 502"),
     )
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature")
 

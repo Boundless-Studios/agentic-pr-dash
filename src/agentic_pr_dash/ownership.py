@@ -45,6 +45,7 @@ from agent_coordinator.service import (
 from agent_coordinator.store import JsonlClaimStore
 
 from ._maintenance._common import _fix_lease_seconds
+from .config import load as load_config
 
 # Ownership claims share the coordinator store with ``coordinator.py``'s dispatch
 # claims but never collide with them: dispatch keys on the PR's *blocker*
@@ -450,6 +451,12 @@ class ClaimOutcome:
     claim_id: str | None = None
     lease_epoch: int | None = None
     conflict_session_id: str | None = None
+    #: The refused claim's holder pid/provenance/lease (BOU-2409) — populated
+    #: alongside ``conflict_session_id`` so a caller (``arm``'s CLI) can name
+    #: the actual refusal instead of a generic "could not write" message.
+    conflict_pid: int | None = None
+    conflict_provenance: str | None = None
+    conflict_lease_expires_at: datetime | None = None
 
 
 def record_ownership(
@@ -483,6 +490,15 @@ def record_ownership(
     before claiming rather than relying on ``claim_task`` to refuse. Stage 1 is
     unaffected: the only callers are marker writes, already gated upstream by
     ``_live_foreign_owner``.
+
+    BOU-2409: an ``armed`` attempt outranks a foreign session's ``adopted``
+    claim. Adoption is a best-effort backstop for a PR nobody else was
+    servicing — it must never fence out the session that actually owns the
+    branch/worktree and is doing the real work, which is exactly what an
+    explicit ``armed`` attempt represents. On conflict with a foreign
+    ``adopted`` claim, this releases it and retries ONCE. A foreign ``armed``
+    claim (or an ``adopted`` attempt against anything) is never overridden —
+    only ``armed`` outranks ``adopted``, nothing outranks ``armed``.
     """
     if not session_id:
         return ClaimOutcome(False, "no session_id")
@@ -496,22 +512,165 @@ def record_ownership(
         worktree_path=worktree_path,
         metadata=metadata,
     )
+    resolved_lease_seconds = (
+        _lease_seconds_for(worktree_path, work_found)
+        if lease_seconds is None
+        else lease_seconds
+    )
+
+    def _conflict_outcome(exc: ClaimConflictError) -> ClaimOutcome:
+        claim = exc.decision.claim
+        holder = claim.owner if claim is not None else None
+        return ClaimOutcome(
+            False,
+            "claim held by another session",
+            conflict_session_id=holder.session_id if holder is not None else None,
+            conflict_pid=holder.pid if holder is not None else None,
+            conflict_provenance=(
+                (holder.metadata or {}).get("provenance") if holder is not None else None
+            ),
+            conflict_lease_expires_at=claim.lease_expires_at if claim is not None else None,
+        )
+
+    # Promote this session's OWN adopted claim before claiming. `claim_task`
+    # treats an active same-session claim as an idempotent heartbeat and keeps
+    # the original owner metadata, so it raises no ClaimConflictError and the
+    # reclaim branch below never runs. A session that auto-adopted a PR and
+    # later explicitly ARMS it would therefore be told it succeeded while the
+    # authoritative claim still said `provenance=adopted` — and with marker
+    # writes off by default (Stage 4) nothing else records the arm. The stop
+    # gate and the await loop both exclude adopted worktrees as
+    # maintenance-loop-owned, so the explicit arm bought no coverage at all.
+    # Releasing first makes the subsequent claim_task mint a fresh claim
+    # carrying `armed`.
+    if (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED and session_id:
+        try:
+            _self = snapshot(now=now)
+            _own = _self.claim_for(repo, pr_number) if _self.known() else None
+            if (
+                _own is not None
+                and _own.status == "active"
+                and _own.owner.session_id == session_id
+                and (_own.owner.metadata or {}).get("provenance") == PROVENANCE_ADOPTED
+            ):
+                release_ownership(
+                    repo=repo, pr_number=pr_number, session_id=session_id,
+                    reason="promoted_adopted_to_armed", now=now,
+                    claim_id=_own.claim_id, lease_epoch=_own.lease_epoch,
+                    expected_provenance=PROVENANCE_ADOPTED,
+                )
+        except Exception:  # noqa: BLE001 — promotion is best-effort; never break the claim
+            pass
+
     try:
         record = _coordinator().claim_task(
-            ownership_task(repo, pr_number),
-            owner,
-            lease_seconds=(
-                _lease_seconds_for(worktree_path, work_found)
-                if lease_seconds is None
-                else lease_seconds
-            ),
-            now=now,
+            ownership_task(repo, pr_number), owner,
+            lease_seconds=resolved_lease_seconds, now=now,
         )
     except ClaimConflictError as exc:
-        holder = exc.decision.claim.owner.session_id if exc.decision.claim else None
-        return ClaimOutcome(False, "claim held by another session", conflict_session_id=holder)
+        holder_claim = exc.decision.claim
+        holder = holder_claim.owner if holder_claim is not None else None
+        holder_provenance = (holder.metadata or {}).get("provenance") if holder is not None else None
+        can_reclaim = (
+            (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED
+            and holder is not None
+            and holder.session_id != session_id
+            and holder_provenance == PROVENANCE_ADOPTED
+        )
+        if not can_reclaim:
+            return _conflict_outcome(exc)
+        released = release_ownership(
+            repo=repo, pr_number=pr_number, session_id=holder.session_id,
+            reason="reclaimed_by_armed_session", now=now,
+            claim_id=holder_claim.claim_id, lease_epoch=holder_claim.lease_epoch,
+            expected_provenance=PROVENANCE_ADOPTED,
+        )
+        if not released.ok:
+            return ClaimOutcome(
+                False, released.reason,
+                conflict_session_id=holder.session_id,
+                conflict_pid=holder.pid,
+                conflict_provenance=holder_provenance,
+                conflict_lease_expires_at=holder_claim.lease_expires_at,
+            )
+        # Fence the durable cleanup the same way the release above is fenced.
+        # Releasing the adopted claim opens a window in which the adopter can
+        # re-arm this PR — appending a FRESH ledger entry and taking a new
+        # coordinator claim carrying `armed` provenance. An unconditional prune
+        # would delete that new entry, so the adopter would go on to win the
+        # claim retry below (correctly) but be left without the durable
+        # ledger/marker artifacts a session-wide waiter needs to find the
+        # worktree after a restart or from another maintenance root. Re-read the
+        # store and only retire durable state while the PR is still unclaimed.
+        # The recheck must gate on `known()`, not on `claim_for()` alone: a
+        # bounded-read failure (lock timeout during a concurrent re-arm) yields
+        # an UNKNOWN snapshot whose `claim_for` still answers None. Treating
+        # that as "unclaimed" would prune the holder's durable state on exactly
+        # the evidence this module promises to fail closed on — and if the
+        # preceding release_ownership read failed the same way, the original
+        # claim was never released either, so the retry then loses to a live
+        # owner whose ledger/marker we just deleted.
+        _snap = snapshot(now=now)
+        _recheck = _snap.claim_for(repo, pr_number) if _snap.known() else None
+        if _snap.known() and (_recheck is None or _recheck.status != "active"):
+            try:
+                from . import session_ledger  # noqa: PLC0415
+                # include_legacy=False deliberately: this reclaim is scoped to
+                # ONE repo, and legacy rows are repo-less, so PR numbers collide
+                # across repos. `include_legacy=True` would drop every repo-less
+                # #N row while reclaiming repo A's #N — including one that
+                # represents repo B's still-open #N — and a restarted or
+                # cross-root waiter would silently lose coverage for repo B.
+                # This is the same hazard session_ledger.prune's own docstring
+                # cites for non-anchor roots (codex PR #30).
+                session_ledger.prune(
+                    holder.session_id, {pr_number}, repo=repo, include_legacy=False,
+                )
+                if holder.worktree_path:
+                    marker_path = load_config(holder.worktree_path).watch_marker_for(
+                        holder.worktree_path
+                    )
+                    fields: dict[str, str] = {}
+                    with open(marker_path, encoding="utf-8") as fh:
+                        for line in fh:
+                            key, _, value = line.strip().partition("=")
+                            fields[key] = value
+                    if (
+                        fields.get("session_id") == holder.session_id
+                        and fields.get("pr") == str(pr_number)
+                        and fields.get("provenance") == PROVENANCE_ADOPTED
+                    ):
+                        os.remove(marker_path)
+            except (OSError, ValueError):
+                pass
+        try:
+            record = _coordinator().claim_task(
+                ownership_task(repo, pr_number), owner,
+                lease_seconds=resolved_lease_seconds, now=now,
+            )
+        except ClaimConflictError as exc2:
+            # Someone else won the race between the release and the retry —
+            # report THAT holder, not the one we already released.
+            return _conflict_outcome(exc2)
+        except Exception as exc2:  # noqa: BLE001 — never break the marker write
+            return ClaimOutcome(False, f"claim store error: {type(exc2).__name__}: {exc2}")
     except Exception as exc:  # noqa: BLE001 — never break the marker write
         return ClaimOutcome(False, f"claim store error: {type(exc).__name__}: {exc}")
+    # Postcondition: an ARMED request must leave an ARMED claim. The promotion
+    # above is best-effort, and `release_ownership` deliberately reports success
+    # for "no claim to release" — which is also what an unreadable snapshot
+    # produces. So the release can silently no-op, after which the same-session
+    # `claim_task` is an idempotent heartbeat that PRESERVES `provenance=adopted`
+    # and we would return "claimed" for an arm that never took. Since both the
+    # stop gate and the await loop exclude adopted worktrees, that success would
+    # be a lie about coverage. Verify the result rather than trusting the path.
+    _got = (record.owner.metadata or {}).get("provenance")
+    if (provenance or PROVENANCE_ARMED) == PROVENANCE_ARMED and _got != PROVENANCE_ARMED:
+        return ClaimOutcome(
+            False,
+            f"claim still records provenance={_got!r} after an armed request; "
+            "the adopted->armed promotion did not take",
+        )
     return ClaimOutcome(True, "claimed", record.claim_id, record.lease_epoch)
 
 
@@ -522,6 +681,9 @@ def release_ownership(
     session_id: str,
     reason: str = "released",
     now: datetime | None = None,
+    claim_id: str | None = None,
+    lease_epoch: int | None = None,
+    expected_provenance: str | None = None,
 ) -> ClaimOutcome:
     """Release this session's ownership claim on ``(repo, pr)``.
 
@@ -545,6 +707,14 @@ def release_ownership(
             "claim owned by another session",
             conflict_session_id=claim.owner.session_id,
         )
+    if claim_id is not None and (
+        claim.claim_id != claim_id or claim.lease_epoch != lease_epoch
+    ):
+        return ClaimOutcome(False, "claim changed before release")
+    if expected_provenance is not None and (
+        (claim.owner.metadata or {}).get("provenance") != expected_provenance
+    ):
+        return ClaimOutcome(False, "claim provenance changed before release")
     if claim.status != "active":
         # Already released under some reason — releasing again would raise.
         return ClaimOutcome(True, "already released", claim.claim_id, claim.lease_epoch)

@@ -452,7 +452,8 @@ def _run_once(
 
 
 def _run(
-    cmd: list[str], timeout_s: int = 20, cwd: str | None = None, env: dict[str, str] | None = None
+    cmd: list[str], timeout_s: float = 20, cwd: str | None = None,
+    env: dict[str, str] | None = None, deadline: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a gh command, retrying transient connectivity failures with backoff.
 
@@ -465,12 +466,18 @@ def _run(
     ``env``, when given, REPLACES the subprocess environment entirely (as
     ``subprocess.run`` does) — callers pass a full ``os.environ`` copy with
     targeted overrides, never a partial dict. ``None`` (the default) inherits
-    this process's environment unchanged.
+    this process's environment unchanged. When ``deadline`` is supplied, all
+    attempts and backoffs draw from that one monotonic wall-clock budget.
     """
+    def remaining_timeout() -> float:
+        if deadline is None:
+            return timeout_s
+        return max(0.0, min(timeout_s, deadline - time.monotonic()))
+
     result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
     for attempt in range(1, _GH_RETRY_ATTEMPTS):
         if _is_transient_connectivity_failure(result):
-            time.sleep(_GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1)))
+            delay = _GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
         elif _is_rate_limit_failure(result):
             if not _RATE_LIMIT_BACKOFF_ENABLED:
                 # Backoff suppressed (e.g. the stop-gate, BOU-1953): a
@@ -482,10 +489,17 @@ def _run(
             # clear within a couple of short sleeps; a persistent primary
             # exhaustion still returns after the bounded attempts so the caller
             # (waiter) can decide to stay alive across ticks (BOU-1921).
-            time.sleep(_rate_limit_backoff_seconds(result.stderr or "", attempt))
+            delay = _rate_limit_backoff_seconds(result.stderr or "", attempt)
         else:
             return result
-        result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
+        if deadline is not None:
+            delay = min(delay, max(0.0, deadline - time.monotonic()))
+        if delay > 0:
+            time.sleep(delay)
+        attempt_timeout = remaining_timeout()
+        if attempt_timeout <= 0:
+            break
+        result = _run_once(cmd, timeout_s=attempt_timeout, cwd=cwd, env=env)
     # Exhausted retries. Record a persistent rate-limit so a tick-based caller
     # can tell "GitHub was quota-limited" from a hard failure (BOU-1921 #62).
     if _is_rate_limit_failure(result):

@@ -478,6 +478,15 @@ def _stop_gate_impl(args) -> int:
     from .worktree_check import DRAFT_PR_MARKER, WARN_ONLY_MARKER  # noqa: PLC0415
     adopted_pending: list[tuple[str, str]] = []
     draft_worktrees: set[str] = set()
+    # BOU-2450: `pr_for` (below, from `resolve_owned`) is a claim-derived
+    # snapshot taken ONCE at the top of this call — before this very loop runs
+    # and can PRUNE a worktree's marker/claim on discovering (via a fresh
+    # per-worktree probe) that its recorded PR already merged/closed. Without
+    # tracking what got pruned THIS tick, the waiter-demand block further down
+    # still finds the stale PR number in `pr_for` and reports "you own open PR
+    # #N" (or demands a waiter for it) for a PR this same tick just confirmed
+    # is no longer open.
+    pruned_pr_keys: set[tuple[str, int]] = set()
     # BOU-2567: accumulated separately from `pending` -- a deferred thread is
     # never a blocker (see `_extract_deferred_count`'s docstring above), but
     # the count must still be visible at this surface, not merely at `check`'s.
@@ -557,9 +566,17 @@ def _stop_gate_impl(args) -> int:
                 worktree, kind="prune_divergence", snap=resolution_snapshot
             )
             if pruned.pr_number is not None:
-                _prune_stale_marker(
+                actually_pruned = _prune_stale_marker(
                     worktree, {"pr": str(pruned.pr_number)}, session_id
                 )
+                # Only when `_prune_stale_marker` ACTUALLY pruned (it no-ops
+                # unless its own fresh `_pr_open_state` probe confirms
+                # merged/closed) does this tick know the PR is dead — a
+                # still-open PR must never be excluded from the waiter-demand
+                # set below.
+                if actually_pruned:
+                    from ._common import _repo_slug as _slug  # noqa: PLC0415
+                    pruned_pr_keys.add((_slug(worktree), pruned.pr_number))
 
     if pr_head_cache_dirty:
         _save_pr_head_cache(cwd, pr_head_cache)
@@ -665,10 +682,37 @@ def _stop_gate_impl(args) -> int:
             marker_open_pr_numbers = (
                 _owned_open_pr_numbers(owned) - exclusively_draft_pr_numbers
             )
-            owned_pr_numbers = marker_open_pr_numbers | claim_open_pr_numbers
+            owned_pr_numbers = (
+                marker_open_pr_numbers | claim_open_pr_numbers
+            )
+            pairs_by_number: dict[int, set[tuple[str, int]]] = {}
+            from ._common import _repo_slug as _slug  # noqa: PLC0415
+            for wt, pr in effective_pr_pairs:
+                pairs_by_number.setdefault(pr, set()).add((_slug(wt), pr))
+            fully_pruned_numbers = {
+                pr for pr, keys in pairs_by_number.items()
+                if keys and keys <= pruned_pr_keys
+            }
+            owned_pr_numbers -= fully_pruned_numbers
+
+            def _live_wts_for(n: int) -> list[str]:
+                """Worktrees for PR ``n`` that were NOT pruned this tick.
+
+                A number is only dropped above when EVERY repo carrying it was
+                pruned. For a partially-pruned number — repo A's #N closed while
+                repo B's #N is still open — the stale repo-A worktree survives in
+                `_wts_for(n)`, is naturally uncovered by any loop, and so makes
+                `all(...)` false and demands a waiter for an already-closed PR.
+                Coverage must be judged only on the worktrees still in play.
+                """
+                return [
+                    wt for wt in _wts_for(n)
+                    if (_slug(wt), n) not in pruned_pr_keys
+                ]
+
             worktree_prs = {
                 n for n in owned_pr_numbers
-                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _wts_for(n))
+                if not all(_loop_mod._loop_covers_pr(wt, n) for wt in _live_wts_for(n))
             }
             detached_prs = set()
             for _dr in _detached_records_across_roots(session_id, cwd):
