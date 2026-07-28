@@ -960,6 +960,57 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
         return 0
 
 
+def _cmd_hold_worktree(args: argparse.Namespace) -> int:
+    """Claim exclusive WRITE access to a worktree (BOU-2590).
+
+    Exit 0 when held, 3 when a LIVE actor already holds it (the caller stands
+    down), 1 on error. 3 rather than 1 so "someone else is writing" — a normal,
+    expected outcome — is distinguishable from a real failure.
+    """
+    from ._maintenance import mutation_lock  # noqa: PLC0415
+
+    cwd = os.path.abspath(args.cwd)
+    try:
+        owner = mutation_lock.acquire(
+            cwd,
+            actor="session",
+            session_id=getattr(args, "session_id", "") or "",
+            pid=getattr(args, "pid", None),
+        )
+    except mutation_lock.WorktreeBusy as busy:
+        print(str(busy), file=sys.stderr)
+        return 3
+    except OSError as exc:
+        print(f"could not take the worktree write lock: {exc}", file=sys.stderr)
+        return 1
+    print(
+        f"holding write lock on {cwd} as {owner.describe()}; the maintenance "
+        "loop's executor will stand down until it is released"
+    )
+    return 0
+
+
+def _cmd_release_worktree(args: argparse.Namespace) -> int:
+    """Release this worktree's write lock. Exit 0 whether or not one was held.
+
+    Idempotent on purpose: a caller unwinding after a crash should not have to
+    know whether it still holds the lock, and a failed release is not a reason
+    to fail the caller's own cleanup path.
+    """
+    from ._maintenance import mutation_lock  # noqa: PLC0415
+
+    cwd = os.path.abspath(args.cwd)
+    owner = mutation_lock.read_owner(cwd)
+    if owner is None:
+        print(f"no write lock held on {cwd}")
+        return 0
+    if mutation_lock.release(cwd, owner):
+        print(f"released write lock on {cwd}")
+    else:
+        print(f"write lock on {cwd} was already gone or is held by another token")
+    return 0
+
+
 def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     import json as _json  # noqa: PLC0415
     records = _owned_pr_records_all_roots(args.session_id, os.path.abspath(args.cwd),
@@ -1635,6 +1686,30 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_p.add_argument("--adopt-orphans", action="store_true",
                              help="Also claim PRs orphaned by DEAD sessions (Component G).")
 
+    # --- hold-worktree / release-worktree (BOU-2590) ---
+    hold_p = subparsers.add_parser(
+        "hold-worktree",
+        help="Claim exclusive WRITE access to a worktree so the maintenance "
+             "loop's executor stands down instead of editing underneath you.",
+    )
+    hold_p.add_argument("--cwd", default=".")
+    hold_p.add_argument("--session-id", default="", metavar="ID")
+    hold_p.add_argument(
+        "--pid",
+        type=int,
+        default=None,
+        metavar="PID",
+        help="Holder pid whose liveness keeps the lock (default: this process). "
+             "Pass the SESSION's pid — a lock held by an exited helper is stale "
+             "the moment it returns.",
+    )
+
+    release_p = subparsers.add_parser(
+        "release-worktree",
+        help="Release this worktree's write lock (only the current holder can).",
+    )
+    release_p.add_argument("--cwd", default=".")
+
     # --- await ---
     await_p = subparsers.add_parser(
         "await",
@@ -1693,6 +1768,10 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_check(args)
     if args.command == "complete":
         return _cmd_complete(args)
+    if args.command == "hold-worktree":
+        return _cmd_hold_worktree(args)
+    if args.command == "release-worktree":
+        return _cmd_release_worktree(args)
     if args.command == "list-owned":
         return _cmd_list_owned(args)
     if args.command == "arm":
