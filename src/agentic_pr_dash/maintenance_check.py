@@ -1134,7 +1134,6 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                             owned.append(wt)
             else:
                 owned = [cwd]
-            _update_await_coverage(cwd, session_id, [*anchors, *owned])
 
             pending: list[tuple[str, str]] = []
             adopted_worktrees: set[str] = set()
@@ -1196,7 +1195,17 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # is dispatched here. The PR is explicitly NOT clean — this
                     # tick must not clean-exit on it (codex PR #75 review).
                     warn_only_deferral = True
-                _touch_owner_heartbeat(worktree, session_id, code == 10)
+                if not is_adopted:
+                    _touch_owner_heartbeat(worktree, session_id, code == 10)
+
+            # Publish only the scope this waiter will actually service. If an
+            # adopted worktree is advertised here, the machine-wide loop sees
+            # this live waiter as wake-capable coverage and defers forever even
+            # though the waiter intentionally ignores that worktree's blockers.
+            watched_owned = [wt for wt in owned if wt not in adopted_worktrees]
+            _update_await_coverage(
+                cwd, session_id, [*anchors, *watched_owned]
+            )
 
             _detached_this_tick: list[dict] = []
             if session_id:
@@ -1280,7 +1289,6 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             )
 
             watch_pending: bool | None = None
-            watched_owned = [wt for wt in owned if wt not in adopted_worktrees]
             if not getattr(args, "keep_alive_without_prs", False):
                 watch_pending = _await_watch_pending_this_tick(
                     watched_owned, _detached_this_tick, cwd, session_id

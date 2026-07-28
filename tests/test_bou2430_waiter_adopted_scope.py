@@ -103,6 +103,79 @@ def test_waiter_does_not_block_on_an_adopted_worktrees_blockers(tmp_path, monkey
     assert watched == [], "adopted worktrees must not feed clean-exit watch evidence"
 
 
+def test_waiter_does_not_publish_or_refresh_adopted_worktree_coverage(
+    tmp_path, monkeypatch
+):
+    """Adopted paths must never advertise wake-capable waiter ownership.
+
+    Otherwise the machine-wide loop defers to this live waiter even though the
+    waiter intentionally excludes the adopted PR from its blocker checks.
+    """
+    adopted_wt = tmp_path / "adopted"
+    armed_wt = tmp_path / "armed"
+    adopted_wt.mkdir()
+    armed_wt.mkdir()
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(adopted_wt), str(armed_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(
+        _ownres_mod,
+        "resolve_worktree",
+        _fake_ownership({
+            str(adopted_wt): "adopted",
+            str(armed_wt): "armed",
+        }),
+    )
+    monkeypatch.setattr(
+        mc,
+        "_check_worktree",
+        lambda path, session_id, *, claim=True: (
+            0,
+            "PR clean\nPR_NUMBER=999",
+        ),
+    )
+    monkeypatch.setattr(
+        mc,
+        "_await_watch_pending_this_tick",
+        lambda owned, detached, cwd, sid: False,
+    )
+
+    published = []
+    heartbeats = []
+    monkeypatch.setattr(
+        mc,
+        "_update_await_coverage",
+        lambda cwd, sid, roots: published.append(list(roots)),
+    )
+    monkeypatch.setattr(
+        mc,
+        "_touch_owner_heartbeat",
+        lambda worktree, sid, pending: heartbeats.append(worktree),
+    )
+
+    mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "1",
+        "--max-wait", "0",
+    ])
+
+    assert all(str(adopted_wt) not in roots for roots in published)
+    assert str(armed_wt) in published[-1]
+    assert str(adopted_wt) not in heartbeats
+    assert str(armed_wt) in heartbeats
+
+
 def test_waiter_still_blocks_on_an_armed_worktrees_blockers(tmp_path, monkeypatch):
     """Control: a genuinely ARMED (this session's own) worktree's blockers must
     still wake the waiter — only the adopted case is excluded."""
