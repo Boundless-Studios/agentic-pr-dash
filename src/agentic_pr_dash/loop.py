@@ -55,7 +55,7 @@ from pathlib import Path
 from agent_coordinator.service import StaleClaimError
 
 from . import coordinator
-from ._maintenance import worktree_check
+from ._maintenance import mutation_lock, worktree_check
 from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
 from .agents import discover_active_agents
@@ -67,6 +67,12 @@ CHECK_WORK_FOUND = 10
 
 
 # ---------------------------------------------------------------------------
+#: Sentinel return from :func:`_run_executor` meaning "another actor holds this
+#: worktree's mutation lock, so nothing was attempted" (BOU-2590). Distinct from
+#: every real executor exit code so a stand-down is never counted as a failure.
+#: 250 is chosen above the 128+signal band and below 255.
+EXECUTOR_STOOD_DOWN = 250
+
 # Per-PR executor-failure streak tracking (BOU-1789 Task 5)
 # ---------------------------------------------------------------------------
 
@@ -1078,7 +1084,38 @@ def _run_executor(executor: str, prompt: str, cwd: str) -> int:
             parts.append(prompt if tok == "{prompt}" else tok)
     else:
         parts = [*shlex.split(executor), prompt]
-    return subprocess.run(parts, cwd=cwd, env=_executor_env()).returncode
+
+    # BOU-2590: this is the loop's ONLY write path into a shared worktree, and
+    # the ownership marker does not exclude a live session editing the same
+    # files. Without this the executor could commit a session's in-progress work
+    # and start a merge underneath it. Standing down costs one tick; the merge
+    # conflict and ambiguous authorship it prevents cost a manual untangle.
+    try:
+        owner = mutation_lock.acquire(cwd, actor="pr-maintenance-loop")
+    except mutation_lock.WorktreeBusy as busy:
+        # Deliberately NOT a dispatch failure: nothing was attempted, so this
+        # must not feed the per-PR failure streak or escalation. The next tick
+        # retries once the other actor releases.
+        print(f"[apd:loop] {busy}", file=sys.stderr)
+        return EXECUTOR_STOOD_DOWN
+    except OSError as exc:
+        # The lock is an ADVISORY improvement on "always dispatch"; it is not a
+        # precondition for maintenance. A worktree whose .gaia/ cannot be
+        # written (read-only mount, odd path) would otherwise lose maintenance
+        # entirely — a worse regression than the race this guards. Degrade to
+        # the pre-BOU-2590 behaviour, loudly.
+        print(
+            f"[apd:loop] WARNING: could not take the mutation lock on {cwd} "
+            f"({exc}); dispatching UNLOCKED — a concurrent editor could "
+            "conflict (BOU-2590)",
+            file=sys.stderr,
+        )
+        return subprocess.run(parts, cwd=cwd, env=_executor_env()).returncode
+
+    try:
+        return subprocess.run(parts, cwd=cwd, env=_executor_env()).returncode
+    finally:
+        mutation_lock.release(cwd, owner)
 
 
 #: Git committer identity stamped on everything the loop's executor commits
@@ -1262,6 +1299,13 @@ def _dispatch_with_fallback(
     rc, err = _try_run(primary, prompt, cwd)
     if rc == 0:
         return True, {}
+    if rc == EXECUTOR_STOOD_DOWN:
+        # BOU-2590: another actor holds the worktree's mutation lock, so nothing
+        # ran. That is neither a service nor a failure: reporting it as a failure
+        # would feed the per-PR streak and escalate a PR whose only problem is
+        # that someone else is currently editing it. Returning no errors also
+        # stops the fallback, which would only queue behind the same lock.
+        return False, {}
     errors = {"primary": f"{_executor_program(primary) or primary}: {err}"}
     if _decision_requested_during_dispatch(cwd, pr, repo_slug=repo_slug):
         print(
