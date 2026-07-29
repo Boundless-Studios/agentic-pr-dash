@@ -952,6 +952,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
+    policy = getattr(args, "policy", None)
+    ledger = getattr(args, "ledger", None)
+    if bool(policy) != bool(ledger):
+        print(
+            "error: --policy and --ledger must be supplied together",
+            file=sys.stderr,
+        )
+        return 2
+    if policy and ledger:
+        # The hook protocol uses 2 for "block this stop"; finalize uses 10 for
+        # ordinary work remaining. Both observation errors and unsettled work
+        # must fail closed here.
+        return 0 if _cmd_finalize(args) == 0 else 2
     try:
         return _stop_gate_impl(args)
     except Exception as exc:  # noqa: BLE001
@@ -965,7 +978,6 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
         # out of time — say so explicitly rather than returning 0 with zero
         # information, so the operator isn't left guessing which of the two
         # actually happened.
-        import sys  # noqa: PLC0415
         print(
             f"[pr-watch] stop-gate CRASHED internally ({type(exc).__name__}: {exc}) "
             f"— this is a bug in the gate itself, NOT a per-PR budget shortfall (a "
@@ -1731,6 +1743,37 @@ def main(argv: list[str] | None = None) -> int:
         default=False,
         help="Skip the waiter-enforcement branch (for codex/non-interactive callers "
         "that have no background-task wake channel).",
+    )
+    stop_gate_p.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="PR number for canonical finalization (default: current branch).",
+    )
+    stop_gate_p.add_argument(
+        "--policy",
+        default=None,
+        metavar="PATH",
+        help="Review policy YAML; requires --ledger and enables canonical finalization.",
+    )
+    stop_gate_p.add_argument(
+        "--ledger",
+        default=None,
+        metavar="PATH",
+        help="Coordinator review ledger JSON; requires --policy.",
+    )
+    stop_gate_p.add_argument(
+        "--stabilization-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Canonical finalization delay between clean observations.",
+    )
+    stop_gate_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print canonical finalization as machine-readable JSON.",
     )
 
     # --- reconcile-prs ---

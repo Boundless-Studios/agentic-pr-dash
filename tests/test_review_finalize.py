@@ -307,3 +307,39 @@ review:
     )
 
     assert rc == 10
+
+
+def test_stop_gate_uses_canonical_finalization_when_configured(
+    monkeypatch,
+) -> None:
+    import argparse
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mc,
+        "_cmd_finalize",
+        lambda args: calls.append(args.policy) or 10,
+    )
+    monkeypatch.setattr(
+        mc,
+        "_stop_gate_impl",
+        lambda args: (_ for _ in ()).throw(
+            AssertionError("legacy stop gate must not run")
+        ),
+    )
+    args = argparse.Namespace(
+        policy="review-policy.yaml",
+        ledger="review-ledger.json",
+    )
+
+    assert mc._cmd_stop_gate(args) == 2
+    assert calls == ["review-policy.yaml"]
+
+
+def test_stop_gate_requires_policy_and_ledger_together(capsys) -> None:
+    import argparse
+
+    args = argparse.Namespace(policy="review-policy.yaml", ledger=None)
+
+    assert mc._cmd_stop_gate(args) == 2
+    assert "--policy and --ledger must be supplied together" in capsys.readouterr().err
