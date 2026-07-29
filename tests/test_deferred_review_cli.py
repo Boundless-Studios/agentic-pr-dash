@@ -14,7 +14,11 @@ import pytest
 
 from agentic_pr_dash import github_api
 from agentic_pr_dash import maintenance_check as mc
-from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash.github_api import (
+    ReviewSubmission,
+    ReviewThread,
+    ReviewThreadComment,
+)
 from agentic_pr_dash.models import PRData, PRStatus
 from agentic_pr_dash._maintenance import deferred_review as dr
 
@@ -33,6 +37,7 @@ def _pr() -> PRData:
     return PRData(
         number=PR_NUMBER, title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
         worktree_path="/wt", status=PRStatus.CLEAN,
+        latest_commit_sha="a" * 40, author="pr-author",
     )
 
 
@@ -216,6 +221,43 @@ def test_defer_reply_failure_still_persists_the_deferral(tmp_path, monkeypatch) 
 
     assert rc == 0
     assert dr.is_thread_deferred(str(tmp_path), PR_NUMBER, "T1") is True
+
+
+def test_defer_review_body_p2_by_review_id(tmp_path, monkeypatch) -> None:
+    _, replied = _wire(monkeypatch, [])
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions",
+        lambda *args, **kwargs: [
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id="a" * 40,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P2] Defend an unobserved edge case.",
+            )
+        ],
+    )
+
+    rc = mc._cmd_complete(
+        _args(
+            cwd=str(tmp_path),
+            defer="review:123",
+            severity="P2",
+            ticket=None,
+            reason="No supported-path reproduction.",
+        )
+    )
+
+    assert rc == 0
+    assert dr.is_thread_deferred(
+        str(tmp_path),
+        PR_NUMBER,
+        "review:123",
+    )
+    assert replied[0][0] is None
+    assert "No supported-path reproduction." in replied[0][1]
 
 
 # ---------------------------------------------------------------------------

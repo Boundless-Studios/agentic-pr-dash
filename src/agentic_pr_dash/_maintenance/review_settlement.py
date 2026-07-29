@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 
 from agent_review_coordinator import (
     Disposition,
@@ -144,6 +145,148 @@ def _github_execution_id(head_sha: str, threads: Sequence) -> str:
     return f"github-backstop:{head_sha}:{digest}"
 
 
+@dataclass
+class _BackstopEvidence:
+    provider: str
+    qualifies_for_slot: bool
+    findings: list[Finding] = field(default_factory=list)
+    disposition_keys: list[tuple[str, str]] = field(default_factory=list)
+
+
+def _record_deferred_findings(
+    ledger: ReviewLedger,
+    *,
+    evidence: _BackstopEvidence,
+    deferrals: Mapping[str, Mapping[str, object]],
+) -> None:
+    for disposition_key, fingerprint in evidence.disposition_keys:
+        record = deferrals.get(disposition_key)
+        if record is None:
+            continue
+        reason = str(record.get("reason") or "").strip()
+        if not reason:
+            continue
+        ledger.record_disposition(
+            fingerprint=fingerprint,
+            disposition=Disposition.DEFER,
+            rationale=reason,
+        )
+
+
+def overlay_backstop_evidence(
+    ledger: ReviewLedger,
+    *,
+    threads: Sequence,
+    deferrals: Mapping[str, Mapping[str, object]],
+    reviews: Sequence,
+    reviewer_count: int,
+) -> ReviewLedger:
+    """Project all live findings and each completed review exactly once.
+
+    Completed current-head reviews qualify for configured backstop slots.
+    Findings from older or uncorrelated threads are retained in an overflow
+    slot, so they block settlement without masquerading as current-head review
+    evidence. Additional reviews after quorum are also retained there because
+    quorum must never suppress a later finding.
+    """
+
+    overlaid = ledger.model_copy(deep=True)
+    evidence_by_execution: dict[str, _BackstopEvidence] = {}
+
+    for review in reviews:
+        execution_id = f"github-review-{review.review_id}"
+        evidence = evidence_by_execution.setdefault(
+            execution_id,
+            _BackstopEvidence(
+                provider=review.author,
+                qualifies_for_slot=True,
+            ),
+        )
+        body_finding = finding_from_review_submission(
+            review,
+            repository=overlaid.repository,
+            head_sha=overlaid.head_sha,
+            reviewer_execution_id=execution_id,
+        )
+        if body_finding is not None:
+            evidence.findings.append(body_finding)
+            evidence.disposition_keys.append(
+                (f"review:{review.review_id}", body_finding.fingerprint)
+            )
+
+    current_review_ids = {review.review_id for review in reviews}
+    for thread in threads:
+        review_id = thread.top.review_id
+        if review_id is not None:
+            execution_id = f"github-review-{review_id}"
+        else:
+            execution_id = _github_execution_id(overlaid.head_sha, [thread])
+        evidence = evidence_by_execution.setdefault(
+            execution_id,
+            _BackstopEvidence(
+                provider=thread.top.author or "github",
+                qualifies_for_slot=review_id in current_review_ids,
+            ),
+        )
+        finding = finding_from_thread(
+            thread,
+            repository=overlaid.repository,
+            head_sha=overlaid.head_sha,
+            reviewer_execution_id=execution_id,
+        )
+        evidence.findings.append(finding)
+        evidence.disposition_keys.append((thread.node_id, finding.fingerprint))
+
+    existing_results = [
+        result
+        for result in overlaid.results
+        if not result.stale and result.stage is ReviewStage.BACKSTOP
+    ]
+    existing_slots = {
+        result.reviewer_execution_id: result.slot_number
+        for result in existing_results
+    }
+    occupied_slots = {
+        result.slot_number
+        for result in existing_results
+        if result.slot_number <= reviewer_count
+    }
+    available_slots = [
+        slot_number
+        for slot_number in range(1, reviewer_count + 1)
+        if slot_number not in occupied_slots
+    ]
+    overflow_slot = reviewer_count + 1
+
+    for execution_id, evidence in evidence_by_execution.items():
+        existing_slot = existing_slots.get(execution_id)
+        if existing_slot is not None:
+            slot_number = existing_slot
+        elif evidence.qualifies_for_slot and available_slots:
+            slot_number = available_slots.pop(0)
+        else:
+            slot_number = overflow_slot
+        if existing_slot is None or evidence.findings:
+            overlaid.submit(
+                ReviewResult(
+                    repository=overlaid.repository,
+                    head_sha=overlaid.head_sha,
+                    stage=ReviewStage.BACKSTOP,
+                    round_number=1,
+                    slot_number=slot_number,
+                    reviewer_execution_id=execution_id,
+                    reviewer_provider=evidence.provider,
+                    findings=evidence.findings,
+                )
+            )
+        _record_deferred_findings(
+            overlaid,
+            evidence=evidence,
+            deferrals=deferrals,
+        )
+    return overlaid
+
+
 def overlay_github_findings(
     ledger: ReviewLedger,
     *,
@@ -152,45 +295,13 @@ def overlay_github_findings(
 ) -> ReviewLedger:
     """Overlay live GitHub findings without synthesizing an empty review run."""
 
-    overlaid = ledger.model_copy(deep=True)
-    if not threads:
-        return overlaid
-
-    execution_id = _github_execution_id(overlaid.head_sha, threads)
-    findings = [
-        finding_from_thread(
-            thread,
-            repository=overlaid.repository,
-            head_sha=overlaid.head_sha,
-            reviewer_execution_id=execution_id,
-        )
-        for thread in threads
-    ]
-    overlaid.submit(
-        ReviewResult(
-            repository=overlaid.repository,
-            head_sha=overlaid.head_sha,
-            stage=ReviewStage.BACKSTOP,
-            round_number=1,
-            slot_number=1,
-            reviewer_execution_id=execution_id,
-            reviewer_provider="github",
-            findings=findings,
-        )
+    return overlay_backstop_evidence(
+        ledger,
+        threads=threads,
+        deferrals=deferrals,
+        reviews=[],
+        reviewer_count=1,
     )
-    for thread, submitted in zip(threads, findings, strict=True):
-        record = deferrals.get(thread.node_id)
-        if record is None:
-            continue
-        reason = str(record.get("reason") or "").strip()
-        if not reason:
-            continue
-        overlaid.record_disposition(
-            fingerprint=submitted.fingerprint,
-            disposition=Disposition.DEFER,
-            rationale=reason,
-        )
-    return overlaid
 
 
 def overlay_backstop_results(
@@ -202,54 +313,18 @@ def overlay_backstop_results(
 ) -> ReviewLedger:
     """Project current-head GitHub review submissions into backstop slots."""
 
-    overlaid = ledger.model_copy(deep=True)
-    existing_results = [
-        result
-        for result in overlaid.results
-        if not result.stale and result.stage is ReviewStage.BACKSTOP
-    ]
-    occupied_slots = {result.slot_number for result in existing_results}
-    execution_ids = {
-        result.reviewer_execution_id for result in existing_results
-    }
-    available_slots = [
-        slot_number
-        for slot_number in range(1, reviewer_count + 1)
-        if slot_number not in occupied_slots
-    ]
     eligible_reviews = [
         review
         for review in reviews
         if review.review_id not in (thread_review_ids or set())
     ]
-    for review, slot_number in zip(
-        eligible_reviews,
-        available_slots,
-        strict=False,
-    ):
-        execution_id = f"github-review-{review.review_id}"
-        if execution_id in execution_ids:
-            continue
-        body_finding = finding_from_review_submission(
-            review,
-            repository=overlaid.repository,
-            head_sha=overlaid.head_sha,
-            reviewer_execution_id=execution_id,
-        )
-        overlaid.submit(
-            ReviewResult(
-                repository=overlaid.repository,
-                head_sha=overlaid.head_sha,
-                stage=ReviewStage.BACKSTOP,
-                round_number=1,
-                slot_number=slot_number,
-                reviewer_execution_id=execution_id,
-                reviewer_provider=review.author,
-                findings=[body_finding] if body_finding is not None else [],
-            )
-        )
-        execution_ids.add(execution_id)
-    return overlaid
+    return overlay_backstop_evidence(
+        ledger,
+        threads=[],
+        deferrals={},
+        reviews=eligible_reviews,
+        reviewer_count=reviewer_count,
+    )
 
 
 def _append_once(items: list[str], item: str) -> None:
@@ -306,20 +381,12 @@ def evaluate_pr_snapshot(
         _append_once(blockers, "ci_not_successful")
 
     current_threads = [thread for thread in threads if not thread.is_resolved]
-    settled_ledger = overlay_github_findings(
+    settled_ledger = overlay_backstop_evidence(
         ledger,
         threads=current_threads,
         deferrals=deferrals,
-    )
-    settled_ledger = overlay_backstop_results(
-        settled_ledger,
         reviews=review_submissions,
         reviewer_count=policy.review.backstop.reviewer_count,
-        thread_review_ids={
-            thread.top.review_id
-            for thread in current_threads
-            if thread.top.review_id is not None
-        },
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
     return FinalizationObservation(

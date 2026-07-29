@@ -227,7 +227,9 @@ gate never turns an unavailable review-thread read into a clean result.
 P1 findings must be addressed. P2 findings must be evaluated individually:
 `complete --defer <thread> --severity P2 --reason <rationale>` records a
 deliberate non-fix disposition, with an optional existing `--ticket`. It never
-creates tracker work. P1 deferral and bulk `--sweep-p2` are refused.
+creates tracker work. For a P2 declared only in a top-level review body, use
+`complete --defer review:<review-database-id> --severity P2 --reason
+<rationale>`. P1 deferral and bulk `--sweep-p2` are refused.
 
 ### One agent per PR
 

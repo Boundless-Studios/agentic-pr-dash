@@ -611,3 +611,29 @@ def test_get_review_submissions_strict_failure_raises(monkeypatch):
 
     with pytest.raises(RuntimeError, match="review submissions"):
         github_api.get_review_submissions(24, "a" * 40, ".", strict=True)
+
+
+def test_get_review_submissions_strict_rejects_malformed_current_head_review(
+    monkeypatch,
+):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    payload = [
+        [
+            {
+                "id": "not-an-integer",
+                "user": {},
+                "state": "COMMENTED",
+                "commit_id": "a" * 40,
+                "submitted_at": "2026-07-28T00:00:00Z",
+                "body": "[P1] This blocker must not be discarded.",
+            }
+        ]
+    ]
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: _cp(json.dumps(payload)),
+    )
+
+    with pytest.raises(RuntimeError, match="malformed current-head review"):
+        github_api.get_review_submissions(24, "a" * 40, ".", strict=True)

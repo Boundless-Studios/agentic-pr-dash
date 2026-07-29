@@ -1725,19 +1725,36 @@ def get_review_submissions(
                     raise TypeError("review record is not an object")
                 state = str(item.get("state") or "").upper()
                 commit_id = str(item.get("commit_id") or "")
-                submitted_at = str(item.get("submitted_at") or "")
-                body = str(item.get("body") or "")
-                user = item.get("user") or {}
-                author = str(user.get("login") or "") if isinstance(user, dict) else ""
+                if commit_id != head_sha or state not in {
+                    "APPROVED",
+                    "COMMENTED",
+                    "CHANGES_REQUESTED",
+                }:
+                    continue
+                submitted_at = item.get("submitted_at")
+                body = item.get("body")
+                user = item.get("user")
+                author = user.get("login") if isinstance(user, dict) else None
                 review_id = item.get("id")
-                if (
-                    commit_id != head_sha
-                    or state not in {"APPROVED", "COMMENTED", "CHANGES_REQUESTED"}
+                malformed = (
+                    not isinstance(submitted_at, str)
                     or not submitted_at
+                    or not isinstance(author, str)
                     or not author
-                    or not isinstance(review_id, int)
-                    or author.casefold() in excluded
-                ):
+                    or type(review_id) is not int
+                    or (
+                        body is not None
+                        and not isinstance(body, str)
+                    )
+                )
+                if malformed:
+                    if strict:
+                        raise RuntimeError(
+                            "get_review_submissions: malformed current-head "
+                            f"review record for PR #{pr_number}"
+                        )
+                    continue
+                if author.casefold() in excluded:
                     continue
                 submissions.append(
                     ReviewSubmission(
@@ -1746,7 +1763,7 @@ def get_review_submissions(
                         state=state,
                         commit_id=commit_id,
                         submitted_at=submitted_at,
-                        body=body,
+                        body=body or "",
                     )
                 )
     except (json.JSONDecodeError, TypeError) as exc:
