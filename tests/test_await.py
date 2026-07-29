@@ -53,10 +53,24 @@ def _bind_pr(monkeypatch, pr: int = 42) -> None:
     monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
 
 
-def _write_pidfile(cwd: str, pid: int, session_id: str) -> None:
+def _write_pidfile(
+    cwd: str,
+    pid: int,
+    session_id: str,
+    process_identity: str = "Mon Jul 27 12:34:56 2026",
+) -> None:
     path = _await_pidfile_path(cwd, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": pid, "session_id": session_id}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "session_id": session_id,
+                "process_identity": process_identity,
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_await_exits_0_when_owner_pid_dead(tmp_path, monkeypatch, capsys):
@@ -142,7 +156,9 @@ def test_await_single_instance_exit_3(tmp_path, monkeypatch, capsys):
 
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: pid == str(live_pid) or pid == live_pid)
     monkeypatch.setattr(
-        _waiter_mod, "_process_is_await_waiter", lambda pid: True
+        _waiter_mod,
+        "_process_identity",
+        lambda pid: "Mon Jul 27 12:34:56 2026",
     )
 
     rc = mc.main([
@@ -207,8 +223,8 @@ def test_await_reclaims_live_pidfile_from_non_waiter_process(
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
     monkeypatch.setattr(
         _waiter_mod,
-        "_process_is_await_waiter",
-        lambda pid: False,
+        "_process_identity",
+        lambda pid: "Mon Jul 27 12:35:01 2026",
     )
     monkeypatch.setattr(
         _worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: []
@@ -232,38 +248,95 @@ def test_await_reclaims_live_pidfile_from_non_waiter_process(
     assert not _await_pidfile_path(str(tmp_path)).exists()
 
 
-@pytest.mark.parametrize(
-    "cmdline",
-    [
-        "python3 -m pr_dashboard.maintenance_check await --session-id sid",
-        "/opt/bin/agentic-pr-dash await --session-id sid",
-        "python3 -m agentic_pr_dash await --session-id sid",
-    ],
-)
-def test_process_identity_recognizes_supported_await_entrypoints(
-    monkeypatch, cmdline
+def test_await_alive_accepts_custom_waiter_with_unmatched_quote(
+    tmp_path, monkeypatch
 ):
+    """Process identity must not parse a configured waiter's command text."""
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_WAITER_DIR",
+        str(tmp_path / "waiters"),
+    )
+    _waiter_mod._write_await_pidfile(
+        "",
+        {
+            "pid": 123,
+            "session_id": SID,
+            "process_identity": "Mon Jul 27 12:34:56 2026",
+        },
+        SID,
+    )
+    monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda pid: True)
+
+    def fake_run(command, **kwargs):
+        if "command=" in command:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="/opt/my-custom-waiter --cwd /tmp/John's/repo "
+                f"--session-id {SID}",
+            )
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="Mon Jul 27 12:34:56 2026",
+        )
+
+    monkeypatch.setattr(_waiter_mod.subprocess, "run", fake_run)
+
+    assert _waiter_mod._await_alive(str(tmp_path), SID) is True
+
+
+def test_await_alive_rejects_recycled_waiter_from_another_session(
+    tmp_path, monkeypatch
+):
+    """A same-shaped command cannot inherit another session's stale pidfile."""
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_WAITER_DIR",
+        str(tmp_path / "waiters"),
+    )
+    _waiter_mod._write_await_pidfile(
+        "",
+        {
+            "pid": 123,
+            "session_id": SID,
+            "process_identity": "Mon Jul 27 12:34:56 2026",
+        },
+        SID,
+    )
+    monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda pid: True)
+
+    def fake_run(command, **kwargs):
+        if "command=" in command:
+            return types.SimpleNamespace(
+                returncode=0,
+                stdout="agentic-pr-dash await --session-id another-session",
+            )
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="Mon Jul 27 12:35:01 2026",
+        )
+
+    monkeypatch.setattr(_waiter_mod.subprocess, "run", fake_run)
+
+    assert _waiter_mod._await_alive(str(tmp_path), SID) is False
+
+
+def test_update_await_coverage_persists_process_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_WAITER_DIR",
+        str(tmp_path / "waiters"),
+    )
     monkeypatch.setattr(
         _waiter_mod.subprocess,
         "run",
         lambda *args, **kwargs: types.SimpleNamespace(
-            returncode=0, stdout=cmdline
+            returncode=0,
+            stdout="Mon Jul 27 12:34:56 2026",
         ),
     )
 
-    assert _waiter_mod._process_is_await_waiter("123") is True
+    _waiter_mod._update_await_coverage(str(tmp_path), SID, [str(tmp_path)])
 
-
-def test_process_identity_rejects_unrelated_live_process(monkeypatch):
-    monkeypatch.setattr(
-        _waiter_mod.subprocess,
-        "run",
-        lambda *args, **kwargs: types.SimpleNamespace(
-            returncode=0, stdout="python3 -m pytest tests/test_await.py"
-        ),
-    )
-
-    assert _waiter_mod._process_is_await_waiter("123") is False
+    data = _waiter_mod._read_await_pidfile("", SID)
+    assert data["process_identity"] == "Mon Jul 27 12:34:56 2026"
 
 
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):

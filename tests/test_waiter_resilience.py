@@ -177,9 +177,20 @@ def test_await_emits_deferred_outcome_on_single_instance_exit_3(tmp_path, monkey
     live_pid = os.getpid()
     path = Path(mc._await_pidfile(str(tmp_path), SID))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": live_pid, "session_id": SID}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "pid": live_pid,
+                "session_id": SID,
+                "process_identity": "test-start",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: str(pid) == str(live_pid))
-    monkeypatch.setattr(_waiter_mod, "_process_is_await_waiter", lambda pid: True)
+    monkeypatch.setattr(
+        _waiter_mod, "_process_identity", lambda pid: "test-start"
+    )
 
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "1"])

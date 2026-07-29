@@ -1,9 +1,9 @@
 """Background feedback waiter helpers."""
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
-import shlex
 import subprocess
 
 from agentic_pr_dash.config import load as load_config
@@ -216,47 +216,54 @@ def _update_await_coverage(cwd: str, session_id: str, roots: list[str]) -> None:
     ]
     data["pid"] = os.getpid()
     data["session_id"] = session_id
+    process_identity = _process_identity(str(os.getpid()))
+    if process_identity is None:
+        data.pop("process_identity", None)
+    else:
+        data["process_identity"] = process_identity
     data["covered_roots"] = covered
     data["requested_roots"] = requested
     _write_await_pidfile(cwd, data, session_id)
 
 
-def _process_is_await_waiter(pid_raw: str) -> bool:
-    """True only when ``pid_raw`` is running an ``await`` command.
+def _process_identity(pid_raw: str) -> str | None:
+    """Return a stable start-time identity for a live process.
 
     ``kill(pid, 0)`` proves only that *some* process owns the pid. A waiter
     pidfile can survive a hard exit long enough for the OS to recycle that pid;
-    treating the unrelated successor as the incumbent strands the session behind
-    a ghost waiter (BOU-2705). This mirrors the command-identity guard used by
-    the CI watcher's pidfile cleanup.
+    the process start time distinguishes the successor without inspecting or
+    parsing its command text. ``ps -o lstart`` is supported by both BSD/macOS
+    and procps/Linux.
     """
     try:
         result = subprocess.run(
-            ["ps", "-o", "command=", "-p", str(int(pid_raw))],
+            ["ps", "-o", "lstart=", "-p", str(int(pid_raw))],
             capture_output=True,
+            env={**os.environ, "LC_ALL": "C"},
             text=True,
             timeout=5,
         )
     except (ValueError, OSError, subprocess.TimeoutExpired):
-        return False
+        return None
     if result.returncode != 0:
+        return None
+    identity = result.stdout.strip()
+    return identity or None
+
+
+def _legacy_process_predates_pidfile(pid_raw: str, path: str) -> bool:
+    """Validate an identity-less pre-upgrade pidfile without command parsing."""
+    identity = _process_identity(pid_raw)
+    if identity is None:
         return False
     try:
-        argv = shlex.split(result.stdout.strip())
-    except ValueError:
+        started_at = datetime.strptime(
+            identity, "%a %b %d %H:%M:%S %Y"
+        ).timestamp()
+        pidfile_updated_at = os.path.getmtime(path)
+    except (OSError, ValueError, OverflowError):
         return False
-    if "await" not in argv:
-        return False
-    return any(
-        token == "agentic-pr-dash"
-        or token.endswith("/agentic-pr-dash")
-        or token == "agentic_pr_dash"
-        or token in {
-            "agentic_pr_dash.maintenance_check",
-            "pr_dashboard.maintenance_check",
-        }
-        for token in argv
-    )
+    return started_at <= pidfile_updated_at
 
 
 def _await_alive(cwd: str, session_id: str) -> bool:
@@ -274,17 +281,27 @@ def _await_alive(cwd: str, session_id: str) -> bool:
         except (OSError, ValueError):
             continue
         pid_raw = str(data.get("pid", "")) if isinstance(data, dict) else ""
-        if (
+        recorded_identity = (
+            data.get("process_identity") if isinstance(data, dict) else None
+        )
+        if not (
             isinstance(data, dict)
             and data.get("session_id") == session_id
             and _pid_alive(pid_raw)
-            and _process_is_await_waiter(pid_raw)
         ):
-            if path != session_path:
-                return True
-            if _covered_or_requested(data, cwd):
-                return True
-            return _request_waiter_coverage(cwd, session_id)
+            continue
+        if isinstance(recorded_identity, str) and recorded_identity:
+            if _process_identity(pid_raw) != recorded_identity:
+                continue
+        elif path == session_path or not _legacy_process_predates_pidfile(
+            pid_raw, path
+        ):
+            continue
+        if path != session_path:
+            return True
+        if _covered_or_requested(data, cwd):
+            return True
+        return _request_waiter_coverage(cwd, session_id)
     return False
 
 
