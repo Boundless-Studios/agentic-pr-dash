@@ -3293,6 +3293,12 @@ def scan_review_threads(
     now = datetime.now(timezone.utc)
     comments: list[ReviewComment] = []
     decisions: list[ThreadDecision] = []
+    from ._maintenance import deferred_review as _deferred_review  # noqa: PLC0415
+
+    deferred_findings = _deferred_review.deferred_threads_for_pr(
+        cwd or ".",
+        pr_number,
+    )
 
     # Inline review threads via GraphQL
     threads = get_review_threads(pr_number, cwd)
@@ -3321,8 +3327,7 @@ def scan_review_threads(
         # BEFORE is_outdated/marker-state so a deferred thread is never picked
         # regardless of its drift or claim-reply state — the deferral decision
         # is authoritative, not one signal among several.
-        from ._maintenance import deferred_review as _deferred_review  # noqa: PLC0415
-        if _deferred_review.is_thread_deferred(cwd or ".", pr_number, thread.node_id):
+        if thread.node_id in deferred_findings:
             decisions.append(ThreadDecision(
                 thread_id=thread.node_id,
                 author=top.author,
@@ -3425,13 +3430,29 @@ def scan_review_threads(
                 submitted = data.get("submitted_at", "")
                 if latest_commit_date and submitted <= latest_commit_date:
                     continue
-                comments.append(ReviewComment(
-                    id=data.get("id", 0),
-                    author=data.get("author", "unknown"),
-                    body=data.get("body", ""),
-                    created_at=submitted,
-                    is_inline=False,
-                ))
+                review_id = data.get("id", 0)
+                body = data.get("body", "")
+                from ._maintenance.review_settlement import (  # noqa: PLC0415
+                    declared_review_body_lines,
+                )
+
+                declared_lines = declared_review_body_lines(body)
+                bodies = declared_lines or [body]
+                for ordinal, finding_body in enumerate(bodies, start=1):
+                    disposition_key = (
+                        f"review:{review_id}"
+                        if len(bodies) == 1
+                        else f"review:{review_id}:{ordinal}"
+                    )
+                    if disposition_key in deferred_findings:
+                        continue
+                    comments.append(ReviewComment(
+                        id=review_id,
+                        author=data.get("author", "unknown"),
+                        body=finding_body,
+                        created_at=submitted,
+                        is_inline=False,
+                    ))
             except json.JSONDecodeError:
                 continue
 

@@ -61,6 +61,16 @@ def _thread_title(body: str) -> str:
     return title or "Unresolved GitHub review finding"
 
 
+def declared_review_body_lines(body: str) -> list[str]:
+    """Return each explicitly declared P1/P2 line from a review body."""
+
+    return [
+        line.strip()
+        for line in body.splitlines()
+        if _SEVERITY_PREFIX.match(line.strip())
+    ]
+
+
 def finding_from_thread(
     thread,
     *,
@@ -113,9 +123,8 @@ def findings_from_review_submission(
     """Translate each declared P1/P2 in a top-level GitHub review body."""
 
     declared_lines = [
-        (line.strip(), match)
-        for line in review.body.splitlines()
-        if (match := _SEVERITY_PREFIX.match(line.strip()))
+        (line, _SEVERITY_PREFIX.match(line))
+        for line in declared_review_body_lines(review.body)
     ]
     return [
         Finding(

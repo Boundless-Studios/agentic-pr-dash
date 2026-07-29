@@ -545,6 +545,11 @@ def test_finalization_reads_submissions_before_review_threads(
     )
     monkeypatch.setattr(
         github_api,
+        "clear_pr_batch_cache",
+        lambda: calls.append("clear"),
+    )
+    monkeypatch.setattr(
+        github_api,
         "get_review_submissions",
         lambda *args, **kwargs: calls.append("submissions") or [],
     )
@@ -565,4 +570,4 @@ def test_finalization_reads_submissions_before_review_threads(
         _ledger(),
     )
 
-    assert calls == ["submissions", "threads"]
+    assert calls == ["clear", "submissions", "threads"]

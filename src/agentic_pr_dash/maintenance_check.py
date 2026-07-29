@@ -220,6 +220,7 @@ def _observe_finalization(args, policy, ledger):
         raise RuntimeError(
             "required CI status is unobservable; refusing to synthesize green"
         )
+    github_api.clear_pr_batch_cache()
     review_submissions = github_api.get_review_submissions(
         pr.number,
         pr.latest_commit_sha,
