@@ -19,6 +19,7 @@ import pytest
 
 from agentic_pr_dash import config, maintenance_check as mc
 from agentic_pr_dash._maintenance import _common as _common_mod
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import markers as _markers_mod
@@ -140,6 +141,9 @@ def test_await_single_instance_exit_3(tmp_path, monkeypatch, capsys):
     _write_pidfile(str(tmp_path), live_pid, SID)
 
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: pid == str(live_pid) or pid == live_pid)
+    monkeypatch.setattr(
+        _waiter_mod, "_process_is_await_waiter", lambda pid: True
+    )
 
     rc = mc.main([
         "await",
@@ -185,6 +189,81 @@ def test_await_stale_pidfile_not_exit_3(tmp_path, monkeypatch, capsys):
     # run ends unbound rather than clean (BOU-2294).
     assert rc != 3
     assert rc == mc._AWAIT_UNBOUND
+
+
+def test_await_reclaims_live_pidfile_from_non_waiter_process(
+    tmp_path, monkeypatch, capsys
+):
+    """A recycled pid is not an incumbent waiter (BOU-2705).
+
+    Process existence alone is not liveness for this registration: the pidfile
+    can outlive its waiter and the OS can assign that pid to an unrelated
+    process. Deferring in that state leaves the session's wake channel owned by
+    a ghost.
+    """
+    live_but_unrelated_pid = os.getpid()
+    _write_pidfile(str(tmp_path), live_but_unrelated_pid, SID)
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_process_is_await_waiter",
+        lambda pid: False,
+    )
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: []
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "12345",
+        "--max-wait", "1",
+    ])
+
+    assert rc == mc._AWAIT_UNBOUND
+    assert '"outcome":"deferred_to_loop"' not in capsys.readouterr().err
+    assert not _await_pidfile_path(str(tmp_path)).exists()
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    [
+        "python3 -m pr_dashboard.maintenance_check await --session-id sid",
+        "/opt/bin/agentic-pr-dash await --session-id sid",
+        "python3 -m agentic_pr_dash await --session-id sid",
+    ],
+)
+def test_process_identity_recognizes_supported_await_entrypoints(
+    monkeypatch, cmdline
+):
+    monkeypatch.setattr(
+        _waiter_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            returncode=0, stdout=cmdline
+        ),
+    )
+
+    assert _waiter_mod._process_is_await_waiter("123") is True
+
+
+def test_process_identity_rejects_unrelated_live_process(monkeypatch):
+    monkeypatch.setattr(
+        _waiter_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: types.SimpleNamespace(
+            returncode=0, stdout="python3 -m pytest tests/test_await.py"
+        ),
+    )
+
+    assert _waiter_mod._process_is_await_waiter("123") is False
 
 
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):

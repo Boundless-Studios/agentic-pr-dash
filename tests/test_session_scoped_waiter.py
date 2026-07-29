@@ -25,6 +25,9 @@ SID = "sess-1924"
 def _isolate_ledger(tmp_path, monkeypatch):
     # session_ledger._DEFAULT_DIR is frozen at import, so isolate per test.
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    # These tests use the pytest process as a stand-in for a live waiter. The
+    # command-identity behavior itself is covered by test_await.py.
+    monkeypatch.setattr(waiter, "_process_is_await_waiter", lambda pid: True)
 
 
 def _write_session_pidfile(session_id: str, pid: int, **extra) -> None:

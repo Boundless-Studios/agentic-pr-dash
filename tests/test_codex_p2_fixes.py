@@ -84,6 +84,7 @@ def test_await_alive_session_a_not_affected_by_session_b_waiter(tmp_path, monkey
 
     # Both pids alive
     monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda p: True)
+    monkeypatch.setattr(_waiter_mod, "_process_is_await_waiter", lambda p: True)
 
     assert mc._await_alive(str(tmp_path), sid_a) is True
     assert mc._await_alive(str(tmp_path), sid_b) is True

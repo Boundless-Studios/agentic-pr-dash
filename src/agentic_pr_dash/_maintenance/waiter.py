@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
+import subprocess
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _pid_alive
@@ -219,6 +221,44 @@ def _update_await_coverage(cwd: str, session_id: str, roots: list[str]) -> None:
     _write_await_pidfile(cwd, data, session_id)
 
 
+def _process_is_await_waiter(pid_raw: str) -> bool:
+    """True only when ``pid_raw`` is running an ``await`` command.
+
+    ``kill(pid, 0)`` proves only that *some* process owns the pid. A waiter
+    pidfile can survive a hard exit long enough for the OS to recycle that pid;
+    treating the unrelated successor as the incumbent strands the session behind
+    a ghost waiter (BOU-2705). This mirrors the command-identity guard used by
+    the CI watcher's pidfile cleanup.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "command=", "-p", str(int(pid_raw))],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        argv = shlex.split(result.stdout.strip())
+    except ValueError:
+        return False
+    if "await" not in argv:
+        return False
+    return any(
+        token == "agentic-pr-dash"
+        or token.endswith("/agentic-pr-dash")
+        or token == "agentic_pr_dash"
+        or token in {
+            "agentic_pr_dash.maintenance_check",
+            "pr_dashboard.maintenance_check",
+        }
+        for token in argv
+    )
+
+
 def _await_alive(cwd: str, session_id: str) -> bool:
     """True if a live waiter pidfile exists for ``session_id``.
 
@@ -233,10 +273,12 @@ def _await_alive(cwd: str, session_id: str) -> bool:
                 data = json.load(fh)
         except (OSError, ValueError):
             continue
+        pid_raw = str(data.get("pid", "")) if isinstance(data, dict) else ""
         if (
             isinstance(data, dict)
             and data.get("session_id") == session_id
-            and _pid_alive(str(data.get("pid", "")))
+            and _pid_alive(pid_raw)
+            and _process_is_await_waiter(pid_raw)
         ):
             if path != session_path:
                 return True
