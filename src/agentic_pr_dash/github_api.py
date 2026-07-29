@@ -110,6 +110,17 @@ class ReviewThread:
     replies: list[ReviewThreadComment] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class ReviewSubmission:
+    """One completed GitHub review against an immutable PR head."""
+
+    review_id: int
+    author: str
+    state: str
+    commit_id: str
+    submitted_at: str
+
+
 # Bounded retry for transient connectivity failures (BOU-1638 / BOU-1694).
 # A gh call that can't *reach* GitHub (DNS / connect / TLS / read timeout, or a
 # transient 5xx) typically succeeds moments later — the interactive shell's gh
@@ -641,7 +652,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     cmd = [
         "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
         "--json", "number,title,headRefName,headRefOid,baseRefName,url,isDraft,"
-        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
+        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt,author",
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -874,7 +885,7 @@ def list_open_prs_cached(
 
 _PR_HEAD_FIELDS = (
     "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
-    "headRefOid,headRefName,headRepositoryOwner,baseRefName,mergedAt"
+    "headRefOid,headRefName,headRepositoryOwner,baseRefName,mergedAt,author"
 )
 
 # GitHub's REST `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}` performs
@@ -1638,6 +1649,106 @@ def get_review_threads(
         paged = True
 
     return threads
+
+
+def get_review_submissions(
+    pr_number: int,
+    head_sha: str,
+    cwd: str | None = None,
+    *,
+    excluded_authors: set[str] | None = None,
+    strict: bool = False,
+) -> list[ReviewSubmission]:
+    """Return completed GitHub reviews submitted against ``head_sha``.
+
+    The review coordinator requires affirmative evidence that the configured
+    backstop ran for the immutable head. Review threads alone cannot provide
+    that evidence because a clean review legitimately creates no thread.
+    Completion gates use ``strict=True`` so an unavailable or malformed reviews
+    response cannot synthesize a satisfied backstop slot.
+    """
+
+    owner, repo = get_repo_info(cwd)
+    if not owner or not repo:
+        if strict:
+            raise RuntimeError(
+                "get_review_submissions: could not resolve the repository; "
+                "refusing to synthesize completed review submissions"
+            )
+        return []
+
+    result = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=cwd,
+        timeout_s=30,
+    )
+    if result.returncode != 0:
+        if strict:
+            raise RuntimeError(
+                f"get_review_submissions: GitHub review submissions failed for "
+                f"PR #{pr_number} (gh exit {result.returncode})"
+            )
+        return []
+
+    excluded = {
+        author.casefold()
+        for author in (excluded_authors or set())
+        if author.strip()
+    }
+    try:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, list):
+            raise TypeError("review response is not a list")
+        pages = payload if not payload or isinstance(payload[0], list) else [payload]
+        submissions: list[ReviewSubmission] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise TypeError("review page is not a list")
+            for item in page:
+                if not isinstance(item, dict):
+                    raise TypeError("review record is not an object")
+                state = str(item.get("state") or "").upper()
+                commit_id = str(item.get("commit_id") or "")
+                submitted_at = str(item.get("submitted_at") or "")
+                user = item.get("user") or {}
+                author = str(user.get("login") or "") if isinstance(user, dict) else ""
+                review_id = item.get("id")
+                if (
+                    commit_id != head_sha
+                    or state not in {"APPROVED", "COMMENTED", "CHANGES_REQUESTED"}
+                    or not submitted_at
+                    or not author
+                    or not isinstance(review_id, int)
+                    or author.casefold() in excluded
+                ):
+                    continue
+                submissions.append(
+                    ReviewSubmission(
+                        review_id=review_id,
+                        author=author,
+                        state=state,
+                        commit_id=commit_id,
+                        submitted_at=submitted_at,
+                    )
+                )
+    except (json.JSONDecodeError, TypeError) as exc:
+        if strict:
+            raise RuntimeError(
+                f"get_review_submissions: malformed review submissions for "
+                f"PR #{pr_number}"
+            ) from exc
+        return []
+
+    return sorted(
+        submissions,
+        key=lambda review: (review.submitted_at, review.review_id),
+    )
 
 
 # ---------------------------------------------------------------------------

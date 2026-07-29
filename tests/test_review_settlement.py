@@ -11,9 +11,14 @@ from agent_review_coordinator import (
 
 from agentic_pr_dash._maintenance.review_settlement import (
     finding_from_thread,
+    overlay_backstop_results,
     overlay_github_findings,
 )
-from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash.github_api import (
+    ReviewSubmission,
+    ReviewThread,
+    ReviewThreadComment,
+)
 
 
 def test_review_coordinator_contract_version() -> None:
@@ -156,3 +161,30 @@ def test_no_threads_does_not_synthesize_backstop_result() -> None:
 
     assert not report.settled
     assert report.missing_slots == ["backstop:1"]
+
+
+def test_current_head_review_submission_fills_backstop_slot() -> None:
+    ledger = overlay_backstop_results(
+        _ledger_with_local_result(),
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert report.settled
+    backstop = [
+        result
+        for result in ledger.results
+        if result.stage is ReviewStage.BACKSTOP
+    ]
+    assert backstop[0].reviewer_execution_id == "github-review-123"
+    assert backstop[0].reviewer_provider == "review-bot"

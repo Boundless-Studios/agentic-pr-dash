@@ -78,6 +78,11 @@ def _login_key(login: str) -> str:
     return login.lower()
 
 
+def _payload_author_login(raw: dict) -> str:
+    author = raw.get("author") or {}
+    return str(author.get("login") or "") if isinstance(author, dict) else ""
+
+
 def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     """True when a REST fallback payload's author is the configured ``pr_author``.
 
@@ -205,6 +210,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
 
     return PRData(
         number=pr_number,
+        author=_payload_author_login(raw),
         title=raw.get("title", ""),
         branch=branch,
         base_branch=raw.get("baseRefName", "main"),
@@ -268,6 +274,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
 
     return PRData(
         number=pr_number,
+        author=_payload_author_login(raw or {}),
         title=(raw or {}).get("title", ""),
         branch=(raw or {}).get("headRefName", ""),
         base_branch=(raw or {}).get("baseRefName", "main"),

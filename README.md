@@ -202,7 +202,10 @@ flowchart LR
 and repository hooks. Reviewer selection stays outside this project: a review
 policy declares provider-neutral slots (including double-reviewer topologies),
 and `agent-review-coordinator` records their results and finding dispositions.
-The dashboard only adds live GitHub, CI, mergeability, and change-request state.
+The dashboard adds live GitHub, CI, mergeability, and change-request state. A
+completed GitHub review submitted against the current head supplies a configured
+backstop slot; PR-author, stale-head, pending, or malformed review records do
+not.
 
 ```bash
 agentic-pr-dash finalize \

@@ -221,6 +221,13 @@ def _observe_finalization(args, policy, ledger):
             "required CI status is unobservable; refusing to synthesize green"
         )
     threads = github_api.get_review_threads(pr.number, cwd, strict=True)
+    review_submissions = github_api.get_review_submissions(
+        pr.number,
+        pr.latest_commit_sha,
+        cwd,
+        excluded_authors={pr.author} if pr.author else set(),
+        strict=True,
+    )
     deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
     return evaluate_pr_snapshot(
         pr=pr,
@@ -228,6 +235,7 @@ def _observe_finalization(args, policy, ledger):
         ledger=ledger,
         threads=threads,
         deferrals=deferrals,
+        review_submissions=review_submissions,
     )
 
 
