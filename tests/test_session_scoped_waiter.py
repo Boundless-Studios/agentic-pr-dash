@@ -154,3 +154,25 @@ def test_await_alive_legacy_per_worktree_pidfile_honored(tmp_path):
         json.dumps({"pid": os.getpid(), "session_id": SID}), encoding="utf-8"
     )
     assert waiter._await_alive(str(wt), SID) is True
+
+
+def test_await_alive_identityless_session_pidfile_honored_during_upgrade(tmp_path):
+    """A pre-upgrade waiter may already use the session-scoped path while still
+    writing the old identity-less payload. Its start time must be validated
+    against the pidfile mtime just like the legacy per-worktree format."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    session = Path(waiter._await_pidfile("", SID))
+    session.parent.mkdir(parents=True, exist_ok=True)
+    session.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "session_id": SID,
+                "covered_roots": [str(wt)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert waiter._await_alive(str(wt), SID) is True

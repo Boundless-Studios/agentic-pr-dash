@@ -1,7 +1,7 @@
 """Background feedback waiter helpers."""
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import os
 import subprocess
@@ -239,7 +239,7 @@ def _process_identity(pid_raw: str) -> str | None:
         result = subprocess.run(
             ["ps", "-o", "lstart=", "-p", str(int(pid_raw))],
             capture_output=True,
-            env={**os.environ, "LC_ALL": "C"},
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
             text=True,
             timeout=5,
         )
@@ -259,7 +259,7 @@ def _legacy_process_predates_pidfile(pid_raw: str, path: str) -> bool:
     try:
         started_at = datetime.strptime(
             identity, "%a %b %d %H:%M:%S %Y"
-        ).timestamp()
+        ).replace(tzinfo=timezone.utc).timestamp()
         pidfile_updated_at = os.path.getmtime(path)
     except (OSError, ValueError, OverflowError):
         return False
@@ -293,9 +293,7 @@ def _await_alive(cwd: str, session_id: str) -> bool:
         if isinstance(recorded_identity, str) and recorded_identity:
             if _process_identity(pid_raw) != recorded_identity:
                 continue
-        elif path == session_path or not _legacy_process_predates_pidfile(
-            pid_raw, path
-        ):
+        elif not _legacy_process_predates_pidfile(pid_raw, path):
             continue
         if path != session_path:
             return True

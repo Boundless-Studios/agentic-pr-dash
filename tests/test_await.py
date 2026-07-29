@@ -339,6 +339,23 @@ def test_update_await_coverage_persists_process_identity(tmp_path, monkeypatch):
     assert data["process_identity"] == "Mon Jul 27 12:34:56 2026"
 
 
+def test_process_identity_uses_utc_timezone(monkeypatch):
+    observed = {}
+
+    def fake_run(command, **kwargs):
+        observed.update(kwargs)
+        return types.SimpleNamespace(
+            returncode=0,
+            stdout="Mon Jul 27 19:34:56 2026",
+        )
+
+    monkeypatch.setenv("TZ", "America/New_York")
+    monkeypatch.setattr(_waiter_mod.subprocess, "run", fake_run)
+
+    assert _waiter_mod._process_identity("123") == "Mon Jul 27 19:34:56 2026"
+    assert observed["env"]["TZ"] == "UTC"
+
+
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
     """When --max-wait 0 and nothing pending, exits 0."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
