@@ -9,7 +9,7 @@ It comes in three layers you can adopt independently:
 
 | Layer | Command | What it does |
 |-------|---------|--------------|
-| **Executor** | `agentic-pr-dash check` / `complete` / `arm` / `list-owned` | Stateless, read-only blocker detection + review-thread resolution. Shells out to `gh` + `git`; almost zero dependencies. |
+| **Executor** | `agentic-pr-dash check` / `finalize` / `complete` / `arm` / `list-owned` | Stateless blocker detection, review settlement, and review-thread resolution. Shells out to `gh` + `git`; almost zero dependencies. |
 | **Loop** | `agentic-pr-dash loop` | Continuously checks your PRs and dispatches the fix to a **configurable agent** (Claude Code, Codex, aider, any prompt-taking CLI). |
 | **Dashboard** | `agentic-pr-dash serve` | A web view (FastAPI + HTMX) of every open PR's status, queued maintenance, and — optionally — your self-hosted CI runner fleet. |
 
@@ -195,6 +195,31 @@ flowchart LR
     E --> F[complete<br/>reply · resolve threads · close task]
     F --> A
 ```
+
+### Bounded, provider-neutral review settlement
+
+`agentic-pr-dash finalize` is the shared completion gate for interactive agents
+and repository hooks. Reviewer selection stays outside this project: a review
+policy declares provider-neutral slots (including double-reviewer topologies),
+and `agent-review-coordinator` records their results and finding dispositions.
+The dashboard only adds live GitHub, CI, mergeability, and change-request state.
+
+```bash
+agentic-pr-dash finalize \
+  --policy config/review-policy.yaml \
+  --ledger .agentic-review/ledger.json \
+  --stabilization-seconds 30 \
+  --json
+```
+
+Exit `0` means two identical observations were fully green; `10` means work
+remains; `2` means GitHub or another observation source was unavailable. The
+gate never turns an unavailable review-thread read into a clean result.
+
+P1 findings must be addressed. P2 findings must be evaluated individually:
+`complete --defer <thread> --severity P2 --reason <rationale>` records a
+deliberate non-fix disposition, with an optional existing `--ticket`. It never
+creates tracker work. P1 deferral and bulk `--sweep-p2` are refused.
 
 ### One agent per PR
 

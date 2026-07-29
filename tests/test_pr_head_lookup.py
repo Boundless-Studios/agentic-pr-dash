@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
 from agentic_pr_dash import github_api
 
 
@@ -426,6 +428,18 @@ def test_get_review_threads_first_page_failure_returns_empty(monkeypatch):
     monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
     monkeypatch.setattr(github_api, "_run", lambda *a, **k: _cp("", returncode=1))
     assert github_api.get_review_threads(5, ".") == []
+
+
+def test_get_review_threads_strict_first_page_failure_raises(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: _cp("", returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="synthesize a clean review state"):
+        github_api.get_review_threads(5, ".", strict=True)
 
 
 def test_get_review_threads_later_page_failure_raises(monkeypatch):

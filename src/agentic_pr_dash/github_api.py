@@ -1532,7 +1532,12 @@ def prime_pr_batch_cache(repo_slug: str, entries: dict[int, dict]) -> None:
         _PR_BATCH_CACHE[(repo_slug, pr_number)] = data
 
 
-def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThread]:
+def get_review_threads(
+    pr_number: int,
+    cwd: str | None = None,
+    *,
+    strict: bool = False,
+) -> list[ReviewThread]:
     """Return all review threads for a PR via GraphQL.
 
     Paginates over ``reviewThreads`` (100 per page) so PRs with more than 100
@@ -1540,15 +1545,16 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
     first page, and a truncated thread list would let resolved-elsewhere or
     still-open threads slip past the caller's resolved/outdated filtering.
 
-    A *first*-page failure returns ``[]`` (total unavailability — callers fail
-    open, matching :func:`find_pr_by_head`). But once a page has succeeded and
-    advertised ``hasNextPage``, a failure fetching a *subsequent* page raises
-    :class:`RuntimeError` rather than returning a partial list: silently
-    dropping later pages would let still-open threads slip past the
-    unresolved-thread gate — the exact truncation hazard this pagination is
-    meant to eliminate. A malformed page that reports ``hasNextPage=true`` but
-    omits/empties ``endCursor`` is treated the same way (we cannot advance, so
-    raising beats truncating).
+    A *first*-page failure returns ``[]`` by default for compatibility with
+    observational callers. ``strict=True`` raises instead, which completion
+    gates use so GitHub unavailability cannot synthesize green. Once a page has
+    succeeded and advertised ``hasNextPage``, a failure fetching a *subsequent*
+    page always raises :class:`RuntimeError` rather than returning a partial
+    list: silently dropping later pages would let still-open threads slip past
+    the unresolved-thread gate — the exact truncation hazard this pagination
+    is meant to eliminate. A malformed page that reports ``hasNextPage=true``
+    but omits/empties ``endCursor`` is treated the same way (we cannot advance,
+    so raising beats truncating).
 
     BOU-2556: a hit in the batch-prefetch cache (see ``prime_pr_batch_cache``)
     short-circuits this whole call — no `gh` invocation at all.
@@ -1582,6 +1588,12 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
                     f"#{pr_number} (gh exit {r.returncode}); refusing to return "
                     f"a partial thread list"
                 )
+            if strict:
+                raise RuntimeError(
+                    f"get_review_threads: first page failed for PR #{pr_number} "
+                    f"(gh exit {r.returncode}); refusing to synthesize a clean "
+                    "review state"
+                )
             break
         try:
             data = json.loads(r.stdout)
@@ -1593,6 +1605,11 @@ def get_review_threads(pr_number: int, cwd: str | None = None) -> list[ReviewThr
                 raise RuntimeError(
                     f"get_review_threads: malformed page after the first for PR "
                     f"#{pr_number}; refusing to return a partial thread list"
+                ) from exc
+            if strict:
+                raise RuntimeError(
+                    f"get_review_threads: malformed first page for PR #{pr_number}; "
+                    "refusing to synthesize a clean review state"
                 ) from exc
             break
 

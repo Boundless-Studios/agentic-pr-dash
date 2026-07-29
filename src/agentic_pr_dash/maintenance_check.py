@@ -194,6 +194,93 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
     return False
 
 
+def _observe_finalization(args, policy, ledger):
+    """Read one fail-closed PR/CI/review snapshot for ``finalize``."""
+
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    from agentic_pr_dash._maintenance.review_settlement import (  # noqa: PLC0415
+        evaluate_pr_snapshot,
+    )
+
+    cwd = os.path.abspath(args.cwd)
+    if args.pr is not None:
+        pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+    else:
+        pr = _resolve_pr_for_branch(cwd, force=True)
+    if pr is _GH_UNAVAILABLE:
+        raise RuntimeError(_gh_unavailable_message(cwd))
+    if pr is None:
+        raise RuntimeError("no open PR for this branch")
+
+    repository = pr.repo or _repo_slug(cwd)
+    pr = pr.model_copy(update={"repo": repository}, deep=True)
+    pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
+    threads = github_api.get_review_threads(pr.number, cwd, strict=True)
+    deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
+    return evaluate_pr_snapshot(
+        pr=pr,
+        policy=policy,
+        ledger=ledger,
+        threads=threads,
+        deferrals=deferrals,
+    )
+
+
+def _cmd_finalize(args: argparse.Namespace) -> int:
+    """Require review settlement and two stable, fully green PR observations."""
+
+    from pathlib import Path  # noqa: PLC0415
+
+    from agent_review_coordinator import ReviewLedger, ReviewPolicy  # noqa: PLC0415
+    from agentic_pr_dash._maintenance.review_settlement import (  # noqa: PLC0415
+        combine_clean_observations,
+    )
+
+    try:
+        policy = ReviewPolicy.from_yaml(
+            Path(args.policy).read_text(encoding="utf-8")
+        )
+        ledger = ReviewLedger.model_validate_json(
+            Path(args.ledger).read_text(encoding="utf-8")
+        )
+        first = _observe_finalization(args, policy, ledger)
+        if first.clean:
+            time.sleep(args.stabilization_seconds)
+            second = _observe_finalization(args, policy, ledger)
+        else:
+            second = None
+        report = combine_clean_observations(first, second)
+    except (OSError, RuntimeError, ValueError) as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "settled": False,
+                        "observation_error": str(exc),
+                    }
+                )
+            )
+        else:
+            print(f"finalization observation failed: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report.model_dump(mode="json"), sort_keys=True))
+    elif report.settled:
+        print(
+            f"PR review and CI settled at {report.head_sha} "
+            f"after {report.observations} stable observations"
+        )
+    else:
+        work = [
+            *report.blockers,
+            *report.review.required_actions,
+            *report.review.missing_slots,
+        ]
+        print("PR not settled: " + ", ".join(work))
+    return 0 if report.settled else 10
+
+
 def _await_watch_pending_this_tick(
     owned: list[str],
     detached_records: list[dict],
@@ -1436,6 +1523,54 @@ def main(argv: list[str] | None = None) -> int:
         "Pass your own id to exclude yourself; omit to defer to any live owner.",
     )
 
+    # --- finalize ---
+    finalize_p = subparsers.add_parser(
+        "finalize",
+        help="Require provider-neutral review settlement and stable green PR/CI state.",
+    )
+    finalize_p.add_argument(
+        "--cwd",
+        default=".",
+        help="Worktree root (default: current directory).",
+    )
+    finalize_p.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="PR number (default: resolve from current branch).",
+    )
+    finalize_p.add_argument(
+        "--session-id",
+        default="",
+        metavar="ID",
+        help="Caller session id, accepted for hook/agent command parity.",
+    )
+    finalize_p.add_argument(
+        "--policy",
+        required=True,
+        metavar="PATH",
+        help="Provider-neutral review policy YAML.",
+    )
+    finalize_p.add_argument(
+        "--ledger",
+        required=True,
+        metavar="PATH",
+        help="Coordinator review ledger JSON for the current PR head.",
+    )
+    finalize_p.add_argument(
+        "--stabilization-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Delay between the two required clean observations (default: 30).",
+    )
+    finalize_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the machine-readable finalization report.",
+    )
+
     # --- complete ---
     complete_p = subparsers.add_parser(
         "complete",
@@ -1465,10 +1600,10 @@ def main(argv: list[str] | None = None) -> int:
         help="BOU-2567: defer ONE review thread (its GraphQL node id, e.g. "
         "PRRT_...) instead of running the normal complete flow. Persists a "
         "deferred-state record keyed by thread id and posts a reply naming the "
-        "ticket + reason. The thread stays UNRESOLVED on GitHub (deferral is "
+        "evaluation reason. The thread stays UNRESOLVED on GitHub (deferral is "
         "the opposite of erasing the finding) but is excluded from every "
-        "consumer's blocker computation from then on. Requires --severity, "
-        "--ticket, and (for P1) --reason.",
+        "consumer's blocker computation from then on. Requires --severity P2 "
+        "and --reason; --ticket is optional. P1 cannot be deferred.",
     )
     complete_p.add_argument(
         "--sweep-p2",
@@ -1691,6 +1826,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         return _cmd_check(args)
+    if args.command == "finalize":
+        return _cmd_finalize(args)
     if args.command == "complete":
         return _cmd_complete(args)
     if args.command == "hold-worktree":

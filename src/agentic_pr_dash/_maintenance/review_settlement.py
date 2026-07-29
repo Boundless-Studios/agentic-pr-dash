@@ -10,14 +10,47 @@ from agent_review_coordinator import (
     Disposition,
     Finding,
     ReviewLedger,
+    ReviewPolicy,
     ReviewResult,
     ReviewStage,
+    SettlementReport,
     Severity,
+    evaluate,
 )
+from pydantic import BaseModel, ConfigDict, Field
+
+from agentic_pr_dash.maintenance import terminal_clean_blockers
+from agentic_pr_dash.models import PRData
 
 from .pr_state import _thread_is_p1
 
 _SEVERITY_PREFIX = re.compile(r"^\s*(?:\*\*)?\[P[12]\]\s*", re.IGNORECASE)
+
+
+class FinalizationObservation(BaseModel):
+    """One immutable reading of PR, CI, and review-settlement state."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repository: str
+    head_sha: str
+    clean: bool
+    blockers: list[str] = Field(default_factory=list)
+    review: SettlementReport
+
+
+class FinalizationReport(BaseModel):
+    """Stable completion result returned to agents and hooks."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    settled: bool
+    stable: bool
+    repository: str
+    head_sha: str
+    observations: int
+    blockers: list[str] = Field(default_factory=list)
+    review: SettlementReport
 
 
 def _thread_title(body: str) -> str:
@@ -112,3 +145,104 @@ def overlay_github_findings(
             rationale=reason,
         )
     return overlaid
+
+
+def _append_once(items: list[str], item: str) -> None:
+    if item not in items:
+        items.append(item)
+
+
+def evaluate_pr_snapshot(
+    *,
+    pr: PRData,
+    policy: ReviewPolicy,
+    ledger: ReviewLedger,
+    threads: Sequence,
+    deferrals: Mapping[str, Mapping[str, object]],
+) -> FinalizationObservation:
+    """Combine one live PR snapshot with provider-neutral review settlement."""
+
+    repository = pr.repo.strip()
+    blockers: list[str] = []
+    if not repository:
+        _append_once(blockers, "repository_unknown")
+    elif repository != ledger.repository:
+        _append_once(blockers, "ledger_repository_mismatch")
+
+    head_sha = pr.latest_commit_sha.strip()
+    if not head_sha:
+        _append_once(blockers, "head_unknown")
+
+    # Review findings below replace PRData.review_comments as the authoritative
+    # thread gate. Keeping both would make an explicitly evaluated P2 block via
+    # the legacy generic "review_comments" signal.
+    readiness_pr = pr.model_copy(update={"review_comments": []}, deep=True)
+    for blocker in terminal_clean_blockers(
+        readiness_pr,
+        validated_head=ledger.head_sha,
+    ):
+        _append_once(blockers, blocker)
+
+    if pr.review_decision.upper() == "CHANGES_REQUESTED":
+        _append_once(blockers, "changes_requested")
+    if pr.is_draft:
+        _append_once(blockers, "draft")
+    if pr.mergeable.upper() != "MERGEABLE":
+        _append_once(blockers, "not_mergeable")
+    if not pr.ci_checks:
+        _append_once(blockers, "ci_unavailable")
+
+    current_threads = [thread for thread in threads if not thread.is_resolved]
+    settled_ledger = overlay_github_findings(
+        ledger,
+        threads=current_threads,
+        deferrals=deferrals,
+    )
+    review = evaluate(policy=policy, ledger=settled_ledger)
+    return FinalizationObservation(
+        repository=repository or ledger.repository,
+        head_sha=head_sha,
+        clean=not blockers and review.settled,
+        blockers=blockers,
+        review=review,
+    )
+
+
+def _observation_key(observation: FinalizationObservation) -> str:
+    payload = observation.model_dump_json(exclude={"clean"})
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def combine_clean_observations(
+    first: FinalizationObservation,
+    second: FinalizationObservation | None,
+) -> FinalizationReport:
+    """Require two identical clean observations before declaring settlement."""
+
+    if second is None:
+        blockers = list(first.blockers)
+        if first.clean:
+            _append_once(blockers, "stabilization_pending")
+        return FinalizationReport(
+            settled=False,
+            stable=False,
+            repository=first.repository,
+            head_sha=first.head_sha,
+            observations=1,
+            blockers=blockers,
+            review=first.review,
+        )
+
+    stable = _observation_key(first) == _observation_key(second)
+    blockers = list(second.blockers)
+    if not stable:
+        _append_once(blockers, "unstable_observation")
+    return FinalizationReport(
+        settled=first.clean and second.clean and stable,
+        stable=stable,
+        repository=second.repository,
+        head_sha=second.head_sha,
+        observations=2,
+        blockers=blockers,
+        review=second.review,
+    )
