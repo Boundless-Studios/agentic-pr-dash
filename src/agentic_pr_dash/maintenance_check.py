@@ -214,7 +214,12 @@ def _observe_finalization(args, policy, ledger):
 
     repository = pr.repo or _repo_slug(cwd)
     pr = pr.model_copy(update={"repo": repository}, deep=True)
+    github_api.reset_checks_probe_failure_seen()
     pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
+    if github_api.checks_probe_failure_seen():
+        raise RuntimeError(
+            "required CI status is unobservable; refusing to synthesize green"
+        )
     threads = github_api.get_review_threads(pr.number, cwd, strict=True)
     deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
     return evaluate_pr_snapshot(
@@ -1002,13 +1007,8 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    if policy:
-        # The hook protocol uses 2 for "block this stop"; finalize uses 10 for
-        # ordinary work remaining. Both observation errors and unsettled work
-        # must fail closed here.
-        return 0 if _cmd_finalize(args) == 0 else 2
     try:
-        return _stop_gate_impl(args)
+        legacy_result = _stop_gate_impl(args)
     except Exception as exc:  # noqa: BLE001
         # BOU-2556 (item 4): a genuine internal crash is fail-OPEN by design
         # (a buggy gate must not wedge every session that hits it) — but that
@@ -1029,6 +1029,14 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+    if legacy_result != 0:
+        return legacy_result
+    if policy:
+        # The hook protocol uses 2 for "block this stop"; finalize uses 10 for
+        # ordinary work remaining. Both observation errors and unsettled work
+        # must fail closed here.
+        return 0 if _cmd_finalize(args) == 0 else 2
+    return 0
 
 
 def _cmd_hold_worktree(args: argparse.Namespace) -> int:

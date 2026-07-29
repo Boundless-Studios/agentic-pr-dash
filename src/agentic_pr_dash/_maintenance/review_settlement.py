@@ -22,9 +22,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from agentic_pr_dash.maintenance import terminal_clean_blockers
 from agentic_pr_dash.models import PRData
 
-from .pr_state import _thread_is_p1
-
-_SEVERITY_PREFIX = re.compile(r"^\s*(?:\*\*)?\[P[12]\]\s*", re.IGNORECASE)
+_SEVERITY_PREFIX = re.compile(
+    r"^\s*(?:\*\*)?\[(P[12])\]\s*",
+    re.IGNORECASE,
+)
 
 
 class FinalizationObservation(BaseModel):
@@ -69,6 +70,11 @@ def finding_from_thread(
     """Translate one unresolved GitHub thread onto the current snapshot."""
 
     body = thread.top.body or "Unresolved GitHub review finding"
+    first_line = next(
+        (line.strip() for line in body.splitlines() if line.strip()),
+        "",
+    )
+    declared = _SEVERITY_PREFIX.match(first_line)
     line = (
         thread.top.line
         if thread.top.line is not None
@@ -79,7 +85,11 @@ def finding_from_thread(
         head_sha=head_sha,
         reviewer_execution_id=reviewer_execution_id,
         reviewer_provider=thread.top.author or None,
-        severity=Severity.P1 if _thread_is_p1(thread) else Severity.P2,
+        severity=(
+            Severity.P1
+            if declared and declared.group(1).upper() == "P1"
+            else Severity.P2
+        ),
         title=_thread_title(body),
         explanation=body,
         path=thread.top.path or ".github/pull-request",
@@ -191,6 +201,13 @@ def evaluate_pr_snapshot(
         _append_once(blockers, "not_mergeable")
     if not pr.ci_checks:
         _append_once(blockers, "ci_unavailable")
+    elif any(
+        check.status == "completed"
+        and (check.conclusion or "").lower()
+        not in {"success", "neutral", "skipped"}
+        for check in pr.ci_checks
+    ):
+        _append_once(blockers, "ci_not_successful")
 
     current_threads = [thread for thread in threads if not thread.is_resolved]
     settled_ledger = overlay_github_findings(

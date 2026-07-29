@@ -94,6 +94,22 @@ def test_finding_from_thread_normalizes_p1_and_snapshot_identity() -> None:
     assert "PRRT_one" in (finding.evidence or "")
 
 
+def test_declared_p2_stays_p2_when_explanation_mentions_p1() -> None:
+    finding = finding_from_thread(
+        _thread(
+            body=(
+                "[P2] Keep this scoped\n"
+                "This was evaluated against the P1 policy and is not blocking."
+            )
+        ),
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="github-backstop",
+    )
+
+    assert finding.severity is Severity.P2
+
+
 def test_equivalent_threads_share_fingerprint() -> None:
     first = finding_from_thread(
         _thread(node_id="PRRT_one", database_id=1),

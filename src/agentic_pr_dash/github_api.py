@@ -640,7 +640,8 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
         "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
-        "--json", "number,title,headRefName,baseRefName,url,isDraft,reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
+        "--json", "number,title,headRefName,headRefOid,baseRefName,url,isDraft,"
+        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -1561,6 +1562,11 @@ def get_review_threads(
     """
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
+        if strict:
+            raise RuntimeError(
+                "get_review_threads: could not resolve the repository; "
+                "refusing to synthesize a clean review state"
+            )
         return []
 
     cached = _PR_BATCH_CACHE.get((f"{owner}/{repo}", pr_number))

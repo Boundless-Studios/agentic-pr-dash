@@ -1,3 +1,4 @@
+import pytest
 from agent_review_coordinator import (
     ReviewLedger,
     ReviewPolicy,
@@ -99,6 +100,20 @@ def test_required_ci_pending_blocks() -> None:
 
 def test_absent_ci_evidence_blocks() -> None:
     assert "ci_unavailable" in _observation(pr=_pr(ci_checks=[])).blockers
+
+
+def test_cancelled_ci_check_blocks() -> None:
+    pr = _pr(
+        ci_checks=[
+            CICheck(
+                name="tests",
+                status="completed",
+                conclusion="cancelled",
+            )
+        ]
+    )
+
+    assert "ci_not_successful" in _observation(pr=pr).blockers
 
 
 def test_merge_conflict_and_change_request_block() -> None:
@@ -320,12 +335,11 @@ def test_stop_gate_uses_canonical_finalization_when_configured(
         "_cmd_finalize",
         lambda args: calls.append(args.policy) or 10,
     )
+    legacy_calls: list[bool] = []
     monkeypatch.setattr(
         mc,
         "_stop_gate_impl",
-        lambda args: (_ for _ in ()).throw(
-            AssertionError("legacy stop gate must not run")
-        ),
+        lambda args: legacy_calls.append(True) or 0,
     )
     args = argparse.Namespace(
         policy="review-policy.yaml",
@@ -333,6 +347,7 @@ def test_stop_gate_uses_canonical_finalization_when_configured(
     )
 
     assert mc._cmd_stop_gate(args) == 2
+    assert legacy_calls == [True]
     assert calls == ["review-policy.yaml"]
 
 
@@ -415,3 +430,37 @@ review:
 
     assert rc == 0
     assert "no_open_pr" in capsys.readouterr().out
+
+
+def test_finalization_observation_fails_when_required_ci_is_unobservable(
+    tmp_path, monkeypatch
+) -> None:
+    import argparse
+
+    from agentic_pr_dash import github_api
+
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: _pr(),
+    )
+    monkeypatch.setattr(mc, "_repo_slug", lambda cwd: REPOSITORY)
+    monkeypatch.setattr(
+        github_api,
+        "reset_checks_probe_failure_seen",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: False,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "checks_probe_failure_seen",
+        lambda: True,
+    )
+    args = argparse.Namespace(cwd=str(tmp_path), pr=None)
+
+    with pytest.raises(RuntimeError, match="required CI status is unobservable"):
+        mc._observe_finalization(args, _policy(), _ledger())

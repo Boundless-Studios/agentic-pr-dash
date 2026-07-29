@@ -442,6 +442,13 @@ def test_get_review_threads_strict_first_page_failure_raises(monkeypatch):
         github_api.get_review_threads(5, ".", strict=True)
 
 
+def test_get_review_threads_strict_repo_lookup_failure_raises(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("", ""))
+
+    with pytest.raises(RuntimeError, match="resolve the repository"):
+        github_api.get_review_threads(5, ".", strict=True)
+
+
 def test_get_review_threads_later_page_failure_raises(monkeypatch):
     # Page 1 advertises hasNextPage; page 2 fails → must NOT return a partial
     # list (silent truncation hazard) — raise instead.
