@@ -3,6 +3,7 @@
 Subcommands:
 
     check         Resolve branch->PR, compute blockers, print a fix prompt (read-only).
+    finalize      Require review settlement and two stable green PR observations.
     complete      Resolve review threads the fix addressed; post completion replies.
     arm           Stamp a worktree's open PR with an ownership marker for a session.
     list-owned    Print worktree paths a session owns.
@@ -15,16 +16,26 @@ Subcommands:
     observe       Inspect the observability event store (comment scans, dispatches, etc.).
     stash         Race-safe labeled-stash push/apply/drop/list (shared cross-worktree stack).
 
-``check/complete/arm/list-owned/stop-gate/reconcile-prs`` route into the stateless maintenance
-executor; ``record`` / ``session-report`` into the session registry; ``loop`` and ``serve`` are runtime
-drivers. Run ``agentic-pr-dash <cmd> --help`` for per-subcommand options.
+``check/finalize/complete/arm/list-owned/stop-gate/reconcile-prs`` route into
+the stateless maintenance executor; ``record`` / ``session-report`` into the
+session registry; ``loop`` and ``serve`` are runtime drivers. Run
+``agentic-pr-dash <cmd> --help`` for per-subcommand options.
 """
 
 from __future__ import annotations
 
 import sys
 
-_EXECUTOR_CMDS = {"check", "complete", "arm", "list-owned", "stop-gate", "reconcile-prs", "await"}
+_EXECUTOR_CMDS = {
+    "check",
+    "finalize",
+    "complete",
+    "arm",
+    "list-owned",
+    "stop-gate",
+    "reconcile-prs",
+    "await",
+}
 _USAGE = __doc__
 
 

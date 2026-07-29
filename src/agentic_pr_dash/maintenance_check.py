@@ -194,6 +194,140 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
     return False
 
 
+def _observe_finalization(args, policy, ledger):
+    """Read one fail-closed PR/CI/review snapshot for ``finalize``."""
+
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    from agentic_pr_dash._maintenance.review_settlement import (  # noqa: PLC0415
+        evaluate_pr_snapshot,
+    )
+
+    cwd = os.path.abspath(args.cwd)
+    if args.pr is not None:
+        pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+    else:
+        pr = _resolve_pr_for_branch(cwd, force=True)
+    if pr is _GH_UNAVAILABLE:
+        raise RuntimeError(_gh_unavailable_message(cwd))
+    if pr is None:
+        raise RuntimeError("no open PR for this branch")
+
+    repository = pr.repo or _repo_slug(cwd)
+    pr = pr.model_copy(update={"repo": repository}, deep=True)
+    github_api.reset_checks_probe_failure_seen()
+    pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
+    if github_api.checks_probe_failure_seen():
+        raise RuntimeError(
+            "required CI status is unobservable; refusing to synthesize green"
+        )
+    threads = github_api.get_review_threads(pr.number, cwd, strict=True)
+    deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
+    return evaluate_pr_snapshot(
+        pr=pr,
+        policy=policy,
+        ledger=ledger,
+        threads=threads,
+        deferrals=deferrals,
+    )
+
+
+def _cmd_finalize(args: argparse.Namespace) -> int:
+    """Require review settlement and two stable, fully green PR observations."""
+
+    from pathlib import Path  # noqa: PLC0415
+
+    from agent_review_coordinator import ReviewLedger, ReviewPolicy  # noqa: PLC0415
+    from agentic_pr_dash._maintenance.review_settlement import (  # noqa: PLC0415
+        combine_clean_observations,
+    )
+
+    try:
+        policy = ReviewPolicy.from_yaml(
+            Path(args.policy).read_text(encoding="utf-8")
+        )
+        ledger_path = Path(
+            args.ledger
+            or os.path.join(
+                os.path.abspath(args.cwd),
+                ".agentic-pr-dash",
+                "review-ledger.json",
+            )
+        )
+        if not ledger_path.is_file():
+            cwd = os.path.abspath(args.cwd)
+            if args.pr is not None:
+                pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+            else:
+                pr = _resolve_pr_for_branch(cwd, force=True)
+            if pr is _GH_UNAVAILABLE:
+                raise RuntimeError(_gh_unavailable_message(cwd))
+            if pr is None:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "settled": True,
+                                "reason": "no_open_pr",
+                            }
+                        )
+                    )
+                else:
+                    print("no open PR for this branch")
+                return 0
+            missing = {
+                "settled": False,
+                "blockers": ["review_ledger_missing"],
+                "ledger": str(ledger_path),
+            }
+            if args.json:
+                print(json.dumps(missing))
+            else:
+                print(
+                    "PR not settled: review_ledger_missing "
+                    f"({ledger_path})"
+                )
+            return 10
+        ledger = ReviewLedger.model_validate_json(
+            ledger_path.read_text(encoding="utf-8")
+        )
+        first = _observe_finalization(args, policy, ledger)
+        if first.clean:
+            time.sleep(args.stabilization_seconds)
+            second = _observe_finalization(args, policy, ledger)
+        else:
+            second = None
+        report = combine_clean_observations(first, second)
+    except (OSError, RuntimeError, ValueError) as exc:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "settled": False,
+                        "observation_error": str(exc),
+                    }
+                )
+            )
+        else:
+            print(f"finalization observation failed: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(report.model_dump(mode="json"), sort_keys=True))
+    elif report.settled:
+        print(
+            f"PR review and CI settled at {report.head_sha} "
+            f"after {report.observations} stable observations"
+        )
+    else:
+        work = [
+            *report.blockers,
+            *report.review.required_actions,
+            *report.review.missing_slots,
+        ]
+        print("PR not settled: " + ", ".join(work))
+    return 0 if report.settled else 10
+
+
 def _await_watch_pending_this_tick(
     owned: list[str],
     detached_records: list[dict],
@@ -464,10 +598,9 @@ def _complete_resolve_target_pr(args: argparse.Namespace, cwd: str):
 def _cmd_complete_defer(args: argparse.Namespace) -> int:
     """BOU-2567: defer ONE review thread — ``complete --defer <thread-id>``.
 
-    Persists a deferred-state record (anti-abuse enforced by
-    ``deferred_review.defer_thread``: a resolvable ticket is required, and a
-    P1 additionally requires a free-text reason) and posts a reply on the
-    thread naming the disposition. Deliberately never calls
+    Persists an individually evaluated P2 deferral and posts a reply on the
+    thread naming the disposition. P1 findings cannot be deferred. A rationale
+    is required; a pre-existing tracker ticket is optional. Deliberately never calls
     ``resolve_review_thread`` — resolving is exactly the wrong move (BOU-2567):
     it erases the deferral and looks identical to "actually fixed". The thread
     stays open on GitHub; every consumer excludes it via the persisted record.
@@ -495,22 +628,21 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # BOU-2567 PR #122 review, P1 #2: a supplied --severity is verified
-    # against the thread's own content, not merely trusted. A thread
-    # `_thread_is_p1` recognizes as P1 downgraded to --severity P2 would skip
-    # the P1-only --reason requirement entirely — precisely the mute-button
-    # abuse the anti-abuse rule exists to stop. Refuse loudly rather than
-    # silently rewrite the operator's input (a silent upgrade is its own
-    # trust problem: the operator asked for one thing and got another). Only
-    # a DOWNGRADE of a detected P1 is refused — deliberately labeling a
-    # non-P1 thread P1 is a valid, more-cautious operator judgment call.
     supplied_severity = (args.severity or "").strip().upper()
-    if _thread_is_p1(thread) and supplied_severity != "P1":
+    if _thread_is_p1(thread) or supplied_severity == "P1":
         print(
-            f"error: thread {thread_id!r} is recognized as P1 by its own "
-            f"content but --severity {args.severity!r} was given; a detected "
-            "P1 cannot be deferred as anything but P1 (pass --severity P1 "
-            "--reason \"...\" if this deferral is deliberate)",
+            f"error: thread {thread_id!r} is P1; P1 findings must be addressed "
+            "before settlement and cannot be deferred",
+            file=sys.stderr,
+        )
+        return 1
+    if supplied_severity != "P2":
+        print("error: --defer requires --severity P2", file=sys.stderr)
+        return 1
+    reason = (args.reason or "").strip()
+    if not reason:
+        print(
+            "error: P2 deferral requires --reason with the evaluation rationale",
             file=sys.stderr,
         )
         return 1
@@ -522,17 +654,19 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
             comment_id=thread.top.database_id,
             severity=args.severity or "",
             ticket=args.ticket or "",
-            reason=args.reason or "",
+            reason=reason,
             deferred_by=args.session_id or "",
         )
     except deferred_review.DeferralError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    ticket_text = f" Tracked as {record.ticket}." if record.ticket else ""
     body = (
-        f"Deferred ({record.severity}): tracked as {record.ticket}."
-        + (f" Reason: {record.reason}" if record.reason else "")
-        + " This finding is real but out of scope for this PR; it is excluded "
+        f"Deferred ({record.severity}) after evaluation.{ticket_text}"
+        + f" Reason: {record.reason}"
+        + " This finding is real but does not warrant implementation in this PR; "
+        "it is excluded "
         "from review/CI automation and will not be dispatched against, but "
         "stays open here for human visibility."
     )
@@ -548,90 +682,20 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    print(f"deferred thread {thread_id} as {record.severity}, tracked as {record.ticket}")
+    ticket_suffix = f", tracked as {record.ticket}" if record.ticket else ""
+    print(f"deferred thread {thread_id} as {record.severity}{ticket_suffix}")
     return 0
 
 
 def _cmd_complete_sweep_p2(args: argparse.Namespace) -> int:
-    """BOU-2567: ``complete --sweep-p2 --ticket <BOU-N>`` — auto-defer every
-    currently-unresolved, non-P1, not-already-deferred thread on the PR under
-    ONE per-PR follow-up ticket, replying on each rolled-in thread.
-
-    The ticket itself is supplied by the caller, not filed by this CLI: this
-    repo has no live Linear client, so "one ticket per PR, not one per
-    finding" is enforced here as "every P2 finding this sweep touches is
-    deferred under the SAME already-filed ticket" — filing that ticket is the
-    caller's job (exactly as the operator's own BOU-2559/2560/2564 precedent
-    was filed externally, then referenced here).
-    """
-    from . import github_api  # noqa: PLC0415
-    from .models import ReviewComment  # noqa: PLC0415
-
-    cwd = os.path.abspath(args.cwd)
-    ticket = args.ticket or ""
-    if not deferred_review.is_valid_ticket(ticket):
-        print(
-            f"error: --sweep-p2 requires a resolvable --ticket (got {ticket!r})",
-            file=sys.stderr,
-        )
-        return 1
-
-    pr = _complete_resolve_target_pr(args, cwd)
-    if pr is _GH_UNAVAILABLE:
-        print(_gh_unavailable_message(cwd))
-        return 2
-    if pr is None:
-        print("no open PR for this branch")
-        return 0
-
-    threads = github_api.get_review_threads(pr.number, cwd)
-    reason = (
-        args.reason
-        or "auto-deferred P2 finding, rolled into the per-PR P2 follow-up"
-    )
-    swept: list[str] = []
-    for thread in threads:
-        if thread.is_resolved:
-            continue
-        if deferred_review.is_thread_deferred(cwd, pr.number, thread.node_id):
-            continue
-        if _thread_is_p1(thread):
-            continue  # P1 never auto-defers — only an explicit --defer can.
-        try:
-            record = deferred_review.defer_thread(
-                cwd, pr.number,
-                thread_id=thread.node_id,
-                comment_id=thread.top.database_id,
-                severity="P2",
-                ticket=ticket,
-                reason=reason,
-                deferred_by=args.session_id or "",
-            )
-        except deferred_review.DeferralError as exc:
-            print(f"warning: could not defer thread {thread.node_id}: {exc}", file=sys.stderr)
-            continue
-        body = f"Deferred (P2): rolled into the per-PR follow-up {record.ticket}. {reason}"
-        stub = ReviewComment(
-            id=thread.top.database_id, author=thread.top.author, body=thread.top.body,
-            path=thread.top.path, line=thread.top.line, created_at=thread.top.created_at,
-            is_inline=True, thread_id=thread.node_id,
-        )
-        if not github_api.reply_to_review_comment(pr.number, stub, body, cwd):
-            print(
-                f"warning: deferred thread {thread.node_id} but the GitHub "
-                "reply failed; it will retry on the next sweep",
-                file=sys.stderr,
-            )
-        swept.append(thread.node_id)
-
-    if swept:
-        deferred_review.set_followup_ticket(cwd, pr.number, ticket)
+    """Refuse bulk P2 deferral; every P2 requires an individual evaluation."""
 
     print(
-        f"swept {len(swept)} P2 thread(s) into follow-up {ticket}: "
-        f"{', '.join(swept) or '<none>'}"
+        "error: --sweep-p2 is disabled; evaluate each P2 individually with "
+        "--defer THREAD --severity P2 --reason TEXT",
+        file=sys.stderr,
     )
-    return 0
+    return 1
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -935,8 +999,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
+    policy = getattr(args, "policy", None)
+    ledger = getattr(args, "ledger", None)
+    if ledger and not policy:
+        print(
+            "error: --ledger requires --policy",
+            file=sys.stderr,
+        )
+        return 2
     try:
-        return _stop_gate_impl(args)
+        legacy_result = _stop_gate_impl(args)
     except Exception as exc:  # noqa: BLE001
         # BOU-2556 (item 4): a genuine internal crash is fail-OPEN by design
         # (a buggy gate must not wedge every session that hits it) — but that
@@ -948,7 +1020,6 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
         # out of time — say so explicitly rather than returning 0 with zero
         # information, so the operator isn't left guessing which of the two
         # actually happened.
-        import sys  # noqa: PLC0415
         print(
             f"[pr-watch] stop-gate CRASHED internally ({type(exc).__name__}: {exc}) "
             f"— this is a bug in the gate itself, NOT a per-PR budget shortfall (a "
@@ -958,6 +1029,14 @@ def _cmd_stop_gate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 0
+    if legacy_result != 0:
+        return legacy_result
+    if policy:
+        # The hook protocol uses 2 for "block this stop"; finalize uses 10 for
+        # ordinary work remaining. Both observation errors and unsettled work
+        # must fail closed here.
+        return 0 if _cmd_finalize(args) == 0 else 2
+    return 0
 
 
 def _cmd_hold_worktree(args: argparse.Namespace) -> int:
@@ -1506,6 +1585,55 @@ def main(argv: list[str] | None = None) -> int:
         "Pass your own id to exclude yourself; omit to defer to any live owner.",
     )
 
+    # --- finalize ---
+    finalize_p = subparsers.add_parser(
+        "finalize",
+        help="Require provider-neutral review settlement and stable green PR/CI state.",
+    )
+    finalize_p.add_argument(
+        "--cwd",
+        default=".",
+        help="Worktree root (default: current directory).",
+    )
+    finalize_p.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="PR number (default: resolve from current branch).",
+    )
+    finalize_p.add_argument(
+        "--session-id",
+        default="",
+        metavar="ID",
+        help="Caller session id, accepted for hook/agent command parity.",
+    )
+    finalize_p.add_argument(
+        "--policy",
+        required=True,
+        metavar="PATH",
+        help="Provider-neutral review policy YAML.",
+    )
+    finalize_p.add_argument(
+        "--ledger",
+        default=None,
+        metavar="PATH",
+        help="Coordinator review ledger JSON (default: "
+        ".agentic-pr-dash/review-ledger.json below --cwd).",
+    )
+    finalize_p.add_argument(
+        "--stabilization-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Delay between the two required clean observations (default: 30).",
+    )
+    finalize_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the machine-readable finalization report.",
+    )
+
     # --- complete ---
     complete_p = subparsers.add_parser(
         "complete",
@@ -1535,19 +1663,16 @@ def main(argv: list[str] | None = None) -> int:
         help="BOU-2567: defer ONE review thread (its GraphQL node id, e.g. "
         "PRRT_...) instead of running the normal complete flow. Persists a "
         "deferred-state record keyed by thread id and posts a reply naming the "
-        "ticket + reason. The thread stays UNRESOLVED on GitHub (deferral is "
+        "evaluation reason. The thread stays UNRESOLVED on GitHub (deferral is "
         "the opposite of erasing the finding) but is excluded from every "
-        "consumer's blocker computation from then on. Requires --severity, "
-        "--ticket, and (for P1) --reason.",
+        "consumer's blocker computation from then on. Requires --severity P2 "
+        "and --reason; --ticket is optional. P1 cannot be deferred.",
     )
     complete_p.add_argument(
         "--sweep-p2",
         action="store_true",
         default=False,
-        help="BOU-2567: auto-defer every currently-unresolved, non-P1, "
-        "not-already-deferred review thread on the PR under ONE per-PR "
-        "follow-up ticket (--ticket) — the P2 severity x scope auto-defer, "
-        "never one ticket per finding. Requires --ticket.",
+        help="Deprecated and disabled: every P2 requires individual evaluation.",
     )
     complete_p.add_argument(
         "--severity",
@@ -1559,16 +1684,14 @@ def main(argv: list[str] | None = None) -> int:
         "--ticket",
         default=None,
         metavar="BOU-N",
-        help="Tracked follow-up ticket for --defer or --sweep-p2. Required — "
-        "deferral without a resolvable ticket is not allowed.",
+        help="Optional existing follow-up ticket for --defer. This command never "
+        "creates tracker work.",
     )
     complete_p.add_argument(
         "--reason",
         default="",
         metavar="TEXT",
-        help="Free-text reason the deferred thread is out of scope for this "
-        "PR. Required when --severity P1 (a P1 deferral must explain itself); "
-        "optional for P2.",
+        help="Required P2 evaluation rationale. P1 findings cannot be deferred.",
     )
     complete_p.add_argument(
         "--session-id",
@@ -1672,6 +1795,37 @@ def main(argv: list[str] | None = None) -> int:
         help="Skip the waiter-enforcement branch (for codex/non-interactive callers "
         "that have no background-task wake channel).",
     )
+    stop_gate_p.add_argument(
+        "--pr",
+        type=int,
+        default=None,
+        metavar="N",
+        help="PR number for canonical finalization (default: current branch).",
+    )
+    stop_gate_p.add_argument(
+        "--policy",
+        default=None,
+        metavar="PATH",
+        help="Review policy YAML; requires --ledger and enables canonical finalization.",
+    )
+    stop_gate_p.add_argument(
+        "--ledger",
+        default=None,
+        metavar="PATH",
+        help="Coordinator review ledger JSON; requires --policy.",
+    )
+    stop_gate_p.add_argument(
+        "--stabilization-seconds",
+        type=float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Canonical finalization delay between clean observations.",
+    )
+    stop_gate_p.add_argument(
+        "--json",
+        action="store_true",
+        help="Print canonical finalization as machine-readable JSON.",
+    )
 
     # --- reconcile-prs ---
     reconcile_p = subparsers.add_parser(
@@ -1766,6 +1920,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "check":
         return _cmd_check(args)
+    if args.command == "finalize":
+        return _cmd_finalize(args)
     if args.command == "complete":
         return _cmd_complete(args)
     if args.command == "hold-worktree":

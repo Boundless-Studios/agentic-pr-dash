@@ -326,6 +326,48 @@ def test_warm_cache_healthy_detail_still_resolves_pr(tmp_path, monkeypatch):
     assert result.number == 11
 
 
+def test_resolver_prefers_pr_payload_head_over_paginated_commit_tail(
+    tmp_path, monkeypatch
+):
+    branch = "long-lived-pr"
+    actual_head = "f" * 40
+    stale_page_tail = "e" * 40
+    raw = {
+        "number": 12,
+        "title": "Long PR",
+        "headRefName": branch,
+        "baseRefName": "main",
+        "url": "https://github.com/o/r/pull/12",
+        "isDraft": False,
+        "reviewDecision": "",
+        "mergeStateStatus": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "headRefOid": actual_head,
+    }
+    monkeypatch.setattr(pr_state, "_current_branch", lambda cwd: branch)
+    monkeypatch.setattr(
+        github_api,
+        "list_open_prs_cached",
+        lambda cwd, force=False: [raw],
+    )
+    github_api.reset_rate_limit_seen()
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda n, cwd=None: (stale_page_tail, "2026-01-01T00:00:00Z"),
+    )
+    monkeypatch.setattr(github_api, "get_ci_checks", lambda n, cwd=None: [])
+    monkeypatch.setattr(
+        github_api,
+        "get_unaddressed_comments",
+        lambda n, d, cwd=None: [],
+    )
+
+    result = pr_state._resolve_pr_for_branch(str(tmp_path))
+
+    assert result.latest_commit_sha == actual_head
+
+
 def test_resolve_by_number_warm_cache_plus_outage_is_unavailable(tmp_path, monkeypatch):
     """Same availability guard for the explicit-number resolver."""
     branch = "feature-z"

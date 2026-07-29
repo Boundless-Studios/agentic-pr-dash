@@ -357,9 +357,10 @@ def defer_thread(
 ) -> DeferredThread:
     """Persist a deferral. Raises :class:`DeferralError` on any anti-abuse violation.
 
-    Anti-abuse (BOU-2567 operator-decided design):
-      * a ticket ID is REQUIRED and must be a well-formed tracker reference —
-        deferral must never become a mute button with no tracked follow-up.
+    Anti-abuse:
+      * a non-empty ticket, when supplied, must be a well-formed tracker
+        reference. A ticket is not required: speculative P2 findings must not
+        manufacture tracker work merely to record an evaluated disposition.
       * a P1 deferral additionally REQUIRES a non-empty free-text ``reason`` —
         P1 blocks by default, so deferring one is a deliberate, explained
         exception, never a silent one.
@@ -376,11 +377,10 @@ def defer_thread(
         )
     if not thread_id:
         raise DeferralError("thread_id is required to defer a review thread")
-    if not is_valid_ticket(ticket):
+    if ticket and not is_valid_ticket(ticket):
         raise DeferralError(
-            "a resolvable ticket ID is required to defer a thread "
-            f"(got {ticket!r}) — deferral without a tracked follow-up is not "
-            "allowed"
+            "a non-empty deferral ticket must be a resolvable tracker ID "
+            f"(got {ticket!r})"
         )
     if severity == "P1" and not (reason or "").strip():
         raise DeferralError(
