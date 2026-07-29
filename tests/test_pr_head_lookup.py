@@ -358,7 +358,14 @@ def test_find_pr_by_head_unqualified_gh_failure_returns_none(monkeypatch):
 # get_review_threads pagination
 # --------------------------------------------------------------------------- #
 
-def _thread_node(db_id: int, path: str, line: int, resolved=False, outdated=False):
+def _thread_node(
+    db_id: int,
+    path: str,
+    line: int,
+    resolved=False,
+    outdated=False,
+    review_id: int | None = None,
+):
     return {
         "id": f"node-{db_id}",
         "isResolved": resolved,
@@ -372,6 +379,7 @@ def _thread_node(db_id: int, path: str, line: int, resolved=False, outdated=Fals
                     "body": "comment",
                     "author": {"login": "rev"},
                     "createdAt": "2026-01-01T00:00:00Z",
+                    "pullRequestReview": {"databaseId": review_id},
                 }
             ]
         },
@@ -413,7 +421,7 @@ def test_get_review_threads_single_page(monkeypatch):
     def fake_run(cmd, timeout_s=20, cwd=None):
         page = {
             "pageInfo": {"hasNextPage": False, "endCursor": None},
-            "nodes": [_thread_node(202, "new.py", 20)],
+            "nodes": [_thread_node(202, "new.py", 20, review_id=123)],
         }
         return _cp(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": page}}}}))
 
@@ -421,6 +429,7 @@ def test_get_review_threads_single_page(monkeypatch):
     threads = github_api.get_review_threads(5, ".")
     assert len(threads) == 1
     assert threads[0].top.database_id == 202
+    assert threads[0].top.review_id == 123
 
 
 def test_get_review_threads_first_page_failure_returns_empty(monkeypatch):
@@ -527,6 +536,7 @@ def test_get_review_submissions_returns_only_current_head_reviews(monkeypatch):
                 "state": "COMMENTED",
                 "commit_id": "a" * 40,
                 "submitted_at": "2026-07-28T00:00:00Z",
+                "body": "[P2] Evaluate this concern.",
             },
             {
                 "id": 102,
@@ -557,8 +567,8 @@ def test_get_review_submissions_returns_only_current_head_reviews(monkeypatch):
         excluded_authors={"pr-author"},
     )
 
-    assert [(review.review_id, review.author) for review in reviews] == [
-        (101, "review-bot")
+    assert [(review.review_id, review.author, review.body) for review in reviews] == [
+        (101, "review-bot", "[P2] Evaluate this concern.")
     ]
 
 

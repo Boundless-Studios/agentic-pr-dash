@@ -75,6 +75,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
               body
               author { login }
               createdAt
+              pullRequestReview { databaseId }
             }
           }
         }
@@ -99,6 +100,7 @@ class ReviewThreadComment:
     # made on. For OUTDATED threads GitHub nulls `line` (it can no longer track
     # the anchor), so this is the only line evidence left (BOU-2095).
     original_line: int | None = None
+    review_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +121,7 @@ class ReviewSubmission:
     state: str
     commit_id: str
     submitted_at: str
+    body: str = ""
 
 
 # Bounded retry for transient connectivity failures (BOU-1638 / BOU-1694).
@@ -1474,6 +1477,7 @@ def get_new_pr_commits(
 
 
 def _parse_review_thread_comment(c: dict) -> ReviewThreadComment:
+    review = c.get("pullRequestReview") or {}
     return ReviewThreadComment(
         database_id=int(c.get("databaseId") or 0),
         path=c.get("path"),
@@ -1482,6 +1486,12 @@ def _parse_review_thread_comment(c: dict) -> ReviewThreadComment:
         author=str((c.get("author") or {}).get("login") or "unknown"),
         created_at=str(c.get("createdAt") or ""),
         original_line=c.get("originalLine"),
+        review_id=(
+            review.get("databaseId")
+            if isinstance(review, dict)
+            and isinstance(review.get("databaseId"), int)
+            else None
+        ),
     )
 
 
@@ -1716,6 +1726,7 @@ def get_review_submissions(
                 state = str(item.get("state") or "").upper()
                 commit_id = str(item.get("commit_id") or "")
                 submitted_at = str(item.get("submitted_at") or "")
+                body = str(item.get("body") or "")
                 user = item.get("user") or {}
                 author = str(user.get("login") or "") if isinstance(user, dict) else ""
                 review_id = item.get("id")
@@ -1735,6 +1746,7 @@ def get_review_submissions(
                         state=state,
                         commit_id=commit_id,
                         submitted_at=submitted_at,
+                        body=body,
                     )
                 )
     except (json.JSONDecodeError, TypeError) as exc:
@@ -2366,7 +2378,7 @@ def batch_fetch_pr_review_and_ci(
                 f'    nodes {{'
                 f'      id isResolved isOutdated'
                 f'      comments(first: 100) {{'
-                f'        nodes {{ databaseId path line originalLine body author {{ login }} createdAt }}'
+                f'        nodes {{ databaseId path line originalLine body author {{ login }} createdAt pullRequestReview {{ databaseId }} }}'
                 f'      }}'
                 f'    }}'
                 f'  }}'

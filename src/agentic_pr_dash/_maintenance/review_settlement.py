@@ -102,6 +102,42 @@ def finding_from_thread(
     )
 
 
+def finding_from_review_submission(
+    review,
+    *,
+    repository: str,
+    head_sha: str,
+    reviewer_execution_id: str,
+) -> Finding | None:
+    """Translate a declared P1/P2 in a top-level GitHub review body."""
+
+    declared_lines = [
+        (line.strip(), match)
+        for line in review.body.splitlines()
+        if (match := _SEVERITY_PREFIX.match(line.strip()))
+    ]
+    if not declared_lines:
+        return None
+    first_line, _ = declared_lines[0]
+    severity = (
+        Severity.P1
+        if any(match.group(1).upper() == "P1" for _, match in declared_lines)
+        else Severity.P2
+    )
+    return Finding(
+        repository=repository,
+        head_sha=head_sha,
+        reviewer_execution_id=reviewer_execution_id,
+        reviewer_provider=review.author or None,
+        severity=severity,
+        title=_thread_title(first_line),
+        explanation=review.body,
+        path=".github/pull-request",
+        invariant=review.body,
+        evidence=f"GitHub top-level review {review.review_id}",
+    )
+
+
 def _github_execution_id(head_sha: str, threads: Sequence) -> str:
     identities = "\n".join(sorted(thread.node_id for thread in threads))
     digest = hashlib.sha256(identities.encode("utf-8")).hexdigest()[:16]
@@ -162,6 +198,7 @@ def overlay_backstop_results(
     *,
     reviews: Sequence,
     reviewer_count: int,
+    thread_review_ids: set[int] | None = None,
 ) -> ReviewLedger:
     """Project current-head GitHub review submissions into backstop slots."""
 
@@ -180,10 +217,25 @@ def overlay_backstop_results(
         for slot_number in range(1, reviewer_count + 1)
         if slot_number not in occupied_slots
     ]
-    for review, slot_number in zip(reviews, available_slots, strict=False):
+    eligible_reviews = [
+        review
+        for review in reviews
+        if review.review_id not in (thread_review_ids or set())
+    ]
+    for review, slot_number in zip(
+        eligible_reviews,
+        available_slots,
+        strict=False,
+    ):
         execution_id = f"github-review-{review.review_id}"
         if execution_id in execution_ids:
             continue
+        body_finding = finding_from_review_submission(
+            review,
+            repository=overlaid.repository,
+            head_sha=overlaid.head_sha,
+            reviewer_execution_id=execution_id,
+        )
         overlaid.submit(
             ReviewResult(
                 repository=overlaid.repository,
@@ -193,6 +245,7 @@ def overlay_backstop_results(
                 slot_number=slot_number,
                 reviewer_execution_id=execution_id,
                 reviewer_provider=review.author,
+                findings=[body_finding] if body_finding is not None else [],
             )
         )
         execution_ids.add(execution_id)
@@ -262,6 +315,11 @@ def evaluate_pr_snapshot(
         settled_ledger,
         reviews=review_submissions,
         reviewer_count=policy.review.backstop.reviewer_count,
+        thread_review_ids={
+            thread.top.review_id
+            for thread in current_threads
+            if thread.top.review_id is not None
+        },
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
     return FinalizationObservation(

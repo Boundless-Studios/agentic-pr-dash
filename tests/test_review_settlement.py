@@ -36,6 +36,7 @@ def _thread(
     body: str = "[P2] Avoid a false green\nRequired CI can be absent.",
     path: str = "scripts/review.py",
     line: int = 10,
+    review_id: int | None = None,
 ) -> ReviewThread:
     return ReviewThread(
         node_id=node_id,
@@ -48,6 +49,7 @@ def _thread(
             body=body,
             author="review-bot",
             created_at="2026-07-28T00:00:00Z",
+            review_id=review_id,
         ),
     )
 
@@ -188,3 +190,73 @@ def test_current_head_review_submission_fills_backstop_slot() -> None:
     ]
     assert backstop[0].reviewer_execution_id == "github-review-123"
     assert backstop[0].reviewer_provider == "review-bot"
+
+
+def test_thread_and_submission_from_same_review_fill_one_backstop_slot() -> None:
+    policy = ReviewPolicy.model_validate(
+        {
+            "version": 1,
+            "review": {
+                "local": {"reviewer_count": 1, "required_results": 1},
+                "backstop": {
+                    "reviewer_count": 2,
+                    "required_results": 2,
+                    "trigger": "new_head_sha",
+                },
+            },
+        }
+    )
+    ledger = overlay_github_findings(
+        _ledger_with_local_result(),
+        threads=[_thread(review_id=123)],
+        deferrals={
+            "PRRT_one": {
+                "reason": "Evaluated and deferred.",
+                "ticket": "",
+            }
+        },
+    )
+    ledger = overlay_backstop_results(
+        ledger,
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+        reviewer_count=2,
+        thread_review_ids={123},
+    )
+
+    report = evaluate(policy=policy, ledger=ledger)
+
+    assert not report.settled
+    assert report.missing_slots == ["backstop:2"]
+
+
+def test_review_body_finding_blocks_backstop_settlement() -> None:
+    ledger = overlay_backstop_results(
+        _ledger_with_local_result(),
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P1] Do not discard a review-level blocker.",
+            )
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert not report.settled
+    assert report.required_actions == ["address_p1"]
+    assert ledger.current_findings[0].title == (
+        "Do not discard a review-level blocker."
+    )
