@@ -3418,7 +3418,7 @@ def scan_review_threads(
     # Review-level comments (CHANGES_REQUESTED with body)
     r2 = _run(
         ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
-         "--jq", '.[] | select(.state == "CHANGES_REQUESTED" and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
+         "--jq", '.[] | select((.state == "APPROVED" or .state == "COMMENTED" or .state == "CHANGES_REQUESTED") and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
         cwd=cwd,
     )
     if r2.returncode == 0:
@@ -3437,6 +3437,11 @@ def scan_review_threads(
                 )
 
                 declared_lines = declared_review_body_lines(body)
+                if (
+                    data.get("state") != "CHANGES_REQUESTED"
+                    and not declared_lines
+                ):
+                    continue
                 bodies = declared_lines or [body]
                 for ordinal, finding_body in enumerate(bodies, start=1):
                     disposition_key = (

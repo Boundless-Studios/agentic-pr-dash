@@ -307,6 +307,44 @@ def test_defer_review_body_requires_ordinal_for_multiple_findings(
     assert len(replied) == 1
 
 
+def test_single_review_body_ordinal_persists_canonical_key(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _wire(monkeypatch, [])
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions",
+        lambda *args, **kwargs: [
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id="a" * 40,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P2] Only finding.",
+            )
+        ],
+    )
+
+    rc = mc._cmd_complete(
+        _args(
+            cwd=str(tmp_path),
+            defer="review:123:1",
+            severity="P2",
+            reason="No supported-path reproduction.",
+        )
+    )
+
+    assert rc == 0
+    assert dr.is_thread_deferred(str(tmp_path), PR_NUMBER, "review:123")
+    assert not dr.is_thread_deferred(
+        str(tmp_path),
+        PR_NUMBER,
+        "review:123:1",
+    )
+
+
 # ---------------------------------------------------------------------------
 # --sweep-p2
 # ---------------------------------------------------------------------------

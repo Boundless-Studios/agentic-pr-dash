@@ -702,6 +702,8 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if review is not None and len(review_findings) == 1:
+        thread_id = f"review:{review.review_id}"
     review_finding = (
         review_findings[review_ordinal - 1]
         if review is not None and review_ordinal is not None
