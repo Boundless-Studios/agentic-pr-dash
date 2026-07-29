@@ -240,8 +240,50 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
         policy = ReviewPolicy.from_yaml(
             Path(args.policy).read_text(encoding="utf-8")
         )
+        ledger_path = Path(
+            args.ledger
+            or os.path.join(
+                os.path.abspath(args.cwd),
+                ".agentic-pr-dash",
+                "review-ledger.json",
+            )
+        )
+        if not ledger_path.is_file():
+            cwd = os.path.abspath(args.cwd)
+            if args.pr is not None:
+                pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+            else:
+                pr = _resolve_pr_for_branch(cwd, force=True)
+            if pr is _GH_UNAVAILABLE:
+                raise RuntimeError(_gh_unavailable_message(cwd))
+            if pr is None:
+                if args.json:
+                    print(
+                        json.dumps(
+                            {
+                                "settled": True,
+                                "reason": "no_open_pr",
+                            }
+                        )
+                    )
+                else:
+                    print("no open PR for this branch")
+                return 0
+            missing = {
+                "settled": False,
+                "blockers": ["review_ledger_missing"],
+                "ledger": str(ledger_path),
+            }
+            if args.json:
+                print(json.dumps(missing))
+            else:
+                print(
+                    "PR not settled: review_ledger_missing "
+                    f"({ledger_path})"
+                )
+            return 10
         ledger = ReviewLedger.model_validate_json(
-            Path(args.ledger).read_text(encoding="utf-8")
+            ledger_path.read_text(encoding="utf-8")
         )
         first = _observe_finalization(args, policy, ledger)
         if first.clean:
@@ -954,13 +996,13 @@ def _cmd_complete(args: argparse.Namespace) -> int:
 def _cmd_stop_gate(args: argparse.Namespace) -> int:
     policy = getattr(args, "policy", None)
     ledger = getattr(args, "ledger", None)
-    if bool(policy) != bool(ledger):
+    if ledger and not policy:
         print(
-            "error: --policy and --ledger must be supplied together",
+            "error: --ledger requires --policy",
             file=sys.stderr,
         )
         return 2
-    if policy and ledger:
+    if policy:
         # The hook protocol uses 2 for "block this stop"; finalize uses 10 for
         # ordinary work remaining. Both observation errors and unsettled work
         # must fail closed here.
@@ -1566,9 +1608,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     finalize_p.add_argument(
         "--ledger",
-        required=True,
+        default=None,
         metavar="PATH",
-        help="Coordinator review ledger JSON for the current PR head.",
+        help="Coordinator review ledger JSON (default: "
+        ".agentic-pr-dash/review-ledger.json below --cwd).",
     )
     finalize_p.add_argument(
         "--stabilization-seconds",

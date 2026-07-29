@@ -212,6 +212,11 @@ agentic-pr-dash finalize \
   --json
 ```
 
+`--ledger` defaults to `.agentic-pr-dash/review-ledger.json` below `--cwd`.
+When a policy is configured, a missing ledger blocks an open PR but remains a
+no-op on a branch with no PR. `stop-gate --policy ...` uses this same behavior
+and maps unsettled state or observation failure to its blocking exit code.
+
 Exit `0` means two identical observations were fully green; `10` means work
 remains; `2` means GitHub or another observation source was unavailable. The
 gate never turns an unavailable review-thread read into a clean result.

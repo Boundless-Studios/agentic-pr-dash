@@ -329,17 +329,89 @@ def test_stop_gate_uses_canonical_finalization_when_configured(
     )
     args = argparse.Namespace(
         policy="review-policy.yaml",
-        ledger="review-ledger.json",
+        ledger=None,
     )
 
     assert mc._cmd_stop_gate(args) == 2
     assert calls == ["review-policy.yaml"]
 
 
-def test_stop_gate_requires_policy_and_ledger_together(capsys) -> None:
+def test_stop_gate_refuses_ledger_without_policy(capsys) -> None:
     import argparse
 
-    args = argparse.Namespace(policy="review-policy.yaml", ledger=None)
+    args = argparse.Namespace(policy=None, ledger="review-ledger.json")
 
     assert mc._cmd_stop_gate(args) == 2
-    assert "--policy and --ledger must be supplied together" in capsys.readouterr().err
+    assert "--ledger requires --policy" in capsys.readouterr().err
+
+
+def test_finalize_without_ledger_blocks_an_open_pr(tmp_path, monkeypatch, capsys) -> None:
+    policy_path = tmp_path / "review-policy.yaml"
+    policy_path.write_text(
+        """
+version: 1
+review:
+  local:
+    reviewer_count: 1
+  backstop:
+    reviewer_count: 1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: _pr(),
+    )
+
+    rc = mc.main(
+        [
+            "finalize",
+            "--cwd",
+            str(tmp_path),
+            "--policy",
+            str(policy_path),
+            "--stabilization-seconds",
+            "0",
+            "--json",
+        ]
+    )
+
+    assert rc == 10
+    assert "review_ledger_missing" in capsys.readouterr().out
+
+
+def test_finalize_without_ledger_is_noop_when_there_is_no_pr(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    policy_path = tmp_path / "review-policy.yaml"
+    policy_path.write_text(
+        """
+version: 1
+review:
+  local:
+    reviewer_count: 1
+  backstop:
+    reviewer_count: 1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: None,
+    )
+
+    rc = mc.main(
+        [
+            "finalize",
+            "--cwd",
+            str(tmp_path),
+            "--policy",
+            str(policy_path),
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    assert "no_open_pr" in capsys.readouterr().out
