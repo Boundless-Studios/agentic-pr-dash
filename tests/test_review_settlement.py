@@ -11,9 +11,15 @@ from agent_review_coordinator import (
 
 from agentic_pr_dash._maintenance.review_settlement import (
     finding_from_thread,
+    overlay_backstop_evidence,
+    overlay_backstop_results,
     overlay_github_findings,
 )
-from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+from agentic_pr_dash.github_api import (
+    ReviewSubmission,
+    ReviewThread,
+    ReviewThreadComment,
+)
 
 
 def test_review_coordinator_contract_version() -> None:
@@ -31,6 +37,7 @@ def _thread(
     body: str = "[P2] Avoid a false green\nRequired CI can be absent.",
     path: str = "scripts/review.py",
     line: int = 10,
+    review_id: int | None = None,
 ) -> ReviewThread:
     return ReviewThread(
         node_id=node_id,
@@ -43,6 +50,7 @@ def _thread(
             body=body,
             author="review-bot",
             created_at="2026-07-28T00:00:00Z",
+            review_id=review_id,
         ),
     )
 
@@ -127,7 +135,7 @@ def test_equivalent_threads_share_fingerprint() -> None:
     assert first.fingerprint == second.fingerprint
 
 
-def test_overlay_applies_explicit_p2_deferral_without_tracker_write() -> None:
+def test_thread_deferral_clears_finding_without_synthesizing_review() -> None:
     ledger = overlay_github_findings(
         _ledger_with_local_result(),
         threads=[_thread()],
@@ -142,7 +150,9 @@ def test_overlay_applies_explicit_p2_deferral_without_tracker_write() -> None:
     finding = ledger.current_findings[0]
     assert finding.disposition is Disposition.DEFER
     assert finding.rationale == "Unsupported provider path with no observed occurrence."
-    assert evaluate(policy=_policy(), ledger=ledger).settled
+    report = evaluate(policy=_policy(), ledger=ledger)
+    assert report.required_actions == []
+    assert report.missing_slots == ["backstop:1"]
 
 
 def test_no_threads_does_not_synthesize_backstop_result() -> None:
@@ -156,3 +166,245 @@ def test_no_threads_does_not_synthesize_backstop_result() -> None:
 
     assert not report.settled
     assert report.missing_slots == ["backstop:1"]
+
+
+def test_current_head_review_submission_fills_backstop_slot() -> None:
+    ledger = overlay_backstop_results(
+        _ledger_with_local_result(),
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert report.settled
+    backstop = [
+        result
+        for result in ledger.results
+        if result.stage is ReviewStage.BACKSTOP
+    ]
+    assert backstop[0].reviewer_execution_id == "github-review-123"
+    assert backstop[0].reviewer_provider == "review-bot"
+
+
+def test_thread_and_submission_from_same_review_fill_one_backstop_slot() -> None:
+    policy = ReviewPolicy.model_validate(
+        {
+            "version": 1,
+            "review": {
+                "local": {"reviewer_count": 1, "required_results": 1},
+                "backstop": {
+                    "reviewer_count": 2,
+                    "required_results": 2,
+                    "trigger": "new_head_sha",
+                },
+            },
+        }
+    )
+    ledger = overlay_github_findings(
+        _ledger_with_local_result(),
+        threads=[_thread(review_id=123)],
+        deferrals={
+            "PRRT_one": {
+                "reason": "Evaluated and deferred.",
+                "ticket": "",
+            }
+        },
+    )
+    ledger = overlay_backstop_results(
+        ledger,
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+        reviewer_count=2,
+        thread_review_ids={123},
+    )
+
+    report = evaluate(policy=policy, ledger=ledger)
+
+    assert not report.settled
+    assert report.missing_slots == ["backstop:2"]
+
+
+def test_review_body_finding_blocks_backstop_settlement() -> None:
+    ledger = overlay_backstop_results(
+        _ledger_with_local_result(),
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P1] Do not discard a review-level blocker.",
+            )
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert not report.settled
+    assert report.required_actions == ["address_p1"]
+    assert ledger.current_findings[0].title == (
+        "Do not discard a review-level blocker."
+    )
+
+
+def test_all_review_bodies_are_inspected_after_required_slots_fill() -> None:
+    ledger = overlay_backstop_evidence(
+        _ledger_with_local_result(),
+        threads=[],
+        deferrals={},
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="first-reviewer",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            ),
+            ReviewSubmission(
+                review_id=456,
+                author="later-reviewer",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:01:00Z",
+                body="[P1] Do not discard findings after quorum.",
+            ),
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert not report.settled
+    assert report.required_actions == ["address_p1"]
+
+
+def test_two_threaded_reviews_fill_two_distinct_backstop_slots() -> None:
+    policy = ReviewPolicy.model_validate(
+        {
+            "version": 1,
+            "review": {
+                "local": {"reviewer_count": 1, "required_results": 1},
+                "backstop": {
+                    "reviewer_count": 2,
+                    "required_results": 2,
+                    "trigger": "new_head_sha",
+                },
+            },
+        }
+    )
+    ledger = overlay_backstop_evidence(
+        _ledger_with_local_result(),
+        threads=[
+            _thread(node_id="PRRT_one", review_id=123),
+            _thread(node_id="PRRT_two", review_id=456),
+        ],
+        deferrals={
+            "PRRT_one": {"reason": "Evaluated first P2."},
+            "PRRT_two": {"reason": "Evaluated second P2."},
+        },
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="first-reviewer",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            ),
+            ReviewSubmission(
+                review_id=456,
+                author="second-reviewer",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:01:00Z",
+            ),
+        ],
+        reviewer_count=2,
+    )
+
+    report = evaluate(policy=policy, ledger=ledger)
+
+    assert report.settled
+    assert {
+        result.reviewer_execution_id
+        for result in ledger.results
+        if result.stage is ReviewStage.BACKSTOP and result.slot_number <= 2
+    } == {"github-review-123", "github-review-456"}
+
+
+def test_review_body_p2_accepts_review_id_deferral() -> None:
+    ledger = overlay_backstop_evidence(
+        _ledger_with_local_result(),
+        threads=[],
+        deferrals={
+            "review:123": {
+                "reason": "No supported-path reproduction.",
+                "ticket": "",
+            }
+        },
+        reviews=[
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P2] Defend an unobserved edge case.",
+            )
+        ],
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert report.settled
+    assert ledger.current_findings[0].disposition is Disposition.DEFER
+
+
+def test_multiple_review_body_p2s_require_individual_dispositions() -> None:
+    reviews = [
+        ReviewSubmission(
+            review_id=123,
+            author="review-bot",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-07-28T00:00:00Z",
+            body="[P2] First edge case.\n\n[P2] Second edge case.",
+        )
+    ]
+    ledger = overlay_backstop_evidence(
+        _ledger_with_local_result(),
+        threads=[],
+        deferrals={
+            "review:123:1": {
+                "reason": "First has no supported-path reproduction.",
+            }
+        },
+        reviews=reviews,
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert not report.settled
+    assert len(ledger.current_findings) == 2
+    assert {
+        finding.disposition for finding in ledger.current_findings
+    } == {Disposition.DEFER, None}

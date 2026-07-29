@@ -12,6 +12,7 @@ from agentic_pr_dash._maintenance.review_settlement import (
     evaluate_pr_snapshot,
 )
 from agentic_pr_dash.models import CICheck, PRData
+from agentic_pr_dash.github_api import ReviewSubmission
 
 REPOSITORY = "Boundless-Studios/agentic-pr-dash"
 HEAD = "a" * 40
@@ -142,6 +143,51 @@ def test_missing_reviewer_result_blocks() -> None:
     ]
 
     observation = _observation(ledger=ledger)
+
+    assert not observation.clean
+    assert observation.review.missing_slots == ["backstop:1"]
+
+
+def test_live_current_head_review_satisfies_missing_backstop_result() -> None:
+    ledger = _ledger()
+    ledger.results = [
+        result for result in ledger.results if result.stage is ReviewStage.LOCAL
+    ]
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[],
+        deferrals={},
+        review_submissions=[
+            ReviewSubmission(
+                review_id=321,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+    )
+
+    assert observation.clean
+
+
+def test_pr_author_review_does_not_satisfy_backstop_result() -> None:
+    ledger = _ledger()
+    ledger.results = [
+        result for result in ledger.results if result.stage is ReviewStage.LOCAL
+    ]
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(author="pr-author"),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[],
+        deferrals={},
+        review_submissions=[],
+    )
 
     assert not observation.clean
     assert observation.review.missing_slots == ["backstop:1"]
@@ -464,3 +510,64 @@ def test_finalization_observation_fails_when_required_ci_is_unobservable(
 
     with pytest.raises(RuntimeError, match="required CI status is unobservable"):
         mc._observe_finalization(args, _policy(), _ledger())
+
+
+def test_finalization_reads_submissions_before_review_threads(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import argparse
+
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import deferred_review
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: _pr(),
+    )
+    monkeypatch.setattr(mc, "_repo_slug", lambda cwd: REPOSITORY)
+    monkeypatch.setattr(
+        github_api,
+        "reset_checks_probe_failure_seen",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: False,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "checks_probe_failure_seen",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "clear_pr_batch_cache",
+        lambda: calls.append("clear"),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions",
+        lambda *args, **kwargs: calls.append("submissions") or [],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_threads",
+        lambda *args, **kwargs: calls.append("threads") or [],
+    )
+    monkeypatch.setattr(
+        deferred_review,
+        "deferred_threads_for_pr",
+        lambda *args, **kwargs: {},
+    )
+
+    mc._observe_finalization(
+        argparse.Namespace(cwd=str(tmp_path), pr=None),
+        _policy(),
+        _ledger(),
+    )
+
+    assert calls == ["clear", "submissions", "threads"]

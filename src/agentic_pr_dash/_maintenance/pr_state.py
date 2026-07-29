@@ -70,12 +70,14 @@ def _login_key(login: str) -> str:
     while REST serializes the same identity as ``<name>[bot]``, and logins are
     case-insensitive — normalize both spellings so a configured bot author
     matches its REST payload."""
-    login = login.strip()
-    if login.startswith("app/"):
-        login = login[len("app/"):]
-    if login.endswith("[bot]"):
-        login = login[: -len("[bot]")]
-    return login.lower()
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    return github_api._login_key(login)
+
+
+def _payload_author_login(raw: dict) -> str:
+    author = raw.get("author") or {}
+    return str(author.get("login") or "") if isinstance(author, dict) else ""
 
 
 def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
@@ -205,6 +207,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
 
     return PRData(
         number=pr_number,
+        author=_payload_author_login(raw),
         title=raw.get("title", ""),
         branch=branch,
         base_branch=raw.get("baseRefName", "main"),
@@ -268,6 +271,7 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
 
     return PRData(
         number=pr_number,
+        author=_payload_author_login(raw or {}),
         title=(raw or {}).get("title", ""),
         branch=(raw or {}).get("headRefName", ""),
         base_branch=(raw or {}).get("baseRefName", "main"),

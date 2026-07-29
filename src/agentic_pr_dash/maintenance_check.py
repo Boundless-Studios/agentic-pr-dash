@@ -220,6 +220,14 @@ def _observe_finalization(args, policy, ledger):
         raise RuntimeError(
             "required CI status is unobservable; refusing to synthesize green"
         )
+    github_api.clear_pr_batch_cache()
+    review_submissions = github_api.get_review_submissions(
+        pr.number,
+        pr.latest_commit_sha,
+        cwd,
+        excluded_authors={pr.author} if pr.author else set(),
+        strict=True,
+    )
     threads = github_api.get_review_threads(pr.number, cwd, strict=True)
     deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
     return evaluate_pr_snapshot(
@@ -228,6 +236,7 @@ def _observe_finalization(args, policy, ledger):
         ledger=ledger,
         threads=threads,
         deferrals=deferrals,
+        review_submissions=review_submissions,
     )
 
 
@@ -596,16 +605,16 @@ def _complete_resolve_target_pr(args: argparse.Namespace, cwd: str):
 
 
 def _cmd_complete_defer(args: argparse.Namespace) -> int:
-    """BOU-2567: defer ONE review thread — ``complete --defer <thread-id>``.
+    """Defer one evaluated P2 thread or top-level review-body finding.
 
-    Persists an individually evaluated P2 deferral and posts a reply on the
-    thread naming the disposition. P1 findings cannot be deferred. A rationale
-    is required; a pre-existing tracker ticket is optional. Deliberately never calls
-    ``resolve_review_thread`` — resolving is exactly the wrong move (BOU-2567):
-    it erases the deferral and looks identical to "actually fixed". The thread
-    stays open on GitHub; every consumer excludes it via the persisted record.
+    Thread IDs use their GraphQL node ID. Review-body findings use
+    ``review:<database-id>``. P1 findings cannot be deferred. A rationale is
+    required; a pre-existing tracker ticket is optional.
     """
     from . import github_api  # noqa: PLC0415
+    from ._maintenance.review_settlement import (  # noqa: PLC0415
+        findings_from_review_submission,
+    )
     from .models import ReviewComment  # noqa: PLC0415
 
     cwd = os.path.abspath(args.cwd)
@@ -620,18 +629,95 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
     thread_id = args.defer
     threads = github_api.get_review_threads(pr.number, cwd)
     thread = next((t for t in threads if t.node_id == thread_id), None)
-    if thread is None:
+    review = None
+    review_ordinal = None
+    if thread is None and thread_id.startswith("review:"):
+        review_parts = thread_id.split(":")
+        try:
+            review_id = int(review_parts[1])
+            if len(review_parts) == 3:
+                review_ordinal = int(review_parts[2])
+            elif len(review_parts) != 2:
+                raise ValueError
+        except (IndexError, ValueError):
+            review_id = 0
+        try:
+            reviews = github_api.get_review_submissions(
+                pr.number,
+                pr.latest_commit_sha,
+                cwd,
+                excluded_authors={pr.author} if pr.author else set(),
+                strict=True,
+            )
+        except RuntimeError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        review = next(
+            (item for item in reviews if item.review_id == review_id),
+            None,
+        )
+    if thread is None and review is None:
         print(
-            f"error: thread {thread_id!r} not found among PR #{pr.number}'s "
-            "review threads (already resolved, or not on this PR?)",
+            f"error: finding {thread_id!r} not found among PR #{pr.number}'s "
+            "review threads or current-head review bodies",
             file=sys.stderr,
         )
         return 1
 
     supplied_severity = (args.severity or "").strip().upper()
-    if _thread_is_p1(thread) or supplied_severity == "P1":
+    review_findings = (
+        findings_from_review_submission(
+            review,
+            repository=pr.repo or "unknown/unknown",
+            head_sha=pr.latest_commit_sha,
+            reviewer_execution_id=f"github-review-{review.review_id}",
+        )
+        if review is not None
+        else []
+    )
+    if review is not None and not review_findings:
         print(
-            f"error: thread {thread_id!r} is P1; P1 findings must be addressed "
+            f"error: review {review.review_id} has no declared P1/P2 finding",
+            file=sys.stderr,
+        )
+        return 1
+    if review is not None and review_ordinal is None:
+        if len(review_findings) != 1:
+            print(
+                f"error: review {review.review_id} declares "
+                f"{len(review_findings)} findings; use review:"
+                f"{review.review_id}:<ordinal> to evaluate one",
+                file=sys.stderr,
+            )
+            return 1
+        review_ordinal = 1
+    if review is not None and (
+        review_ordinal is None
+        or review_ordinal < 1
+        or review_ordinal > len(review_findings)
+    ):
+        print(
+            f"error: review finding ordinal {review_ordinal!r} is invalid for "
+            f"review {review.review_id}",
+            file=sys.stderr,
+        )
+        return 1
+    if review is not None and len(review_findings) == 1:
+        thread_id = f"review:{review.review_id}"
+    review_finding = (
+        review_findings[review_ordinal - 1]
+        if review is not None and review_ordinal is not None
+        else None
+    )
+    detected_p1 = (
+        _thread_is_p1(thread)
+        if thread is not None
+        else review_finding is not None
+        and review_finding.severity.value == "P1"
+    )
+    if detected_p1 or supplied_severity == "P1":
+        print(
+            f"error: finding {thread_id!r} is P1; P1 findings must be addressed "
             "before settlement and cannot be deferred",
             file=sys.stderr,
         )
@@ -651,7 +737,11 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         record = deferred_review.defer_thread(
             cwd, pr.number,
             thread_id=thread_id,
-            comment_id=thread.top.database_id,
+            comment_id=(
+                thread.top.database_id
+                if thread is not None
+                else review.review_id
+            ),
             severity=args.severity or "",
             ticket=args.ticket or "",
             reason=reason,
@@ -670,20 +760,35 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         "from review/CI automation and will not be dispatched against, but "
         "stays open here for human visibility."
     )
-    stub = ReviewComment(
-        id=thread.top.database_id, author=thread.top.author, body=thread.top.body,
-        path=thread.top.path, line=thread.top.line, created_at=thread.top.created_at,
-        is_inline=True, thread_id=thread.node_id,
+    stub = (
+        ReviewComment(
+            id=thread.top.database_id,
+            author=thread.top.author,
+            body=thread.top.body,
+            path=thread.top.path,
+            line=thread.top.line,
+            created_at=thread.top.created_at,
+            is_inline=True,
+            thread_id=thread.node_id,
+        )
+        if thread is not None
+        else ReviewComment(
+            id=review.review_id,
+            author=review.author,
+            body=review.body,
+            created_at=review.submitted_at,
+            is_inline=False,
+        )
     )
     if not github_api.reply_to_review_comment(pr.number, stub, body, cwd):
         print(
             f"warning: deferral recorded but the GitHub reply failed for "
-            f"thread {thread_id}; re-run --defer to retry the reply",
+            f"finding {thread_id}; re-run --defer to retry the reply",
             file=sys.stderr,
         )
 
     ticket_suffix = f", tracked as {record.ticket}" if record.ticket else ""
-    print(f"deferred thread {thread_id} as {record.severity}{ticket_suffix}")
+    print(f"deferred finding {thread_id} as {record.severity}{ticket_suffix}")
     return 0
 
 

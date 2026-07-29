@@ -75,6 +75,7 @@ query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
               body
               author { login }
               createdAt
+              pullRequestReview { databaseId }
             }
           }
         }
@@ -99,6 +100,7 @@ class ReviewThreadComment:
     # made on. For OUTDATED threads GitHub nulls `line` (it can no longer track
     # the anchor), so this is the only line evidence left (BOU-2095).
     original_line: int | None = None
+    review_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,29 @@ class ReviewThread:
     is_outdated: bool
     top: ReviewThreadComment
     replies: list[ReviewThreadComment] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class ReviewSubmission:
+    """One completed GitHub review against an immutable PR head."""
+
+    review_id: int
+    author: str
+    state: str
+    commit_id: str
+    submitted_at: str
+    body: str = ""
+
+
+def _login_key(login: str) -> str:
+    """Canonicalize GitHub App and REST bot spellings for comparisons."""
+
+    key = login.strip().casefold()
+    if key.startswith("app/"):
+        key = key[len("app/"):]
+    if key.endswith("[bot]"):
+        key = key[:-len("[bot]")]
+    return key
 
 
 # Bounded retry for transient connectivity failures (BOU-1638 / BOU-1694).
@@ -641,7 +666,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     cmd = [
         "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
         "--json", "number,title,headRefName,headRefOid,baseRefName,url,isDraft,"
-        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt",
+        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt,author",
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -874,7 +899,7 @@ def list_open_prs_cached(
 
 _PR_HEAD_FIELDS = (
     "number,title,body,url,isDraft,mergeStateStatus,reviewDecision,"
-    "headRefOid,headRefName,headRepositoryOwner,baseRefName,mergedAt"
+    "headRefOid,headRefName,headRepositoryOwner,baseRefName,mergedAt,author"
 )
 
 # GitHub's REST `GET /repos/{owner}/{repo}/pulls?head={owner}:{branch}` performs
@@ -1463,6 +1488,7 @@ def get_new_pr_commits(
 
 
 def _parse_review_thread_comment(c: dict) -> ReviewThreadComment:
+    review = c.get("pullRequestReview") or {}
     return ReviewThreadComment(
         database_id=int(c.get("databaseId") or 0),
         path=c.get("path"),
@@ -1471,6 +1497,12 @@ def _parse_review_thread_comment(c: dict) -> ReviewThreadComment:
         author=str((c.get("author") or {}).get("login") or "unknown"),
         created_at=str(c.get("createdAt") or ""),
         original_line=c.get("originalLine"),
+        review_id=(
+            review.get("databaseId")
+            if isinstance(review, dict)
+            and isinstance(review.get("databaseId"), int)
+            else None
+        ),
     )
 
 
@@ -1638,6 +1670,125 @@ def get_review_threads(
         paged = True
 
     return threads
+
+
+def get_review_submissions(
+    pr_number: int,
+    head_sha: str,
+    cwd: str | None = None,
+    *,
+    excluded_authors: set[str] | None = None,
+    strict: bool = False,
+) -> list[ReviewSubmission]:
+    """Return completed GitHub reviews submitted against ``head_sha``.
+
+    The review coordinator requires affirmative evidence that the configured
+    backstop ran for the immutable head. Review threads alone cannot provide
+    that evidence because a clean review legitimately creates no thread.
+    Completion gates use ``strict=True`` so an unavailable or malformed reviews
+    response cannot synthesize a satisfied backstop slot.
+    """
+
+    owner, repo = get_repo_info(cwd)
+    if not owner or not repo:
+        if strict:
+            raise RuntimeError(
+                "get_review_submissions: could not resolve the repository; "
+                "refusing to synthesize completed review submissions"
+            )
+        return []
+
+    result = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/pulls/{pr_number}/reviews",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=cwd,
+        timeout_s=30,
+    )
+    if result.returncode != 0:
+        if strict:
+            raise RuntimeError(
+                f"get_review_submissions: GitHub review submissions failed for "
+                f"PR #{pr_number} (gh exit {result.returncode})"
+            )
+        return []
+
+    excluded = {
+        _login_key(author)
+        for author in (excluded_authors or set())
+        if author.strip()
+    }
+    try:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, list):
+            raise TypeError("review response is not a list")
+        pages = payload if not payload or isinstance(payload[0], list) else [payload]
+        submissions: list[ReviewSubmission] = []
+        for page in pages:
+            if not isinstance(page, list):
+                raise TypeError("review page is not a list")
+            for item in page:
+                if not isinstance(item, dict):
+                    raise TypeError("review record is not an object")
+                state = str(item.get("state") or "").upper()
+                commit_id = str(item.get("commit_id") or "")
+                if commit_id != head_sha or state not in {
+                    "APPROVED",
+                    "COMMENTED",
+                    "CHANGES_REQUESTED",
+                }:
+                    continue
+                submitted_at = item.get("submitted_at")
+                body = item.get("body")
+                user = item.get("user")
+                author = user.get("login") if isinstance(user, dict) else None
+                review_id = item.get("id")
+                malformed = (
+                    not isinstance(submitted_at, str)
+                    or not submitted_at
+                    or not isinstance(author, str)
+                    or not author
+                    or type(review_id) is not int
+                    or (
+                        body is not None
+                        and not isinstance(body, str)
+                    )
+                )
+                if malformed:
+                    if strict:
+                        raise RuntimeError(
+                            "get_review_submissions: malformed current-head "
+                            f"review record for PR #{pr_number}"
+                        )
+                    continue
+                if _login_key(author) in excluded:
+                    continue
+                submissions.append(
+                    ReviewSubmission(
+                        review_id=review_id,
+                        author=author,
+                        state=state,
+                        commit_id=commit_id,
+                        submitted_at=submitted_at,
+                        body=body or "",
+                    )
+                )
+    except (json.JSONDecodeError, TypeError) as exc:
+        if strict:
+            raise RuntimeError(
+                f"get_review_submissions: malformed review submissions for "
+                f"PR #{pr_number}"
+            ) from exc
+        return []
+
+    return sorted(
+        submissions,
+        key=lambda review: (review.submitted_at, review.review_id),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -2255,7 +2406,7 @@ def batch_fetch_pr_review_and_ci(
                 f'    nodes {{'
                 f'      id isResolved isOutdated'
                 f'      comments(first: 100) {{'
-                f'        nodes {{ databaseId path line originalLine body author {{ login }} createdAt }}'
+                f'        nodes {{ databaseId path line originalLine body author {{ login }} createdAt pullRequestReview {{ databaseId }} }}'
                 f'      }}'
                 f'    }}'
                 f'  }}'
@@ -3142,6 +3293,12 @@ def scan_review_threads(
     now = datetime.now(timezone.utc)
     comments: list[ReviewComment] = []
     decisions: list[ThreadDecision] = []
+    from ._maintenance import deferred_review as _deferred_review  # noqa: PLC0415
+
+    deferred_findings = _deferred_review.deferred_threads_for_pr(
+        cwd or ".",
+        pr_number,
+    )
 
     # Inline review threads via GraphQL
     threads = get_review_threads(pr_number, cwd)
@@ -3170,8 +3327,7 @@ def scan_review_threads(
         # BEFORE is_outdated/marker-state so a deferred thread is never picked
         # regardless of its drift or claim-reply state — the deferral decision
         # is authoritative, not one signal among several.
-        from ._maintenance import deferred_review as _deferred_review  # noqa: PLC0415
-        if _deferred_review.is_thread_deferred(cwd or ".", pr_number, thread.node_id):
+        if thread.node_id in deferred_findings:
             decisions.append(ThreadDecision(
                 thread_id=thread.node_id,
                 author=top.author,
@@ -3262,7 +3418,7 @@ def scan_review_threads(
     # Review-level comments (CHANGES_REQUESTED with body)
     r2 = _run(
         ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
-         "--jq", '.[] | select(.state == "CHANGES_REQUESTED" and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
+         "--jq", '.[] | select((.state == "APPROVED" or .state == "COMMENTED" or .state == "CHANGES_REQUESTED") and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
         cwd=cwd,
     )
     if r2.returncode == 0:
@@ -3274,13 +3430,34 @@ def scan_review_threads(
                 submitted = data.get("submitted_at", "")
                 if latest_commit_date and submitted <= latest_commit_date:
                     continue
-                comments.append(ReviewComment(
-                    id=data.get("id", 0),
-                    author=data.get("author", "unknown"),
-                    body=data.get("body", ""),
-                    created_at=submitted,
-                    is_inline=False,
-                ))
+                review_id = data.get("id", 0)
+                body = data.get("body", "")
+                from ._maintenance.review_settlement import (  # noqa: PLC0415
+                    declared_review_body_lines,
+                )
+
+                declared_lines = declared_review_body_lines(body)
+                if (
+                    data.get("state") != "CHANGES_REQUESTED"
+                    and not declared_lines
+                ):
+                    continue
+                bodies = declared_lines or [body]
+                for ordinal, finding_body in enumerate(bodies, start=1):
+                    disposition_key = (
+                        f"review:{review_id}"
+                        if len(bodies) == 1
+                        else f"review:{review_id}:{ordinal}"
+                    )
+                    if disposition_key in deferred_findings:
+                        continue
+                    comments.append(ReviewComment(
+                        id=review_id,
+                        author=data.get("author", "unknown"),
+                        body=finding_body,
+                        created_at=submitted,
+                        is_inline=False,
+                    ))
             except json.JSONDecodeError:
                 continue
 
@@ -3308,8 +3485,8 @@ def reply_to_review_comment(
 ) -> int | None:
     """Reply to an inline review comment, or fall back to a PR comment.
 
-    Returns the new reply comment ID (int) for inline replies, or None for
-    non-inline / fallback replies or on failure.
+    Returns the new reply comment ID for inline replies, ``True`` for a
+    successful non-inline PR comment, or ``None`` on failure.
     """
     if comment.is_inline:
         r = _run_mutation(
@@ -3336,7 +3513,7 @@ def reply_to_review_comment(
         cwd=cwd,
         timeout_s=20,
     )
-    return None
+    return True if r.returncode == 0 else None
 
 
 def get_failed_logs(sha: str, check_names: list[str], cwd: str | None = None) -> dict[str, str]:

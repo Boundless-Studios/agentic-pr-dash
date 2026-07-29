@@ -202,7 +202,10 @@ flowchart LR
 and repository hooks. Reviewer selection stays outside this project: a review
 policy declares provider-neutral slots (including double-reviewer topologies),
 and `agent-review-coordinator` records their results and finding dispositions.
-The dashboard only adds live GitHub, CI, mergeability, and change-request state.
+The dashboard adds live GitHub, CI, mergeability, and change-request state. A
+completed GitHub review submitted against the current head supplies a configured
+backstop slot; PR-author, stale-head, pending, or malformed review records do
+not.
 
 ```bash
 agentic-pr-dash finalize \
@@ -224,7 +227,11 @@ gate never turns an unavailable review-thread read into a clean result.
 P1 findings must be addressed. P2 findings must be evaluated individually:
 `complete --defer <thread> --severity P2 --reason <rationale>` records a
 deliberate non-fix disposition, with an optional existing `--ticket`. It never
-creates tracker work. P1 deferral and bulk `--sweep-p2` are refused.
+creates tracker work. For a P2 declared only in a top-level review body, use
+`complete --defer review:<review-database-id> --severity P2 --reason
+<rationale>`. If that body declares multiple findings, address one at a time
+with `review:<review-database-id>:<ordinal>`. P1 deferral and bulk
+`--sweep-p2` are refused.
 
 ### One agent per PR
 

@@ -10,8 +10,10 @@ is exercised end-to-end.
 """
 
 from types import SimpleNamespace
+import json
 
 from agentic_pr_dash import github_api
+from agentic_pr_dash._maintenance import deferred_review
 from agentic_pr_dash.github_api import (
     CLAIM_MARKER,
     COMPLETE_MARKER,
@@ -53,6 +55,72 @@ def _wire(monkeypatch, threads: list[ReviewThread]) -> None:
 
 
 LATEST = "2026-06-27T09:00:00Z"
+
+
+def test_deferred_review_body_is_not_returned_to_legacy_automation(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *a, **k: [])
+    review = {
+        "id": 123,
+        "author": "reviewer",
+        "body": "[P2] Unsupported edge case.",
+        "state": "CHANGES_REQUESTED",
+        "submitted_at": "2026-06-27T10:00:00Z",
+    }
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(review),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        deferred_review,
+        "deferred_threads_for_pr",
+        lambda *a, **k: {
+            "review:123": {
+                "reason": "No supported-path reproduction.",
+            }
+        },
+    )
+
+    comments, _ = scan_review_threads(1, LATEST, cwd=".")
+
+    assert comments == []
+
+
+def test_commented_review_body_finding_is_actionable(monkeypatch) -> None:
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *a, **k: [])
+    review = {
+        "id": 456,
+        "author": "reviewer",
+        "body": "[P1] Body-only blocker.",
+        "state": "COMMENTED",
+        "submitted_at": "2026-06-27T10:00:00Z",
+    }
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *a, **k: SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(review),
+            stderr="",
+        ),
+    )
+    monkeypatch.setattr(
+        deferred_review,
+        "deferred_threads_for_pr",
+        lambda *a, **k: {},
+    )
+
+    comments, _ = scan_review_threads(1, LATEST, cwd=".")
+
+    assert [comment.body for comment in comments] == [
+        "[P1] Body-only blocker."
+    ]
 
 
 # ---------------------------------------------------------------------------
