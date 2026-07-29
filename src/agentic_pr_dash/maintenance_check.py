@@ -464,10 +464,9 @@ def _complete_resolve_target_pr(args: argparse.Namespace, cwd: str):
 def _cmd_complete_defer(args: argparse.Namespace) -> int:
     """BOU-2567: defer ONE review thread — ``complete --defer <thread-id>``.
 
-    Persists a deferred-state record (anti-abuse enforced by
-    ``deferred_review.defer_thread``: a resolvable ticket is required, and a
-    P1 additionally requires a free-text reason) and posts a reply on the
-    thread naming the disposition. Deliberately never calls
+    Persists an individually evaluated P2 deferral and posts a reply on the
+    thread naming the disposition. P1 findings cannot be deferred. A rationale
+    is required; a pre-existing tracker ticket is optional. Deliberately never calls
     ``resolve_review_thread`` — resolving is exactly the wrong move (BOU-2567):
     it erases the deferral and looks identical to "actually fixed". The thread
     stays open on GitHub; every consumer excludes it via the persisted record.
@@ -495,22 +494,21 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         )
         return 1
 
-    # BOU-2567 PR #122 review, P1 #2: a supplied --severity is verified
-    # against the thread's own content, not merely trusted. A thread
-    # `_thread_is_p1` recognizes as P1 downgraded to --severity P2 would skip
-    # the P1-only --reason requirement entirely — precisely the mute-button
-    # abuse the anti-abuse rule exists to stop. Refuse loudly rather than
-    # silently rewrite the operator's input (a silent upgrade is its own
-    # trust problem: the operator asked for one thing and got another). Only
-    # a DOWNGRADE of a detected P1 is refused — deliberately labeling a
-    # non-P1 thread P1 is a valid, more-cautious operator judgment call.
     supplied_severity = (args.severity or "").strip().upper()
-    if _thread_is_p1(thread) and supplied_severity != "P1":
+    if _thread_is_p1(thread) or supplied_severity == "P1":
         print(
-            f"error: thread {thread_id!r} is recognized as P1 by its own "
-            f"content but --severity {args.severity!r} was given; a detected "
-            "P1 cannot be deferred as anything but P1 (pass --severity P1 "
-            "--reason \"...\" if this deferral is deliberate)",
+            f"error: thread {thread_id!r} is P1; P1 findings must be addressed "
+            "before settlement and cannot be deferred",
+            file=sys.stderr,
+        )
+        return 1
+    if supplied_severity != "P2":
+        print("error: --defer requires --severity P2", file=sys.stderr)
+        return 1
+    reason = (args.reason or "").strip()
+    if not reason:
+        print(
+            "error: P2 deferral requires --reason with the evaluation rationale",
             file=sys.stderr,
         )
         return 1
@@ -522,17 +520,19 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
             comment_id=thread.top.database_id,
             severity=args.severity or "",
             ticket=args.ticket or "",
-            reason=args.reason or "",
+            reason=reason,
             deferred_by=args.session_id or "",
         )
     except deferred_review.DeferralError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    ticket_text = f" Tracked as {record.ticket}." if record.ticket else ""
     body = (
-        f"Deferred ({record.severity}): tracked as {record.ticket}."
-        + (f" Reason: {record.reason}" if record.reason else "")
-        + " This finding is real but out of scope for this PR; it is excluded "
+        f"Deferred ({record.severity}) after evaluation.{ticket_text}"
+        + f" Reason: {record.reason}"
+        + " This finding is real but does not warrant implementation in this PR; "
+        "it is excluded "
         "from review/CI automation and will not be dispatched against, but "
         "stays open here for human visibility."
     )
@@ -548,90 +548,20 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    print(f"deferred thread {thread_id} as {record.severity}, tracked as {record.ticket}")
+    ticket_suffix = f", tracked as {record.ticket}" if record.ticket else ""
+    print(f"deferred thread {thread_id} as {record.severity}{ticket_suffix}")
     return 0
 
 
 def _cmd_complete_sweep_p2(args: argparse.Namespace) -> int:
-    """BOU-2567: ``complete --sweep-p2 --ticket <BOU-N>`` — auto-defer every
-    currently-unresolved, non-P1, not-already-deferred thread on the PR under
-    ONE per-PR follow-up ticket, replying on each rolled-in thread.
-
-    The ticket itself is supplied by the caller, not filed by this CLI: this
-    repo has no live Linear client, so "one ticket per PR, not one per
-    finding" is enforced here as "every P2 finding this sweep touches is
-    deferred under the SAME already-filed ticket" — filing that ticket is the
-    caller's job (exactly as the operator's own BOU-2559/2560/2564 precedent
-    was filed externally, then referenced here).
-    """
-    from . import github_api  # noqa: PLC0415
-    from .models import ReviewComment  # noqa: PLC0415
-
-    cwd = os.path.abspath(args.cwd)
-    ticket = args.ticket or ""
-    if not deferred_review.is_valid_ticket(ticket):
-        print(
-            f"error: --sweep-p2 requires a resolvable --ticket (got {ticket!r})",
-            file=sys.stderr,
-        )
-        return 1
-
-    pr = _complete_resolve_target_pr(args, cwd)
-    if pr is _GH_UNAVAILABLE:
-        print(_gh_unavailable_message(cwd))
-        return 2
-    if pr is None:
-        print("no open PR for this branch")
-        return 0
-
-    threads = github_api.get_review_threads(pr.number, cwd)
-    reason = (
-        args.reason
-        or "auto-deferred P2 finding, rolled into the per-PR P2 follow-up"
-    )
-    swept: list[str] = []
-    for thread in threads:
-        if thread.is_resolved:
-            continue
-        if deferred_review.is_thread_deferred(cwd, pr.number, thread.node_id):
-            continue
-        if _thread_is_p1(thread):
-            continue  # P1 never auto-defers — only an explicit --defer can.
-        try:
-            record = deferred_review.defer_thread(
-                cwd, pr.number,
-                thread_id=thread.node_id,
-                comment_id=thread.top.database_id,
-                severity="P2",
-                ticket=ticket,
-                reason=reason,
-                deferred_by=args.session_id or "",
-            )
-        except deferred_review.DeferralError as exc:
-            print(f"warning: could not defer thread {thread.node_id}: {exc}", file=sys.stderr)
-            continue
-        body = f"Deferred (P2): rolled into the per-PR follow-up {record.ticket}. {reason}"
-        stub = ReviewComment(
-            id=thread.top.database_id, author=thread.top.author, body=thread.top.body,
-            path=thread.top.path, line=thread.top.line, created_at=thread.top.created_at,
-            is_inline=True, thread_id=thread.node_id,
-        )
-        if not github_api.reply_to_review_comment(pr.number, stub, body, cwd):
-            print(
-                f"warning: deferred thread {thread.node_id} but the GitHub "
-                "reply failed; it will retry on the next sweep",
-                file=sys.stderr,
-            )
-        swept.append(thread.node_id)
-
-    if swept:
-        deferred_review.set_followup_ticket(cwd, pr.number, ticket)
+    """Refuse bulk P2 deferral; every P2 requires an individual evaluation."""
 
     print(
-        f"swept {len(swept)} P2 thread(s) into follow-up {ticket}: "
-        f"{', '.join(swept) or '<none>'}"
+        "error: --sweep-p2 is disabled; evaluate each P2 individually with "
+        "--defer THREAD --severity P2 --reason TEXT",
+        file=sys.stderr,
     )
-    return 0
+    return 1
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
@@ -1544,10 +1474,7 @@ def main(argv: list[str] | None = None) -> int:
         "--sweep-p2",
         action="store_true",
         default=False,
-        help="BOU-2567: auto-defer every currently-unresolved, non-P1, "
-        "not-already-deferred review thread on the PR under ONE per-PR "
-        "follow-up ticket (--ticket) — the P2 severity x scope auto-defer, "
-        "never one ticket per finding. Requires --ticket.",
+        help="Deprecated and disabled: every P2 requires individual evaluation.",
     )
     complete_p.add_argument(
         "--severity",
@@ -1559,16 +1486,14 @@ def main(argv: list[str] | None = None) -> int:
         "--ticket",
         default=None,
         metavar="BOU-N",
-        help="Tracked follow-up ticket for --defer or --sweep-p2. Required — "
-        "deferral without a resolvable ticket is not allowed.",
+        help="Optional existing follow-up ticket for --defer. This command never "
+        "creates tracker work.",
     )
     complete_p.add_argument(
         "--reason",
         default="",
         metavar="TEXT",
-        help="Free-text reason the deferred thread is out of scope for this "
-        "PR. Required when --severity P1 (a P1 deferral must explain itself); "
-        "optional for P2.",
+        help="Required P2 evaluation rationale. P1 findings cannot be deferred.",
     )
     complete_p.add_argument(
         "--session-id",

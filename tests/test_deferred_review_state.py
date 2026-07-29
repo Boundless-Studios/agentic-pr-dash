@@ -79,10 +79,20 @@ def test_redeferring_same_thread_is_idempotent_not_an_error(tmp_path: Path) -> N
 # --- anti-abuse ---------------------------------------------------------
 
 
-def test_defer_without_ticket_raises(tmp_path: Path) -> None:
-    with pytest.raises(dr.DeferralError, match="ticket"):
-        dr.defer_thread(str(tmp_path), 1, thread_id="T1", comment_id=1,
-                        severity="P2", ticket="")
+def test_defer_without_ticket_records_explicit_reason(tmp_path: Path) -> None:
+    dr.defer_thread(
+        str(tmp_path),
+        1,
+        thread_id="T1",
+        comment_id=1,
+        severity="P2",
+        ticket="",
+        reason="Unsupported provider path with no observed occurrence.",
+    )
+
+    record = dr.deferred_threads_for_pr(str(tmp_path), 1)["T1"]
+    assert record["ticket"] == ""
+    assert record["reason"] == "Unsupported provider path with no observed occurrence."
 
 
 def test_defer_with_malformed_ticket_raises(tmp_path: Path) -> None:
