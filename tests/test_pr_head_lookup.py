@@ -578,7 +578,7 @@ def test_get_review_submissions_excludes_pr_author(monkeypatch):
         [
             {
                 "id": 101,
-                "user": {"login": "pr-author"},
+                "user": {"login": "pr-author[bot]"},
                 "state": "COMMENTED",
                 "commit_id": "a" * 40,
                 "submitted_at": "2026-07-28T00:00:00Z",
@@ -595,7 +595,7 @@ def test_get_review_submissions_excludes_pr_author(monkeypatch):
         24,
         "a" * 40,
         ".",
-        excluded_authors={"PR-AUTHOR"},
+        excluded_authors={"app/PR-AUTHOR"},
     )
 
     assert reviews == []

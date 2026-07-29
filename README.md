@@ -229,7 +229,9 @@ P1 findings must be addressed. P2 findings must be evaluated individually:
 deliberate non-fix disposition, with an optional existing `--ticket`. It never
 creates tracker work. For a P2 declared only in a top-level review body, use
 `complete --defer review:<review-database-id> --severity P2 --reason
-<rationale>`. P1 deferral and bulk `--sweep-p2` are refused.
+<rationale>`. If that body declares multiple findings, address one at a time
+with `review:<review-database-id>:<ordinal>`. P1 deferral and bulk
+`--sweep-p2` are refused.
 
 ### One agent per PR
 

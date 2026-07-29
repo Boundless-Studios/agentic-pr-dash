@@ -510,3 +510,59 @@ def test_finalization_observation_fails_when_required_ci_is_unobservable(
 
     with pytest.raises(RuntimeError, match="required CI status is unobservable"):
         mc._observe_finalization(args, _policy(), _ledger())
+
+
+def test_finalization_reads_submissions_before_review_threads(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import argparse
+
+    from agentic_pr_dash import github_api
+    from agentic_pr_dash._maintenance import deferred_review
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: _pr(),
+    )
+    monkeypatch.setattr(mc, "_repo_slug", lambda cwd: REPOSITORY)
+    monkeypatch.setattr(
+        github_api,
+        "reset_checks_probe_failure_seen",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: False,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "checks_probe_failure_seen",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions",
+        lambda *args, **kwargs: calls.append("submissions") or [],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_threads",
+        lambda *args, **kwargs: calls.append("threads") or [],
+    )
+    monkeypatch.setattr(
+        deferred_review,
+        "deferred_threads_for_pr",
+        lambda *args, **kwargs: {},
+    )
+
+    mc._observe_finalization(
+        argparse.Namespace(cwd=str(tmp_path), pr=None),
+        _policy(),
+        _ledger(),
+    )
+
+    assert calls == ["submissions", "threads"]

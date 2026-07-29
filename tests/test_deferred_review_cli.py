@@ -260,6 +260,53 @@ def test_defer_review_body_p2_by_review_id(tmp_path, monkeypatch) -> None:
     assert "No supported-path reproduction." in replied[0][1]
 
 
+def test_defer_review_body_requires_ordinal_for_multiple_findings(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    _, replied = _wire(monkeypatch, [])
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions",
+        lambda *args, **kwargs: [
+            ReviewSubmission(
+                review_id=123,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id="a" * 40,
+                submitted_at="2026-07-28T00:00:00Z",
+                body="[P2] First edge.\n[P2] Second edge.",
+            )
+        ],
+    )
+
+    ambiguous = mc._cmd_complete(
+        _args(
+            cwd=str(tmp_path),
+            defer="review:123",
+            severity="P2",
+            reason="Must be individual.",
+        )
+    )
+    second = mc._cmd_complete(
+        _args(
+            cwd=str(tmp_path),
+            defer="review:123:2",
+            severity="P2",
+            reason="Second has no supported-path reproduction.",
+        )
+    )
+
+    assert ambiguous == 1
+    assert second == 0
+    assert dr.is_thread_deferred(
+        str(tmp_path),
+        PR_NUMBER,
+        "review:123:2",
+    )
+    assert len(replied) == 1
+
+
 # ---------------------------------------------------------------------------
 # --sweep-p2
 # ---------------------------------------------------------------------------

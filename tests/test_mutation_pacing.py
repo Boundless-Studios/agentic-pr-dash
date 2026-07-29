@@ -251,3 +251,22 @@ def test_reply_to_review_comment_inline_uses_run_mutation(monkeypatch):
     result = github_api.reply_to_review_comment(7, comment, "reply body")
     assert result == 42
     assert len(calls) == 1
+
+
+def test_reply_to_review_comment_non_inline_reports_success(monkeypatch):
+    from agentic_pr_dash.models import ReviewComment
+
+    monkeypatch.setattr(
+        github_api,
+        "_run_mutation",
+        lambda *a, **k: _cp(returncode=0),
+    )
+    comment = ReviewComment(
+        id=1,
+        author="alice",
+        body="hi",
+        created_at="2026-01-01T00:00:00Z",
+        is_inline=False,
+    )
+
+    assert github_api.reply_to_review_comment(7, comment, "reply body") is True

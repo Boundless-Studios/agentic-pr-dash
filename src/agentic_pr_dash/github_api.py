@@ -124,6 +124,17 @@ class ReviewSubmission:
     body: str = ""
 
 
+def _login_key(login: str) -> str:
+    """Canonicalize GitHub App and REST bot spellings for comparisons."""
+
+    key = login.strip().casefold()
+    if key.startswith("app/"):
+        key = key[len("app/"):]
+    if key.endswith("[bot]"):
+        key = key[:-len("[bot]")]
+    return key
+
+
 # Bounded retry for transient connectivity failures (BOU-1638 / BOU-1694).
 # A gh call that can't *reach* GitHub (DNS / connect / TLS / read timeout, or a
 # transient 5xx) typically succeeds moments later — the interactive shell's gh
@@ -1707,7 +1718,7 @@ def get_review_submissions(
         return []
 
     excluded = {
-        author.casefold()
+        _login_key(author)
         for author in (excluded_authors or set())
         if author.strip()
     }
@@ -1754,7 +1765,7 @@ def get_review_submissions(
                             f"review record for PR #{pr_number}"
                         )
                     continue
-                if author.casefold() in excluded:
+                if _login_key(author) in excluded:
                     continue
                 submissions.append(
                     ReviewSubmission(
@@ -3448,8 +3459,8 @@ def reply_to_review_comment(
 ) -> int | None:
     """Reply to an inline review comment, or fall back to a PR comment.
 
-    Returns the new reply comment ID (int) for inline replies, or None for
-    non-inline / fallback replies or on failure.
+    Returns the new reply comment ID for inline replies, ``True`` for a
+    successful non-inline PR comment, or ``None`` on failure.
     """
     if comment.is_inline:
         r = _run_mutation(
@@ -3476,7 +3487,7 @@ def reply_to_review_comment(
         cwd=cwd,
         timeout_s=20,
     )
-    return None
+    return True if r.returncode == 0 else None
 
 
 def get_failed_logs(sha: str, check_names: list[str], cwd: str | None = None) -> dict[str, str]:

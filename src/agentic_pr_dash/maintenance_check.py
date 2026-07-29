@@ -220,7 +220,6 @@ def _observe_finalization(args, policy, ledger):
         raise RuntimeError(
             "required CI status is unobservable; refusing to synthesize green"
         )
-    threads = github_api.get_review_threads(pr.number, cwd, strict=True)
     review_submissions = github_api.get_review_submissions(
         pr.number,
         pr.latest_commit_sha,
@@ -228,6 +227,7 @@ def _observe_finalization(args, policy, ledger):
         excluded_authors={pr.author} if pr.author else set(),
         strict=True,
     )
+    threads = github_api.get_review_threads(pr.number, cwd, strict=True)
     deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
     return evaluate_pr_snapshot(
         pr=pr,
@@ -612,7 +612,7 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
     """
     from . import github_api  # noqa: PLC0415
     from ._maintenance.review_settlement import (  # noqa: PLC0415
-        finding_from_review_submission,
+        findings_from_review_submission,
     )
     from .models import ReviewComment  # noqa: PLC0415
 
@@ -629,10 +629,16 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
     threads = github_api.get_review_threads(pr.number, cwd)
     thread = next((t for t in threads if t.node_id == thread_id), None)
     review = None
+    review_ordinal = None
     if thread is None and thread_id.startswith("review:"):
+        review_parts = thread_id.split(":")
         try:
-            review_id = int(thread_id.removeprefix("review:"))
-        except ValueError:
+            review_id = int(review_parts[1])
+            if len(review_parts) == 3:
+                review_ordinal = int(review_parts[2])
+            elif len(review_parts) != 2:
+                raise ValueError
+        except (IndexError, ValueError):
             review_id = 0
         try:
             reviews = github_api.get_review_submissions(
@@ -658,22 +664,48 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
         return 1
 
     supplied_severity = (args.severity or "").strip().upper()
-    review_finding = (
-        finding_from_review_submission(
+    review_findings = (
+        findings_from_review_submission(
             review,
             repository=pr.repo or "unknown/unknown",
             head_sha=pr.latest_commit_sha,
             reviewer_execution_id=f"github-review-{review.review_id}",
         )
         if review is not None
-        else None
+        else []
     )
-    if review is not None and review_finding is None:
+    if review is not None and not review_findings:
         print(
             f"error: review {review.review_id} has no declared P1/P2 finding",
             file=sys.stderr,
         )
         return 1
+    if review is not None and review_ordinal is None:
+        if len(review_findings) != 1:
+            print(
+                f"error: review {review.review_id} declares "
+                f"{len(review_findings)} findings; use review:"
+                f"{review.review_id}:<ordinal> to evaluate one",
+                file=sys.stderr,
+            )
+            return 1
+        review_ordinal = 1
+    if review is not None and (
+        review_ordinal is None
+        or review_ordinal < 1
+        or review_ordinal > len(review_findings)
+    ):
+        print(
+            f"error: review finding ordinal {review_ordinal!r} is invalid for "
+            f"review {review.review_id}",
+            file=sys.stderr,
+        )
+        return 1
+    review_finding = (
+        review_findings[review_ordinal - 1]
+        if review is not None and review_ordinal is not None
+        else None
+    )
     detected_p1 = (
         _thread_is_p1(thread)
         if thread is not None

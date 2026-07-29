@@ -376,3 +376,35 @@ def test_review_body_p2_accepts_review_id_deferral() -> None:
 
     assert report.settled
     assert ledger.current_findings[0].disposition is Disposition.DEFER
+
+
+def test_multiple_review_body_p2s_require_individual_dispositions() -> None:
+    reviews = [
+        ReviewSubmission(
+            review_id=123,
+            author="review-bot",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-07-28T00:00:00Z",
+            body="[P2] First edge case.\n\n[P2] Second edge case.",
+        )
+    ]
+    ledger = overlay_backstop_evidence(
+        _ledger_with_local_result(),
+        threads=[],
+        deferrals={
+            "review:123:1": {
+                "reason": "First has no supported-path reproduction.",
+            }
+        },
+        reviews=reviews,
+        reviewer_count=1,
+    )
+
+    report = evaluate(policy=_policy(), ledger=ledger)
+
+    assert not report.settled
+    assert len(ledger.current_findings) == 2
+    assert {
+        finding.disposition for finding in ledger.current_findings
+    } == {Disposition.DEFER, None}

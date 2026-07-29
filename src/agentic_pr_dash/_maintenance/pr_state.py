@@ -70,12 +70,9 @@ def _login_key(login: str) -> str:
     while REST serializes the same identity as ``<name>[bot]``, and logins are
     case-insensitive — normalize both spellings so a configured bot author
     matches its REST payload."""
-    login = login.strip()
-    if login.startswith("app/"):
-        login = login[len("app/"):]
-    if login.endswith("[bot]"):
-        login = login[: -len("[bot]")]
-    return login.lower()
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    return github_api._login_key(login)
 
 
 def _payload_author_login(raw: dict) -> str:

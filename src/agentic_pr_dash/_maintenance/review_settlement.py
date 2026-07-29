@@ -103,6 +103,44 @@ def finding_from_thread(
     )
 
 
+def findings_from_review_submission(
+    review,
+    *,
+    repository: str,
+    head_sha: str,
+    reviewer_execution_id: str,
+) -> list[Finding]:
+    """Translate each declared P1/P2 in a top-level GitHub review body."""
+
+    declared_lines = [
+        (line.strip(), match)
+        for line in review.body.splitlines()
+        if (match := _SEVERITY_PREFIX.match(line.strip()))
+    ]
+    return [
+        Finding(
+            repository=repository,
+            head_sha=head_sha,
+            reviewer_execution_id=reviewer_execution_id,
+            reviewer_provider=review.author or None,
+            severity=(
+                Severity.P1
+                if match.group(1).upper() == "P1"
+                else Severity.P2
+            ),
+            title=_thread_title(line),
+            explanation=line,
+            path=".github/pull-request",
+            invariant=f"Review declaration {ordinal}: {line}",
+            evidence=(
+                f"GitHub top-level review {review.review_id}; "
+                f"declaration {ordinal}"
+            ),
+        )
+        for ordinal, (line, match) in enumerate(declared_lines, start=1)
+    ]
+
+
 def finding_from_review_submission(
     review,
     *,
@@ -110,33 +148,15 @@ def finding_from_review_submission(
     head_sha: str,
     reviewer_execution_id: str,
 ) -> Finding | None:
-    """Translate a declared P1/P2 in a top-level GitHub review body."""
+    """Compatibility helper for callers expecting one declared finding."""
 
-    declared_lines = [
-        (line.strip(), match)
-        for line in review.body.splitlines()
-        if (match := _SEVERITY_PREFIX.match(line.strip()))
-    ]
-    if not declared_lines:
-        return None
-    first_line, _ = declared_lines[0]
-    severity = (
-        Severity.P1
-        if any(match.group(1).upper() == "P1" for _, match in declared_lines)
-        else Severity.P2
-    )
-    return Finding(
+    findings = findings_from_review_submission(
+        review,
         repository=repository,
         head_sha=head_sha,
         reviewer_execution_id=reviewer_execution_id,
-        reviewer_provider=review.author or None,
-        severity=severity,
-        title=_thread_title(first_line),
-        explanation=review.body,
-        path=".github/pull-request",
-        invariant=review.body,
-        evidence=f"GitHub top-level review {review.review_id}",
     )
+    return findings[0] if findings else None
 
 
 def _github_execution_id(head_sha: str, threads: Sequence) -> str:
@@ -202,16 +222,21 @@ def overlay_backstop_evidence(
                 qualifies_for_slot=True,
             ),
         )
-        body_finding = finding_from_review_submission(
+        body_findings = findings_from_review_submission(
             review,
             repository=overlaid.repository,
             head_sha=overlaid.head_sha,
             reviewer_execution_id=execution_id,
         )
-        if body_finding is not None:
-            evidence.findings.append(body_finding)
+        evidence.findings.extend(body_findings)
+        for ordinal, body_finding in enumerate(body_findings, start=1):
+            disposition_key = (
+                f"review:{review.review_id}"
+                if len(body_findings) == 1
+                else f"review:{review.review_id}:{ordinal}"
+            )
             evidence.disposition_keys.append(
-                (f"review:{review.review_id}", body_finding.fingerprint)
+                (disposition_key, body_finding.fingerprint)
             )
 
     current_review_ids = {review.review_id for review in reviews}
