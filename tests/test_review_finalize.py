@@ -12,6 +12,7 @@ from agentic_pr_dash._maintenance.review_settlement import (
     evaluate_pr_snapshot,
 )
 from agentic_pr_dash.models import CICheck, PRData
+from agentic_pr_dash.github_api import ReviewSubmission
 
 REPOSITORY = "Boundless-Studios/agentic-pr-dash"
 HEAD = "a" * 40
@@ -145,6 +146,32 @@ def test_missing_reviewer_result_blocks() -> None:
 
     assert not observation.clean
     assert observation.review.missing_slots == ["backstop:1"]
+
+
+def test_live_current_head_review_satisfies_missing_backstop_result() -> None:
+    ledger = _ledger()
+    ledger.results = [
+        result for result in ledger.results if result.stage is ReviewStage.LOCAL
+    ]
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[],
+        deferrals={},
+        review_submissions=[
+            ReviewSubmission(
+                review_id=321,
+                author="review-bot",
+                state="COMMENTED",
+                commit_id=HEAD,
+                submitted_at="2026-07-28T00:00:00Z",
+            )
+        ],
+    )
+
+    assert observation.clean
 
 
 def test_unevaluated_p2_blocks_and_deferral_settles() -> None:

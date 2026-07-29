@@ -157,6 +157,48 @@ def overlay_github_findings(
     return overlaid
 
 
+def overlay_backstop_results(
+    ledger: ReviewLedger,
+    *,
+    reviews: Sequence,
+    reviewer_count: int,
+) -> ReviewLedger:
+    """Project current-head GitHub review submissions into backstop slots."""
+
+    overlaid = ledger.model_copy(deep=True)
+    existing_results = [
+        result
+        for result in overlaid.results
+        if not result.stale and result.stage is ReviewStage.BACKSTOP
+    ]
+    occupied_slots = {result.slot_number for result in existing_results}
+    execution_ids = {
+        result.reviewer_execution_id for result in existing_results
+    }
+    available_slots = [
+        slot_number
+        for slot_number in range(1, reviewer_count + 1)
+        if slot_number not in occupied_slots
+    ]
+    for review, slot_number in zip(reviews, available_slots, strict=False):
+        execution_id = f"github-review-{review.review_id}"
+        if execution_id in execution_ids:
+            continue
+        overlaid.submit(
+            ReviewResult(
+                repository=overlaid.repository,
+                head_sha=overlaid.head_sha,
+                stage=ReviewStage.BACKSTOP,
+                round_number=1,
+                slot_number=slot_number,
+                reviewer_execution_id=execution_id,
+                reviewer_provider=review.author,
+            )
+        )
+        execution_ids.add(execution_id)
+    return overlaid
+
+
 def _append_once(items: list[str], item: str) -> None:
     if item not in items:
         items.append(item)
@@ -169,6 +211,7 @@ def evaluate_pr_snapshot(
     ledger: ReviewLedger,
     threads: Sequence,
     deferrals: Mapping[str, Mapping[str, object]],
+    review_submissions: Sequence = (),
 ) -> FinalizationObservation:
     """Combine one live PR snapshot with provider-neutral review settlement."""
 
@@ -214,6 +257,11 @@ def evaluate_pr_snapshot(
         ledger,
         threads=current_threads,
         deferrals=deferrals,
+    )
+    settled_ledger = overlay_backstop_results(
+        settled_ledger,
+        reviews=review_submissions,
+        reviewer_count=policy.review.backstop.reviewer_count,
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
     return FinalizationObservation(

@@ -515,3 +515,55 @@ def test_get_review_threads_later_page_malformed_raises(monkeypatch):
     monkeypatch.setattr(github_api, "_run", fake_run)
     with pytest.raises(RuntimeError, match="partial thread list"):
         github_api.get_review_threads(5, ".")
+
+
+def test_get_review_submissions_returns_only_current_head_reviews(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    payload = [
+        [
+            {
+                "id": 101,
+                "user": {"login": "review-bot"},
+                "state": "COMMENTED",
+                "commit_id": "a" * 40,
+                "submitted_at": "2026-07-28T00:00:00Z",
+            },
+            {
+                "id": 102,
+                "user": {"login": "review-bot"},
+                "state": "APPROVED",
+                "commit_id": "b" * 40,
+                "submitted_at": "2026-07-28T00:01:00Z",
+            },
+            {
+                "id": 103,
+                "user": {"login": "review-bot"},
+                "state": "PENDING",
+                "commit_id": "a" * 40,
+                "submitted_at": None,
+            },
+        ]
+    ]
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: _cp(json.dumps(payload)),
+    )
+
+    reviews = github_api.get_review_submissions(24, "a" * 40, ".")
+
+    assert [(review.review_id, review.author) for review in reviews] == [
+        (101, "review-bot")
+    ]
+
+
+def test_get_review_submissions_strict_failure_raises(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: _cp("", returncode=1),
+    )
+
+    with pytest.raises(RuntimeError, match="review submissions"):
+        github_api.get_review_submissions(24, "a" * 40, ".", strict=True)
