@@ -223,7 +223,7 @@ def overlay_backstop_evidence(
     evidence_by_execution: dict[str, _BackstopEvidence] = {}
 
     for review in reviews:
-        execution_id = f"github-review-{review.review_id}"
+        execution_id = f"github-{review.source}-{review.review_id}"
         evidence = evidence_by_execution.setdefault(
             execution_id,
             _BackstopEvidence(

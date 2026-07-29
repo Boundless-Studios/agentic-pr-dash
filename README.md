@@ -205,7 +205,12 @@ and `agent-review-coordinator` records their results and finding dispositions.
 The dashboard adds live GitHub, CI, mergeability, and change-request state. A
 completed GitHub review submitted against the current head supplies a configured
 backstop slot; PR-author, stale-head, pending, or malformed review records do
-not.
+not. Codex's clean-result issue-comment format is adapted into the same evidence
+contract because GitHub does not expose that outcome as a formal review
+submission. This compatibility adapter does not select or require Codex; other
+reviewers continue to qualify through ordinary GitHub reviews. The adapter
+trusts only the Codex GitHub App identity and resolves its short reviewed-commit
+SHA through GitHub before matching the immutable PR head.
 
 ```bash
 agentic-pr-dash finalize \
