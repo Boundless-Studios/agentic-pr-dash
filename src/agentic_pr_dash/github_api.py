@@ -52,6 +52,15 @@ WEEKLY_RUNNER_JOB_FETCH_WORKERS = 8
 WEEKLY_RUNNER_RUN_QUERY_DAYS = 1
 RUNNER_SUMMARY_CACHE = Path.home() / ".cache" / "agentic-pr-dash" / "runner-summary.json"
 _RUN_ID_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/actions/runs/(\d+)(?:[/?#]|$)")
+_CODEX_CLEAN_REVIEW_RE = re.compile(
+    r"^\s*Codex Review:\s*Didn't find any major issues\.\s*(?::rocket:|🚀)?",
+    re.IGNORECASE,
+)
+_CODEX_REVIEW_AUTHOR_KEY = "chatgpt-codex-connector"
+_REVIEWED_COMMIT_RE = re.compile(
+    r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{7,40})`",
+    re.IGNORECASE,
+)
 
 _REVIEW_THREADS_QUERY = """
 query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
@@ -122,6 +131,7 @@ class ReviewSubmission:
     commit_id: str
     submitted_at: str
     body: str = ""
+    source: str = "review"
 
 
 def _login_key(login: str) -> str:
@@ -1680,13 +1690,18 @@ def get_review_submissions(
     excluded_authors: set[str] | None = None,
     strict: bool = False,
 ) -> list[ReviewSubmission]:
-    """Return completed GitHub reviews submitted against ``head_sha``.
+    """Return completed GitHub review evidence against ``head_sha``.
 
     The review coordinator requires affirmative evidence that the configured
     backstop ran for the immutable head. Review threads alone cannot provide
-    that evidence because a clean review legitimately creates no thread.
+    that evidence because a clean review legitimately creates no thread. Most
+    providers create a formal review submission; Codex reports a clean review
+    as a top-level issue comment, so that explicit completion format is adapted
+    into the same provider-neutral result.
     Completion gates use ``strict=True`` so an unavailable or malformed reviews
-    response cannot synthesize a satisfied backstop slot.
+    response cannot synthesize a satisfied backstop slot. The optional Codex
+    comment adapter fails to absent evidence instead of making Issues-read
+    permission mandatory.
     """
 
     owner, repo = get_repo_info(cwd)
@@ -1785,9 +1800,113 @@ def get_review_submissions(
             ) from exc
         return []
 
+    comments_result = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{owner}/{repo}/issues/{pr_number}/comments",
+            "--paginate",
+            "--slurp",
+        ],
+        cwd=cwd,
+        timeout_s=30,
+    )
+    if comments_result.returncode != 0:
+        return sorted(
+            submissions,
+            key=lambda review: (
+                review.submitted_at,
+                review.source,
+                review.review_id,
+            ),
+        )
+
+    try:
+        comments_payload = json.loads(comments_result.stdout)
+        if not isinstance(comments_payload, list):
+            raise TypeError("issue comment response is not a list")
+        comment_pages = (
+            comments_payload
+            if not comments_payload or isinstance(comments_payload[0], list)
+            else [comments_payload]
+        )
+        for page in comment_pages:
+            if not isinstance(page, list):
+                raise TypeError("issue comment page is not a list")
+            for item in page:
+                if not isinstance(item, dict):
+                    raise TypeError("issue comment record is not an object")
+                user = item.get("user")
+                author = user.get("login") if isinstance(user, dict) else None
+                if (
+                    not isinstance(author, str)
+                    or _login_key(author) != _CODEX_REVIEW_AUTHOR_KEY
+                ):
+                    continue
+                body = item.get("body")
+                if not isinstance(body, str) or not _CODEX_CLEAN_REVIEW_RE.match(body):
+                    continue
+                reviewed_commit = _REVIEWED_COMMIT_RE.search(body)
+                if reviewed_commit is None:
+                    continue
+                commit_prefix = reviewed_commit.group(1).lower()
+                if not head_sha.lower().startswith(commit_prefix):
+                    continue
+                if commit_prefix != head_sha.lower():
+                    commit_result = _run(
+                        [
+                            "gh",
+                            "api",
+                            f"repos/{owner}/{repo}/commits/{commit_prefix}",
+                        ],
+                        cwd=cwd,
+                        timeout_s=30,
+                    )
+                    if commit_result.returncode != 0:
+                        continue
+                    try:
+                        commit_payload = json.loads(commit_result.stdout)
+                        resolved_commit = (
+                            commit_payload.get("sha")
+                            if isinstance(commit_payload, dict)
+                            else None
+                        )
+                    except json.JSONDecodeError:
+                        continue
+                    if resolved_commit != head_sha:
+                        continue
+                submitted_at = item.get("created_at")
+                comment_id = item.get("id")
+                malformed = (
+                    not isinstance(submitted_at, str)
+                    or not submitted_at
+                    or type(comment_id) is not int
+                )
+                if malformed:
+                    continue
+                if _login_key(author) in excluded:
+                    continue
+                submissions.append(
+                    ReviewSubmission(
+                        review_id=comment_id,
+                        author=author,
+                        state="COMMENTED",
+                        commit_id=head_sha,
+                        submitted_at=submitted_at,
+                        body="",
+                        source="issue-comment",
+                    )
+                )
+    except (json.JSONDecodeError, TypeError):
+        pass
+
     return sorted(
         submissions,
-        key=lambda review: (review.submitted_at, review.review_id),
+        key=lambda review: (
+            review.submitted_at,
+            review.source,
+            review.review_id,
+        ),
     )
 
 

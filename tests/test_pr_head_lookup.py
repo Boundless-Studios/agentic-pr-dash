@@ -572,6 +572,226 @@ def test_get_review_submissions_returns_only_current_head_reviews(monkeypatch):
     ]
 
 
+def test_get_review_submissions_includes_current_head_codex_clean_comment(
+    monkeypatch,
+):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    head_sha = "2be2b15baee1c82ecef3b791180cd5ca34f9c13c"
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")),
+            "",
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(json.dumps([[]]))
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "id": 5117824708,
+                                "user": {
+                                    "login": "chatgpt-codex-connector[bot]",
+                                },
+                                "created_at": "2026-07-29T12:30:00Z",
+                                "body": (
+                                    "Codex Review: Didn't find any major issues. "
+                                    ":rocket:\n\n"
+                                    "**Reviewed commit:** `aaaaaaaaaa`\n"
+                                ),
+                            },
+                            {
+                                "id": 5117824709,
+                                "user": {"login": "pr-author"},
+                                "created_at": "2026-07-29T12:31:00Z",
+                                "body": (
+                                    "Codex Review: Didn't find any major issues. "
+                                    ":rocket:\n\n"
+                                    "**Reviewed commit:** `2be2b15bae`\n"
+                                ),
+                            },
+                            {
+                                "id": 5117824710,
+                                "user": {"login": "another-bot"},
+                                "created_at": "2026-07-29T12:32:00Z",
+                                "body": (
+                                    "Codex Review: Didn't find any major issues. "
+                                    ":rocket:\n\n"
+                                    "**Reviewed commit:** `2be2b15bae`\n"
+                                ),
+                            },
+                            {
+                                "id": 5117824711,
+                                "user": {
+                                    "login": "chatgpt-codex-connector[bot]",
+                                },
+                                "created_at": "2026-07-29T12:36:36Z",
+                                "body": (
+                                    "Codex Review: Didn't find any major issues. "
+                                    ":rocket:\n\n"
+                                    "**Reviewed commit:** `2be2b15bae`\n"
+                                ),
+                            }
+                        ]
+                    ]
+                )
+            )
+        if endpoint.endswith("/commits/2be2b15bae"):
+            return _cp(json.dumps({"sha": head_sha}))
+        raise AssertionError(f"unexpected gh invocation: {cmd}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    reviews = github_api.get_review_submissions(
+        24,
+        head_sha,
+        ".",
+        excluded_authors={"pr-author"},
+        strict=True,
+    )
+
+    assert [
+        (
+            review.review_id,
+            review.author,
+            review.commit_id,
+            review.body,
+            review.source,
+        )
+        for review in reviews
+    ] == [
+        (
+            5117824711,
+            "chatgpt-codex-connector[bot]",
+            head_sha,
+            "",
+            "issue-comment",
+        )
+    ]
+
+
+def test_get_review_submissions_rejects_prefix_resolving_to_another_commit(
+    monkeypatch,
+):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    head_sha = "abcdef1234" + ("0" * 30)
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")),
+            "",
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(json.dumps([[]]))
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "id": 5117824711,
+                                "user": {
+                                    "login": "chatgpt-codex-connector[bot]",
+                                },
+                                "created_at": "2026-07-29T12:36:36Z",
+                                "body": (
+                                    "Codex Review: Didn't find any major issues. "
+                                    ":rocket:\n\n"
+                                    "**Reviewed commit:** `abcdef1234`\n"
+                                ),
+                            }
+                        ]
+                    ]
+                )
+            )
+        if endpoint.endswith("/commits/abcdef1234"):
+            return _cp(json.dumps({"sha": "abcdef1234" + ("f" * 30)}))
+        raise AssertionError(f"unexpected gh invocation: {cmd}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    reviews = github_api.get_review_submissions(
+        24,
+        head_sha,
+        ".",
+        strict=True,
+    )
+
+    assert reviews == []
+
+
+def test_get_review_submissions_keeps_formal_reviews_when_comments_unavailable(
+    monkeypatch,
+):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    head_sha = "a" * 40
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")),
+            "",
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "id": 101,
+                                "user": {"login": "review-bot"},
+                                "state": "COMMENTED",
+                                "commit_id": head_sha,
+                                "submitted_at": "2026-07-28T00:00:00Z",
+                                "body": "",
+                            }
+                        ]
+                    ]
+                )
+            )
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp("", returncode=1)
+        raise AssertionError(f"unexpected gh invocation: {cmd}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    reviews = github_api.get_review_submissions(
+        24,
+        head_sha,
+        ".",
+        strict=True,
+    )
+
+    assert [review.review_id for review in reviews] == [101]
+
+
+def test_get_review_submissions_treats_unavailable_comments_as_no_evidence(
+    monkeypatch,
+):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            (part for part in cmd if isinstance(part, str) and part.startswith("repos/")),
+            "",
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(json.dumps([[]]))
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp("", returncode=1)
+        raise AssertionError(f"unexpected gh invocation: {cmd}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    assert github_api.get_review_submissions(
+        24,
+        "a" * 40,
+        ".",
+        strict=True,
+    ) == []
+
+
 def test_get_review_submissions_excludes_pr_author(monkeypatch):
     monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
     payload = [
