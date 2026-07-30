@@ -194,6 +194,10 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
     return False
 
 
+class _NoOpenPR(RuntimeError):
+    """The requested branch or PR has no open pull request to finalize."""
+
+
 def _observe_finalization(args, policy, ledger):
     """Read one fail-closed PR/CI/review snapshot for ``finalize``."""
 
@@ -210,7 +214,7 @@ def _observe_finalization(args, policy, ledger):
     if pr is _GH_UNAVAILABLE:
         raise RuntimeError(_gh_unavailable_message(cwd))
     if pr is None:
-        raise RuntimeError("no open PR for this branch")
+        raise _NoOpenPR("no open PR for this branch")
 
     repository = pr.repo or _repo_slug(cwd)
     pr = pr.model_copy(update={"repo": repository}, deep=True)
@@ -271,18 +275,7 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
             if pr is _GH_UNAVAILABLE:
                 raise RuntimeError(_gh_unavailable_message(cwd))
             if pr is None:
-                if args.json:
-                    print(
-                        json.dumps(
-                            {
-                                "settled": True,
-                                "reason": "no_open_pr",
-                            }
-                        )
-                    )
-                else:
-                    print("no open PR for this branch")
-                return 0
+                raise _NoOpenPR("no open PR for this branch")
             missing = {
                 "settled": False,
                 "blockers": ["review_ledger_missing"],
@@ -306,6 +299,19 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
         else:
             second = None
         report = combine_clean_observations(first, second)
+    except _NoOpenPR:
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "settled": True,
+                        "reason": "no_open_pr",
+                    }
+                )
+            )
+        else:
+            print("no open PR for this branch")
+        return 0
     except (OSError, RuntimeError, ValueError) as exc:
         if args.json:
             print(
