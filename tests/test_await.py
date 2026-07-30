@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import types
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -324,6 +325,7 @@ def test_update_await_coverage_persists_process_identity(tmp_path, monkeypatch):
         "AGENTIC_PR_DASH_WAITER_DIR",
         str(tmp_path / "waiters"),
     )
+    monkeypatch.setattr(_waiter_mod, "_proc_stat", lambda pid: None)
     monkeypatch.setattr(
         _waiter_mod.subprocess,
         "run",
@@ -341,6 +343,7 @@ def test_update_await_coverage_persists_process_identity(tmp_path, monkeypatch):
 
 def test_process_identity_uses_utc_timezone(monkeypatch):
     observed = {}
+    monkeypatch.setattr(_waiter_mod, "_proc_stat", lambda pid: None)
 
     def fake_run(command, **kwargs):
         observed.update(kwargs)
@@ -354,6 +357,58 @@ def test_process_identity_uses_utc_timezone(monkeypatch):
 
     assert _waiter_mod._process_identity("123") == "Mon Jul 27 19:34:56 2026"
     assert observed["env"]["TZ"] == "UTC"
+
+
+def test_process_identity_uses_linux_proc_start_token_without_ps(monkeypatch):
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_proc_stat",
+        lambda pid: "123 (waiter) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242",
+    )
+    monkeypatch.setattr(
+        _waiter_mod.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(FileNotFoundError()),
+    )
+
+    assert _waiter_mod._process_identity("123") == "proc:424242"
+
+
+def test_await_alive_rejects_zombie_with_matching_identity(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTIC_PR_DASH_WAITER_DIR", str(tmp_path / "waiters"))
+    _waiter_mod._write_await_pidfile(
+        "",
+        {
+            "pid": 123,
+            "session_id": SID,
+            "process_identity": "proc:424242",
+            "covered_roots": [str(tmp_path)],
+        },
+        SID,
+    )
+    monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(_waiter_mod, "_process_identity", lambda pid: "proc:424242")
+    monkeypatch.setattr(_waiter_mod, "_process_state", lambda pid: "Z")
+
+    assert _waiter_mod._await_alive(str(tmp_path), SID) is False
+
+
+def test_legacy_identity_rejects_ambiguous_same_second_successor(
+    tmp_path, monkeypatch
+):
+    pidfile = tmp_path / "waiter.json"
+    pidfile.write_text("{}", encoding="utf-8")
+    updated_at = datetime(
+        2026, 7, 27, 12, 34, 56, 900_000, tzinfo=UTC
+    ).timestamp()
+    os.utime(pidfile, (updated_at, updated_at))
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_process_identity",
+        lambda pid: "Mon Jul 27 12:34:56 2026",
+    )
+
+    assert _waiter_mod._legacy_process_predates_pidfile("123", str(pidfile)) is False
 
 
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):

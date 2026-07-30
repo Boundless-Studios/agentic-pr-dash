@@ -1,10 +1,11 @@
 """Background feedback waiter helpers."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 import json
 import os
 import subprocess
+from pathlib import Path
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _pid_alive
@@ -226,22 +227,76 @@ def _update_await_coverage(cwd: str, session_id: str, roots: list[str]) -> None:
     _write_await_pidfile(cwd, data, session_id)
 
 
+def _proc_stat(pid: int) -> str | None:
+    """Read Linux process metadata without depending on an external command."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    raw = _proc_stat(pid)
+    if raw is None:
+        return None
+    fields = raw.rpartition(")")[2].split()
+    try:
+        # /proc/<pid>/stat field 22; ``fields`` starts at field 3 (state).
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _process_state(pid_raw: str) -> str | None:
+    """Return a process state, preferring Linux procfs over ``ps``."""
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return None
+    raw = _proc_stat(pid)
+    if raw is not None:
+        fields = raw.rpartition(")")[2].split()
+        return fields[0] if fields else None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    states = result.stdout.strip().split()
+    return states[0] if states else None
+
+
 def _process_identity(pid_raw: str) -> str | None:
     """Return a stable start-time identity for a live process.
 
     ``kill(pid, 0)`` proves only that *some* process owns the pid. A waiter
     pidfile can survive a hard exit long enough for the OS to recycle that pid;
     the process start time distinguishes the successor without inspecting or
-    parsing its command text. ``ps -o lstart`` is supported by both BSD/macOS
-    and procps/Linux.
+    parsing its command text. Linux procfs exposes the kernel start tick
+    directly, with finer precision and no external-command dependency.
+    ``ps -o lstart`` remains the portable fallback for BSD/macOS.
     """
     try:
+        pid = int(pid_raw)
+        start_ticks = _proc_start_ticks(pid)
+        if start_ticks is not None:
+            return f"proc:{start_ticks}"
         result = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(int(pid_raw))],
+            ["ps", "-o", "lstart=", "-p", str(pid)],
             capture_output=True,
             env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
             text=True,
             timeout=5,
+            check=False,
         )
     except (ValueError, OSError, subprocess.TimeoutExpired):
         return None
@@ -257,11 +312,24 @@ def _legacy_process_predates_pidfile(pid_raw: str, path: str) -> bool:
     if identity is None:
         return False
     try:
-        started_at = datetime.strptime(
-            identity, "%a %b %d %H:%M:%S %Y"
-        ).replace(tzinfo=timezone.utc).timestamp()
+        if identity.startswith("proc:"):
+            start_ticks = int(identity.removeprefix("proc:"))
+            boot_line = next(
+                line for line in Path("/proc/stat").read_text().splitlines()
+                if line.startswith("btime ")
+            )
+            boot_time = int(boot_line.split()[1])
+            started_at = boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
+            coarse = False
+        else:
+            started_at = datetime.strptime(
+                identity, "%a %b %d %H:%M:%S %Y"
+            ).replace(tzinfo=UTC).timestamp()
+            coarse = True
         pidfile_updated_at = os.path.getmtime(path)
-    except (OSError, ValueError, OverflowError):
+    except (OSError, StopIteration, ValueError, OverflowError):
+        return False
+    if coarse and int(started_at) == int(pidfile_updated_at):
         return False
     return started_at <= pidfile_updated_at
 
@@ -289,6 +357,9 @@ def _await_alive(cwd: str, session_id: str) -> bool:
             and data.get("session_id") == session_id
             and _pid_alive(pid_raw)
         ):
+            continue
+        state = _process_state(pid_raw)
+        if state is not None and state.startswith("Z"):
             continue
         if isinstance(recorded_identity, str) and recorded_identity:
             if _process_identity(pid_raw) != recorded_identity:
