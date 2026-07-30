@@ -478,6 +478,46 @@ review:
     assert "no_open_pr" in capsys.readouterr().out
 
 
+def test_finalize_with_existing_ledger_is_noop_when_there_is_no_pr(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    policy_path = tmp_path / "review-policy.yaml"
+    policy_path.write_text(
+        """
+version: 1
+review:
+  local:
+    reviewer_count: 1
+  backstop:
+    reviewer_count: 1
+""".lstrip(),
+        encoding="utf-8",
+    )
+    ledger_path = tmp_path / "review-ledger.json"
+    ledger_path.write_text(_ledger().model_dump_json(), encoding="utf-8")
+    monkeypatch.setattr(
+        mc,
+        "_resolve_pr_for_branch",
+        lambda cwd, force=False: None,
+    )
+
+    rc = mc.main(
+        [
+            "finalize",
+            "--cwd",
+            str(tmp_path),
+            "--policy",
+            str(policy_path),
+            "--ledger",
+            str(ledger_path),
+            "--json",
+        ]
+    )
+
+    assert rc == 0
+    assert "no_open_pr" in capsys.readouterr().out
+
+
 def test_finalization_observation_fails_when_required_ci_is_unobservable(
     tmp_path, monkeypatch
 ) -> None:
