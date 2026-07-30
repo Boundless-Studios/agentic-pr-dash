@@ -1,8 +1,11 @@
 """Background feedback waiter helpers."""
 from __future__ import annotations
 
+from datetime import UTC, datetime
 import json
 import os
+import subprocess
+from pathlib import Path
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _pid_alive
@@ -214,9 +217,121 @@ def _update_await_coverage(cwd: str, session_id: str, roots: list[str]) -> None:
     ]
     data["pid"] = os.getpid()
     data["session_id"] = session_id
+    process_identity = _process_identity(str(os.getpid()))
+    if process_identity is None:
+        data.pop("process_identity", None)
+    else:
+        data["process_identity"] = process_identity
     data["covered_roots"] = covered
     data["requested_roots"] = requested
     _write_await_pidfile(cwd, data, session_id)
+
+
+def _proc_stat(pid: int) -> str | None:
+    """Read Linux process metadata without depending on an external command."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return None
+
+
+def _proc_start_ticks(pid: int) -> int | None:
+    raw = _proc_stat(pid)
+    if raw is None:
+        return None
+    fields = raw.rpartition(")")[2].split()
+    try:
+        # /proc/<pid>/stat field 22; ``fields`` starts at field 3 (state).
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def _process_state(pid_raw: str) -> str | None:
+    """Return a process state, preferring Linux procfs over ``ps``."""
+    try:
+        pid = int(pid_raw)
+    except ValueError:
+        return None
+    raw = _proc_stat(pid)
+    if raw is not None:
+        fields = raw.rpartition(")")[2].split()
+        return fields[0] if fields else None
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    states = result.stdout.strip().split()
+    return states[0] if states else None
+
+
+def _process_identity(pid_raw: str) -> str | None:
+    """Return a stable start-time identity for a live process.
+
+    ``kill(pid, 0)`` proves only that *some* process owns the pid. A waiter
+    pidfile can survive a hard exit long enough for the OS to recycle that pid;
+    the process start time distinguishes the successor without inspecting or
+    parsing its command text. Linux procfs exposes the kernel start tick
+    directly, with finer precision and no external-command dependency.
+    ``ps -o lstart`` remains the portable fallback for BSD/macOS.
+    """
+    try:
+        pid = int(pid_raw)
+        start_ticks = _proc_start_ticks(pid)
+        if start_ticks is not None:
+            return f"proc:{start_ticks}"
+        result = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            capture_output=True,
+            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"},
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    identity = result.stdout.strip()
+    return identity or None
+
+
+def _legacy_process_predates_pidfile(pid_raw: str, path: str) -> bool:
+    """Validate an identity-less pre-upgrade pidfile without command parsing."""
+    identity = _process_identity(pid_raw)
+    if identity is None:
+        return False
+    try:
+        if identity.startswith("proc:"):
+            start_ticks = int(identity.removeprefix("proc:"))
+            boot_line = next(
+                line for line in Path("/proc/stat").read_text().splitlines()
+                if line.startswith("btime ")
+            )
+            boot_time = int(boot_line.split()[1])
+            started_at = boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
+        else:
+            started_at = datetime.strptime(
+                identity, "%a %b %d %H:%M:%S %Y"
+            ).replace(tzinfo=UTC).timestamp()
+        pidfile_updated_at = os.path.getmtime(path)
+    except (OSError, StopIteration, ValueError, OverflowError):
+        return False
+    # Both epoch anchors are only trustworthy to one second: ``ps lstart``
+    # omits subsecond precision, while Linux ``btime`` is a whole-second value
+    # even though the relative start tick is finer. Require a full second of
+    # separation so an uncertain recycled successor cannot inherit the file.
+    return started_at + 1.0 <= pidfile_updated_at
 
 
 def _await_alive(cwd: str, session_id: str) -> bool:
@@ -233,16 +348,29 @@ def _await_alive(cwd: str, session_id: str) -> bool:
                 data = json.load(fh)
         except (OSError, ValueError):
             continue
-        if (
+        pid_raw = str(data.get("pid", "")) if isinstance(data, dict) else ""
+        recorded_identity = (
+            data.get("process_identity") if isinstance(data, dict) else None
+        )
+        if not (
             isinstance(data, dict)
             and data.get("session_id") == session_id
-            and _pid_alive(str(data.get("pid", "")))
+            and _pid_alive(pid_raw)
         ):
-            if path != session_path:
-                return True
-            if _covered_or_requested(data, cwd):
-                return True
-            return _request_waiter_coverage(cwd, session_id)
+            continue
+        state = _process_state(pid_raw)
+        if state is not None and state.startswith("Z"):
+            continue
+        if isinstance(recorded_identity, str) and recorded_identity:
+            if _process_identity(pid_raw) != recorded_identity:
+                continue
+        elif not _legacy_process_predates_pidfile(pid_raw, path):
+            continue
+        if path != session_path:
+            return True
+        if _covered_or_requested(data, cwd):
+            return True
+        return _request_waiter_coverage(cwd, session_id)
     return False
 
 

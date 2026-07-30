@@ -79,11 +79,24 @@ def test_await_alive_session_a_not_affected_by_session_b_waiter(tmp_path, monkey
     sid_a = "sess-alive-A"
     sid_b = "sess-alive-B"
 
-    mc._write_await_pidfile(str(tmp_path), {"pid": 3001, "session_id": sid_a}, sid_a)
-    mc._write_await_pidfile(str(tmp_path), {"pid": 3002, "session_id": sid_b}, sid_b)
+    mc._write_await_pidfile(
+        str(tmp_path),
+        {"pid": 3001, "session_id": sid_a, "process_identity": "start-a"},
+        sid_a,
+    )
+    mc._write_await_pidfile(
+        str(tmp_path),
+        {"pid": 3002, "session_id": sid_b, "process_identity": "start-b"},
+        sid_b,
+    )
 
     # Both pids alive
     monkeypatch.setattr(_waiter_mod, "_pid_alive", lambda p: True)
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_process_identity",
+        lambda p: {"3001": "start-a", "3002": "start-b"}[str(p)],
+    )
 
     assert mc._await_alive(str(tmp_path), sid_a) is True
     assert mc._await_alive(str(tmp_path), sid_b) is True

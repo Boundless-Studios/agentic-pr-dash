@@ -19,19 +19,34 @@ import pytest
 from agentic_pr_dash._maintenance import waiter
 
 SID = "sess-1924"
+PROCESS_IDENTITY = "Mon Jul 27 12:34:56 2026"
 
 
 @pytest.fixture(autouse=True)
 def _isolate_ledger(tmp_path, monkeypatch):
     # session_ledger._DEFAULT_DIR is frozen at import, so isolate per test.
     monkeypatch.setenv("GAIA_PR_LEDGER_DIR", str(tmp_path / "ledger"))
+    # These tests use the pytest process as a stand-in for a live waiter. The
+    # process-identity behavior itself is covered by test_await.py.
+    monkeypatch.setattr(
+        waiter,
+        "_process_identity",
+        lambda pid: PROCESS_IDENTITY,
+    )
 
 
 def _write_session_pidfile(session_id: str, pid: int, **extra) -> None:
     p = Path(waiter._await_pidfile("", session_id))
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(
-        json.dumps({"pid": pid, "session_id": session_id, **extra}),
+        json.dumps(
+            {
+                "pid": pid,
+                "session_id": session_id,
+                "process_identity": PROCESS_IDENTITY,
+                **extra,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -138,4 +153,26 @@ def test_await_alive_legacy_per_worktree_pidfile_honored(tmp_path):
     legacy.write_text(
         json.dumps({"pid": os.getpid(), "session_id": SID}), encoding="utf-8"
     )
+    assert waiter._await_alive(str(wt), SID) is True
+
+
+def test_await_alive_identityless_session_pidfile_honored_during_upgrade(tmp_path):
+    """A pre-upgrade waiter may already use the session-scoped path while still
+    writing the old identity-less payload. Its start time must be validated
+    against the pidfile mtime just like the legacy per-worktree format."""
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    session = Path(waiter._await_pidfile("", SID))
+    session.parent.mkdir(parents=True, exist_ok=True)
+    session.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "session_id": SID,
+                "covered_roots": [str(wt)],
+            }
+        ),
+        encoding="utf-8",
+    )
+
     assert waiter._await_alive(str(wt), SID) is True

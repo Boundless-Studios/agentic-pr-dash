@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from agentic_pr_dash import config, github_api, maintenance_check as mc
+from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 
@@ -176,8 +177,20 @@ def test_await_emits_deferred_outcome_on_single_instance_exit_3(tmp_path, monkey
     live_pid = os.getpid()
     path = Path(mc._await_pidfile(str(tmp_path), SID))
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"pid": live_pid, "session_id": SID}), encoding="utf-8")
+    path.write_text(
+        json.dumps(
+            {
+                "pid": live_pid,
+                "session_id": SID,
+                "process_identity": "test-start",
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: str(pid) == str(live_pid))
+    monkeypatch.setattr(
+        _waiter_mod, "_process_identity", lambda pid: "test-start"
+    )
 
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "1"])
