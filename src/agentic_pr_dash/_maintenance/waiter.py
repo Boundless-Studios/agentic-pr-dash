@@ -320,18 +320,18 @@ def _legacy_process_predates_pidfile(pid_raw: str, path: str) -> bool:
             )
             boot_time = int(boot_line.split()[1])
             started_at = boot_time + start_ticks / os.sysconf("SC_CLK_TCK")
-            coarse = False
         else:
             started_at = datetime.strptime(
                 identity, "%a %b %d %H:%M:%S %Y"
             ).replace(tzinfo=UTC).timestamp()
-            coarse = True
         pidfile_updated_at = os.path.getmtime(path)
     except (OSError, StopIteration, ValueError, OverflowError):
         return False
-    if coarse and int(started_at) == int(pidfile_updated_at):
-        return False
-    return started_at <= pidfile_updated_at
+    # Both epoch anchors are only trustworthy to one second: ``ps lstart``
+    # omits subsecond precision, while Linux ``btime`` is a whole-second value
+    # even though the relative start tick is finer. Require a full second of
+    # separation so an uncertain recycled successor cannot inherit the file.
+    return started_at + 1.0 <= pidfile_updated_at
 
 
 def _await_alive(cwd: str, session_id: str) -> bool:

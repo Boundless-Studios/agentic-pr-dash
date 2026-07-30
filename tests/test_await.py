@@ -411,6 +411,27 @@ def test_legacy_identity_rejects_ambiguous_same_second_successor(
     assert _waiter_mod._legacy_process_predates_pidfile("123", str(pidfile)) is False
 
 
+def test_legacy_identity_rejects_proc_start_within_boot_anchor_uncertainty(
+    tmp_path, monkeypatch
+):
+    pidfile = tmp_path / "waiter.json"
+    pidfile.write_text("{}", encoding="utf-8")
+    os.utime(pidfile, (1000.9, 1000.9))
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_process_identity",
+        lambda pid: "proc:50",
+    )
+    monkeypatch.setattr(
+        _waiter_mod.Path,
+        "read_text",
+        lambda path: "btime 1000\n",
+    )
+    monkeypatch.setattr(_waiter_mod.os, "sysconf", lambda name: 100)
+
+    assert _waiter_mod._legacy_process_predates_pidfile("123", str(pidfile)) is False
+
+
 def test_await_max_wait_expiry_exit_0(tmp_path, monkeypatch, capsys):
     """When --max-wait 0 and nothing pending, exits 0."""
     monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
