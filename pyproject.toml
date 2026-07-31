@@ -35,7 +35,7 @@ dependencies = [
     # Additive for us: ``StaleClaimError`` gains ``current_claim_id`` and the
     # claimed event gains ``superseded_claim_ids``; no signature we call changed.
     #
-    # ``853a40c`` is agent-coordinator 0.4.0 (BOU-2039): the durable human-decision
+    # v0.4.0 (BOU-2039) added the durable human-decision
     # protocol this package's decision-wait path is built on —
     # ``request_decision`` / ``resolve_decision`` / ``decision_status`` /
     # ``pending_decisions`` / ``resume_task``, plus ``DecisionPendingError`` on a
@@ -43,10 +43,11 @@ dependencies = [
     # signature is unchanged, and a ledger written by 0.3.2 reads back cleanly
     # (no decision events -> no decisions).
     #
-    # Gaia pins this same package (BOU-2228). uv cannot resolve two different git
-    # revs for one package, so gaia's harness pin cannot move past the v0.3.2-based
-    # harness until this bump lands and APD_REF follows it.
-    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@853a40c0c9d0567855ef52a2ae8f814cef443b6a",
+    # v0.5.0 (BOU-2710) adds the fenced local-command lease runner. The existing
+    # claim and decision APIs remain additive and unchanged. Gaia, this package,
+    # and agent-session-harness intentionally share this exact immutable tag
+    # because uv cannot resolve two revisions of one git dependency.
+    "agent-coordinator @ git+https://github.com/Boundless-Studios/agent-coordinator.git@v0.5.0",
 ]
 
 [project.optional-dependencies]
