@@ -148,6 +148,49 @@ def test_missing_reviewer_result_blocks() -> None:
     assert observation.review.missing_slots == ["backstop:1"]
 
 
+def test_draft_pr_does_not_require_backstop_settlement() -> None:
+    ledger = _ledger()
+    ledger.results = [
+        result for result in ledger.results if result.stage is ReviewStage.LOCAL
+    ]
+
+    observation = _observation(pr=_pr(is_draft=True), ledger=ledger)
+
+    assert observation.clean
+    assert observation.review.settled
+    assert observation.review.missing_slots == []
+
+
+def test_draft_pr_ignores_ship_readiness_blockers() -> None:
+    observation = _observation(
+        pr=_pr(
+            is_draft=True,
+            merge_state="DIRTY",
+            mergeable="CONFLICTING",
+            review_decision="CHANGES_REQUESTED",
+            ci_checks=[
+                CICheck(
+                    name="tests",
+                    status="completed",
+                    conclusion="failure",
+                )
+            ],
+        )
+    )
+
+    assert observation.clean
+
+
+def test_draft_pr_still_requires_local_review_result() -> None:
+    ledger = _ledger()
+    ledger.results = []
+
+    observation = _observation(pr=_pr(is_draft=True), ledger=ledger)
+
+    assert not observation.clean
+    assert observation.review.missing_slots == ["local:1"]
+
+
 def test_live_current_head_review_satisfies_missing_backstop_result() -> None:
     ledger = _ledger()
     ledger.results = [
