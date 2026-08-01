@@ -242,3 +242,83 @@ def test_one_pr_enrichment_error_does_not_drop_the_others(monkeypatch, _base_stu
     assert any(
         "Enrichment failed for PR #2" in e.message for e in orch.events
     )
+
+
+def test_refresh_primes_one_repo_batch_before_per_pr_enrichment(
+    monkeypatch, _base_stubs
+):
+    raw_prs = [
+        _raw_pr(i, "org/anchor-repo", branch=f"feature/{i}") for i in range(1, 6)
+    ]
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: raw_prs)
+    monkeypatch.setattr(
+        github_api, "get_repo_info", lambda cwd=None: ("org", "anchor-repo")
+    )
+    calls: list[tuple[str, object]] = []
+
+    def fake_batch(owner, repo, numbers, cwd=None):
+        calls.append(("batch", (owner, repo, tuple(numbers), cwd)))
+        return {
+            number: {
+                "latest_commit": (f"sha-{number}", "2026-06-11T12:00:00Z"),
+                "ci_checks": [],
+                "threads": [],
+                "required_pending": False,
+                "head_sha": f"sha-{number}",
+                "merge_state": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "review_decision": "none",
+            }
+            for number in numbers
+        }
+
+    monkeypatch.setattr(github_api, "batch_fetch_pr_review_and_ci", fake_batch)
+    monkeypatch.setattr(
+        github_api,
+        "prime_pr_batch_cache",
+        lambda repo, entries, cwd=None: calls.append(
+            ("prime", (repo, tuple(entries), cwd))
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "clear_pr_batch_cache",
+        lambda: calls.append(("clear", None)),
+    )
+
+    orch = orchestrator.Orchestrator(repo_cwd=ANCHOR_ROOT)
+    asyncio.run(orch.refresh_prs())
+
+    assert calls == [
+        ("clear", None),
+        ("batch", ("org", "anchor-repo", (1, 2, 3, 4, 5), ANCHOR_ROOT)),
+        ("prime", ("org/anchor-repo", (1, 2, 3, 4, 5), ANCHOR_ROOT)),
+    ]
+
+
+def test_primed_repo_path_avoids_per_pr_repo_detection(monkeypatch, tmp_path):
+    from agentic_pr_dash import config
+
+    github_api.clear_pr_batch_cache()
+    github_api.prime_pr_batch_cache(
+        "org/anchor-repo",
+        {
+            7: {
+                "latest_commit": ("sha-7", "2026-06-11T12:00:00Z"),
+                "ci_checks": [],
+                "threads": [],
+            }
+        },
+        cwd=str(tmp_path),
+    )
+    monkeypatch.setattr(
+        config,
+        "_detect_repo",
+        lambda _cwd: (_ for _ in ()).throw(
+            AssertionError("primed access must not invoke gh repo detection")
+        ),
+    )
+
+    assert github_api.get_latest_commit(7, str(tmp_path))[0] == "sha-7"
+    assert github_api.get_ci_checks(7, str(tmp_path)) == []
+    assert github_api.get_review_threads(7, str(tmp_path)) == []

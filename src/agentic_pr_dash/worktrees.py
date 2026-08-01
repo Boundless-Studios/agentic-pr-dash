@@ -267,6 +267,8 @@ def selected_worktree_cleanup_reason(
     worktree: dict,
     active_agents: list[object],
     main_repo: str | None = None,
+    *,
+    check_remote_pr: bool = True,
 ) -> tuple[bool, str]:
     """Return whether a worktree is eligible for conservative no-open-PR cleanup."""
     path = worktree.get("path") or ""
@@ -279,13 +281,24 @@ def selected_worktree_cleanup_reason(
     if _worktree_is_dirty(path):
         return False, "local changes present"
 
-    pr_state = _branch_pr_state(branch, resolved_main)
-    if pr_state == PR_LOOKUP_UNKNOWN:
-        return False, "PR lookup unavailable"
-    if pr_state == "OPEN":
-        return False, "open PR exists"
-    if pr_state in {"MERGED", "CLOSED"}:
-        return True, f"{pr_state.lower()} PR branch"
+    if check_remote_pr:
+        pr_state = _branch_pr_state(branch, resolved_main)
+        if pr_state == PR_LOOKUP_UNKNOWN:
+            return False, "PR lookup unavailable"
+        if pr_state == "OPEN":
+            return False, "open PR exists"
+        if pr_state in {"MERGED", "CLOSED"}:
+            return True, f"{pr_state.lower()} PR branch"
+    else:
+        # Dashboard rendering already has an authoritative open-PR snapshot.
+        # Avoid a second `gh pr list` for every no-PR worktree; only make the
+        # conservative local stale/merged determination here. A closed but
+        # unmerged recent branch remains non-reclaimable (a safe false negative).
+        merged = _run(
+            ["git", "-C", resolved_main, "merge-base", "--is-ancestor", branch, "main"]
+        )
+        if merged.returncode == 0:
+            return True, "branch merged into main"
 
     stale_reason = _worktree_branch_stale_reason(path, branch, resolved_main)
     if stale_reason:
