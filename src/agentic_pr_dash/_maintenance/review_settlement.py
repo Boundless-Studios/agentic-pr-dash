@@ -392,27 +392,33 @@ def evaluate_pr_snapshot(
     # thread gate. Keeping both would make an explicitly evaluated P2 block via
     # the legacy generic "review_comments" signal.
     readiness_pr = pr.model_copy(update={"review_comments": []}, deep=True)
-    for blocker in terminal_clean_blockers(
-        readiness_pr,
-        validated_head=ledger.head_sha,
-    ):
+    readiness_blockers = terminal_clean_blockers(
+        readiness_pr, validated_head=ledger.head_sha
+    )
+    if pr.is_draft:
+        # Drafts are not ship candidates: do not make their intentionally
+        # incomplete CI/merge state a settlement blocker. Head drift remains a
+        # blocker because it invalidates every other observation.
+        readiness_blockers = [
+            blocker for blocker in readiness_blockers if blocker == "head_drift"
+        ]
+    for blocker in readiness_blockers:
         _append_once(blockers, blocker)
 
-    if pr.review_decision.upper() == "CHANGES_REQUESTED":
-        _append_once(blockers, "changes_requested")
-    if pr.is_draft:
-        _append_once(blockers, "draft")
-    if pr.mergeable.upper() != "MERGEABLE":
-        _append_once(blockers, "not_mergeable")
-    if not pr.ci_checks:
-        _append_once(blockers, "ci_unavailable")
-    elif any(
-        check.status == "completed"
-        and (check.conclusion or "").lower()
-        not in {"success", "neutral", "skipped"}
-        for check in pr.ci_checks
-    ):
-        _append_once(blockers, "ci_not_successful")
+    if not pr.is_draft:
+        if pr.review_decision.upper() == "CHANGES_REQUESTED":
+            _append_once(blockers, "changes_requested")
+        if pr.mergeable.upper() != "MERGEABLE":
+            _append_once(blockers, "not_mergeable")
+        if not pr.ci_checks:
+            _append_once(blockers, "ci_unavailable")
+        elif any(
+            check.status == "completed"
+            and (check.conclusion or "").lower()
+            not in {"success", "neutral", "skipped"}
+            for check in pr.ci_checks
+        ):
+            _append_once(blockers, "ci_not_successful")
 
     current_threads = [thread for thread in threads if not thread.is_resolved]
     settled_ledger = overlay_backstop_evidence(
@@ -423,6 +429,20 @@ def evaluate_pr_snapshot(
         reviewer_count=policy.review.backstop.reviewer_count,
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
+    if pr.is_draft:
+        # A draft never becomes a ship candidate, so its backstop quorum is not
+        # applicable. Keep local-slot and finding actions intact.
+        missing_slots = [
+            slot
+            for slot in review.missing_slots
+            if not slot.startswith(f"{ReviewStage.BACKSTOP.value}:")
+        ]
+        review = review.model_copy(
+            update={
+                "settled": not missing_slots and not review.required_actions,
+                "missing_slots": missing_slots,
+            }
+        )
     return FinalizationObservation(
         repository=repository or ledger.repository,
         head_sha=head_sha,
