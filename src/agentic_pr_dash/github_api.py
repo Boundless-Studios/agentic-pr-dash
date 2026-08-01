@@ -1261,6 +1261,11 @@ def _pr_head_owner(pr: dict) -> str:
 
 def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
     """Get the SHA and date of the latest commit on a PR."""
+    repo = _repo_for_cwd(cwd)
+    cached = _PR_BATCH_CACHE.get((repo, pr_number)) if repo else None
+    if cached is not None and "latest_commit" in cached:
+        sha, committed_at = cached["latest_commit"]
+        return str(sha), str(committed_at)
     r = _run(
         ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/commits",
          "--jq", ".[-1] | [.sha, .commit.author.date] | @tsv"],
@@ -1557,6 +1562,57 @@ def _parse_review_thread_nodes(nodes: list) -> list[ReviewThread]:
 # the same number can exist in two different maintenance repos, BOU-1801/#50).
 # ---------------------------------------------------------------------------
 _PR_BATCH_CACHE: dict[tuple[str, int], dict] = {}
+
+
+@dataclass(frozen=True)
+class PrMaintenanceSnapshot:
+    """One immutable-head PR observation collected by the aggregate query."""
+
+    pr_number: int
+    head_sha: str
+    head_committed_at: str
+    ci_checks: tuple[CICheck, ...]
+    required_pending: bool
+    unresolved_threads: tuple[ReviewThread, ...]
+    merge_state: str
+    mergeable: str
+    review_decision: str
+
+    @property
+    def merge_conflict(self) -> bool:
+        return self.mergeable.upper() == "CONFLICTING" or self.merge_state.upper() == "DIRTY"
+
+    @property
+    def changes_requested(self) -> bool:
+        return self.review_decision.upper() == "CHANGES_REQUESTED"
+
+    def cache_entry(self) -> dict:
+        return {
+            "threads": list(self.unresolved_threads),
+            "required_pending": self.required_pending,
+            "latest_commit": (self.head_sha, self.head_committed_at),
+            "ci_checks": list(self.ci_checks),
+            "head_sha": self.head_sha,
+            "merge_state": self.merge_state,
+            "mergeable": self.mergeable,
+            "review_decision": self.review_decision,
+        }
+
+
+@dataclass(frozen=True)
+class PrMaintenanceSnapshotBatch:
+    """Aggregate result that never collapses a partial read into clean."""
+
+    requested: tuple[int, ...]
+    observed: dict[int, PrMaintenanceSnapshot]
+    missing: tuple[int, ...]
+
+    @property
+    def complete(self) -> bool:
+        return not self.missing
+
+    def cache_entries(self) -> dict[int, dict]:
+        return {number: snapshot.cache_entry() for number, snapshot in self.observed.items()}
 
 
 def clear_pr_batch_cache() -> None:
@@ -2216,6 +2272,11 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     (every PR with running/failing CI read as Clean — BOU-1980). Fall back to
     the REST check-runs API, which needs only Checks: Read.
     """
+    repo = _repo_for_cwd(cwd)
+    cached = _PR_BATCH_CACHE.get((repo, pr_number)) if repo else None
+    if cached is not None and "ci_checks" in cached:
+        return list(cached["ci_checks"])
+
     r = _run(
         ["gh", "pr", "checks", str(pr_number),
          "--json", "name,bucket,state"],
@@ -2481,6 +2542,39 @@ def repo_slug_for_prefetch(cwd: str | None) -> str:
     return _repo_for_cwd(cwd) or ""
 
 
+def _batch_ci_checks(contexts: list[dict]) -> list[CICheck]:
+    """Normalize GraphQL rollup contexts to the same model as ``gh pr checks``."""
+    checks: list[CICheck] = []
+    for context in contexts:
+        if not isinstance(context, dict):
+            continue
+        if context.get("__typename") == "CheckRun":
+            status = str(context.get("status") or "unknown").lower()
+            conclusion_raw = str(context.get("conclusion") or "").lower()
+            conclusion = conclusion_raw or None
+            if conclusion in _REST_FAIL_CONCLUSIONS:
+                conclusion = "failure"
+            checks.append(CICheck(
+                name=str(context.get("name") or "?"),
+                status=status,
+                conclusion=conclusion,
+            ))
+        elif context.get("__typename") == "StatusContext":
+            state = str(context.get("state") or "unknown").lower()
+            if state in ("expected", "pending"):
+                status, conclusion = "in_progress", None
+            elif state == "success":
+                status, conclusion = "completed", "success"
+            else:
+                status, conclusion = "completed", "failure"
+            checks.append(CICheck(
+                name=str(context.get("context") or "?"),
+                status=status,
+                conclusion=conclusion,
+            ))
+    return checks
+
+
 def batch_fetch_pr_review_and_ci(
     owner: str, repo: str, pr_numbers: list[int], cwd: str | None = None,
 ) -> dict[int, dict]:
@@ -2520,6 +2614,7 @@ def batch_fetch_pr_review_and_ci(
         for n in chunk:
             fields.append(
                 f'pr_{n}: pullRequest(number: {n}) {{'
+                f'  headRefOid mergeStateStatus mergeable reviewDecision'
                 f'  reviewThreads(first: 100) {{'
                 f'    pageInfo {{ hasNextPage }}'
                 f'    nodes {{'
@@ -2530,12 +2625,12 @@ def batch_fetch_pr_review_and_ci(
                 f'    }}'
                 f'  }}'
                 f'  commits(last: 1) {{'
-                f'    nodes {{ commit {{ statusCheckRollup {{ contexts(first: 100) {{'
+                f'    nodes {{ commit {{ oid committedDate statusCheckRollup {{ contexts(first: 100) {{'
                 f'      pageInfo {{ hasNextPage }}'
                 f'      nodes {{'
                 f'        __typename'
-                f'        ... on CheckRun {{ status isRequired(pullRequestNumber: {n}) }}'
-                f'        ... on StatusContext {{ state isRequired(pullRequestNumber: {n}) }}'
+                f'        ... on CheckRun {{ name status conclusion isRequired(pullRequestNumber: {n}) }}'
+                f'        ... on StatusContext {{ context state isRequired(pullRequestNumber: {n}) }}'
                 f'      }}'
                 f'    }} }} }} }}'
                 f'  }}'
@@ -2613,8 +2708,58 @@ def batch_fetch_pr_review_and_ci(
                 if not required_pending:
                     required_pending = unrequired_pending and not saw_required
 
-            results[n] = {"threads": threads, "required_pending": required_pending}
+            commit = commit_nodes[0]["commit"] if commit_nodes else {}
+            ci_checks = _batch_ci_checks(
+                (rollup or {}).get("contexts", {}).get("nodes", []) if rollup else []
+            )
+            results[n] = {
+                "threads": threads,
+                "required_pending": required_pending,
+                "latest_commit": (
+                    str(pr_node.get("headRefOid") or commit.get("oid") or ""),
+                    str(commit.get("committedDate") or ""),
+                ),
+                "ci_checks": ci_checks,
+                "head_sha": str(pr_node.get("headRefOid") or commit.get("oid") or ""),
+                "merge_state": str(pr_node.get("mergeStateStatus") or "unknown"),
+                "mergeable": str(pr_node.get("mergeable") or "unknown"),
+                "review_decision": str(pr_node.get("reviewDecision") or "none"),
+            }
     return results
+
+
+def collect_pr_maintenance_snapshots(
+    owner: str, repo: str, pr_numbers: list[int], cwd: str | None = None,
+) -> PrMaintenanceSnapshotBatch:
+    """Collect bounded aggregate PR state while preserving partial results.
+
+    Omitted, malformed, or paginated PRs remain in ``missing``. Callers may
+    retry just those identities or report them unknown; they must never infer
+    clean from an incomplete batch.
+    """
+    requested = tuple(sorted(set(pr_numbers)))
+    entries = batch_fetch_pr_review_and_ci(owner, repo, list(requested), cwd=cwd)
+    observed: dict[int, PrMaintenanceSnapshot] = {}
+    for number, entry in entries.items():
+        latest = entry.get("latest_commit") or ("", "")
+        head_sha = str(entry.get("head_sha") or latest[0] or "")
+        if not head_sha:
+            continue
+        observed[number] = PrMaintenanceSnapshot(
+            pr_number=number,
+            head_sha=head_sha,
+            head_committed_at=str(latest[1] or ""),
+            ci_checks=tuple(entry.get("ci_checks") or ()),
+            required_pending=bool(entry.get("required_pending")),
+            unresolved_threads=tuple(
+                thread for thread in entry.get("threads", ()) if not thread.is_resolved
+            ),
+            merge_state=str(entry.get("merge_state") or "unknown"),
+            mergeable=str(entry.get("mergeable") or "unknown"),
+            review_decision=str(entry.get("review_decision") or "none"),
+        )
+    missing = tuple(number for number in requested if number not in observed)
+    return PrMaintenanceSnapshotBatch(requested, observed, missing)
 
 
 def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
