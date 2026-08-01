@@ -145,6 +145,106 @@ def test_batch_fetch_pr_review_and_ci_is_one_round_trip_for_many_prs(monkeypatch
             assert result[n]["required_pending"] is False
 
 
+def test_batch_snapshot_is_typed_complete_and_primes_all_detail_reads(monkeypatch):
+    """One aggregate observation carries every stop-gate fact for each PR.
+
+    In particular, resolving a PR after priming must not fall back to the two
+    serial calls that survived BOU-2556: latest commit and full CI checks.
+    """
+    calls: list[list[str]] = []
+
+    def _fake_run(cmd, cwd=None, timeout_s=30):
+        calls.append(cmd)
+        payload = {
+            "data": {"repository": {"pr_401": {
+                "headRefOid": "abc123",
+                "mergeStateStatus": "DIRTY",
+                "mergeable": "CONFLICTING",
+                "reviewDecision": "CHANGES_REQUESTED",
+                "reviewThreads": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [{
+                        "id": "T401", "isResolved": False, "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9, "path": "x.py", "line": 2,
+                            "originalLine": 2, "body": "fix", "createdAt": "2026-07-01T00:00:00Z",
+                            "author": {"login": "reviewer"},
+                        }]},
+                    }],
+                },
+                "commits": {"nodes": [{"commit": {
+                    "oid": "abc123", "committedDate": "2026-07-01T01:00:00Z",
+                    "statusCheckRollup": {"contexts": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [{
+                            "__typename": "CheckRun", "name": "unit",
+                            "status": "COMPLETED", "conclusion": "FAILURE",
+                            "isRequired": True,
+                        }],
+                    }},
+                }}]},
+            }}},
+        }
+        import json as _json
+        return subprocess.CompletedProcess(cmd, 0, stdout=_json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(_github_api_mod, "_run", _fake_run)
+    monkeypatch.setattr(_github_api_mod, "_repo_for_cwd", lambda cwd: "acme/widgets")
+    batch = _github_api_mod.collect_pr_maintenance_snapshots(
+        "acme", "widgets", [401], cwd="/tmp/repo",
+    )
+
+    assert batch.complete is True
+    assert batch.requested == (401,)
+    assert batch.missing == ()
+    snapshot = batch.observed[401]
+    assert snapshot.head_sha == "abc123"
+    assert snapshot.merge_conflict is True
+    assert snapshot.changes_requested is True
+    assert [check.name for check in snapshot.ci_checks] == ["unit"]
+    assert snapshot.ci_checks[0].conclusion == "failure"
+    assert len(snapshot.unresolved_threads) == 1
+
+    _github_api_mod.clear_pr_batch_cache()
+    _github_api_mod.prime_pr_batch_cache("acme/widgets", batch.cache_entries())
+    calls.clear()
+    assert _github_api_mod.get_latest_commit(401, "/tmp/repo") == (
+        "abc123", "2026-07-01T01:00:00Z",
+    )
+    checks = _github_api_mod.get_ci_checks(401, "/tmp/repo")
+    assert [(c.name, c.status, c.conclusion) for c in checks] == [
+        ("unit", "completed", "failure"),
+    ]
+    assert calls == []
+
+
+def test_batch_snapshot_preserves_observed_results_when_another_pr_is_missing(monkeypatch):
+    def _fake_run(cmd, cwd=None, timeout_s=30):
+        import json as _json
+        payload = {"data": {"repository": {
+            "pr_501": {
+                "headRefOid": "head501", "mergeStateStatus": "CLEAN",
+                "mergeable": "MERGEABLE", "reviewDecision": "APPROVED",
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+                "commits": {"nodes": [{"commit": {
+                    "oid": "head501", "committedDate": "2026-07-01T00:00:00Z",
+                    "statusCheckRollup": None,
+                }}]},
+            },
+            "pr_502": None,
+        }}}
+        return subprocess.CompletedProcess(cmd, 0, stdout=_json.dumps(payload), stderr="")
+
+    monkeypatch.setattr(_github_api_mod, "_run", _fake_run)
+    batch = _github_api_mod.collect_pr_maintenance_snapshots(
+        "acme", "widgets", [501, 502], cwd="/tmp/repo",
+    )
+
+    assert batch.complete is False
+    assert set(batch.observed) == {501}
+    assert batch.missing == (502,)
+
+
 # ---------------------------------------------------------------------------
 # 2. The stop-gate's prefetch orchestration batches once per repo, not once
 #    per worktree.
