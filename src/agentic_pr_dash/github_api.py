@@ -1562,6 +1562,7 @@ def _parse_review_thread_nodes(nodes: list) -> list[ReviewThread]:
 # the same number can exist in two different maintenance repos, BOU-1801/#50).
 # ---------------------------------------------------------------------------
 _PR_BATCH_CACHE: dict[tuple[str, int], dict] = {}
+_PR_BATCH_REPO_BY_CWD: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -1620,15 +1621,22 @@ def clear_pr_batch_cache() -> None:
     this is a plain module global and would otherwise leak across ticks in a
     long-lived process, e.g. across pytest cases in the same interpreter)."""
     _PR_BATCH_CACHE.clear()
+    _PR_BATCH_REPO_BY_CWD.clear()
 
 
-def prime_pr_batch_cache(repo_slug: str, entries: dict[int, dict]) -> None:
+def prime_pr_batch_cache(
+    repo_slug: str,
+    entries: dict[int, dict],
+    cwd: str | None = None,
+) -> None:
     """Populate the cache for ``repo_slug`` with one entry per PR number.
 
     Each entry is ``{"threads": list[ReviewThread], "required_pending": bool}``.
     """
     for pr_number, data in entries.items():
         _PR_BATCH_CACHE[(repo_slug, pr_number)] = data
+    if cwd:
+        _PR_BATCH_REPO_BY_CWD[str(Path(cwd).resolve())] = repo_slug
 
 
 def get_review_threads(
@@ -1658,6 +1666,18 @@ def get_review_threads(
     BOU-2556: a hit in the batch-prefetch cache (see ``prime_pr_batch_cache``)
     short-circuits this whole call — no `gh` invocation at all.
     """
+    primed_repo = (
+        _PR_BATCH_REPO_BY_CWD.get(str(Path(cwd).resolve())) if cwd else None
+    )
+    cached = (
+        _PR_BATCH_CACHE.get((primed_repo, pr_number)) if primed_repo else None
+    )
+    if cached is not None and "threads" in cached:
+        return list(cached["threads"])
+
+    # Preserve the historical unprimed lookup path (and its strict failure
+    # semantics). Only a primed dashboard tick bypasses this gh repository
+    # lookup; ordinary completion-gate callers still resolve exactly as before.
     owner, repo = get_repo_info(cwd)
     if not owner or not repo:
         if strict:
@@ -1667,7 +1687,8 @@ def get_review_threads(
             )
         return []
 
-    cached = _PR_BATCH_CACHE.get((f"{owner}/{repo}", pr_number))
+    repo_slug = f"{owner}/{repo}"
+    cached = _PR_BATCH_CACHE.get((repo_slug, pr_number))
     if cached is not None and "threads" in cached:
         return list(cached["threads"])
 
@@ -2423,6 +2444,9 @@ def _repo_for_cwd(cwd: str | None) -> str | None:
     config-resolved repo (codex PR #50 review)."""
     from .config import _detect_repo  # noqa: PLC0415
     if cwd:
+        cached = _PR_BATCH_REPO_BY_CWD.get(str(Path(cwd).resolve()))
+        if cached:
+            return cached
         detected = _detect_repo(Path(cwd))
         if detected:
             return detected

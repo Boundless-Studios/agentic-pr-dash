@@ -56,12 +56,17 @@ def _pr(**overrides: object) -> PRData:
 @pytest.fixture(autouse=True)
 def _isolate_card_builder(monkeypatch):
     """Keep the card builders off the network/filesystem probes."""
+    monkeypatch.setattr(app, "get_main_repo_root", lambda: "/tmp/main")
+    monkeypatch.setattr(app.orchestrator, "observed_roots", {"/tmp/main"})
     monkeypatch.setattr(app, "_ownership_for_card", lambda **kwargs: {})
     monkeypatch.setattr(app, "_legacy_agent_activity_state", lambda path: "none")
     monkeypatch.setattr(
         app,
         "_selected_worktree_cleanup_reason",
-        lambda worktree, agents: (False, "selected worktree is not stale enough"),
+        lambda worktree, agents, **kwargs: (
+            False,
+            "selected worktree is not stale enough",
+        ),
     )
 
 
@@ -69,7 +74,7 @@ def _reclaimable(monkeypatch, reason: str = "merged PR branch") -> None:
     monkeypatch.setattr(
         app,
         "_selected_worktree_cleanup_reason",
-        lambda worktree, agents: (not agents, reason),
+        lambda worktree, agents, **kwargs: (not agents, reason),
     )
 
 

@@ -482,11 +482,21 @@ def _now_epoch() -> int:
     return _worktree_now_epoch()
 
 
-def _selected_worktree_cleanup_reason(worktree: dict, active_agents: list[AgentProcess]) -> tuple[bool, str]:
+def _selected_worktree_cleanup_reason(
+    worktree: dict,
+    active_agents: list[AgentProcess],
+    *,
+    check_remote_pr: bool = True,
+) -> tuple[bool, str]:
     original_subprocess = _worktrees.subprocess
     _worktrees.subprocess = subprocess
     try:
-        return selected_worktree_cleanup_reason(worktree, active_agents, main_repo=get_main_repo_root())
+        return selected_worktree_cleanup_reason(
+            worktree,
+            active_agents,
+            main_repo=get_main_repo_root(),
+            check_remote_pr=check_remote_pr,
+        )
     finally:
         _worktrees.subprocess = original_subprocess
 
@@ -865,8 +875,15 @@ def _build_card_for_worktree(
     # Skipped entirely while the agent is working — nothing downstream consumes
     # it in that case, and the probe shells out to `gh` on every board poll.
     reclaimable = False
-    if pr is None and activity != "working":
-        reclaimable, _ = _selected_worktree_cleanup_reason(worktree, [])
+    root = get_main_repo_root()
+    if (
+        pr is None
+        and activity != "working"
+        and root in orchestrator.observed_roots
+    ):
+        reclaimable, _ = _selected_worktree_cleanup_reason(
+            worktree, [], check_remote_pr=False
+        )
     cleanup_candidate = reclaimable and not fallback_agents
     status = _card_status(pr, activity, reclaimable)
     activity_message, activity_source = _card_activity_message(
@@ -1084,8 +1101,14 @@ def _bug_bash_ready_count(cards: list[WorktreeCard]) -> int:
     return count
 
 
-def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "board") -> dict[str, object]:
-    cards, worktree_count, hidden_agent_worktree_count = build_worktree_cards(show_agent_worktrees=show_agent_worktrees)
+def _dashboard_context_from_cards(
+    cards: list[WorktreeCard],
+    worktree_count: int,
+    hidden_agent_worktree_count: int,
+    *,
+    show_agent_worktrees: bool,
+    active_tab: str,
+) -> dict[str, object]:
     runner_summary = orchestrator.weekly_runner_execution_summary
     runner_issues = _runner_issues(cards)
     running_github_jobs = _running_github_jobs(cards)
@@ -1116,6 +1139,17 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
         "no_pr_cards": no_pr_cards(cards),
         "asset_version": _asset_version(),
     }
+
+
+def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "board") -> dict[str, object]:
+    cards, worktree_count, hidden_agent_worktree_count = build_worktree_cards(show_agent_worktrees=show_agent_worktrees)
+    return _dashboard_context_from_cards(
+        cards,
+        worktree_count,
+        hidden_agent_worktree_count,
+        show_agent_worktrees=show_agent_worktrees,
+        active_tab=active_tab,
+    )
 
 
 def runner_fleet_context() -> dict[str, object]:
@@ -1247,24 +1281,53 @@ async def _dashboard_context_async(
     key = (show_agent_worktrees, active_tab)
     now = time.monotonic()
     cached = _dashboard_context_cache.get(key)
+    if cached is None:
+        # A cold process has no materialized worktree/session snapshot yet.
+        # Serve a valid empty board immediately and let the normal stale-cache
+        # path populate it in the background. Browser polling replaces this
+        # skeleton as soon as discovery completes, while a slow local scan can
+        # no longer make the dashboard look dead after an upgrade/restart.
+        cached = (
+            0.0,
+            _dashboard_context_from_cards(
+                [],
+                0,
+                0,
+                show_agent_worktrees=show_agent_worktrees,
+                active_tab=active_tab,
+            ),
+        )
+        _dashboard_context_cache[key] = cached
     if cached and now - cached[0] <= CONTEXT_CACHE_TTL_SECONDS:
         return cached[1]
 
     task = _dashboard_context_tasks.get(key)
     if task is None or task.done():
         context_func = runner_dashboard_context if active_tab == "runner_issues" else dashboard_context
-        task = asyncio.create_task(asyncio.to_thread(
-            context_func,
-            show_agent_worktrees=show_agent_worktrees,
-            active_tab=active_tab,
-        ))
+
+        async def rebuild() -> dict[str, object]:
+            context = await asyncio.to_thread(
+                context_func,
+                show_agent_worktrees=show_agent_worktrees,
+                active_tab=active_tab,
+            )
+            current_task = asyncio.current_task()
+            if _dashboard_context_tasks.get(key) is current_task:
+                _dashboard_context_tasks.pop(key, None)
+                _dashboard_context_cache[key] = (time.monotonic(), context)
+            return context
+
+        task = asyncio.create_task(rebuild())
         _dashboard_context_tasks[key] = task
 
-    context = await task
-    if _dashboard_context_tasks.get(key) is task:
-        _dashboard_context_tasks.pop(key, None)
-        _dashboard_context_cache[key] = (time.monotonic(), context)
-    return context
+    # Building cards inspects worktrees, processes, session logs, and ownership
+    # records. That can take several seconds on a busy workstation. Once a
+    # context exists, serve it immediately while one shared background task
+    # rebuilds it; otherwise every five-second HTMX poll blocks on the scan and
+    # the board appears frozen despite fresh orchestrator state.
+    if cached:
+        return cached[1]
+    return await task
 
 
 def _runner_execution_summary(cards: list[WorktreeCard]) -> RunnerExecutionSummary:

@@ -73,12 +73,11 @@ ACTIVE_QUEUED_STATES = frozenset({MaintenanceStatus.QUEUED, MaintenanceStatus.SI
 # unchanged ("agentic-pr-dash-dashboard"), which matters: it is persisted in live
 # coordinator claims and matched by existing tests and log-scraping.
 DASHBOARD_OWNER_SESSION_ID = f"agentic-pr-dash-{MaintenanceActor.DASHBOARD_QUEUE.value.removesuffix('-queue')}"
-# Each poll enriches every open PR with several REST + GraphQL calls. At 15s
-# this comfortably exceeded GitHub's hourly API limit for even a handful of
-# PRs, starving the API to zero and causing refresh failures. 60s keeps the
-# steady-state burn well under budget while staying responsive enough for a
-# PR babysitter.
-POLL_INTERVAL_SECONDS = 60
+# The refresh primes all immutable-head PR state from one batched GraphQL
+# observation per repository. A 15-second cadence therefore stays responsive
+# without returning to the old per-PR request fan-out that exhausted GitHub's
+# API budget.
+POLL_INTERVAL_SECONDS = 15
 
 # Per-PR enrichment (mergeability / latest commit / CI checks / queue health /
 # unaddressed comments) is independent across PRs, so each poll enriches them
@@ -161,6 +160,7 @@ class Orchestrator:
         # only its OWN merged/closed PRs (even when that root returns zero PRs)
         # and never drops another repo's PRs on a transient failure.
         self._pr_root: dict[PRKey, str | None] = {}
+        self.observed_roots: set[str | None] = set()
         self._inflight_prs: set[int] = set()
         self.events: list[EventEntry] = []
         cached_runner_summary = github_api.load_runner_execution_summary_cache()
@@ -263,15 +263,19 @@ class Orchestrator:
     def start(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_loop())
-            self.log("Orchestrator started — polling every 15s")
+            self.log(
+                f"Orchestrator started — polling every {POLL_INTERVAL_SECONDS}s"
+            )
 
     async def _poll_loop(self) -> None:
         while True:
+            started = asyncio.get_running_loop().time()
             try:
                 await self.refresh_prs()
             except Exception as exc:
                 self.log(f"Poll error: {exc}", level="error")
-            await asyncio.sleep(POLL_INTERVAL_SECONDS)
+            elapsed = asyncio.get_running_loop().time() - started
+            await asyncio.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
     async def refresh_prs(self) -> list[PRData]:
         """Fetch all open PRs across every configured repo and update state.
@@ -335,6 +339,7 @@ class Orchestrator:
                 level="error",
             )
             return
+        self.observed_roots.add(root)
 
         # Prune merged/closed PRs FIRST, straight from the cheap open-PR list,
         # so a failure in the per-PR enrichment below can never leave a merged
@@ -354,6 +359,27 @@ class Orchestrator:
                     pr_number=key[1],
                     level="success",
                 )
+
+        # Prime the existing per-PR accessors from one immutable-head GraphQL
+        # observation before enrichment. Without this, every dashboard poll
+        # performs latest-commit, CI, and review-thread requests separately for
+        # every PR; a nominal 60-second poll then takes several minutes for a
+        # busy repository and the board serves stale state between completions.
+        # Missing/paginated entries deliberately fall through to the original
+        # per-PR accessors, preserving their correctness behavior.
+        github_api.clear_pr_batch_cache()
+        owner, repo_name = await asyncio.to_thread(github_api.get_repo_info, root)
+        if owner and repo_name and open_numbers:
+            entries = await asyncio.to_thread(
+                github_api.batch_fetch_pr_review_and_ci,
+                owner,
+                repo_name,
+                sorted(open_numbers),
+                root,
+            )
+            github_api.prime_pr_batch_cache(
+                f"{owner}/{repo_name}", entries, cwd=root
+            )
 
         # Get-or-create every PR object up front (cheap, mutates the shared
         # ``self.prs`` map serially to avoid races), then enrich the independent
