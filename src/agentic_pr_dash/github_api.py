@@ -643,6 +643,38 @@ class GhFailure:
 # can't bleed into a later healthy call.
 _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 
+# --------------------------------------------------------------------------- #
+# One PR-state resolution per repo, shared by every reader (BOU-2810)
+# --------------------------------------------------------------------------- #
+#
+# `gh pr list` and `gh pr view` are GraphQL calls, and every poller on a host
+# shares ONE App-installation token with a single 5000-point hourly budget. The
+# old shape had each caller resolve PR state on its own: the dashboard, the
+# maintenance loop, each session's `await`, the stop-gate's own branch probe,
+# and a per-PR `gh pr view` for each PR being checked. That is why the budget
+# drained in ~3 minutes.
+#
+# The fix is to fetch ONE list per (repo, author) per TTL window and serve
+# everything from it. That only works if the single fetch carries every field
+# any reader might want — hence this superset. `gh pr list --json` costs the
+# same one GraphQL round trip whether you ask for 3 fields or 15, so widening
+# it is free and removes the need for per-PR follow-up calls entirely.
+#
+# DELIBERATELY EXCLUDED: `statusCheckRollup`. It is large (every check run on
+# every PR), it changes far faster than this TTL, and only one caller wants it.
+# Including it would bloat every snapshot to serve one reader stale CI state.
+# That caller keeps its own direct call — see `resolve_pr`'s fall-through.
+PR_SNAPSHOT_FIELDS = (
+    "number,title,body,url,state,isDraft,mergeStateStatus,mergeable,"
+    "reviewDecision,headRefOid,headRefName,headRepositoryOwner,baseRefName,"
+    "mergedAt,author,labels,createdAt"
+)
+
+#: Fields a caller may request and still be served from the snapshot. Anything
+#: outside this set falls through to a real `gh pr view`, so a reader can never
+#: be handed a field the snapshot did not actually fetch.
+_SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
+
 
 def last_list_open_prs_failure() -> GhFailure | None:
     """Return diagnostics for the most recent failed :func:`list_open_prs` call.
@@ -676,8 +708,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
         "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
-        "--json", "number,title,headRefName,headRefOid,baseRefName,url,isDraft,"
-        "reviewDecision,mergeStateStatus,mergeable,labels,createdAt,author",
+        "--json", PR_SNAPSHOT_FIELDS,
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -966,6 +997,105 @@ _PR_HEAD_FIELDS = (
 # We use the exact REST query for resolution instead, so the result is
 # independent of how many prefix-matches exist.
 #
+def peek_pr_snapshot(
+    cwd: str | None = None, *, ttl_s: float | None = None
+) -> list[dict] | None:
+    """Return the shared snapshot if one is fresh, WITHOUT ever fetching.
+
+    The read-only half of :func:`list_open_prs_cached`, for callers that operate
+    under a hard deadline — the Stop-hook reconciliation path bounds its `gh`
+    subprocess with the remaining budget (BOU-1787), so it must never be routed
+    through something that might issue a fetch. Those callers peek first, use the
+    snapshot when a sibling process has already populated it, and otherwise fall
+    back to their own timeout-bounded call.
+
+    ``None`` means "no usable snapshot", never "no PRs".
+    """
+    effective_ttl = _PR_SNAPSHOT_TTL_S if ttl_s is None else ttl_s
+    if effective_ttl <= 0:
+        return None
+    try:
+        from .config import load as _load_config  # noqa: PLC0415
+
+        author = _load_config(cwd).pr_author
+        path = _pr_snapshot_path(cwd)
+    except (OSError, ValueError):
+        # Config/repo resolution genuinely unavailable — degrade to "no snapshot".
+        # Deliberately NOT a bare `except Exception`: an earlier version swallowed
+        # everything and silently hid an argument-order bug in the call below,
+        # turning every peek into a miss while looking like it worked.
+        return None
+    return _read_pr_snapshot(path, effective_ttl, author)
+
+
+def resolve_pr(
+    pr_number: int,
+    fields: str,
+    cwd: str | None = None,
+    *,
+    force: bool = False,
+) -> dict | None:
+    """Resolve one PR's state, reusing the host-global list snapshot (BOU-2810).
+
+    This is the converged replacement for scattered ``gh pr view <n> --json ...``
+    calls. Those are GraphQL, and with several tracked PRs polled from several
+    sessions they were a large share of the traffic that exhausted the shared
+    installation token's hourly budget. The list snapshot already contains every
+    open PR by the tracked author, with the full :data:`PR_SNAPSHOT_FIELDS`
+    superset — so for the common case there is nothing left to ask GitHub.
+
+    Falls through to a real ``gh pr view`` — never guesses — when the snapshot
+    genuinely cannot answer:
+
+    * ``force=True`` (a caller about to act on the result wants it live)
+    * a requested field is outside the superset (e.g. ``statusCheckRollup``)
+    * the PR is absent from the snapshot, which is normal and important: the
+      list is ``--author <tracked>`` and open-only, so someone else's PR or a
+      closed/merged one is simply not in it.
+
+    Returns the PR dict restricted to ``fields``, or ``None`` if it cannot be
+    resolved at all. A ``None`` here means "unknown", never "does not exist".
+    """
+    wanted = [field.strip() for field in fields.split(",") if field.strip()]
+    if not wanted:
+        return None
+
+    if not force and _SNAPSHOT_SERVABLE_FIELDS.issuperset(wanted):
+        prs = list_open_prs_cached(cwd) or []
+        for pr in prs:
+            if pr.get("number") == pr_number:
+                # Only hand back what was asked for, so a caller cannot silently
+                # start depending on a field it never requested.
+                return {key: pr.get(key) for key in wanted}
+
+    result = _run(["gh", "pr", "view", str(pr_number), "--json", fields], cwd=cwd)
+    if result.returncode != 0:
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def resolve_pr_field(
+    pr_number: int,
+    field: str,
+    cwd: str | None = None,
+    *,
+    force: bool = False,
+):
+    """Single-field convenience wrapper around :func:`resolve_pr`.
+
+    Returns ``None`` when the PR could not be resolved, which callers must treat
+    as "unknown" rather than as a value.
+    """
+    data = resolve_pr(pr_number, field, cwd, force=force)
+    if data is None:
+        return None
+    return data.get(field)
+
+
 # REST `state` is one of {open, closed, all} (no "merged"); a merged PR is a
 # closed PR, so we map merged→closed for the *server-side* query. The REST API
 # cannot distinguish merged-from-closed, so when the caller asked for "merged"

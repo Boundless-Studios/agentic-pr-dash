@@ -476,7 +476,27 @@ def _gh_pr_list_json(
 
 
 def _resolve_open_pr_for_branch(cwd: str, branch: str):
-    """(pr_number, is_draft) for this branch's open @me PR, or None if none."""
+    """(pr_number, is_draft) for this branch's open @me PR, or None if none.
+
+    Served from the shared host-global snapshot when one is fresh (BOU-2810), so
+    every session resolving branches reuses ONE `gh pr list` instead of each
+    issuing its own GraphQL call. Falls back to the direct probe on a cold
+    snapshot, so behaviour is unchanged when nothing has populated it yet.
+
+    Matching on the snapshot is EXACT on `headRefName`. `gh pr list --head` is a
+    *prefix* filter — `--head fix` also returns `fix-123` — which this function
+    papered over by taking `data[0]`. The exact match is the intent; see the
+    `_PR_HEAD_FIELDS` note in github_api about the same hazard.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    snapshot = github_api.peek_pr_snapshot(cwd)
+    if snapshot is not None:
+        for entry in snapshot:
+            if entry.get("headRefName") == branch:
+                return int(entry.get("number")), bool(entry.get("isDraft", False))
+        return None
+
     data = _gh_pr_list_json(cwd, ["--head", branch], "number,isDraft")
     if not data:
         return None
@@ -487,8 +507,29 @@ def _resolve_open_pr_for_branch(cwd: str, branch: str):
 def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, bool]]:
     """Map branch -> (pr_number, is_draft) for the user's open PRs; {} on failure.
 
-    ``timeout`` bounds the underlying gh subprocess (BOU-1787 review)."""
-    data = _gh_pr_list_json(cwd, [], "number,headRefName,isDraft", timeout=timeout)
+    ``timeout`` bounds the underlying gh subprocess (BOU-1787 review).
+
+    Peeks the shared host-global snapshot first (BOU-2810). This is the Stop-hook
+    path, so it uses the read-only peek rather than ``list_open_prs_cached``: the
+    peek can never issue a fetch, which keeps the caller's remaining-budget
+    contract intact. A cold snapshot falls straight through to the original
+    timeout-bounded call.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    # Budget check BEFORE the peek. `timeout <= 0` means "no time left" and the
+    # contract is that NOTHING shells out — and the peek can shell out, because
+    # resolving the snapshot path needs the repo/author from `config.load`, which
+    # falls back to `gh repo view` on a cold process. Peeking first therefore
+    # spawned a subprocess on an exhausted budget
+    # (test_gh_pr_list_skips_subprocess_when_no_budget) and added a GraphQL call
+    # to the very path this change exists to make cheaper.
+    if timeout <= 0:
+        return {}
+
+    data = github_api.peek_pr_snapshot(cwd)
+    if data is None:
+        data = _gh_pr_list_json(cwd, [], "number,headRefName,isDraft", timeout=timeout)
     if not data:
         return {}
     out: dict[str, tuple[int, bool]] = {}
