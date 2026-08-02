@@ -191,7 +191,23 @@ def find_prcreate_cwd(payload: dict) -> str | None:
 
 
 def _pr_is_draft(pr_number: int, cwd: str) -> bool:
-    """Best-effort ``isDraft`` lookup; on any failure treat as non-draft (False)."""
+    """Best-effort ``isDraft`` lookup; on any failure treat as non-draft (False).
+
+    Resolved through the shared host-global snapshot (BOU-2810) rather than its
+    own ``gh pr view``: `isDraft` is already in every snapshot, so in the common
+    case this costs no GraphQL at all. `resolve_pr_field` falls through to a real
+    call when the PR is not in the snapshot (someone else's PR, or already
+    closed), so behaviour is unchanged — only the traffic is.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    try:
+        return bool(github_api.resolve_pr_field(pr_number, "isDraft", cwd))
+    except Exception:  # noqa: BLE001 — best-effort by contract; never raise here
+        return False
+
+
+def _pr_is_draft_uncached(pr_number: int, cwd: str) -> bool:
+    """Retained direct path (unused by default) for debugging a snapshot mismatch."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
     try:
         r = subprocess.run(
