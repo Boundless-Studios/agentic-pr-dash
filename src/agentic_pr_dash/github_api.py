@@ -13,6 +13,7 @@ reappearing as live work.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -738,8 +739,52 @@ _PR_SNAPSHOT_TTL_S = float(os.environ.get("APD_PR_SNAPSHOT_TTL_S", "45"))
 _PR_SNAPSHOT_LOCK_WAIT_S = float(os.environ.get("APD_PR_SNAPSHOT_LOCK_WAIT_S", "5"))
 
 
+def _pr_snapshot_dir() -> Path:
+    """Host-global snapshot directory — deliberately NOT inside a worktree.
+
+    See :func:`_pr_snapshot_path` for why.
+    """
+    override = os.environ.get("APD_PR_SNAPSHOT_DIR")
+    if override:
+        return Path(override).expanduser()
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache"
+    )
+    return Path(base) / "agentic-pr-dash"
+
+
 def _pr_snapshot_path(cwd: str | None) -> Path:
-    return load_config(cwd).state_dir_for(cwd or ".") / _PR_SNAPSHOT_FILENAME
+    """Where the shared PR-list snapshot lives, keyed by (repo, author).
+
+    This used to be ``<cwd>/.gaia/pr-snapshot.json`` — i.e. **per worktree**.
+    That defeated the cache's own purpose (BOU-2810). ``gh pr list --author X
+    --state open`` is scoped to a repo and an author; the answer is identical no
+    matter which worktree you ask from. Partitioning it by worktree bought
+    nothing and multiplied the call volume by the number of active worktrees:
+    five concurrent ``await`` processes across five worktrees meant five
+    independent snapshots and five real GraphQL calls per window, against ONE
+    shared installation token with a single 5000-point hourly budget. Observed
+    2026-08-02 draining a full budget in ~3 minutes, after which every PR read
+    fails and the stop gate reports ``gh state unknown`` for healthy PRs.
+
+    Keying by (repo, author) instead makes every process on the host — daemons,
+    stop-gates, and each session's waiter — share one fetch per TTL window,
+    which is what the cache was always meant to do. Different repos and
+    different authors still get separate snapshots, so no correctness is traded
+    for the sharing.
+
+    The key is hashed to keep the filename filesystem-safe (``owner/name``
+    contains a separator) and fixed-length.
+    """
+    config = load_config(cwd)
+    try:
+        repo = config.resolved_repo(Path(cwd) if cwd else None) or "unknown-repo"
+    except Exception:  # noqa: BLE001 — repo detection must never break caching
+        repo = "unknown-repo"
+    author = getattr(config, "pr_author", None) or "unknown-author"
+    key = hashlib.sha256(f"{repo}\n{author}".encode("utf-8")).hexdigest()[:16]
+    stem = _PR_SNAPSHOT_FILENAME.removesuffix(".json")
+    return _pr_snapshot_dir() / f"{stem}-{key}.json"
 
 
 def _acquire_snapshot_lock(path: Path) -> "int | None":
