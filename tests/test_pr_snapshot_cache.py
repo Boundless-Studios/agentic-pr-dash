@@ -4,16 +4,33 @@ The stop-gate, the detached loop, and every in-session ``await`` waiter each
 resolve "my open PRs" on their own cadence, all via the same underlying
 ``gh pr list --author @me --state open`` call
 (:func:`github_api.list_open_prs`). :func:`github_api.list_open_prs_cached`
-shares ONE snapshot (a JSON file under the worktree's ``state_dir``) across
-those callers within a short TTL so a burst of calls collapses to a single
-real fetch instead of one per caller.
+shares ONE snapshot across those callers within a short TTL so a burst of calls
+collapses to a single real fetch instead of one per caller.
+
+The snapshot is **host-global**, keyed by (repo, author) — not per worktree
+(BOU-2810). Because of that these tests must isolate it explicitly, or they
+would share one real file under ``~/.cache`` with each other and with the
+developer's live snapshot; ``isolated_snapshot_dir`` below does that.
 """
 from __future__ import annotations
 
 import json
 
+import pytest
+
 from agentic_pr_dash import github_api
 from agentic_pr_dash._maintenance import pr_state
+
+
+@pytest.fixture(autouse=True)
+def isolated_snapshot_dir(tmp_path, monkeypatch):
+    """Point the host-global snapshot at a per-test directory.
+
+    Without this, every test in this file (and every other process on the
+    machine) would share one snapshot file — which is precisely the sharing the
+    production code now wants, and precisely what test isolation must not have.
+    """
+    monkeypatch.setenv("APD_PR_SNAPSHOT_DIR", str(tmp_path / "snapshot-home"))
 
 
 def _fake_prs(n: int = 1) -> list[dict]:
@@ -410,8 +427,8 @@ def test_author_mismatch_is_a_cache_miss(tmp_path, monkeypatch):
     from agentic_pr_dash import config
 
     stale_author_prs = []  # what @me-as-App-bot saw: nothing
-    path = github_api._pr_snapshot_path(str(tmp_path))
-    github_api._write_pr_snapshot(path, stale_author_prs, "@me")
+    stale_path = github_api._pr_snapshot_path(str(tmp_path))
+    github_api._write_pr_snapshot(stale_path, stale_author_prs, "@me")
 
     (tmp_path / "agentic-pr-dash.toml").write_text(
         'pr_author = "ilganeli"\n', encoding="utf-8"
@@ -431,8 +448,19 @@ def test_author_mismatch_is_a_cache_miss(tmp_path, monkeypatch):
 
         assert result == fresh  # the @me snapshot was NOT served
         assert calls["n"] == 1  # a real fetch happened despite the fresh file
-        on_disk = json.loads(path.read_text(encoding="utf-8"))
-        assert on_disk["author"] == "ilganeli"  # rewritten under the new key
+
+        # Since BOU-2810 the author is part of the snapshot PATH, not just a
+        # field inside it, so the two authors no longer share a file. That makes
+        # the invariant structural rather than checked: a @me snapshot cannot be
+        # served to `ilganeli` because it is not even looked at. The in-file
+        # `author` field stays as defence in depth.
+        fresh_path = github_api._pr_snapshot_path(str(tmp_path))
+        assert fresh_path != stale_path, "a different author must key a different file"
+        assert json.loads(fresh_path.read_text(encoding="utf-8"))["author"] == "ilganeli"
+
+        # And the old author's snapshot is left intact rather than thrashed —
+        # two identities polling the same host no longer evict each other.
+        assert json.loads(stale_path.read_text(encoding="utf-8"))["author"] == "@me"
     finally:
         config.load.cache_clear()
 
@@ -467,3 +495,60 @@ def test_same_author_hit_still_skips_gh(tmp_path, monkeypatch):
     )
 
     assert github_api.list_open_prs_cached(str(tmp_path)) == cached
+
+
+# --------------------------------------------------------------------------- #
+# BOU-2810: the snapshot is HOST-GLOBAL, not per-worktree
+# --------------------------------------------------------------------------- #
+
+def test_two_worktrees_share_one_snapshot(tmp_path, monkeypatch):
+    """The fix, stated as a test.
+
+    The snapshot used to live at ``<cwd>/.gaia/pr-snapshot.json``, so N active
+    worktrees meant N independent caches and N real GraphQL calls per window
+    against ONE shared installation token. ``gh pr list --author X --state open``
+    is scoped to a repo and an author, so the answer does not depend on which
+    worktree asks — partitioning by worktree bought nothing and multiplied the
+    call volume, draining the hourly budget in ~3 minutes.
+
+    Two different cwds must now resolve to the SAME snapshot, and the second
+    caller must not reach gh.
+    """
+    worktree_a = tmp_path / "worktree-a"
+    worktree_b = tmp_path / "worktree-b"
+    worktree_a.mkdir()
+    worktree_b.mkdir()
+
+    assert github_api._pr_snapshot_path(str(worktree_a)) == github_api._pr_snapshot_path(
+        str(worktree_b)
+    ), "two worktrees on the same repo must share one snapshot"
+
+    calls = {"n": 0}
+
+    def _counted(cwd=None):
+        calls["n"] += 1
+        return _fake_prs(3)
+
+    monkeypatch.setattr(github_api, "list_open_prs", _counted)
+
+    first = github_api.list_open_prs_cached(str(worktree_a))
+    second = github_api.list_open_prs_cached(str(worktree_b))
+
+    assert first == second == _fake_prs(3)
+    assert calls["n"] == 1, (
+        "the second worktree must reuse the first worktree's fetch — one real "
+        "gh call per host per TTL window, not one per worktree"
+    )
+
+
+def test_snapshot_lives_outside_any_worktree(tmp_path):
+    """A path inside the worktree is what caused the bug; guard against regressing."""
+    worktree = tmp_path / "some-worktree"
+    worktree.mkdir()
+
+    path = github_api._pr_snapshot_path(str(worktree))
+
+    assert worktree not in path.parents, (
+        f"snapshot {path} is inside the worktree — it must be host-global so "
+        f"every session and daemon shares it"
+    )
