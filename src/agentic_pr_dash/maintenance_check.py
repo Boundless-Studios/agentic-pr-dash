@@ -244,6 +244,85 @@ def _observe_finalization(args, policy, ledger):
     )
 
 
+# ── BOU-2845: the Phase B payload must not demand a push for local-review work ──
+# ``_cmd_finalize`` renders "PR not settled: <work>" from three structured lists:
+# report.blockers (terminal_clean_blockers + PR readiness), report.review.required_actions
+# (agent_review_coordinator finding dispositions), and report.review.missing_slots
+# (e.g. "local:1", "backstop:2"). Pushing per review round is what turned a local
+# review loop into one full CI run per round (BOU-2831 / PR #3106), because
+# review_local.py anchors on the LOCAL head. The instruction is therefore conditioned
+# on the category: local-review-only → commit locally + re-run the review, push once
+# slots are clean; any CI/remote item → push to the EXISTING branch.
+#
+# Local-review items are settled by a local commit + re-running review_local.py: the
+# coordinator's required actions, missing local/backstop slots, and head_drift (a push
+# is what creates drift — re-review settles it).
+_LOCAL_REVIEW_ITEMS = frozenset(
+    {
+        "verify_fix",
+        "address_p1",
+        "evaluate_p2",
+        "fix_p2",
+        "prove_p2",
+        "fix_reproduced_p2",
+    }
+)
+
+# CI/remote items require the fix to reach the remote PR; any one of them forces the
+# push instruction. Observation errors are neither local-review nor actionable by
+# pushing, but must never silently collapse into the local-review guidance.
+_CI_REMOTE_ITEMS = frozenset(
+    {
+        "ci_not_successful",
+        "ci_unavailable",
+        "ci_pending",
+        "ci_failure",
+        "changes_requested",
+        "not_mergeable",
+        "merge_conflict",
+        "review_comments",
+        "repository_unknown",
+        "ledger_repository_mismatch",
+        "head_unknown",
+        "stabilization_pending",
+        "unstable_observation",
+    }
+)
+
+
+def _is_local_review_item(item: str) -> bool:
+    """True when ``item`` is settled by a local commit + re-review, not a push."""
+    return (
+        item in _LOCAL_REVIEW_ITEMS
+        or item.startswith(("local:", "backstop:"))
+        or item == "head_drift"
+    )
+
+
+def _render_unsettled_message(work: list[str]) -> str:
+    """Render the Phase B block for an unsettled review, conditioning the push
+    instruction on whether any CI/remote blocker is present.
+
+    Both variants keep the exact ``PR not settled:`` prefix — gaia's Stop-hook
+    adapter matches it (``stop-pr-maintenance.py::_BLOCKING_SIGNALS``) so a block
+    is never misclassified as an observation outage.
+    """
+    if not work:
+        raise ValueError("unsettled work list must not be empty")
+    items = ", ".join(work)
+    if any(not _is_local_review_item(item) for item in work):
+        return (
+            f"PR not settled: {items}. Address the pending review/CI work and push "
+            "to the EXISTING branch, then re-run the review."
+        )
+    return (
+        f"PR not settled: local review unsettled ({items}). Commit your fix locally "
+        "and re-run the local review (scripts/agent_ops/review_local.py); push to "
+        "the EXISTING branch once the local review slots record clean — do not push "
+        "per review round."
+    )
+
+
 def _cmd_finalize(args: argparse.Namespace) -> int:
     """Require review settlement and two stable, fully green PR observations."""
 
@@ -339,7 +418,7 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
             *report.review.required_actions,
             *report.review.missing_slots,
         ]
-        print("PR not settled: " + ", ".join(work))
+        print(_render_unsettled_message(work))
     return 0 if report.settled else 10
 
 
