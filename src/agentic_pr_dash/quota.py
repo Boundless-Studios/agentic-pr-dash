@@ -237,6 +237,7 @@ class QuotaLedger:
         self._background_hourly_budget = background_hourly_budget
         self._maintenance_reserve = maintenance_reserve
         self._latest: RateLimitSnapshot | None = None
+        self._estimated_cost_since_snapshot = 0
         self._usage: list[_Usage] = []
         self._request_count = 0
         self._cache_hit_count = 0
@@ -299,7 +300,7 @@ class QuotaLedger:
         latest = self._latest
         if latest is None or now >= latest.reset_at:
             return None
-        return latest.remaining
+        return max(0, latest.remaining - self._estimated_cost_since_snapshot)
 
     def _reserved_cost(
         self,
@@ -609,6 +610,7 @@ class QuotaLedger:
                 raise ValueError("unknown or already reconciled quota reservation")
             del self._reservations[reservation.reservation_id]
         self._latest = snapshot
+        self._estimated_cost_since_snapshot = 0
         self._usage.append(_Usage(now, caller, work_class, cost))
         self._request_count += 1
         self._failure_active = False
@@ -666,6 +668,8 @@ class QuotaLedger:
                     raise ValueError("unknown or already reconciled quota reservation")
                 del self._reservations[reservation.reservation_id]
             self._usage.append(_Usage(now, caller, work_class, cost))
+            if self._latest is not None and now < self._latest.reset_at:
+                self._estimated_cost_since_snapshot += cost
             self._request_count += 1
             self._failure_active = False
             self._failure_reason = None

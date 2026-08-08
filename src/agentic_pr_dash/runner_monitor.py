@@ -119,7 +119,12 @@ def _local_docker_runner_load(
     except json.JSONDecodeError:
         return None
     if not containers:
-        return None
+        # A successful listing that matches nothing is an authoritative zero,
+        # not an unavailable probe. Configuring a container prefix declares the
+        # fleet local; returning None here would fall through to the GitHub
+        # runner endpoint, which needs Administration: Read and may report
+        # unrelated registered runners in place of the real local total.
+        return parse_runner_inventory({"runners": []}, label=label)
 
     runners: list[dict[str, Any]] = []
     for index, container in enumerate(containers, start=1):

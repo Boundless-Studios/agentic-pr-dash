@@ -9,6 +9,7 @@ import pytest
 from agentic_pr_dash.observation import (
     ObservationController,
     ObservationKey,
+    ObservationPlan,
     ObservationReason,
     ObservationSlice,
 )
@@ -143,6 +144,90 @@ def test_pending_ci_is_due_every_poll_interval_until_terminal() -> None:
         )
         is None
     )
+
+
+def test_hourly_review_reconciliation_outranks_pending_ci_poll() -> None:
+    """A stuck pending job must not starve the hourly review repair."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    _prime(controller, clock, ci_pending=True)
+
+    clock.advance(timedelta(hours=1))
+    plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=True
+    )
+
+    assert plan is not None
+    assert plan.reason is ObservationReason.REVIEW_RECONCILIATION
+    assert plan.slices == frozenset(
+        {ObservationSlice.REVIEW, ObservationSlice.CI}
+    )
+
+
+def test_review_event_does_not_starve_terminal_ci_reconciliation() -> None:
+    """Review freshness must not reset the independent CI deadline."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    _prime(controller, clock, ci_pending=False)
+
+    clock.advance(timedelta(minutes=30))
+    controller.handle_event(
+        "pull_request_review", "acme/widgets", 7, "head-1", now=clock()
+    )
+    clock.advance(timedelta(seconds=2))
+    review_plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert review_plan is not None
+    assert review_plan.slices == frozenset({ObservationSlice.REVIEW})
+    controller.record_refresh(review_plan, now=clock(), ci_pending=False)
+
+    clock.advance(timedelta(minutes=29, seconds=58))
+    ci_plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+
+    assert ci_plan is not None
+    assert ci_plan.reason is ObservationReason.REVIEW_RECONCILIATION
+    assert ObservationSlice.CI in ci_plan.slices
+
+
+def test_partial_review_ack_retries_never_observed_ci_immediately() -> None:
+    """Each missing initial slice remains due after its sibling succeeds."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    initial = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert initial is not None
+    acknowledged = frozenset(
+        {ObservationSlice.METADATA, ObservationSlice.REVIEW}
+    )
+    controller.record_refresh(
+        ObservationPlan(
+            initial.key,
+            acknowledged,
+            initial.reason,
+            frozenset(
+                (observation_slice, generation)
+                for observation_slice, generation in (
+                    initial.invalidation_generations
+                )
+                if observation_slice in acknowledged
+            ),
+        ),
+        now=clock(),
+        ci_pending=False,
+    )
+
+    retry = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert retry is not None
+    assert retry.slices == frozenset({ObservationSlice.CI})
 
 
 @pytest.mark.parametrize(

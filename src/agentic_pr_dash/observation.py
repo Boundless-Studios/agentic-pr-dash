@@ -77,7 +77,6 @@ class _ObservationState:
             ObservationSlice.CI: None,
         }
     )
-    full_review_observed_at: datetime | None = None
     ci_pending: bool = False
     invalidated: set[ObservationSlice] = field(default_factory=set)
     invalidated_at: datetime | None = None
@@ -219,39 +218,49 @@ class ObservationController:
 
         pending = state.ci_pending if ci_pending is None else ci_pending
         ci_observed_at = state.observed_at[ObservationSlice.CI]
-        if pending and ci_observed_at is not None:
-            if observed_at >= ci_observed_at + self._ci_poll_interval:
-                return ObservationPlan(
-                    key,
-                    frozenset({ObservationSlice.CI}),
-                    ObservationReason.CI_POLL,
-                    self._invalidation_snapshot(
-                        state, frozenset({ObservationSlice.CI})
-                    ),
-                )
-
-        full_review_at = state.full_review_observed_at
-        if full_review_at is None or (
-            observed_at >= full_review_at + self._review_reconciliation_interval
-        ):
-            return ObservationPlan(
-                key,
-                _REVIEW_AND_CI,
-                ObservationReason.REVIEW_RECONCILIATION,
-                self._invalidation_snapshot(state, _REVIEW_AND_CI),
-            )
-
         metadata_at = state.observed_at[ObservationSlice.METADATA]
-        if metadata_at is None or (
+        review_observed_at = state.observed_at[ObservationSlice.REVIEW]
+        review_due = review_observed_at is None or (
+            observed_at
+            >= review_observed_at + self._review_reconciliation_interval
+        )
+        ci_due = ci_observed_at is None or (
+            pending
+            and observed_at >= ci_observed_at + self._ci_poll_interval
+        ) or (
+            not pending
+            and observed_at
+            >= ci_observed_at + self._review_reconciliation_interval
+        )
+        metadata_due = metadata_at is None or (
             observed_at >= metadata_at + self._metadata_reconciliation_interval
-        ):
+        )
+        due_slices: set[ObservationSlice] = set()
+        if review_due:
+            due_slices.add(ObservationSlice.REVIEW)
+        if ci_due:
+            due_slices.add(ObservationSlice.CI)
+        if due_slices:
+            if review_due:
+                reason = ObservationReason.REVIEW_RECONCILIATION
+            elif ci_due and pending:
+                reason = ObservationReason.CI_POLL
+            else:
+                reason = ObservationReason.REVIEW_RECONCILIATION
+            slices = frozenset(due_slices)
             return ObservationPlan(
                 key,
-                frozenset({ObservationSlice.METADATA}),
+                slices,
+                reason,
+                self._invalidation_snapshot(state, slices),
+            )
+        if metadata_due:
+            slices = frozenset({ObservationSlice.METADATA})
+            return ObservationPlan(
+                key,
+                slices,
                 ObservationReason.METADATA_RECONCILIATION,
-                self._invalidation_snapshot(
-                    state, frozenset({ObservationSlice.METADATA})
-                ),
+                self._invalidation_snapshot(state, slices),
             )
         return None
 
@@ -282,8 +291,6 @@ class ObservationController:
 
         if ObservationSlice.CI in plan.slices:
             state.ci_pending = ci_pending
-        if _REVIEW_AND_CI <= plan.slices:
-            state.full_review_observed_at = observed_at
         if not state.invalidated:
             state.invalidated_at = None
             state.invalidation_reason = None

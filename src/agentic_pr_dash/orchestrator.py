@@ -115,7 +115,25 @@ ENRICHMENT_CONCURRENCY = 6
 # the same interval for its per-head reconciliation plan; the orchestrator
 # uses it to decide when the cached raw PR list must be replaced.
 METADATA_RECONCILIATION_INTERVAL = timedelta(minutes=15)
+# Cold start has no cached projection to fall back on, so the board is simply
+# empty until the first list succeeds. One transient at daemon startup must not
+# hold it empty for a whole reconciliation interval; retry on the next poll tick
+# instead. Once a usable cache exists, the long backoff above applies again.
+METADATA_COLD_START_RETRY_INTERVAL = timedelta(seconds=POLL_INTERVAL_SECONDS)
 EVENT_DEBOUNCE_WINDOW = timedelta(seconds=2)
+# Blocker statuses that are only as current as the last successful review+CI
+# observation of the PR's immutable head. See ``_enrich_pr``'s status
+# computation: when that head has never been observed these describe a previous
+# head and must not be reported (or auto-dispatched) as if they were current.
+_OBSERVATION_DERIVED_STATUSES = frozenset(
+    {
+        PRStatus.CLEAN,
+        PRStatus.CI_PENDING,
+        PRStatus.CI_FAILING,
+        PRStatus.HAS_COMMENTS,
+        PRStatus.CI_AND_COMMENTS,
+    }
+)
 # Admission estimates are intentionally conservative until the GraphQL batch
 # returns a real ``rateLimit.cost`` sample. They are only used to decide if a
 # background request may start; successful batch requests reconcile to the
@@ -213,6 +231,9 @@ class Orchestrator:
         self._pr_root: dict[PRKey, str | None] = {}
         self._observation_keys: dict[PRKey, ObservationKey] = {}
         self._observed_blocker_keys: set[ObservationKey] = set()
+        self._observed_blocker_slices: dict[
+            ObservationKey, set[ObservationSlice]
+        ] = {}
         # The poll loop and manual refresh endpoint share one mutable PR/cache
         # projection. Serialize complete refresh transactions so an older
         # GitHub response can never land after a newer one.
@@ -472,7 +493,15 @@ class Orchestrator:
         interval = self._metadata_interval()
         last_attempt = self._metadata_last_attempt.get(root)
         if root not in self._metadata_cache:
-            return last_attempt is None or now >= last_attempt + interval
+            # Cold start: nothing has ever been loaded for this root, so a
+            # failed first attempt leaves the board blank rather than merely
+            # stale. Retry on the next poll tick instead of sitting out the
+            # full reconciliation interval. ``min`` keeps a deliberately short
+            # configured interval from being lengthened by this floor.
+            if last_attempt is None:
+                return True
+            retry = min(interval, METADATA_COLD_START_RETRY_INTERVAL)
+            return now >= last_attempt + retry
 
         last_success = self._metadata_last_success.get(root)
         references = [
@@ -737,10 +766,14 @@ class Orchestrator:
                 # Per-repo isolation: one bad repo must not sink the dashboard.
                 self.log(f"Poll error for repo root {root}: {exc}", level="error")
 
-        self.observation_controller.prune(self._observation_keys.values())
-        self._observed_blocker_keys.intersection_update(
-            self._observation_keys.values()
-        )
+        active_observation_keys = set(self._observation_keys.values())
+        self.observation_controller.prune(active_observation_keys)
+        self._observed_blocker_keys.intersection_update(active_observation_keys)
+        self._observed_blocker_slices = {
+            key: slices
+            for key, slices in self._observed_blocker_slices.items()
+            if key in active_observation_keys
+        }
 
         return list(self.prs.values())
 
@@ -1301,10 +1334,16 @@ class Orchestrator:
                 )
         elif review_requested:
             # Review-only events must not spend another latest-commit read. The
-            # cached commit date is the immutable-head filter used by the
-            # review scanner; without it, fail closed rather than scanning a
-            # potentially unrelated review history.
-            if pr.latest_commit_date:
+            # cached commit date is reusable only when it belongs to this
+            # plan's immutable head. A partial head-change observation can
+            # leave the previous head's date on ``pr``; refetch the prerequisite
+            # before scanning rather than applying stale review history.
+            plan_head = plan.key.head_sha if plan is not None else ""
+            if (
+                pr.latest_commit_date
+                and pr.latest_commit_sha
+                and pr.latest_commit_sha == plan_head
+            ):
                 review_result = await self._review_fallback_observation(
                     num,
                     pr.latest_commit_date,
@@ -1312,9 +1351,33 @@ class Orchestrator:
                     force=force,
                 )
             else:
-                review_result = github_api.ObservationReadResult.unavailable(
-                    "review observation unavailable: cached latest commit date missing"
+                latest_value = await asyncio.to_thread(
+                    github_api.get_latest_commit, num, root
                 )
+                if (
+                    len(latest_value) >= 2
+                    and bool(latest_value[0])
+                    and bool(latest_value[1])
+                    and str(latest_value[0]) == plan_head
+                ):
+                    latest_result = github_api.ObservationReadResult.observed(
+                        (str(latest_value[0]), str(latest_value[1]))
+                    )
+                    latest_commit_date = str(latest_value[1])
+                    review_result = await self._review_fallback_observation(
+                        num,
+                        latest_commit_date,
+                        root,
+                        force=force,
+                    )
+                else:
+                    latest_result = github_api.ObservationReadResult.unavailable(
+                        "latest commit observation unavailable for review retry"
+                    )
+                    review_result = github_api.ObservationReadResult.unavailable(
+                        "review observation unavailable: current-head latest "
+                        "commit date missing"
+                    )
         if ci_requested:
             if (
                 batch_denied
@@ -1359,112 +1422,169 @@ class Orchestrator:
                     github_api.get_ci_checks_observation, num, root
                 )
 
-        requested_results = [
-            result
-            for result in (latest_result, ci_result, review_result)
-            if result is not None
-        ]
-        observation_succeeded = all(
-            result.observable and result.value is not None
-            for result in requested_results
+        latest_observed = (
+            latest_result is not None
+            and latest_result.observable
+            and latest_result.value is not None
         )
-        observation_unavailable = False
-        if requested_results and not observation_succeeded:
+        ci_observed = (
+            ci_result is not None
+            and ci_result.observable
+            and ci_result.value is not None
+        )
+        review_observed = (
+            review_result is not None
+            and review_result.observable
+            and review_result.value is not None
+            and (not full_observation_requested or latest_observed)
+        )
+        failed_requested_slice = (
+            metadata_requested
+            and full_observation_requested
+            and not latest_observed
+        ) or (ci_requested and not ci_observed) or (
+            review_requested and not review_observed
+        )
+        observation_unavailable = bool(
+            failed_requested_slice
+            and plan is not None
+            and plan.key not in self._observed_blocker_keys
+        )
+        if failed_requested_slice:
             errors = [
                 result.error or "unobservable read"
-                for result in requested_results
-                if not result.observable
+                for result in (latest_result, ci_result, review_result)
+                if result is not None
+                and (not result.observable or result.value is None)
             ]
+            if (
+                full_observation_requested
+                and review_result is not None
+                and review_result.observable
+                and not latest_observed
+            ):
+                errors.append(
+                    "review observation unavailable: latest commit prerequisite "
+                    "unavailable"
+                )
             self.log(
                 f"Preserving cached blockers for PR #{num}: {'; '.join(errors)}",
                 pr_number=num,
                 level="warn",
             )
-            if plan is not None and plan.key not in self._observed_blocker_keys:
-                observation_unavailable = True
-        else:
-            if latest_result is not None and latest_result.value is not None:
-                previous_commit_sha = pr.latest_commit_sha
-                sha, latest_commit_date = latest_result.value
-                pr.latest_commit_sha = sha
-                pr.latest_commit_date = latest_commit_date
-                if previous_commit_sha and sha != previous_commit_sha:
-                    pr.no_push_comment_retry_count = 0
 
-            if ci_result is not None and ci_result.value is not None:
-                checks = ci_result.value
-                pr.ci_checks = checks
-                ci_pending = any(
-                    c.status in {"queued", "in_progress"} for c in checks
-                )
-                if ci_pending and plan is not None and {
-                    ObservationSlice.REVIEW,
-                    ObservationSlice.CI,
-                } <= plan.slices:
-                    queued_jobs, runner_pool_health, runner_execution_summary = (
-                        await asyncio.to_thread(
-                            github_api.get_workflow_queue_health, num, root
-                        )
+        if latest_observed and latest_result is not None:
+            previous_commit_sha = pr.latest_commit_sha
+            sha, latest_commit_date = latest_result.value
+            pr.latest_commit_sha = sha
+            pr.latest_commit_date = latest_commit_date
+            if previous_commit_sha and sha != previous_commit_sha:
+                pr.no_push_comment_retry_count = 0
+
+        if ci_observed and ci_result is not None:
+            checks = ci_result.value
+            pr.ci_checks = checks
+            ci_pending = any(
+                c.status in {"queued", "in_progress"} for c in checks
+            )
+            # Queue diagnostics belong to the CI slice, not the full
+            # observation. A PR that stays pending after its first full read
+            # is polled every 30s with a CI-only plan.
+            if ci_pending:
+                queued_jobs, runner_pool_health, runner_execution_summary = (
+                    await asyncio.to_thread(
+                        github_api.get_workflow_queue_health, num, root
                     )
-                    pr.queued_jobs = queued_jobs
-                    pr.runner_pool_health = runner_pool_health
-                    pr.runner_execution_summary = runner_execution_summary
-                elif not ci_pending:
-                    pr.queued_jobs = []
-                    pr.runner_pool_health = []
-                    pr.runner_execution_summary = (
-                        pr.runner_execution_summary.__class__()
-                    )
-                pr.failing_checks = [
-                    c.name
-                    for c in checks
-                    if c.conclusion == "failure"
-                    and not github_api._is_infra_check(c.name)
-                ]
-
-            if review_result is not None and review_result.value is not None:
-                comments, decisions = review_result.value
-                pr.review_comments = comments
-                self._emit(
-                    "comment_scan",
-                    pr_number=num,
-                    repo=root,
-                    details={
-                        "decisions": [d.model_dump() for d in decisions],
-                        "picked": len(comments),
-                    },
                 )
-                if not comments:
-                    pr.no_push_comment_retry_count = 0
-                current_comment_ids = {c.id for c in comments}
-                new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
-                if new_comment_ids and num not in self._inflight_prs:
-                    if pr.agent_failure_reason:
-                        self.log(
-                            f"New unaddressed comment(s) on PR #{num} — "
-                            "clearing stuck failure state",
-                            pr_number=num,
-                        )
-                        pr.agent_failure_reason = None
-                    pr.no_push_comment_retry_count = 0
-                pr.last_seen_comment_ids = current_comment_ids
+                pr.queued_jobs = queued_jobs
+                pr.runner_pool_health = runner_pool_health
+                pr.runner_execution_summary = runner_execution_summary
+            else:
+                pr.queued_jobs = []
+                pr.runner_pool_health = []
+                pr.runner_execution_summary = (
+                    pr.runner_execution_summary.__class__()
+                )
+            pr.failing_checks = [
+                c.name
+                for c in checks
+                if c.conclusion == "failure"
+                and not github_api._is_infra_check(c.name)
+            ]
 
-            if plan is not None:
+        if review_observed and review_result is not None:
+            comments, decisions = review_result.value
+            pr.review_comments = comments
+            self._emit(
+                "comment_scan",
+                pr_number=num,
+                repo=root,
+                details={
+                    "decisions": [d.model_dump() for d in decisions],
+                    "picked": len(comments),
+                },
+            )
+            if not comments:
+                pr.no_push_comment_retry_count = 0
+            current_comment_ids = {c.id for c in comments}
+            new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
+            if new_comment_ids and num not in self._inflight_prs:
+                if pr.agent_failure_reason:
+                    self.log(
+                        f"New unaddressed comment(s) on PR #{num} — "
+                        "clearing stuck failure state",
+                        pr_number=num,
+                    )
+                    pr.agent_failure_reason = None
+                pr.no_push_comment_retry_count = 0
+            pr.last_seen_comment_ids = current_comment_ids
+
+        if plan is not None:
+            observed_slices: set[ObservationSlice] = set()
+            if metadata_requested and (
+                not full_observation_requested or latest_observed
+            ):
+                observed_slices.add(ObservationSlice.METADATA)
+            if ci_requested and ci_observed:
+                observed_slices.add(ObservationSlice.CI)
+            if review_requested and review_observed:
+                observed_slices.add(ObservationSlice.REVIEW)
+            if observed_slices:
+                acknowledged_slices = frozenset(observed_slices)
+                acknowledged_plan = ObservationPlan(
+                    plan.key,
+                    acknowledged_slices,
+                    plan.reason,
+                    frozenset(
+                        (observation_slice, generation)
+                        for observation_slice, generation in (
+                            plan.invalidation_generations
+                        )
+                        if observation_slice in acknowledged_slices
+                    ),
+                )
                 self.observation_controller.record_refresh(
-                    plan,
+                    acknowledged_plan,
                     ci_pending=(
                         any(
                             c.status in {"queued", "in_progress"}
                             for c in pr.ci_checks
                         )
-                        if ci_requested
+                        if ObservationSlice.CI in acknowledged_slices
                         else False
                     ),
                 )
+                blocker_slices = observed_slices.intersection(
+                    {ObservationSlice.REVIEW, ObservationSlice.CI}
+                )
+                if blocker_slices:
+                    self._observed_blocker_slices.setdefault(
+                        plan.key, set()
+                    ).update(blocker_slices)
                 if {
                     ObservationSlice.REVIEW,
                     ObservationSlice.CI,
-                } <= plan.slices:
+                } <= self._observed_blocker_slices.get(plan.key, set()):
                     self._observed_blocker_keys.add(plan.key)
 
         # Read escalation marker (best-effort): if the maintenance loop has
@@ -1483,10 +1603,22 @@ class Orchestrator:
             pass
 
         # Compute status
+        #
+        # ``observation_unavailable`` means THIS immutable head has never had a
+        # successful review+CI read, so every blocker below came from a previous
+        # head — the very push we could not observe may already have fixed it.
+        # Reporting that stale verdict is not just cosmetic: CI_FAILING and the
+        # comment statuses are auto-dispatch triggers, so maintenance would be
+        # launched against work that no longer exists. Fail closed to
+        # "unavailable" for every observation-derived status, not only CLEAN.
+        # Statuses sourced elsewhere stay authoritative: a pending human
+        # decision and a local agent failure are dashboard state, and merge
+        # conflict comes from the metadata slice's own mergeability refetch.
         computed_status = self._compute_status(pr)
         pr.status = (
             PRStatus.OBSERVATION_UNAVAILABLE
-            if observation_unavailable and computed_status is PRStatus.CLEAN
+            if observation_unavailable
+            and computed_status in _OBSERVATION_DERIVED_STATUSES
             else computed_status
         )
         pr.last_polled = now

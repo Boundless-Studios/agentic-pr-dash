@@ -946,3 +946,56 @@ def test_batch_fetch_records_one_quota_sample_per_chunk(
     telemetry = ledger.telemetry()
     assert telemetry.request_count == expected_chunks
     assert telemetry.rolling_cost_by_work_class[QuotaWorkClass.BACKGROUND_OBSERVATION] == expected_chunks * 37
+
+
+def test_estimated_reads_reduce_sampled_remaining_until_next_snapshot() -> None:
+    """GraphQL reads without rateLimit data must still protect the reserve."""
+
+    clock = ManualClock()
+    ledger = QuotaLedger(
+        clock=clock,
+        background_hourly_budget=500,
+        maintenance_reserve=1_000,
+    )
+    ledger.record_graphql(
+        caller=QuotaCaller.DASHBOARD,
+        work_class=QuotaWorkClass.BACKGROUND_OBSERVATION,
+        cost=1,
+        remaining=1_050,
+        reset_at=clock.current + timedelta(hours=1),
+        limit=5_000,
+    )
+
+    reservation = ledger.reserve(
+        QuotaCaller.DASHBOARD,
+        QuotaWorkClass.BACKGROUND_OBSERVATION,
+        estimated_cost=50,
+    )
+    assert reservation is not None
+    ledger.record_estimated(
+        QuotaCaller.DASHBOARD,
+        QuotaWorkClass.BACKGROUND_OBSERVATION,
+        50,
+        reservation=reservation,
+    )
+
+    decision = ledger.allow(
+        QuotaCaller.DASHBOARD,
+        QuotaWorkClass.BACKGROUND_OBSERVATION,
+        estimated_cost=1,
+    )
+    assert decision.reason is QuotaDecisionReason.MAINTENANCE_RESERVE
+
+    ledger.record_graphql(
+        caller=QuotaCaller.MAINTENANCE,
+        work_class=QuotaWorkClass.MAINTENANCE_GATE,
+        cost=1,
+        remaining=1_200,
+        reset_at=clock.current + timedelta(hours=1),
+        limit=5_000,
+    )
+    assert ledger.allow(
+        QuotaCaller.DASHBOARD,
+        QuotaWorkClass.BACKGROUND_OBSERVATION,
+        estimated_cost=1,
+    ).allowed is True
