@@ -125,6 +125,13 @@ def test_refresh_threads_pr_repo_root_into_worktree_resolution(monkeypatch):
     )
     monkeypatch.setattr(github_api, "get_ci_checks", lambda num, cwd=None: [])
     monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda num, latest, cwd=None: github_api.ObservationReadResult.observed(
+            ([], [])
+        ),
+    )
+    monkeypatch.setattr(
         github_api, "get_unaddressed_comments", lambda num, latest, cwd=None: []
     )
 
@@ -166,6 +173,13 @@ def _base_stubs(monkeypatch):
     monkeypatch.setattr(github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None)
     monkeypatch.setattr(github_api, "get_mergeability", lambda num, cwd=None: ("CLEAN", "MERGEABLE"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda num, cwd=None: [])
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda num, latest, cwd=None: github_api.ObservationReadResult.observed(
+            ([], [])
+        ),
+    )
     monkeypatch.setattr(
         github_api, "get_unaddressed_comments", lambda num, latest, cwd=None: []
     )

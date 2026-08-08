@@ -1862,7 +1862,7 @@ async def retry_ci(pr_number: int, request: Request):
 
 @app.post("/api/refresh")
 async def force_refresh():
-    await orchestrator.refresh_prs()
+    await orchestrator.refresh_prs(force=True)
     _invalidate_dashboard_context()
     return RedirectResponse(url="/", status_code=303)
 

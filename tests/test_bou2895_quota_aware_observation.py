@@ -432,4 +432,6 @@ async def test_overlapping_refreshes_are_serialized(monkeypatch):
     release_list.set()
     await asyncio.gather(first, second)
 
-    assert calls == {"list": 2, "batch": 1, "latest": 1, "ci": 1, "review": 1}
+    # The second waiter joins the completed transaction and reuses its
+    # successful metadata cache; only the first immediate tick lists PRs.
+    assert calls == {"list": 1, "batch": 1, "latest": 1, "ci": 1, "review": 1}

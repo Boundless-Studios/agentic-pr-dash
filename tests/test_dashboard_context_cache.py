@@ -28,6 +28,7 @@ def test_force_refresh_discards_inflight_context_result(monkeypatch):
         await started.wait()
         stale_build = app._dashboard_context_tasks[(False, "board")]
         await app.force_refresh()
+        app.orchestrator.refresh_prs.assert_awaited_once_with(force=True)
 
         fresh_request = asyncio.create_task(app._dashboard_context_async())
         await asyncio.sleep(0)

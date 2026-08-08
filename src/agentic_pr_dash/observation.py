@@ -356,6 +356,15 @@ class ObservationController:
     def _observation_time(self, now: datetime | None) -> datetime:
         return _as_utc(self._clock() if now is None else now)
 
+    def now(self) -> datetime:
+        """Return the controller's timezone-aware current observation time."""
+        return self._observation_time(None)
+
+    @property
+    def metadata_reconciliation_interval(self) -> timedelta:
+        """Configured interval for repository metadata reconciliation."""
+        return self._metadata_reconciliation_interval
+
     @staticmethod
     def _invalidation_snapshot(
         state: _ObservationState | None,
