@@ -640,6 +640,39 @@ class QuotaLedger:
                 self._backoff_reason = None
             self._refresh_degraded(self._now())
 
+    def record_estimated(
+        self,
+        caller: QuotaCaller,
+        work_class: QuotaWorkClass,
+        cost: int,
+        *,
+        reservation: QuotaReservation | None = None,
+    ) -> None:
+        """Record a successful request that did not expose ``rateLimit``.
+
+        ``gh pr list`` is a GraphQL-backed command but only returns the rich
+        payload, not GitHub's top-level rate-limit sample.  Accounting its
+        conservative admission estimate still protects the local hourly
+        dashboard budget while leaving the latest server sample untouched.
+        """
+
+        if cost < 1:
+            raise ValueError("estimated GraphQL cost must be at least one")
+        with self._lock:
+            now = self._prune()
+            if reservation is not None:
+                current = self._reservations.get(reservation.reservation_id)
+                if current != reservation:
+                    raise ValueError("unknown or already reconciled quota reservation")
+                del self._reservations[reservation.reservation_id]
+            self._usage.append(_Usage(now, caller, work_class, cost))
+            self._request_count += 1
+            self._failure_active = False
+            self._failure_reason = None
+            self._refresh_degraded(now)
+
+    record_estimated_cost = record_estimated
+
     def record_backoff(self, duration: timedelta, *, reason: str) -> None:
         """Record a bounded backoff/degraded interval."""
 

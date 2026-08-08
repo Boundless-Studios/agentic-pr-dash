@@ -81,6 +81,37 @@ class ObservationReadResult(Generic[ObservationValue]):
         return cls(value=value, observable=False, error=error)
 
 
+@dataclass(frozen=True, slots=True)
+class ConditionalPRListProbe:
+    """The result of a conditional REST open-PR metadata probe.
+
+    The dashboard uses this endpoint as a cheap validator for its rich
+    ``gh pr list`` snapshot.  A ``304`` is an authoritative statement that the
+    cached metadata is still current; a ``200`` means the validator changed
+    and the caller may choose to spend a GraphQL-rich relist.  Keeping the
+    response typed prevents a failed probe from being confused with an empty
+    open-PR list (which would otherwise prune the dashboard).
+    """
+
+    status_code: int | None
+    prs: list[dict]
+    etag: str | None = None
+    last_modified: str | None = None
+    error: str | None = None
+
+    @property
+    def observable(self) -> bool:
+        return self.status_code in {200, 304} and self.error is None
+
+    @property
+    def not_modified(self) -> bool:
+        return self.status_code == 304 and self.error is None
+
+    @property
+    def changed(self) -> bool:
+        return self.status_code == 200 and self.error is None
+
+
 class _ObservedList(list):
     """List-compatible legacy return carrying boundary observability."""
 
@@ -97,6 +128,18 @@ class _ObservedList(list):
         super().__init__(values)
         self.observable = observable
         self.error = error
+
+
+class _BatchObservationDict(dict[int, dict]):
+    """Dict-compatible batch result carrying quota admission state."""
+
+    denied: bool
+    error: str | None
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.denied = False
+        self.error = None
 
 
 def _runner_label() -> str | None:
@@ -800,6 +843,153 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
         return None
     _LAST_LIST_OPEN_PRS_FAILURE = None
     return prs
+
+
+def _parse_included_rest_response(
+    stdout: str,
+) -> tuple[int | None, dict[str, str], str]:
+    """Split ``gh api --include`` output into status, headers, and body.
+
+    ``gh`` emits the response headers before the JSON body.  The parser also
+    accepts body-only output because that is the convenient shape used by
+    tests and by older gh versions when a proxy strips ``--include`` output.
+    """
+
+    text = stdout or ""
+    status: int | None = None
+    headers: dict[str, str] = {}
+    body = text
+    sections = re.split(r"\r?\n\r?\n", text)
+    header_index: int | None = None
+    for index, section in enumerate(sections):
+        match = re.search(r"^HTTP/\S+\s+(\d{3})\b", section, re.MULTILINE)
+        if match is None:
+            continue
+        header_index = index
+        status = int(match.group(1))
+        for line in section.splitlines()[1:]:
+            name, separator, value = line.partition(":")
+            if separator:
+                headers[name.strip().casefold()] = value.strip()
+        # A redirect can produce multiple header blocks.  The last block is
+        # the response whose body follows it.
+    if header_index is not None:
+        body = "\n\n".join(sections[header_index + 1 :]).strip()
+        # Some gh/proxy combinations place the body in the same section as the
+        # headers when there is no blank separator.
+        if not body:
+            section = sections[header_index]
+            lines = section.splitlines()
+            body = "\n".join(lines[1 + len(headers) :]).strip()
+    return status, headers, body
+
+
+def probe_open_prs_rest(
+    owner: str,
+    repo: str,
+    *,
+    etag: str | None = None,
+    last_modified: str | None = None,
+    author: str | None = None,
+    cwd: str | None = None,
+) -> ConditionalPRListProbe:
+    """Conditionally validate the cached open-PR metadata via REST.
+
+    This intentionally does not call ``gh pr list`` or GraphQL.  The response
+    is capped at 100 records, which is the GitHub REST page maximum and is
+    sufficient for the dashboard's supported open-PR population.  The rich
+    relist remains the source of labels, mergeability, and review metadata when
+    the validator reports a change.
+    """
+
+    if not owner or not repo:
+        return ConditionalPRListProbe(None, [], error="repository identity unavailable")
+
+    endpoint = (
+        f"repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc"
+        "&per_page=100&page=1"
+    )
+    cmd = ["gh", "api", "--include", endpoint]
+    if etag:
+        cmd.extend(["-H", f"If-None-Match: {etag}"])
+    if last_modified:
+        cmd.extend(["-H", f"If-Modified-Since: {last_modified}"])
+    result = _run(cmd, cwd=cwd, timeout_s=30)
+    status, headers, body = _parse_included_rest_response(result.stdout or "")
+    # A 304 is a successful conditional response even though some gh builds
+    # surface it as a non-zero subprocess result.
+    if status == 304:
+        return ConditionalPRListProbe(
+            status,
+            [],
+            etag=headers.get("etag") or etag,
+            last_modified=headers.get("last-modified") or last_modified,
+        )
+    if result.returncode != 0:
+        return ConditionalPRListProbe(
+            status,
+            [],
+            etag=headers.get("etag") or etag,
+            last_modified=headers.get("last-modified") or last_modified,
+            error=(result.stderr or "REST open-PR probe failed").strip(),
+        )
+    if status is not None and status != 200:
+        return ConditionalPRListProbe(
+            status,
+            [],
+            etag=headers.get("etag") or etag,
+            last_modified=headers.get("last-modified") or last_modified,
+            error=f"REST open-PR probe returned HTTP {status}",
+        )
+    try:
+        payload = json.loads(body or "[]")
+    except json.JSONDecodeError as exc:
+        return ConditionalPRListProbe(
+            status or 200,
+            [],
+            etag=headers.get("etag") or etag,
+            last_modified=headers.get("last-modified") or last_modified,
+            error=f"REST open-PR probe returned invalid JSON: {exc}",
+        )
+    if not isinstance(payload, list):
+        return ConditionalPRListProbe(
+            status or 200,
+            [],
+            etag=headers.get("etag") or etag,
+            last_modified=headers.get("last-modified") or last_modified,
+            error="REST open-PR probe returned a non-list payload",
+        )
+
+    configured_author = author
+    if not configured_author:
+        configured_author = load_config(cwd).pr_author
+    configured_author = (configured_author or "").strip()
+    if configured_author.casefold() in {"@me", "me"}:
+        configured_author = _rest_viewer_login(cwd)
+    expected_author = configured_author.casefold()
+    normalized: list[dict] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        if expected_author:
+            user = item.get("user")
+            login = user.get("login") if isinstance(user, dict) else ""
+            if str(login or "").casefold() != expected_author:
+                continue
+        converted = _normalize_rest_pr_payload(item)
+        if converted is not None:
+            normalized.append(converted)
+    return ConditionalPRListProbe(
+        status or 200,
+        normalized,
+        etag=headers.get("etag") or etag,
+        last_modified=headers.get("last-modified") or last_modified,
+    )
+
+
+# Explicit alias for callers that describe this read as a metadata probe.
+probe_open_pr_metadata = probe_open_prs_rest
+conditional_open_pr_probe = probe_open_prs_rest
 
 
 # ---------------------------------------------------------------------------
@@ -1801,6 +1991,12 @@ _PR_BATCH_CACHE: dict[tuple[str, int], dict] = {}
 _PR_BATCH_REPO_BY_CWD: dict[str, str] = {}
 
 
+def _batch_repo_for_cwd(cwd: str | None) -> str | None:
+    """Return the repository primed for ``cwd`` (including legacy ``None``)."""
+    key = str(Path(cwd).resolve()) if cwd else ""
+    return _PR_BATCH_REPO_BY_CWD.get(key)
+
+
 @dataclass(frozen=True)
 class PrMaintenanceSnapshot:
     """One immutable-head PR observation collected by the aggregate query."""
@@ -1871,8 +2067,10 @@ def prime_pr_batch_cache(
     """
     for pr_number, data in entries.items():
         _PR_BATCH_CACHE[(repo_slug, pr_number)] = data
-    if cwd:
-        _PR_BATCH_REPO_BY_CWD[str(Path(cwd).resolve())] = repo_slug
+    # ``None`` is the legacy single-repository call shape. Keep a sentinel
+    # mapping for it too, so a successful batch is still consumed from cache
+    # instead of triggering the old per-PR GraphQL lookup.
+    _PR_BATCH_REPO_BY_CWD[str(Path(cwd).resolve()) if cwd else ""] = repo_slug
 
 
 def get_review_threads(
@@ -1902,9 +2100,7 @@ def get_review_threads(
     BOU-2556: a hit in the batch-prefetch cache (see ``prime_pr_batch_cache``)
     short-circuits this whole call — no `gh` invocation at all.
     """
-    primed_repo = (
-        _PR_BATCH_REPO_BY_CWD.get(str(Path(cwd).resolve())) if cwd else None
-    )
+    primed_repo = _batch_repo_for_cwd(cwd)
     cached = (
         _PR_BATCH_CACHE.get((primed_repo, pr_number)) if primed_repo else None
     )
@@ -2639,6 +2835,15 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
         _note_checks_probe_failure()
         return _ObservedList([], observable=False, error="CI head SHA unavailable")
 
+    return _get_ci_checks_rest_for_sha(sha, cwd)
+
+
+def _get_ci_checks_rest_for_sha(
+    sha: str,
+    cwd: str | None = None,
+) -> list[CICheck]:
+    """Read CI from REST endpoints for an already-cached PR head."""
+
     runs = get_check_runs_for_commit(sha, cwd)
     if isinstance(runs, _ObservedList) and not runs.observable:
         return _ObservedList([], observable=False, error="CI status reads unavailable")
@@ -2652,6 +2857,44 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
             conclusion = "failure"
         checks.append(CICheck(name=run.get("name", "?"), status=status, conclusion=conclusion))
     return _ObservedList(checks, observable=True)
+
+
+def get_ci_checks_rest_observation(
+    head_sha: str,
+    cwd: str | None = None,
+    *,
+    pr_number: int | None = None,
+) -> ObservationReadResult[list[CICheck]]:
+    """Return a typed, REST-only CI read for a cached immutable head.
+
+    Pending CI polls are frequent and must not fall back to ``gh pr checks``
+    (which is backed by the expensive GraphQL rollup).  The orchestrator passes
+    the head SHA already present in its metadata/observation cache, so this
+    boundary performs only ``check-runs`` and combined commit-status REST reads.
+    Test adapters that replace the historical ``get_ci_checks`` boundary keep
+    their compatibility behavior, while production always uses this path.
+    """
+
+    if not head_sha:
+        return ObservationReadResult.unavailable("CI observation unavailable: cached head SHA missing")
+    try:
+        if get_ci_checks.__module__ != __name__:
+            value = get_ci_checks(pr_number or 0, cwd)
+            if isinstance(value, ObservationReadResult):
+                return value
+            if isinstance(value, _ObservedList):
+                return ObservationReadResult(
+                    value=list(value), observable=value.observable, error=value.error
+                )
+            return ObservationReadResult.observed(list(value))
+        value = _get_ci_checks_rest_for_sha(head_sha, cwd)
+    except Exception as exc:  # noqa: BLE001
+        return ObservationReadResult.unavailable(f"REST CI observation raised: {exc}")
+    if isinstance(value, _ObservedList):
+        return ObservationReadResult(
+            value=list(value), observable=value.observable, error=value.error
+        )
+    return ObservationReadResult.observed(list(value))
 
 
 # GraphQL statusCheckRollup: per-context required-ness + non-terminal state.
@@ -2702,10 +2945,10 @@ def _repo_for_cwd(cwd: str | None) -> str | None:
     anchor repo. Detect from the cwd's git remote first and only fall back to the
     config-resolved repo (codex PR #50 review)."""
     from .config import _detect_repo  # noqa: PLC0415
+    cached = _batch_repo_for_cwd(cwd)
+    if cached:
+        return cached
     if cwd:
-        cached = _PR_BATCH_REPO_BY_CWD.get(str(Path(cwd).resolve()))
-        if cached:
-            return cached
         detected = _detect_repo(Path(cwd))
         if detected:
             return detected
@@ -2915,7 +3158,7 @@ def batch_fetch_pr_review_and_ci(
             work_class=work_class,
         )
 
-    results: dict[int, dict] = {}
+    results: _BatchObservationDict = _BatchObservationDict()
     numbers = sorted(set(pr_numbers))
     for start in range(0, len(numbers), _BATCH_CHUNK_SIZE):
         chunk = numbers[start:start + _BATCH_CHUNK_SIZE]
@@ -2974,6 +3217,8 @@ def batch_fetch_pr_review_and_ci(
                 estimated_cost=estimated_cost,
             )
             if reservation is None:
+                results.denied = True
+                results.error = "dashboard quota denied batch observation"
                 continue
 
         try:
