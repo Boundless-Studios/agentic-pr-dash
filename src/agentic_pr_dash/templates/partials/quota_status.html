@@ -1,0 +1,32 @@
+<details class="quota-status{% if quota.degraded %} quota-status-degraded{% elif not quota.observed %} quota-status-unobserved{% endif %}">
+    <summary>
+        <span class="quota-dot" aria-hidden="true"></span>
+        <span>{{ quota.label }}</span>
+    </summary>
+    <div class="quota-details">
+        <dl>
+            <div><dt>Latest cost</dt><dd>{{ quota.latest_cost if quota.latest_cost is not none else '—' }}</dd></div>
+            <div><dt>Reset</dt><dd>{{ quota.reset_at if quota.reset_at else 'Unobserved' }}</dd></div>
+            <div><dt>Cache hit rate</dt><dd>{{ '%.0f' | format(quota.cache_hit_rate * 100) }}% ({{ quota.cache_hit_count }}/{{ quota.total_request_count }})</dd></div>
+            <div><dt>Background budget</dt><dd>{{ quota.background_hourly_spend }} / {{ quota.background_hourly_budget }} per hour</dd></div>
+            <div><dt>Maintenance reserve</dt><dd>{{ quota.maintenance_reserve }}</dd></div>
+        </dl>
+        <div class="quota-attribution">
+            <span>Rolling caller cost</span>
+            {% if quota.rolling_cost_by_caller %}
+                {% for caller, cost in quota.rolling_cost_by_caller.items() %}<code>{{ caller }}={{ cost }}</code>{% endfor %}
+            {% else %}<code>none</code>{% endif %}
+        </div>
+        <div class="quota-attribution">
+            <span>Rolling class cost</span>
+            {% if quota.rolling_cost_by_work_class %}
+                {% for work_class, cost in quota.rolling_cost_by_work_class.items() %}<code>{{ work_class }}={{ cost }}</code>{% endfor %}
+            {% else %}<code>none</code>{% endif %}
+        </div>
+        {% if quota.degraded or quota.backoff_active %}
+        <p class="quota-warning">
+            Observation degraded{% if quota.degraded_reason %}: {{ quota.degraded_reason }}{% endif %}{% if quota.backoff_until %} · retry after {{ quota.backoff_until }}{% endif %}
+        </p>
+        {% endif %}
+    </div>
+</details>

@@ -637,6 +637,50 @@ class Orchestrator:
                 now=self.observation_controller.now(),
             )
 
+    async def handle_github_check_event(
+        self,
+        event_name: str,
+        repo: str,
+        head_sha: str,
+        action: str | None = None,
+    ) -> None:
+        """Invalidate CI by immutable head when GitHub omits PR associations."""
+
+        normalized_repo = _normalize_repo(repo)
+        normalized_event = event_name.strip().casefold()
+        normalized_action = action.strip().casefold() if action is not None else None
+        async with self._refresh_lock:
+            root = self._known_event_root(repo)
+            if root is _EventRepoResolution.UNKNOWN:
+                self.log(
+                    f"Ignoring check event for unknown GitHub repo {repo!r}",
+                    level="warn",
+                )
+                return
+
+            matched = False
+            for key, observation_key in self._observation_keys.items():
+                if self._pr_root.get(key) != root:
+                    continue
+                if _normalize_repo(key[0]) != normalized_repo:
+                    continue
+                if observation_key.head_sha != head_sha:
+                    continue
+                matched = True
+                self.observation_controller.handle_event(
+                    normalized_event,
+                    observation_key.repo,
+                    observation_key.number,
+                    observation_key.head_sha,
+                    action=normalized_action,
+                    now=self.observation_controller.now(),
+                )
+            if not matched:
+                self.log(
+                    f"Ignoring check event for untracked head {head_sha[:12]} in {repo}",
+                    level="info",
+                )
+
     def start(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -1439,10 +1483,11 @@ class Orchestrator:
             pass
 
         # Compute status
+        computed_status = self._compute_status(pr)
         pr.status = (
             PRStatus.OBSERVATION_UNAVAILABLE
-            if observation_unavailable
-            else self._compute_status(pr)
+            if observation_unavailable and computed_status is PRStatus.CLEAN
+            else computed_status
         )
         pr.last_polled = now
 

@@ -150,6 +150,7 @@ def test_pending_ci_is_due_every_poll_interval_until_terminal() -> None:
     [
         ("pull_request_review", ObservationSlice.REVIEW),
         ("pull_request_review_comment", ObservationSlice.REVIEW),
+        ("pull_request_review_thread", ObservationSlice.REVIEW),
         ("check_run", ObservationSlice.CI),
         ("check_suite", ObservationSlice.CI),
     ],

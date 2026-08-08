@@ -96,7 +96,11 @@ _REVIEW_AND_CI: Final[frozenset[ObservationSlice]] = frozenset(
     {ObservationSlice.REVIEW, ObservationSlice.CI}
 )
 _REVIEW_EVENTS: Final[frozenset[str]] = frozenset(
-    {"pull_request_review", "pull_request_review_comment"}
+    {
+        "pull_request_review",
+        "pull_request_review_comment",
+        "pull_request_review_thread",
+    }
 )
 _CI_EVENTS: Final[frozenset[str]] = frozenset({"check_run", "check_suite"})
 _HEAD_CHANGING_ACTIONS: Final[frozenset[str]] = frozenset(

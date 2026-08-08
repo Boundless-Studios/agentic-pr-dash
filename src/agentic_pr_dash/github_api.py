@@ -4203,7 +4203,11 @@ def scan_review_threads(
     )
 
     # Inline review threads via GraphQL
-    threads = get_review_threads(pr_number, cwd, strict=strict)
+    threads = (
+        get_review_threads(pr_number, cwd, strict=True)
+        if strict
+        else get_review_threads(pr_number, cwd)
+    )
     for thread in threads:
         top = thread.top
         created_dt = _parse_github_time(top.created_at)

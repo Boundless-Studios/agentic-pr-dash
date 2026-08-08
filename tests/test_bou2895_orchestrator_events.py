@@ -276,7 +276,9 @@ async def test_review_event_refresh_reuses_latest_commit_and_skips_ci(
 
 
 @pytest.mark.asyncio
-async def test_check_event_reads_ci_only(monkeypatch, observation_boundaries):
+async def test_unassociated_check_event_resolves_head_and_reads_ci_only(
+    monkeypatch, observation_boundaries
+):
     clock = ManualClock()
     calls = {"list": 0, "latest": 0, "ci": 0, "review": 0}
     monkeypatch.setattr(
@@ -313,7 +315,9 @@ async def test_check_event_reads_ci_only(monkeypatch, observation_boundaries):
     orch.observation_controller = ObservationController(clock=clock)
     await orch.refresh_prs()
 
-    await orch.handle_github_event("check_suite", "org/widgets", 7, "head-1")
+    await orch.handle_github_check_event(
+        "check_suite", "org/widgets", "head-1", action="completed"
+    )
     clock.advance(timedelta(seconds=2))
     await orch.refresh_prs()
 

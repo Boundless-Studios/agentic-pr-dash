@@ -791,17 +791,7 @@ def ledger_from_environment(
 ) -> QuotaLedger:
     """Create a ledger using deployment-configurable observation budgets."""
 
-    return QuotaLedger(
-        clock=clock,
-        background_hourly_budget=_nonnegative_env_int(
-            ("APD_GRAPHQL_BACKGROUND_HOURLY_BUDGET",),
-            DEFAULT_BACKGROUND_HOURLY_BUDGET,
-        ),
-        maintenance_reserve=_nonnegative_env_int(
-            ("APD_GRAPHQL_MAINTENANCE_RESERVE",),
-            DEFAULT_MAINTENANCE_RESERVE,
-        ),
-    )
+    return QuotaLedger(clock=clock)
 
 
 # Short names are convenient for call sites that use the typed contract as a

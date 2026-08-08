@@ -16,6 +16,7 @@ from agentic_pr_dash.quota import (
     QuotaDecisionReason,
     QuotaLedger,
     QuotaWorkClass,
+    ledger_from_environment,
 )
 
 
@@ -210,6 +211,22 @@ def test_environment_defaults_override_constructor_defaults(
 
     assert ledger.background_hourly_budget == 321
     assert ledger.maintenance_reserve == 654
+
+
+def test_production_ledger_factory_accepts_long_environment_names(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("APD_GRAPHQL_BACKGROUND_HOURLY_BUDGET", raising=False)
+    monkeypatch.delenv("APD_GRAPHQL_MAINTENANCE_RESERVE", raising=False)
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_GRAPHQL_BACKGROUND_HOURLY_BUDGET", "432"
+    )
+    monkeypatch.setenv("AGENTIC_PR_DASH_GRAPHQL_MAINTENANCE_RESERVE", "765")
+
+    ledger = ledger_from_environment()
+
+    assert ledger.background_hourly_budget == 432
+    assert ledger.maintenance_reserve == 765
 
 
 def test_failed_observation_stays_degraded_and_retains_reason() -> None:

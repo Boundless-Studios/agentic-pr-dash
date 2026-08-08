@@ -119,6 +119,14 @@
                 {% include 'partials/runner_fleet.html' %}
             </div>
             {% endif %}
+            {% if quota is defined %}
+            <div class="quota-status-slot"
+                 hx-get="/partials/quota"
+                 hx-trigger="every 15s"
+                 hx-swap="innerHTML">
+                {% include 'partials/quota_status.html' %}
+            </div>
+            {% endif %}
             <h2>Activity</h2>
             <div class="event-list"
                  hx-get="/partials/event-log"

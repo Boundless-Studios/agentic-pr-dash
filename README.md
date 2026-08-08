@@ -36,8 +36,9 @@ Gaia owns its beads, proof, test, Docker, and database policy, while
 Every open PR, grouped by what it needs — **Needs Attention** (failing CI or
 unaddressed review comments), **Agent Working** (an agent holds the lease and is
 actively fixing it), **CI Pending**, and **Clean** (ready to merge). The board
-polls GitHub in the background; cards update live as CI finishes and agents make
-progress.
+polls its local projection in the background; GitHub webhooks invalidate review
+and CI observations as work changes, while bounded reconciliation catches missed
+events.
 
 ### Harness status projection (optional)
 
@@ -146,6 +147,42 @@ not need a GitHub token for runner inventory. Without a local prefix it falls
 back to GitHub's repository runner endpoint, which requires **Repository
 Administration: Read**; a missing permission is reported as an unauthorized
 probe rather than runner downtime.
+
+### GitHub observation and quota
+
+For near-real-time review and CI updates, configure a GitHub repository webhook
+whose payload URL is the dashboard's externally reachable
+`/api/github/webhook` endpoint. Subscribe to `pull_request`,
+`pull_request_review`, `pull_request_review_comment`,
+`pull_request_review_thread`, `check_suite`, and `check_run`. Set the same
+random secret through one of these process environment variables:
+
+```bash
+AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET=<webhook-secret>
+# Or mount a secret file and set only its path:
+AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET_FILE=/run/secrets/pr-dashboard-webhook
+```
+
+The endpoint accepts at most 1 MiB, verifies GitHub's HMAC-SHA256 signature,
+deduplicates delivery IDs, and returns `202` before refreshing. Bursts coalesce
+into one refresh after two seconds. Never place the secret in the TOML file or
+in a webhook URL. A dashboard bound only to localhost needs an authenticated
+reverse proxy or tunnel before GitHub can deliver events to it.
+
+Webhooks are optional. Without a reachable webhook, the dashboard still updates
+its local projection every 15 seconds, rechecks nonterminal CI every 30 seconds,
+conditionally reconciles PR metadata every 15 minutes, and performs a full
+review reconciliation every hour. Manual Refresh bypasses those timers.
+
+Background GraphQL observation is capped at 500 cost points per rolling hour and
+protects a 1,000-point reserve for explicit operator and maintenance gates.
+Override the defaults when necessary with
+`AGENTIC_PR_DASH_GRAPHQL_BACKGROUND_HOURLY_BUDGET` and
+`AGENTIC_PR_DASH_GRAPHQL_MAINTENANCE_RESERVE` (the shorter `APD_` prefixes are
+also accepted). The dashboard quota chip and `/api/quota` expose remaining and
+reset time, latest query cost, rolling cost by caller/work class, cache hit rate,
+and active degradation/backoff. Before the first valid GitHub rate-limit sample,
+the chip explicitly reports **GitHub quota unobserved**.
 
 ```toml
 [project]
