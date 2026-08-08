@@ -139,6 +139,14 @@ maintains and grant **Pull requests: Read and write**. The token is used only
 as the fallback identity for thread-resolution mutations; other GitHub calls
 continue using the normal identity.
 
+When `runner_label` describes runners hosted on the dashboard machine (or its
+configured Docker daemon), set `local_runner_container_prefix` to their Docker
+name prefix. The dashboard then derives online/busy/idle state locally and does
+not need a GitHub token for runner inventory. Without a local prefix it falls
+back to GitHub's repository runner endpoint, which requires **Repository
+Administration: Read**; a missing permission is reported as an unauthorized
+probe rather than runner downtime.
+
 ```toml
 [project]
 # repo = "owner/name"          # auto-detected from the git remote if omitted
@@ -147,6 +155,7 @@ tracker = "none"                # "none" | "beads" | "github-issues"
 executor = "claude --dangerously-skip-permissions -p {prompt}"
 discovery_names = ["claude", "codex"]   # process names treated as live agents
 # runner_label = "my-ci-fleet"  # self-hosted runner label; omit to hide the runner panel
+# local_runner_container_prefix = "gha-runner-"  # credential-free local Docker probe
 ```
 
 ### Task tracker (optional)

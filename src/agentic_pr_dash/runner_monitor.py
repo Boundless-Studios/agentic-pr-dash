@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
+import os
 import subprocess
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
@@ -53,6 +54,104 @@ class RunnerFleetLoad:
 
 
 RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProcess[str]]
+
+_INTEGRATION_PERMISSION_ERRORS = (
+    "resource not accessible by integration",
+    "http 403",
+)
+
+
+def _runner_probe_failure(detail: str) -> RunnerFleetLoad:
+    normalized = detail.casefold()
+    if all(fragment in normalized for fragment in _INTEGRATION_PERMISSION_ERRORS):
+        return _degraded_load(
+            "Runner probe unauthorized: the GitHub App installation needs "
+            "Repository Administration: Read to list self-hosted runners; "
+            "the runners may still be online.",
+            recommendation=(
+                "Runner inventory probe is unauthorized; runner health is unknown."
+            ),
+        )
+    return _degraded_load(f"Runner probe failed: {detail}")
+
+
+def _configured_local_container_prefix(cwd: str | None) -> str:
+    raw = os.environ.get("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX")
+    if raw is None:
+        raw = load_config(cwd).extra.get("local_runner_container_prefix")
+    return str(raw or "").strip()
+
+
+def _local_docker_runner_load(
+    prefix: str,
+    label: str,
+    cwd: str | None,
+    run: RunCommand,
+) -> RunnerFleetLoad | None:
+    """Read a co-located Docker runner fleet without GitHub credentials."""
+    try:
+        listed = run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"name={prefix}",
+                "--format",
+                "{{json .}}",
+            ],
+            cwd,
+            10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if listed.returncode != 0:
+        return None
+
+    containers: list[dict[str, Any]] = []
+    try:
+        for line in listed.stdout.splitlines():
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if isinstance(item, dict) and str(item.get("Names", "")).startswith(prefix):
+                containers.append(item)
+    except json.JSONDecodeError:
+        return None
+    if not containers:
+        return None
+
+    runners: list[dict[str, Any]] = []
+    for index, container in enumerate(containers, start=1):
+        name = str(container.get("Names") or "")
+        state = str(container.get("State") or "").casefold()
+        online = state == "running"
+        busy = False
+        if online:
+            try:
+                processes = run(
+                    ["docker", "top", name, "-eo", "args"], cwd, 5
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                return None
+            if processes.returncode != 0:
+                return None
+            busy = "Runner.Worker" in processes.stdout
+        raw_id = str(container.get("ID") or "")
+        try:
+            runner_id = int(raw_id[:12], 16)
+        except ValueError:
+            runner_id = index
+        runners.append(
+            {
+                "id": runner_id,
+                "name": name,
+                "status": "online" if online else "offline",
+                "busy": busy,
+                "labels": [{"name": label}],
+            }
+        )
+    return parse_runner_inventory({"runners": runners}, label=label)
 
 
 def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
@@ -117,11 +216,21 @@ def get_runner_fleet_load(
     repo: str | None = None,
     label: str | None = None,
     cwd: str | None = None,
+    local_container_prefix: str | None = None,
     run: RunCommand = _run,
 ) -> RunnerFleetLoad:
     label = label or _runner_label()
     if label is None:
         return RunnerFleetLoad()
+    prefix = (
+        _configured_local_container_prefix(cwd)
+        if local_container_prefix is None
+        else local_container_prefix.strip()
+    )
+    if prefix:
+        local_load = _local_docker_runner_load(prefix, label, cwd, run)
+        if local_load is not None:
+            return local_load
     repo_name = repo or _get_repo_full_name(cwd=cwd, run=run)
     if not repo_name:
         return _degraded_load("Runner probe failed: could not determine active GitHub repository.")
@@ -134,7 +243,7 @@ def get_runner_fleet_load(
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown error").strip()
-        return _degraded_load(f"Runner probe failed: {detail}")
+        return _runner_probe_failure(detail)
 
     try:
         payload = json.loads(result.stdout or "{}")
@@ -234,8 +343,12 @@ def _recommendation(
     return "Self-hosted CI load is available."
 
 
-def _degraded_load(error: str) -> RunnerFleetLoad:
+def _degraded_load(
+    error: str,
+    *,
+    recommendation: str = "Self-hosted CI runner load is unavailable.",
+) -> RunnerFleetLoad:
     return RunnerFleetLoad(
-        recommendation="Self-hosted CI runner load is unavailable.",
+        recommendation=recommendation,
         error=error,
     )
