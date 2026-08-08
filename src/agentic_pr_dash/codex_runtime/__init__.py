@@ -30,6 +30,7 @@ from agentic_pr_dash.codex_runtime.payload import (
 from agentic_pr_dash.codex_runtime.runners import (
     HOOK_FAILURE_OUTPUT_LIMIT,
     HookFailure,
+    HookProtocolResponse,
     HumanOutputBuffer,
     StopChecksReport,
     StopChecksRunner,
@@ -55,6 +56,7 @@ __all__ = [
     "normalized_tool_name",
     "HOOK_FAILURE_OUTPUT_LIMIT",
     "HookFailure",
+    "HookProtocolResponse",
     "HumanOutputBuffer",
     "StopChecksReport",
     "StopChecksRunner",

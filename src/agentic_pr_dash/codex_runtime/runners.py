@@ -51,11 +51,22 @@ class HookFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class HookProtocolResponse:
+    """A valid JSON response attributed to the hook that emitted it."""
+
+    hook_name: str
+    hook_path: str
+    exit_code: int
+    stdout: str
+
+
+@dataclass(frozen=True, slots=True)
 class StopChecksReport:
     """Structured result retained without changing ``StopChecksRunner.run``."""
 
     final_rc: int
     failures: tuple[HookFailure, ...]
+    protocol_responses: tuple[HookProtocolResponse, ...] = ()
 
 
 def _bounded_failure_output(
@@ -277,6 +288,7 @@ class StopChecksRunner:
         """
         final_rc = 0
         failures: list[HookFailure] = []
+        protocol_responses: list[HookProtocolResponse] = []
         self.last_report = StopChecksReport(final_rc=0, failures=())
         human_output = HumanOutputBuffer()
         # Defer JSON emission until every hook has run so a later BLOCKING
@@ -357,6 +369,15 @@ class StopChecksRunner:
                     final_rc = 1
                 continue
             child_stdout_is_json = _stdout_is_json(result.stdout)
+            if child_stdout_is_json:
+                protocol_responses.append(
+                    HookProtocolResponse(
+                        hook_name=hook_name,
+                        hook_path=resolved_path,
+                        exit_code=result.returncode,
+                        stdout=result.stdout,
+                    )
+                )
             child_blocking = result.returncode == 2
             failure_class: HookFailureClass | None = None
             if child_blocking and not child_stdout_is_json:
@@ -430,5 +451,9 @@ class StopChecksRunner:
         if chosen_json is not None:
             print(chosen_json, end="")
         human_output.emit()
-        self.last_report = StopChecksReport(final_rc=final_rc, failures=tuple(failures))
+        self.last_report = StopChecksReport(
+            final_rc=final_rc,
+            failures=tuple(failures),
+            protocol_responses=tuple(protocol_responses),
+        )
         return final_rc
