@@ -167,6 +167,64 @@ def test_check_event_fans_out_and_delivery_is_deduplicated(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_failed_fanout_delivery_can_be_retried(monkeypatch) -> None:
+    class _FlakyFanoutOrchestrator(_Orchestrator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_event.set()
+            self.calls: list[int] = []
+            self.failed_once = False
+
+        async def handle_github_event(
+            self,
+            event_name: str,
+            repo: str,
+            number: int,
+            head_sha: str,
+            action: str | None = None,
+        ) -> None:
+            self.calls.append(number)
+            if number == 8 and not self.failed_once:
+                self.failed_once = True
+                raise RuntimeError("fanout invalidation failed")
+            self.events.append((event_name, repo, number, head_sha, action))
+
+    async def scenario() -> None:
+        monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")
+        orchestrator = _FlakyFanoutOrchestrator()
+        ingress = GithubWebhookIngress(orchestrator, lambda: None, debounce_seconds=0.01)
+        body = json.dumps(
+            {
+                "action": "completed",
+                "repository": {"full_name": "acme/widgets"},
+                "check_run": {
+                    "head_sha": "def456",
+                    "pull_requests": [{"number": 7}, {"number": 8}],
+                },
+            }
+        ).encode()
+        signature = _signature("hook-secret", body)
+
+        assert ingress.accept("check_run", "retryable", signature, body) == 202
+        await asyncio.sleep(0.01)
+        assert orchestrator.calls == [7, 8]
+        assert orchestrator.refreshes == 0
+
+        assert ingress.accept("check_run", "retryable", signature, body) == 202
+        await asyncio.sleep(0.04)
+
+        assert orchestrator.calls == [7, 8, 7, 8]
+        assert orchestrator.events == [
+            ("check_run", "acme/widgets", 7, "def456", "completed"),
+            ("check_run", "acme/widgets", 7, "def456", "completed"),
+            ("check_run", "acme/widgets", 8, "def456", "completed"),
+        ]
+        assert orchestrator.refreshes == 1
+        await ingress.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_review_thread_resolution_and_unassociated_check_are_invalidated(
     monkeypatch,
 ) -> None:

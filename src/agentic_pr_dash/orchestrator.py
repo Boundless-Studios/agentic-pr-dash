@@ -158,6 +158,7 @@ _STALE_HEAD_DERIVED_STATUSES = _OBSERVATION_DERIVED_STATUSES | {PRStatus.MERGE_C
 METADATA_GRAPHQL_ESTIMATED_COST = 50
 REVIEW_GRAPHQL_ESTIMATED_COST = 25
 BATCH_GRAPHQL_ESTIMATED_COST = github_api.BATCH_GRAPHQL_ESTIMATED_COST
+REVIEW_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
 
 
 def _parse_session_timestamp(value: str | None) -> datetime | None:
@@ -485,6 +486,10 @@ class Orchestrator:
             self.quota_ledger.record_failure(
                 reason="review_fallback_failed"
             )
+            self.quota_ledger.record_backoff(
+                REVIEW_GRAPHQL_FAILURE_BACKOFF,
+                reason="review_fallback_failed",
+            )
             return github_api.ObservationReadResult.unavailable(
                 f"review fallback raised: {exc}"
             )
@@ -494,6 +499,10 @@ class Orchestrator:
         self._record_estimated_failure(reservation)
         self.quota_ledger.record_failure(
             reason="review_fallback_unavailable"
+        )
+        self.quota_ledger.record_backoff(
+            REVIEW_GRAPHQL_FAILURE_BACKOFF,
+            reason="review_fallback_unavailable",
         )
         return result
 

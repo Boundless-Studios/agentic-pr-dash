@@ -15,6 +15,7 @@ from agentic_pr_dash.models import (
     RunnerExecutionSummary,
 )
 from agentic_pr_dash.observation import ObservationController
+from agentic_pr_dash.quota import QuotaLedger
 
 
 class ManualClock:
@@ -307,7 +308,10 @@ async def test_unobservable_refresh_is_never_clean_and_preserves_known_blockers(
     monkeypatch.setattr(github_api, "scan_review_threads", fake_scan_review_threads)
     monkeypatch.setattr(github_api, "batch_fetch_pr_review_and_ci", fake_batch)
 
-    orch = orchestrator.Orchestrator(repo_cwd=anchor_root)
+    orch = orchestrator.Orchestrator(
+        repo_cwd=anchor_root,
+        quota_ledger=QuotaLedger(clock=clock, maintenance_reserve=0),
+    )
     orch.observation_controller = ObservationController(clock=clock)
 
     await orch.refresh_prs()
@@ -316,6 +320,7 @@ async def test_unobservable_refresh_is_never_clean_and_preserves_known_blockers(
     assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
 
     phase["unobservable"] = False
+    clock.advance(timedelta(seconds=30))
     await orch.refresh_prs()
     pr = orch.get_pr(2895)
     assert pr is not None
@@ -332,7 +337,9 @@ async def test_unobservable_refresh_is_never_clean_and_preserves_known_blockers(
     assert [comment.id for comment in pr.review_comments] == [101]
 
     await orch.refresh_prs()
-    assert calls == {"batch": 4, "latest": 4, "ci": 4, "review": 4}
+    # The failed review read starts a bounded GraphQL backoff, so the immediate
+    # retry still observes REST latest/CI but spends no batch/review request.
+    assert calls == {"batch": 3, "latest": 4, "ci": 4, "review": 3}
 
 
 @pytest.mark.asyncio

@@ -600,12 +600,17 @@ async def test_failed_review_fallback_counts_request_without_success_cost(
 ) -> None:
     clock = ManualClock()
     ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    calls = 0
+
+    def fail_review(number, latest, cwd=None):
+        nonlocal calls
+        calls += 1
+        raise RuntimeError("review transport down")
+
     monkeypatch.setattr(
         github_api,
         "scan_review_threads_observation",
-        lambda number, latest, cwd=None: (_ for _ in ()).throw(
-            RuntimeError("review transport down")
-        ),
+        fail_review,
     )
     orch = _orchestrator(clock, ledger)
 
@@ -615,11 +620,20 @@ async def test_failed_review_fallback_counts_request_without_success_cost(
         "/repos/widgets",
         force=False,
     )
+    deferred = await orch._review_fallback_observation(
+        7,
+        "2026-08-08T00:00:00Z",
+        "/repos/widgets",
+        force=False,
+    )
 
     assert result.observable is False
+    assert deferred.observable is False
+    assert calls == 1
     telemetry = ledger.telemetry()
     assert telemetry.request_count == 1
     assert telemetry.background_hourly_spend == 0
+    assert telemetry.backoff_until == clock.current + timedelta(seconds=30)
 
 
 @pytest.mark.asyncio

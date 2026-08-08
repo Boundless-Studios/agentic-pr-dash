@@ -221,7 +221,7 @@ class GithubWebhookIngress:
         if not events:
             return 202
 
-        task = asyncio.create_task(self._apply_events(events))
+        task = asyncio.create_task(self._apply_events(events, normalized_delivery))
         self._event_tasks.add(task)
         task.add_done_callback(self._event_tasks.discard)
         return 202
@@ -235,7 +235,9 @@ class GithubWebhookIngress:
             self._deliveries.popitem(last=False)
 
     async def _apply_events(
-        self, events: tuple[NormalizedGithubEvent, ...]
+        self,
+        events: tuple[NormalizedGithubEvent, ...],
+        delivery_id: str,
     ) -> None:
         try:
             for event in events:
@@ -258,6 +260,8 @@ class GithubWebhookIngress:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if delivery_id:
+                self._deliveries.pop(delivery_id, None)
             _LOG.exception("GitHub webhook observation invalidation failed")
 
     def _schedule_refresh(self) -> None:

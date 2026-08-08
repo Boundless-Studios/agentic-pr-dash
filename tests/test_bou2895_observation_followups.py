@@ -27,6 +27,7 @@ from agentic_pr_dash.models import (
     RunnerPoolHealth,
 )
 from agentic_pr_dash.observation import ObservationController, ObservationSlice
+from agentic_pr_dash.quota import QuotaLedger
 
 
 class ManualClock:
@@ -396,7 +397,10 @@ async def test_partial_observation_applies_and_acknowledges_ci_independently(
         ),
     )
 
-    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        quota_ledger=QuotaLedger(clock=clock, maintenance_reserve=0),
+    )
     orch.observation_controller = ObservationController(clock=clock)
 
     await orch.refresh_prs()
@@ -413,6 +417,7 @@ async def test_partial_observation_applies_and_acknowledges_ci_independently(
     assert retry.slices == frozenset({ObservationSlice.REVIEW})
 
     review_available["value"] = True
+    clock.advance(timedelta(seconds=30))
     await orch.refresh_prs()
     assert pr.status is PRStatus.CI_FAILING
 
@@ -480,6 +485,7 @@ async def test_legacy_head_review_only_retry_recovers_after_partial_observation(
 
     raw = _raw_pr()
     raw.pop("headRefOid")
+    clock = ManualClock()
     review_available = {"value": False}
     review_calls = 0
     monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw])
@@ -500,7 +506,11 @@ async def test_legacy_head_review_only_retry_recovers_after_partial_observation(
         github_api, "scan_review_threads_observation", review_observation
     )
 
-    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+        quota_ledger=QuotaLedger(clock=clock, maintenance_reserve=0),
+    )
     await orch.refresh_prs()
 
     pr = orch.get_pr(7)
@@ -514,6 +524,7 @@ async def test_legacy_head_review_only_retry_recovers_after_partial_observation(
     assert retry.slices == frozenset({ObservationSlice.REVIEW})
 
     review_available["value"] = True
+    clock.advance(timedelta(seconds=30))
     await orch.refresh_prs()
 
     assert review_calls == 2
