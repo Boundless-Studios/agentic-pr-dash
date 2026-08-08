@@ -3243,6 +3243,7 @@ def batch_fetch_pr_review_and_ci(
         ]
 
         reservation = None
+        reserved_estimated_cost = 0
         if quota_context is not None:
             estimated_cost = max(
                 quota_context.estimated_cost,
@@ -3251,6 +3252,7 @@ def batch_fetch_pr_review_and_ci(
             latest = quota_context.ledger.latest
             if latest is not None and latest.cost > 0:
                 estimated_cost = max(estimated_cost, latest.cost)
+            reserved_estimated_cost = estimated_cost
             reservation = quota_context.ledger.reserve(
                 quota_context.caller,
                 quota_context.work_class,
@@ -3279,7 +3281,18 @@ def batch_fetch_pr_review_and_ci(
                 data = json.loads(r.stdout)
                 data_node = data["data"]
             except (json.JSONDecodeError, KeyError, TypeError):
-                deny_invalid_response("graphql_response_invalid")
+                if quota_context is not None and reservation is not None:
+                    quota_context.ledger.record_estimated(
+                        quota_context.caller,
+                        quota_context.work_class,
+                        reserved_estimated_cost,
+                        reservation=reservation,
+                    )
+                    reservation = None
+                deny_invalid_response(
+                    "graphql_response_invalid",
+                    count_request=False,
+                )
                 continue
 
             rate_limit_recorded = False
@@ -3298,7 +3311,18 @@ def batch_fetch_pr_review_and_ci(
                     reservation = None
                     rate_limit_recorded = True
                 except (KeyError, TypeError, ValueError, OverflowError):
-                    deny_invalid_response("graphql_rate_limit_invalid")
+                    if reservation is not None:
+                        quota_context.ledger.record_estimated(
+                            quota_context.caller,
+                            quota_context.work_class,
+                            reserved_estimated_cost,
+                            reservation=reservation,
+                        )
+                        reservation = None
+                    deny_invalid_response(
+                        "graphql_rate_limit_invalid",
+                        count_request=False,
+                    )
                     continue
 
             try:

@@ -326,6 +326,136 @@ async def test_unobserved_new_head_is_unavailable_and_not_dispatched(
 
 
 @pytest.mark.asyncio
+async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatch(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    list_results = [
+        [_raw_pr(head="head-1")],
+        None,
+        [_raw_pr(head="head-1")],
+    ]
+    current_head = {"value": "head-1"}
+    dispatched: list[int] = []
+
+    monkeypatch.setattr(
+        github_api, "list_open_prs", lambda cwd=None: list_results.pop(0)
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: (
+            current_head["value"],
+            "2026-08-08T01:00:00Z",
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks",
+        lambda number, cwd=None: [
+            CICheck(name="build", status="completed", conclusion="failure")
+        ],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_rest_observation",
+        lambda head, cwd=None, *, pr_number=None: (
+            github_api.ObservationReadResult.observed(
+                [
+                    CICheck(
+                        name="build",
+                        status="completed",
+                        conclusion="failure",
+                    )
+                ]
+                if head == "head-1"
+                else []
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda number, latest, cwd=None: (
+            github_api.ObservationReadResult.observed(([], []))
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator, "find_worktree_for_branch", lambda branch, root=None: "/wt/widgets"
+    )
+    monkeypatch.setattr(
+        orchestrator.coordinator,
+        "dispatch_decision_for_pr",
+        lambda pr: SimpleNamespace(state="ready", should_dispatch=True, reason="test"),
+    )
+
+    async def record_dispatch(self, pr):
+        dispatched.append(pr.number)
+
+    monkeypatch.setattr(
+        orchestrator.Orchestrator, "dispatch_pr_maintenance", record_dispatch
+    )
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+        quota_ledger=QuotaLedger(clock=clock, maintenance_reserve=0),
+    )
+
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.CI_FAILING
+    assert dispatched == [7]
+    dispatched.clear()
+
+    current_head["value"] = "head-2"
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-2", action="synchronize"
+    )
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="labeled"
+    )
+    assert orch._event_head_overrides[("org/widgets", 7)] == "head-2"
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+
+    assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-2"
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert dispatched == []
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-2", now=clock(), ci_pending=False
+    )
+    assert retry is not None
+    assert ObservationSlice.METADATA in retry.slices
+
+    # REVIEW+CI for head-2 may now be acknowledged while the rich relist is
+    # still backed off.  The following metadata-only plan is unavailable and
+    # gets dropped before enrichment, but the retained event head must keep the
+    # old raw head non-actionable until a successful rich list supersedes it.
+    clock.advance(timedelta(seconds=15))
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+
+    assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-2"
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert dispatched == []
+
+    # A completed relist may itself briefly lag the synchronize event.  It is
+    # authoritative for other metadata but must not clear the event-owned head
+    # until that exact SHA appears in the rich row.
+    clock.advance(timedelta(minutes=15))
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+
+    assert orch._event_head_overrides[("org/widgets", 7)] == "head-2"
+    assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-2"
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert dispatched == []
+
+
+@pytest.mark.asyncio
 async def test_cold_start_metadata_failure_retries_on_the_next_poll(
     monkeypatch, observation_boundaries
 ):

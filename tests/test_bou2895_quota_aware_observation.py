@@ -231,6 +231,107 @@ async def test_pending_ci_poll_reuses_review_until_ci_is_terminal(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_rest_ci_poll_preserves_missing_expected_required_check(monkeypatch):
+    anchor_root = "/repos/anchor"
+    clock = ManualClock()
+    raw_pr = {
+        "number": 2895,
+        "title": "Expected required check",
+        "headRefName": "feature/expected-check",
+        "headRefOid": "expected-head",
+        "baseRefName": "main",
+        "url": "https://github.com/org/anchor-repo/pull/2895",
+        "isDraft": False,
+        "reviewDecision": "",
+        "mergeStateStatus": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "labels": [],
+        "createdAt": "2026-06-11T12:00:00Z",
+    }
+    expected = CICheck(name="required", status="in_progress")
+
+    monkeypatch.setattr(
+        orchestrator, "_resolve_maintenance_roots", lambda cwd: [anchor_root]
+    )
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw_pr])
+    monkeypatch.setattr(
+        github_api, "get_weekly_runner_execution_summary", lambda cwd=None: None
+    )
+    monkeypatch.setattr(
+        github_api, "get_repo_info", lambda cwd=None: ("org", "anchor-repo")
+    )
+    monkeypatch.setattr(
+        github_api, "get_mergeability", lambda num, cwd=None: ("CLEAN", "MERGEABLE")
+    )
+    monkeypatch.setattr(
+        github_api,
+        "batch_fetch_pr_review_and_ci",
+        lambda owner, repo, numbers, cwd=None, **kwargs: {
+            2895: {
+                "latest_commit": ("expected-head", "2026-06-11T12:00:00Z"),
+                "ci_checks": [expected],
+                "threads": [],
+                "required_pending": True,
+                "head_sha": "expected-head",
+                "merge_state": "CLEAN",
+                "mergeable": "MERGEABLE",
+                "review_decision": "none",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda num, cwd=None: ("expected-head", "2026-06-11T12:00:00Z"),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_observation",
+        lambda num, cwd=None: github_api.ObservationReadResult.observed([expected]),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda num, latest, cwd=None: (
+            github_api.ObservationReadResult.observed(([], []))
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_rest_observation",
+        lambda head, cwd=None, *, pr_number=None: (
+            github_api.ObservationReadResult.observed([])
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_workflow_queue_health",
+        lambda num, cwd=None: ([], [], RunnerExecutionSummary()),
+    )
+    monkeypatch.setattr(
+        orchestrator, "find_worktree_for_branch", lambda branch, root=None: None
+    )
+
+    orch = orchestrator.Orchestrator(
+        repo_cwd=anchor_root,
+        observation_controller=ObservationController(clock=clock),
+        quota_ledger=QuotaLedger(clock=clock, maintenance_reserve=0),
+    )
+    await orch.refresh_prs()
+    pr = orch.get_pr(2895)
+    assert pr is not None
+    assert pr.status is PRStatus.CI_PENDING
+
+    clock.advance(timedelta(seconds=30))
+    await orch.refresh_prs()
+
+    assert [(check.name, check.status) for check in pr.ci_checks] == [
+        ("required", "in_progress")
+    ]
+    assert pr.status is PRStatus.CI_PENDING
+
+
+@pytest.mark.asyncio
 async def test_unobservable_refresh_is_never_clean_and_preserves_known_blockers(
     monkeypatch,
 ):

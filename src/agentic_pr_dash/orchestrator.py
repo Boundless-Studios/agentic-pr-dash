@@ -254,6 +254,11 @@ class Orchestrator:
         # and never drops another repo's PRs on a transient failure.
         self._pr_root: dict[PRKey, str | None] = {}
         self._observation_keys: dict[PRKey, ObservationKey] = {}
+        # A synchronize event can advance the immutable head before the
+        # debounced repository listing reflects it.  Retain that event-owned
+        # identity until a successful rich metadata read supersedes it so a
+        # failed relist cannot fall back to actionable state from the old head.
+        self._event_head_overrides: dict[PRKey, str] = {}
         self._observed_blocker_keys: set[ObservationKey] = set()
         self._observed_blocker_slices: dict[
             ObservationKey, set[ObservationSlice]
@@ -561,6 +566,19 @@ class Orchestrator:
         self._metadata_last_attempt[root] = now
         self._metadata_last_rich_success[root] = now
 
+        # A successful rich list is the authoritative repository/head
+        # projection.  It supersedes any temporary head identity learned from
+        # a webhook while the cached list was stale.
+        for raw in cache:
+            number = raw.get("number")
+            if not isinstance(number, int):
+                continue
+            repo = _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
+            key = (repo, number)
+            override = self._event_head_overrides.get(key)
+            if override and str(raw.get("headRefOid") or "") == override:
+                self._event_head_overrides.pop(key, None)
+
         slugs = {
             _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
             for raw in cache
@@ -606,15 +624,15 @@ class Orchestrator:
             return next(iter(roots))
         return _EventRepoResolution.UNKNOWN
 
-    def _event_observation_key(
+    def _event_observation_target(
         self, root: str | None, repo: str, number: int
-    ) -> ObservationKey | None:
+    ) -> tuple[PRKey, ObservationKey] | None:
         normalized = _normalize_repo(repo)
         for key, observation_key in self._observation_keys.items():
             if key[1] != number or self._pr_root.get(key) != root:
                 continue
             if _normalize_repo(key[0]) == normalized:
-                return observation_key
+                return key, observation_key
         return None
 
     def _plan_for_available_slices(
@@ -669,8 +687,8 @@ class Orchestrator:
             is_pull_request = normalized_event == "pull_request"
             is_metadata_change = is_pull_request
 
-            observation_key = self._event_observation_key(root, repo, number)
-            if observation_key is None and not is_pull_request:
+            observation_target = self._event_observation_target(root, repo, number)
+            if observation_target is None and not is_pull_request:
                 self.log(
                     f"Ignoring event for untracked PR #{number} in {repo}",
                     pr_number=number,
@@ -685,11 +703,20 @@ class Orchestrator:
                     due_at if existing_due is None else max(existing_due, due_at)
                 )
 
-            if observation_key is None:
+            if observation_target is None:
                 # A known repo can receive ``opened`` for a PR absent from the
                 # cache.  The debounced metadata relist above will discover it;
                 # there is no immutable key to invalidate yet.
                 return
+
+            tracked_key, observation_key = observation_target
+            if (
+                is_pull_request
+                and normalized_action == "synchronize"
+                and head_sha
+                and head_sha != observation_key.head_sha
+            ):
+                self._event_head_overrides[tracked_key] = head_sha
 
             self.observation_controller.handle_event(
                 normalized_event,
@@ -846,6 +873,7 @@ class Orchestrator:
             return self._metadata_cache.get(root), False
 
         list_error: Exception | None = None
+        invalid_list_result = False
         try:
             listed_prs = await asyncio.to_thread(github_api.list_open_prs, root)
         except Exception as exc:  # noqa: BLE001 - preserve cached metadata
@@ -853,14 +881,27 @@ class Orchestrator:
             list_error = exc
         if listed_prs is not None and not isinstance(listed_prs, list):
             listed_prs = None
+            invalid_list_result = True
             list_error = TypeError("list_open_prs returned a non-list result")
         self._metadata_last_attempt[root] = now
         if listed_prs is None:
-            self._record_estimated_failure(reservation)
-            self.quota_ledger.record_failure(
-                reason="rich_metadata_unavailable"
-            )
             failure = github_api.last_list_open_prs_failure()
+            completed_unparseable = (
+                failure is not None
+                and failure.reason in {"invalid-json", "not-a-list"}
+            ) or invalid_list_result
+            if completed_unparseable:
+                # GitHub completed this GraphQL-backed command and consumed
+                # quota even though its payload could not be projected. Charge
+                # the conservative reservation once, then retain degradation
+                # below because the observation itself was unusable.
+                self._record_estimated_success(context, reservation)
+            else:
+                self._record_estimated_failure(reservation)
+            self.quota_ledger.record_failure(
+                reason="rich_metadata_unavailable",
+                count_request=not completed_unparseable,
+            )
             if failure is not None and failure.is_rate_limited:
                 self.quota_ledger.record_backoff(
                     METADATA_GRAPHQL_FAILURE_BACKOFF,
@@ -1061,6 +1102,7 @@ class Orchestrator:
                     old = self.prs.pop(key)
                     self._pr_root.pop(key, None)
                     self._observation_keys.pop(key, None)
+                    self._event_head_overrides.pop(key, None)
                     self.log(
                         f"PR #{key[1]} closed/merged: {old.title}",
                         pr_number=key[1],
@@ -1106,7 +1148,9 @@ class Orchestrator:
             # Keep that value as the observation identity: the latest-commit
             # accessor is a requested read, not the identity that decides
             # whether a plan is due.
-            head_sha = str(raw.get("headRefOid") or "")
+            head_sha = self._event_head_overrides.get(key) or str(
+                raw.get("headRefOid") or ""
+            )
             if not head_sha:
                 # Older test/fixture payloads and degraded REST fallbacks may
                 # omit headRefOid. Keep those callers on a stable legacy key;
@@ -1348,6 +1392,9 @@ class Orchestrator:
         # results below distinguish that from an authoritative clean result.
         latest_result = None
         ci_result = None
+        ci_from_rest = False
+        ci_rest_head = ""
+        cached_ci_head = pr.latest_commit_sha
         review_result = None
         latest_commit_date = pr.latest_commit_date
         plan_head_changed = False
@@ -1480,11 +1527,13 @@ class Orchestrator:
                 # Prefer the plan identity, then a validated latest-commit
                 # result, then raw metadata; consult the cached PR only for
                 # legacy callers that have none of those current-head values.
-                cached_head = (
-                    str(plan.key.head_sha)
-                    if plan is not None and plan.key.head_sha
-                    else ""
-                )
+                cached_head = ""
+                if (
+                    plan is not None
+                    and plan.key.head_sha
+                    and not plan.key.head_sha.startswith("legacy-head-")
+                ):
+                    cached_head = str(plan.key.head_sha)
                 if (
                     not cached_head
                     and latest_result is not None
@@ -1496,6 +1545,8 @@ class Orchestrator:
                     cached_head = str(raw.get("headRefOid") or "")
                 if not cached_head:
                     cached_head = pr.latest_commit_sha
+                ci_from_rest = True
+                ci_rest_head = cached_head
                 ci_result = await asyncio.to_thread(
                     github_api.get_ci_checks_rest_observation,
                     cached_head,
@@ -1562,7 +1613,19 @@ class Orchestrator:
                 pr.no_push_comment_retry_count = 0
 
         if ci_observed and ci_result is not None:
-            checks = ci_result.value
+            checks = list(ci_result.value)
+            if (
+                ci_from_rest
+                and cached_ci_head
+                and ci_rest_head == cached_ci_head
+            ):
+                observed_names = {check.name for check in checks}
+                checks.extend(
+                    check
+                    for check in pr.ci_checks
+                    if check.status in {"queued", "in_progress"}
+                    and check.name not in observed_names
+                )
             pr.ci_checks = checks
             ci_pending = any(
                 c.status in {"queued", "in_progress"} for c in checks
@@ -1700,8 +1763,14 @@ class Orchestrator:
             if plan is not None
             else self._observation_keys.get((pr.repo, num))
         )
+        raw_head = str(raw.get("headRefOid") or "")
+        pending_event_head = self._event_head_overrides.get((pr.repo, num), "")
+        metadata_head_unconfirmed = bool(
+            pending_event_head and raw_head != pending_event_head
+        )
         observation_unavailable = bool(
             plan_head_changed
+            or metadata_head_unconfirmed
             or (
                 current_observation_key is not None
                 and current_observation_key not in self._observed_blocker_keys
@@ -1710,7 +1779,10 @@ class Orchestrator:
         computed_status = self._compute_status(pr)
         pr.status = (
             PRStatus.OBSERVATION_UNAVAILABLE
-            if (plan_head_changed and computed_status in _STALE_HEAD_DERIVED_STATUSES)
+            if (
+                (plan_head_changed or metadata_head_unconfirmed)
+                and computed_status in _STALE_HEAD_DERIVED_STATUSES
+            )
             or (
                 observation_unavailable
                 and computed_status in _OBSERVATION_DERIVED_STATUSES

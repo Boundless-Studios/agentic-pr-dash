@@ -395,6 +395,9 @@ def test_batch_malformed_reset_at_fails_closed_without_raising(
     assert result == {}
     telemetry = ledger.telemetry()
     assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == (
+        github_api.BATCH_GRAPHQL_ESTIMATED_COST
+    )
     assert telemetry.degraded_reason == "graphql_rate_limit_invalid"
 
 
@@ -489,6 +492,27 @@ def test_malformed_batch_activates_backoff_and_suppresses_fallbacks(
     telemetry = ledger.telemetry()
     assert telemetry.backoff_active is True
     assert telemetry.backoff_reason == "graphql_response_invalid"
+    assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == (
+        github_api.BATCH_GRAPHQL_ESTIMATED_COST
+    )
+
+
+def test_estimated_success_clears_stale_failure_degradation() -> None:
+    ledger = QuotaLedger(maintenance_reserve=0)
+    ledger.record_failure(reason="rich_metadata_unavailable")
+    assert ledger.telemetry().degraded is True
+
+    ledger.record_estimated(
+        QuotaCaller.DASHBOARD,
+        QuotaWorkClass.BACKGROUND_OBSERVATION,
+        25,
+    )
+
+    telemetry = ledger.telemetry()
+    assert telemetry.degraded is False
+    assert telemetry.degraded_reason is None
+    assert telemetry.backoff_reason is None
 
 
 def test_background_budget_degraded_state_survives_protected_work_and_expires() -> None:

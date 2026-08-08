@@ -9,7 +9,7 @@ import subprocess
 import pytest
 
 from agentic_pr_dash import github_api, orchestrator
-from agentic_pr_dash.models import CICheck, RunnerExecutionSummary
+from agentic_pr_dash.models import CICheck, PRStatus, RunnerExecutionSummary
 from agentic_pr_dash.observation import ObservationController
 from agentic_pr_dash.quota import (
     QuotaCaller,
@@ -243,6 +243,57 @@ async def test_rate_limited_rich_metadata_failure_activates_backoff(
 
 
 @pytest.mark.asyncio
+async def test_malformed_rich_metadata_charges_reserved_estimate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: None)
+    monkeypatch.setattr(
+        github_api,
+        "last_list_open_prs_failure",
+        lambda: github_api.GhFailure(
+            ["gh", "pr", "list"],
+            0,
+            "malformed JSON",
+            "invalid-json",
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    await orch._rich_metadata_list("/repos/widgets", clock(), force=False)
+
+    telemetry = ledger.telemetry()
+    assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == (
+        orchestrator.METADATA_GRAPHQL_ESTIMATED_COST
+    )
+    assert telemetry.degraded_reason == "rich_metadata_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_rich_metadata_transport_type_error_releases_without_charging(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+
+    def type_error(cwd=None):
+        raise TypeError("transport adapter failed")
+
+    monkeypatch.setattr(github_api, "list_open_prs", type_error)
+    monkeypatch.setattr(github_api, "last_list_open_prs_failure", lambda: None)
+    orch = _orchestrator(clock, ledger)
+
+    await orch._rich_metadata_list("/repos/widgets", clock(), force=False)
+
+    telemetry = ledger.telemetry()
+    assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == 0
+    assert telemetry.degraded_reason == "rich_metadata_unavailable"
+
+
+@pytest.mark.asyncio
 async def test_event_metadata_invalidation_is_acknowledged_by_304(
     monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
 ) -> None:
@@ -439,6 +490,53 @@ async def test_pending_ci_uses_rest_head_path_when_graphql_budget_is_denied(
 
     assert rest_calls[-1] == ("head-1", 7)
     assert graphql_ci_calls == []  # both full fallback and pending CI stay REST-only
+
+
+@pytest.mark.asyncio
+async def test_rest_ci_does_not_carry_pending_check_across_heads(
+    monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    current_head = {"value": "head-1"}
+    monkeypatch.setattr(
+        github_api,
+        "list_open_prs",
+        lambda cwd=None: [_raw_pr(head=current_head["value"])],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: (
+            current_head["value"],
+            "2026-08-08T00:00:00Z",
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_rest_observation",
+        lambda head, cwd=None, *, pr_number=None: (
+            github_api.ObservationReadResult.observed(
+                [CICheck(name="old-required", status="in_progress")]
+                if head == "head-1"
+                else []
+            )
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    await orch.refresh_prs(force=True)
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.CI_PENDING
+
+    current_head["value"] = "head-2"
+    clock.advance(timedelta(hours=1))
+    await orch.refresh_prs(force=True)
+
+    assert pr.latest_commit_sha == "head-2"
+    assert pr.ci_checks == []
+    assert pr.status is PRStatus.CLEAN
 
 
 @pytest.mark.asyncio

@@ -673,6 +673,9 @@ class QuotaLedger:
             self._request_count += 1
             self._failure_active = False
             self._failure_reason = None
+            self._degraded_reason = None
+            if self._backoff_until is None:
+                self._backoff_reason = None
             self._refresh_degraded(now)
 
     record_estimated_cost = record_estimated
