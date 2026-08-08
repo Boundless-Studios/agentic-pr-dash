@@ -429,6 +429,39 @@ def test_batch_records_rate_limit_before_malformed_repository(
     assert telemetry.degraded_reason == "graphql_repository_invalid"
 
 
+def test_failed_batch_activates_backoff_and_suppresses_immediate_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ledger = QuotaLedger()
+    calls = 0
+
+    def fake_run(cmd, cwd=None, timeout_s=30):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(
+            cmd,
+            1,
+            stdout="",
+            stderr="GraphQL: API rate limit already exceeded",
+        )
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    first = github_api.batch_fetch_pr_review_and_ci(
+        "acme", "widgets", [1], quota_ledger=ledger
+    )
+    second = github_api.batch_fetch_pr_review_and_ci(
+        "acme", "widgets", [1], quota_ledger=ledger
+    )
+
+    assert first.denied is True
+    assert second.denied is True
+    assert calls == 1
+    telemetry = ledger.telemetry()
+    assert telemetry.backoff_active is True
+    assert telemetry.backoff_reason == "graphql_request_failed"
+
+
 def test_background_budget_degraded_state_survives_protected_work_and_expires() -> None:
     clock = ManualClock()
     ledger = QuotaLedger(
@@ -836,7 +869,8 @@ def test_zero_estimated_cost_is_rejected_at_typed_boundaries() -> None:
 def test_batch_releases_reservation_after_failed_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    ledger = QuotaLedger()
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock)
     responses = [
         subprocess.CompletedProcess(
             [],
@@ -869,7 +903,9 @@ def test_batch_releases_reservation_after_failed_request(
         quota_ledger=ledger,
     ) == {}
     assert ledger.reservation_count == 0
+    assert ledger.telemetry().backoff_active is True
 
+    clock.advance(timedelta(seconds=31))
     result = github_api.batch_fetch_pr_review_and_ci(
         "acme",
         "widgets",

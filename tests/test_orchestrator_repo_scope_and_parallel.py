@@ -264,7 +264,17 @@ def test_refresh_primes_one_repo_batch_before_per_pr_enrichment(
     raw_prs = [
         _raw_pr(i, "org/anchor-repo", branch=f"feature/{i}") for i in range(1, 6)
     ]
+    for raw in raw_prs:
+        raw["headRefOid"] = f"sha-{raw['number']}"
     monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: raw_prs)
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: (
+            f"sha-{number}",
+            "2026-06-11T12:00:00Z",
+        ),
+    )
     monkeypatch.setattr(
         github_api, "get_repo_info", lambda cwd=None: ("org", "anchor-repo")
     )

@@ -78,6 +78,18 @@ def _normalize_repo(repo: str | None) -> str:
 
     return (repo or "").strip().casefold()
 
+
+def _observation_head_matches(plan_head: str, observed_head: str) -> bool:
+    """Match a read to its immutable plan, with one legacy adapter exception."""
+
+    return bool(
+        observed_head
+        and (
+            plan_head.startswith("legacy-head-")
+            or observed_head == plan_head
+        )
+    )
+
 # Rolling "past 7 days" runner usage. The full recompute is heavy (~hundreds of
 # REST calls, several minutes), so it can't run every poll, but 24h left the
 # figure visibly stale all day. 6h keeps it fresh enough to be useful while the
@@ -1087,8 +1099,9 @@ class Orchestrator:
         batch_numbers = sorted(
             {
                 pr.number
-                for pr, _raw, plan in to_enrich
+                for pr, raw, plan in to_enrich
                 if plan is not None
+                and bool(raw.get("headRefOid"))
                 and ObservationSlice.REVIEW in plan.slices
                 and ObservationSlice.CI in plan.slices
             }
@@ -1292,7 +1305,9 @@ class Orchestrator:
         ci_result = None
         review_result = None
         latest_commit_date = pr.latest_commit_date
+        plan_head_changed = False
         if full_observation_requested:
+            plan_head = plan.key.head_sha if plan is not None else ""
             latest_value = await asyncio.to_thread(
                 github_api.get_latest_commit, num, root
             )
@@ -1300,17 +1315,33 @@ class Orchestrator:
                 len(latest_value) >= 2
                 and bool(latest_value[0])
                 and bool(latest_value[1])
+                and _observation_head_matches(
+                    plan_head, str(latest_value[0])
+                )
             ):
                 latest_result = github_api.ObservationReadResult.observed(
                     (str(latest_value[0]), str(latest_value[1]))
                 )
             else:
+                plan_head_changed = bool(
+                    len(latest_value) >= 1
+                    and latest_value[0]
+                    and plan_head
+                    and not _observation_head_matches(
+                        plan_head, str(latest_value[0])
+                    )
+                )
                 latest_result = github_api.ObservationReadResult.unavailable(
                     "latest commit observation unavailable"
                 )
             if latest_result.observable and latest_result.value is not None:
                 _sha, latest_commit_date = latest_result.value
-            if batch_denied:
+            if plan_head_changed:
+                review_result = github_api.ObservationReadResult.unavailable(
+                    "review observation unavailable: observation plan head "
+                    "is no longer current"
+                )
+            elif batch_denied:
                 review_result = github_api.ObservationReadResult.unavailable(
                     "review observation deferred: dashboard quota denied batch"
                 )
@@ -1342,7 +1373,9 @@ class Orchestrator:
             if (
                 pr.latest_commit_date
                 and pr.latest_commit_sha
-                and pr.latest_commit_sha == plan_head
+                and _observation_head_matches(
+                    plan_head, pr.latest_commit_sha
+                )
             ):
                 review_result = await self._review_fallback_observation(
                     num,
@@ -1358,7 +1391,9 @@ class Orchestrator:
                     len(latest_value) >= 2
                     and bool(latest_value[0])
                     and bool(latest_value[1])
-                    and str(latest_value[0]) == plan_head
+                    and _observation_head_matches(
+                        plan_head, str(latest_value[0])
+                    )
                 ):
                     latest_result = github_api.ObservationReadResult.observed(
                         (str(latest_value[0]), str(latest_value[1]))
@@ -1375,11 +1410,16 @@ class Orchestrator:
                         "latest commit observation unavailable for review retry"
                     )
                     review_result = github_api.ObservationReadResult.unavailable(
-                        "review observation unavailable: current-head latest "
-                        "commit date missing"
+                    "review observation unavailable: current-head latest "
+                    "commit date missing"
                     )
         if ci_requested:
-            if (
+            if full_observation_requested and plan_head_changed:
+                ci_result = github_api.ObservationReadResult.unavailable(
+                    "CI observation unavailable: observation plan head is no "
+                    "longer current"
+                )
+            elif (
                 batch_denied
                 or batch_fallback
                 or (not review_requested and not full_observation_requested)

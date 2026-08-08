@@ -21,6 +21,7 @@ DEFAULT_DELIVERY_TTL_SECONDS = 60 * 60.0
 DEFAULT_MAX_DELIVERIES = 4096
 
 _SUPPORTED_EVENTS = {
+    "ping",
     "pull_request",
     "pull_request_review",
     "pull_request_review_comment",
@@ -121,6 +122,8 @@ def _normalize(event_name: str, payload: object) -> tuple[NormalizedGithubEvent,
         raise WebhookRejected(400, "Unsupported GitHub webhook event")
     if not isinstance(payload, dict):
         raise WebhookRejected(400, "Malformed GitHub webhook payload")
+    if normalized_name == "ping":
+        return ()
 
     repository = payload.get("repository")
     repo = _string(repository, "full_name")
@@ -215,6 +218,8 @@ class GithubWebhookIngress:
             self._deliveries[normalized_delivery] = now
             while len(self._deliveries) > self._max_deliveries:
                 self._deliveries.popitem(last=False)
+        if not events:
+            return 202
 
         task = asyncio.create_task(self._apply_events(events))
         self._event_tasks.add(task)

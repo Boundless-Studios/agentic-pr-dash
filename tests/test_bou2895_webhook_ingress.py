@@ -240,6 +240,36 @@ def test_malformed_or_unsupported_payload_is_rejected(monkeypatch) -> None:
     asyncio.run(scenario())
 
 
+def test_authenticated_ping_is_accepted_without_refresh(monkeypatch) -> None:
+    async def scenario() -> None:
+        monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")
+        orchestrator = _Orchestrator()
+        orchestrator.release_event.set()
+        invalidations = 0
+
+        def invalidate() -> None:
+            nonlocal invalidations
+            invalidations += 1
+
+        ingress = GithubWebhookIngress(orchestrator, invalidate, debounce_seconds=0.01)
+        body = json.dumps(
+            {"zen": "Keep it logically awesome.", "hook_id": 12345}
+        ).encode()
+
+        assert ingress.accept(
+            "ping", "delivery-ping", _signature("hook-secret", body), body
+        ) == 202
+        await asyncio.sleep(0.04)
+
+        assert orchestrator.events == []
+        assert orchestrator.head_events == []
+        assert orchestrator.refreshes == 0
+        assert invalidations == 0
+        await ingress.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_webhook_route_streams_a_bounded_body_and_returns_accepted(monkeypatch) -> None:
     class _Request:
         def __init__(self, body: bytes, headers: dict[str, str]) -> None:

@@ -423,3 +423,98 @@ async def test_partial_observation_applies_and_acknowledges_ci_independently(
     clock.advance(timedelta(seconds=2))
     await orch.refresh_prs()
     assert pr.status is PRStatus.CI_FAILING
+
+
+@pytest.mark.asyncio
+async def test_full_observation_rejects_a_head_newer_than_its_plan(
+    monkeypatch, observation_boundaries
+):
+    """A metadata/observation race must not acknowledge the superseded key."""
+
+    calls = {"review": 0, "ci": 0}
+    monkeypatch.setattr(
+        github_api, "list_open_prs", lambda cwd=None: [_raw_pr(head="head-1")]
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: ("head-2", "2026-08-08T01:00:00Z"),
+    )
+
+    def review_observation(number, latest, cwd=None):
+        calls["review"] += 1
+        return github_api.ObservationReadResult.observed(([], []))
+
+    def ci_observation(head, cwd=None, *, pr_number=None):
+        calls["ci"] += 1
+        return github_api.ObservationReadResult.observed([])
+
+    monkeypatch.setattr(
+        github_api, "scan_review_threads_observation", review_observation
+    )
+    monkeypatch.setattr(
+        github_api, "get_ci_checks_rest_observation", ci_observation
+    )
+
+    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    await orch.refresh_prs()
+
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert calls == {"review": 0, "ci": 0}
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", ci_pending=False
+    )
+    assert retry is not None
+    assert retry.slices == frozenset(
+        {ObservationSlice.METADATA, ObservationSlice.REVIEW, ObservationSlice.CI}
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_head_review_only_retry_recovers_after_partial_observation(
+    monkeypatch, observation_boundaries
+):
+    """A synthetic plan key must reuse the real SHA learned by its full read."""
+
+    raw = _raw_pr()
+    raw.pop("headRefOid")
+    review_available = {"value": False}
+    review_calls = 0
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw])
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: ("real-head", "2026-08-08T01:00:00Z"),
+    )
+
+    def review_observation(number, latest, cwd=None):
+        nonlocal review_calls
+        review_calls += 1
+        if review_available["value"]:
+            return github_api.ObservationReadResult.observed(([], []))
+        return github_api.ObservationReadResult.unavailable("review unavailable")
+
+    monkeypatch.setattr(
+        github_api, "scan_review_threads_observation", review_observation
+    )
+
+    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    await orch.refresh_prs()
+
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.latest_commit_sha == "real-head"
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "legacy-head-7", ci_pending=False
+    )
+    assert retry is not None
+    assert retry.slices == frozenset({ObservationSlice.REVIEW})
+
+    review_available["value"] = True
+    await orch.refresh_prs()
+
+    assert review_calls == 2
+    assert pr.status is PRStatus.CLEAN

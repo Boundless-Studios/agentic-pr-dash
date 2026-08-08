@@ -3061,6 +3061,7 @@ _BATCH_CHUNK_SIZE = 15
 # Keep admission conservative before the first rate-limit sample (or after a
 # cheap unrelated query); callers may still provide a higher estimate.
 BATCH_GRAPHQL_ESTIMATED_COST: Final[int] = 50
+BATCH_GRAPHQL_FAILURE_BACKOFF: Final[timedelta] = timedelta(seconds=30)
 
 
 def repo_slug_for_prefetch(cwd: str | None) -> str:
@@ -3228,6 +3229,12 @@ def batch_fetch_pr_review_and_ci(
                     quota_context.ledger.record_failure(
                         reason="graphql_request_failed",
                     )
+                    quota_context.ledger.record_backoff(
+                        BATCH_GRAPHQL_FAILURE_BACKOFF,
+                        reason="graphql_request_failed",
+                    )
+                results.denied = True
+                results.error = "graphql_request_failed"
                 continue
             try:
                 data = json.loads(r.stdout)
