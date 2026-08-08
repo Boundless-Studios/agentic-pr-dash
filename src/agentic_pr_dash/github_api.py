@@ -33,9 +33,69 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Generic, TypeVar
 
 from .config import load as load_config
-from .models import CICheck, QueuedWorkflowJob, ReviewComment, RunnerExecutionSummary, RunnerPoolHealth, ThreadDecision
+from .models import (
+    CICheck,
+    QueuedWorkflowJob,
+    ReviewComment,
+    RunnerExecutionSummary,
+    RunnerPoolHealth,
+    ThreadDecision,
+)
+
+
+ObservationValue = TypeVar("ObservationValue")
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationReadResult(Generic[ObservationValue]):
+    """Result of a dashboard observation boundary read.
+
+    ``observable=False`` means the boundary could not establish the requested
+    slice.  An observable empty value is therefore represented by
+    ``ObservationReadResult(value=[], observable=True)`` rather than being
+    conflated with an unavailable read.  The dashboard uses this type to stage
+    values before touching ``PRData``; other callers keep the historical
+    fail-open sequence APIs below.
+    """
+
+    value: ObservationValue | None
+    observable: bool
+    error: str | None = None
+
+    @classmethod
+    def observed(
+        cls, value: ObservationValue
+    ) -> ObservationReadResult[ObservationValue]:
+        return cls(value=value, observable=True)
+
+    @classmethod
+    def unavailable(
+        cls,
+        error: str,
+        value: ObservationValue | None = None,
+    ) -> ObservationReadResult[ObservationValue]:
+        return cls(value=value, observable=False, error=error)
+
+
+class _ObservedList(list):
+    """List-compatible legacy return carrying boundary observability."""
+
+    observable: bool
+    error: str | None
+
+    def __init__(
+        self,
+        values: list,
+        *,
+        observable: bool,
+        error: str | None = None,
+    ) -> None:
+        super().__init__(values)
+        self.observable = observable
+        self.error = error
 
 
 def _runner_label() -> str | None:
@@ -2471,7 +2531,7 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
     repo = _repo_for_cwd(cwd)
     cached = _PR_BATCH_CACHE.get((repo, pr_number)) if repo else None
     if cached is not None and "ci_checks" in cached:
-        return list(cached["ci_checks"])
+        return _ObservedList(list(cached["ci_checks"]), observable=True)
 
     r = _run(
         ["gh", "pr", "checks", str(pr_number),
@@ -2512,7 +2572,27 @@ def get_ci_checks(pr_number: int, cwd: str | None = None) -> list[CICheck]:
             conclusion = None
             status = state or "unknown"
         checks.append(CICheck(name=c.get("name", "?"), status=status, conclusion=conclusion))
-    return checks
+    return _ObservedList(checks, observable=True)
+
+
+def get_ci_checks_observation(
+    pr_number: int,
+    cwd: str | None = None,
+) -> ObservationReadResult[list[CICheck]]:
+    """Return CI checks without collapsing an unavailable read into clean."""
+    try:
+        value = get_ci_checks(pr_number, cwd)
+    except Exception as exc:  # noqa: BLE001
+        return ObservationReadResult.unavailable(f"CI observation raised: {exc}")
+    if isinstance(value, ObservationReadResult):
+        return value
+    if isinstance(value, _ObservedList):
+        return ObservationReadResult(
+            value=list(value),
+            observable=value.observable,
+            error=value.error,
+        )
+    return ObservationReadResult.observed(list(value))
 
 
 # REST check-run conclusions that ``gh pr checks`` buckets as ``fail`` — must
@@ -2556,10 +2636,13 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
         # clean observation — this is the path where BOTH the `gh pr checks`
         # JSON read and the REST fallback died (codex PR #75 review, round 5).
         _note_checks_probe_failure()
-        return []
+        return _ObservedList([], observable=False, error="CI head SHA unavailable")
 
+    runs = get_check_runs_for_commit(sha, cwd)
+    if isinstance(runs, _ObservedList) and not runs.observable:
+        return _ObservedList([], observable=False, error="CI status reads unavailable")
     checks = []
-    for run in get_check_runs_for_commit(sha, cwd):
+    for run in runs:
         status = run.get("status") or ""
         conclusion = run.get("conclusion")
         if status != "completed" and status not in _REST_PENDING_STATUSES:
@@ -2567,7 +2650,7 @@ def _get_ci_checks_rest(pr_number: int, cwd: str | None = None) -> list[CICheck]
         if conclusion in _REST_FAIL_CONCLUSIONS:
             conclusion = "failure"
         checks.append(CICheck(name=run.get("name", "?"), status=status, conclusion=conclusion))
-    return checks
+    return _ObservedList(checks, observable=True)
 
 
 # GraphQL statusCheckRollup: per-context required-ness + non-terminal state.
@@ -2987,7 +3070,8 @@ def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
          "--jq", ".check_runs[] | {name, status, conclusion}"],
         cwd=cwd, timeout_s=30,
     )
-    if r.returncode == 0:
+    check_runs_observable = r.returncode == 0
+    if check_runs_observable:
         for line in r.stdout.strip().split("\n"):
             if not line.strip():
                 continue
@@ -3001,13 +3085,26 @@ def get_check_runs_for_commit(sha: str, cwd: str | None = None) -> list[dict]:
         # "no check runs" (codex PR #75 review, round 5).
         _note_checks_probe_failure()
 
-    checks.extend(_get_commit_statuses(sha, cwd))
+    statuses = _get_commit_statuses(sha, cwd)
+    statuses_observable = (
+        not isinstance(statuses, _ObservedList) or statuses.observable
+    )
+    checks.extend(statuses)
 
     by_name: dict[str, dict] = {}
     for c in checks:
         if c.get("name"):
             by_name[c["name"]] = c
-    return list(by_name.values()) if by_name else checks
+    values = list(by_name.values()) if by_name else checks
+    return _ObservedList(
+        values,
+        observable=check_runs_observable and statuses_observable,
+        error=(
+            None
+            if check_runs_observable and statuses_observable
+            else "one or more commit status mechanisms were unavailable"
+        ),
+    )
 
 
 # Combined-status states → our (status, conclusion) model. A commit status is
@@ -3035,7 +3132,7 @@ def _get_commit_statuses(sha: str, cwd: str | None = None) -> list[dict]:
         # Same unobservability contract as the check-runs read above: a failed
         # commit-status read may hide an external-CI failure (round 5).
         _note_checks_probe_failure()
-        return []
+        return _ObservedList([], observable=False, error="commit statuses unavailable")
     out: list[dict] = []
     for line in r.stdout.strip().split("\n"):
         if not line.strip():
@@ -3051,7 +3148,7 @@ def _get_commit_statuses(sha: str, cwd: str | None = None) -> list[dict]:
             entry.get("state", ""), ("in_progress", None)
         )
         out.append({"name": context, "status": status, "conclusion": conclusion})
-    return out
+    return _ObservedList(out, observable=True)
 
 
 def get_workflow_queue_health(
@@ -3744,6 +3841,8 @@ def scan_review_threads(
     pr_number: int,
     latest_commit_date: str,
     cwd: str | None = None,
+    *,
+    strict: bool = False,
 ) -> tuple[list[ReviewComment], list[ThreadDecision]]:
     """Return (picked_comments, decisions) for all review threads on a PR.
 
@@ -3764,7 +3863,7 @@ def scan_review_threads(
     )
 
     # Inline review threads via GraphQL
-    threads = get_review_threads(pr_number, cwd)
+    threads = get_review_threads(pr_number, cwd, strict=strict)
     for thread in threads:
         top = thread.top
         created_dt = _parse_github_time(top.created_at)
@@ -3922,9 +4021,47 @@ def scan_review_threads(
                         is_inline=False,
                     ))
             except json.JSONDecodeError:
+                if strict:
+                    raise RuntimeError(
+                        "scan_review_threads: malformed review-level response; "
+                        "refusing to synthesize a clean review state"
+                    )
                 continue
+    elif strict:
+        raise RuntimeError(
+            "scan_review_threads: review-level read failed; refusing to "
+            "synthesize a clean review state"
+        )
 
     return comments, decisions
+
+
+def scan_review_threads_observation(
+    pr_number: int,
+    latest_commit_date: str,
+    cwd: str | None = None,
+) -> ObservationReadResult[tuple[list[ReviewComment], list[ThreadDecision]]]:
+    """Strict dashboard review read with an explicit unavailable outcome."""
+    try:
+        if scan_review_threads.__module__ == __name__:
+            value = scan_review_threads(
+                pr_number,
+                latest_commit_date,
+                cwd,
+                strict=True,
+            )
+        else:
+            # Tests and external adapters historically replace the public
+            # boundary with a three-argument callable. Their return is the
+            # explicit observation contract for that adapter.
+            value = scan_review_threads(pr_number, latest_commit_date, cwd)
+    except Exception as exc:  # noqa: BLE001
+        return ObservationReadResult.unavailable(
+            f"review observation unavailable: {exc}"
+        )
+    if isinstance(value, ObservationReadResult):
+        return value
+    return ObservationReadResult.observed(value)
 
 
 def get_unaddressed_comments(

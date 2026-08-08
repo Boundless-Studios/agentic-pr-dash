@@ -73,6 +73,7 @@ def test_agent_state_bare_statuses():
     """Each PRStatus maps to its baseline agent_state when no maintenance is set."""
     cases = [
         (PRStatus.CLEAN, "clean"),
+        (PRStatus.OBSERVATION_UNAVAILABLE, "observation_unavailable"),
         (PRStatus.NO_PR, "no_pr"),
         (PRStatus.CI_FAILING, "ci_failing"),
         (PRStatus.CI_PENDING, "ci_pending"),
@@ -151,7 +152,8 @@ def test_agent_state_agent_failed_status():
 
 _ALL_STATES = [
     "failed", "working", "waiting", "ready_cleanup", "queued", "awaiting_fixes",
-    "ci_failing", "ci_pending", "merge_conflict", "no_pr", "clean",
+    "ci_failing", "ci_pending", "merge_conflict", "observation_unavailable",
+    "no_pr", "clean",
 ]
 
 
@@ -181,6 +183,8 @@ def test_agent_state_label_non_empty_and_distinct():
             card = _minimal_card(status=PRStatus.CI_PENDING)
         elif state_val == "merge_conflict":
             card = _minimal_card(status=PRStatus.MERGE_CONFLICT)
+        elif state_val == "observation_unavailable":
+            card = _minimal_card(status=PRStatus.OBSERVATION_UNAVAILABLE)
         elif state_val == "no_pr":
             card = _minimal_card(status=PRStatus.NO_PR)
         else:  # clean

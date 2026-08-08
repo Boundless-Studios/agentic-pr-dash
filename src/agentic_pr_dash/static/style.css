@@ -542,7 +542,8 @@ header h1 {
 
 /* State → warn */
 .card-state.state-awaiting_fixes,
-.card-state.state-queued {
+.card-state.state-queued,
+.card-state.state-observation_unavailable {
     background: color-mix(in srgb, var(--warn) 14%, transparent);
     color: var(--warn);
 }

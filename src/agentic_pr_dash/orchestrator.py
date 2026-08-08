@@ -25,6 +25,12 @@ from .models import (
     RunnerExecutionSummary,
 )
 from .observability import ObservabilityEvent, get_event_store
+from .observation import (
+    ObservationController,
+    ObservationKey,
+    ObservationPlan,
+    ObservationSlice,
+)
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
 # Composite key for the tracked-PR map. The dashboard aggregates PRs across any
@@ -151,8 +157,16 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
 
 
 class Orchestrator:
-    def __init__(self, repo_cwd: str | None = None):
+    def __init__(
+        self,
+        repo_cwd: str | None = None,
+        *,
+        observation_controller: ObservationController | None = None,
+    ):
         self.repo_cwd = repo_cwd
+        self.observation_controller = (
+            observation_controller or ObservationController()
+        )
         # Keyed by ``(repo, number)`` so PRs aggregated from multiple repos
         # (anchor + ``maintenance_repo_roots``) never collide on PR number.
         self.prs: dict[PRKey, PRData] = {}
@@ -160,6 +174,12 @@ class Orchestrator:
         # only its OWN merged/closed PRs (even when that root returns zero PRs)
         # and never drops another repo's PRs on a transient failure.
         self._pr_root: dict[PRKey, str | None] = {}
+        self._observation_keys: dict[PRKey, ObservationKey] = {}
+        self._observed_blocker_keys: set[ObservationKey] = set()
+        # The poll loop and manual refresh endpoint share one mutable PR/cache
+        # projection. Serialize complete refresh transactions so an older
+        # GitHub response can never land after a newer one.
+        self._refresh_lock = asyncio.Lock()
         self.observed_roots: set[str | None] = set()
         self._inflight_prs: set[int] = set()
         self.events: list[EventEntry] = []
@@ -287,6 +307,11 @@ class Orchestrator:
         drop another repo's PRs. With no extra roots configured this reduces to
         exactly today's single-repo behavior.
         """
+        async with self._refresh_lock:
+            return await self._refresh_prs_locked()
+
+    async def _refresh_prs_locked(self) -> list[PRData]:
+        """Run one refresh transaction while :attr:`_refresh_lock` is held."""
         now = datetime.now(timezone.utc)
 
         # Runner-execution summary is a fleet-wide stat — poll it once (anchor),
@@ -309,6 +334,11 @@ class Orchestrator:
             except Exception as exc:
                 # Per-repo isolation: one bad repo must not sink the dashboard.
                 self.log(f"Poll error for repo root {root}: {exc}", level="error")
+
+        self.observation_controller.prune(self._observation_keys.values())
+        self._observed_blocker_keys.intersection_update(
+            self._observation_keys.values()
+        )
 
         return list(self.prs.values())
 
@@ -354,38 +384,23 @@ class Orchestrator:
             if key[1] not in open_numbers:
                 old = self.prs.pop(key)
                 self._pr_root.pop(key, None)
+                self._observation_keys.pop(key, None)
                 self.log(
                     f"PR #{key[1]} closed/merged: {old.title}",
                     pr_number=key[1],
                     level="success",
                 )
 
-        # Prime the existing per-PR accessors from one immutable-head GraphQL
-        # observation before enrichment. Without this, every dashboard poll
-        # performs latest-commit, CI, and review-thread requests separately for
-        # every PR; a nominal 60-second poll then takes several minutes for a
-        # busy repository and the board serves stale state between completions.
-        # Missing/paginated entries deliberately fall through to the original
-        # per-PR accessors, preserving their correctness behavior.
+        # Drop the previous tick's batch entries before planning. A CI-only
+        # refresh must reach the live CI accessor rather than reusing a stale
+        # full-observation cache entry.
         github_api.clear_pr_batch_cache()
-        owner, repo_name = await asyncio.to_thread(github_api.get_repo_info, root)
-        if owner and repo_name and open_numbers:
-            entries = await asyncio.to_thread(
-                github_api.batch_fetch_pr_review_and_ci,
-                owner,
-                repo_name,
-                sorted(open_numbers),
-                root,
-            )
-            github_api.prime_pr_batch_cache(
-                f"{owner}/{repo_name}", entries, cwd=root
-            )
 
         # Get-or-create every PR object up front (cheap, mutates the shared
         # ``self.prs`` map serially to avoid races), then enrich the independent
         # per-PR REST/GraphQL work CONCURRENTLY below (BOU-1637 #4). Each PR's
         # enrichment only touches its own ``PRData``, so gathering them is safe.
-        to_enrich: list[tuple[PRData, dict]] = []
+        to_enrich: list[tuple[PRData, dict, ObservationPlan | None]] = []
         for raw in raw_prs:
             num = raw.get("number")
             if not isinstance(num, int):
@@ -410,22 +425,88 @@ class Orchestrator:
                 self.prs[key] = pr
                 self.log(f"Discovered PR #{num}: {pr.title}", pr_number=num)
             self._pr_root[key] = root
-            to_enrich.append((pr, raw))
+
+            # GitHub's bulk PR listing exposes the immutable head directly.
+            # Keep that value as the observation identity: the latest-commit
+            # accessor is a requested read, not the identity that decides
+            # whether a plan is due.
+            head_sha = str(raw.get("headRefOid") or "")
+            if not head_sha:
+                # Older test/fixture payloads and degraded REST fallbacks may
+                # omit headRefOid. Keep those callers on a stable legacy key;
+                # real GitHub list payloads always take the branch above.
+                head_sha = f"legacy-head-{num}"
+            observation_repo = pr.repo or root or "legacy-repo"
+            observation_number = num
+            if num <= 0:
+                # ObservationKey models real GitHub PR identities, whose
+                # numbers are positive. Keep malformed fixture/REST entries
+                # isolated without letting one bad number abort this repo's
+                # enrichment batch.
+                observation_repo = f"{observation_repo}:legacy-{num}"
+                observation_number = 1
+            observation_key = ObservationKey(
+                observation_repo, observation_number, head_sha
+            )
+            self._observation_keys[key] = observation_key
+            plan = self.observation_controller.plan_for(
+                observation_key.repo,
+                observation_key.number,
+                observation_key.head_sha,
+            )
+            to_enrich.append((pr, raw, plan))
+
+        # Prime the existing per-PR accessors from one immutable-head GraphQL
+        # observation, but only when at least one PR needs BOTH review and CI.
+        # Missing/paginated entries deliberately fall through to the original
+        # per-PR accessors, preserving their correctness behavior.
+        batch_numbers = sorted(
+            {
+                pr.number
+                for pr, _raw, plan in to_enrich
+                if plan is not None
+                and ObservationSlice.REVIEW in plan.slices
+                and ObservationSlice.CI in plan.slices
+            }
+        )
+        if batch_numbers:
+            try:
+                owner, repo_name = await asyncio.to_thread(
+                    github_api.get_repo_info, root
+                )
+                if owner and repo_name:
+                    entries = await asyncio.to_thread(
+                        github_api.batch_fetch_pr_review_and_ci,
+                        owner,
+                        repo_name,
+                        batch_numbers,
+                        root,
+                    )
+                    github_api.prime_pr_batch_cache(
+                        f"{owner}/{repo_name}", entries, cwd=root
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self.log(
+                    f"Batch observation failed for repo root {root}: {exc}",
+                    level="warn",
+                )
 
         # Enrich each PR concurrently, bounded by a modest semaphore so a large
         # pool doesn't hammer the gh API into a rate-limit wall. Per-PR error
         # isolation: one PR's failed enrichment must not drop the others.
         sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
 
-        async def _guarded(pr: PRData, raw: dict) -> None:
+        async def _guarded(
+            pr: PRData, raw: dict, plan: ObservationPlan | None
+        ) -> None:
             async with sem:
-                await self._enrich_pr(pr, raw, root, now)
+                await self._enrich_pr(pr, raw, root, now, plan)
 
         results = await asyncio.gather(
-            *(_guarded(pr, raw) for pr, raw in to_enrich),
+            *(_guarded(pr, raw, plan) for pr, raw, plan in to_enrich),
             return_exceptions=True,
         )
-        for (pr, _raw), result in zip(to_enrich, results):
+        for (pr, _raw, _plan), result in zip(to_enrich, results):
             if isinstance(result, Exception):
                 self.log(
                     f"Enrichment failed for PR #{pr.number}: {result}",
@@ -434,16 +515,30 @@ class Orchestrator:
                 )
 
     async def _enrich_pr(
-        self, pr: PRData, raw: dict, root: str | None, now: datetime
+        self,
+        pr: PRData,
+        raw: dict,
+        root: str | None,
+        now: datetime,
+        plan: ObservationPlan | None = None,
     ) -> None:
         """Enrich a single PR with its per-PR REST/GraphQL state.
 
         Only ``pr``'s own fields are mutated here, so multiple ``_enrich_pr``
         calls run concurrently without sharing state (BOU-1637 #4). ``root`` is
         the repo cwd passed to every ``github_api.*`` call so the enrichment is
-        scoped to that PR's repo.
+        scoped to that PR's repo. ``plan`` controls the expensive review and CI
+        reads; ``None`` refreshes cheap list metadata and projects status from
+        the already-cached observation.
         """
         num = pr.number
+        review_requested = (
+            plan is not None and ObservationSlice.REVIEW in plan.slices
+        )
+        ci_requested = plan is not None and ObservationSlice.CI in plan.slices
+        metadata_requested = (
+            plan is not None and ObservationSlice.METADATA in plan.slices
+        )
 
         # Update metadata
         pr.title = raw.get("title", pr.title)
@@ -476,7 +571,10 @@ class Orchestrator:
         # single-repo/no-cwd path, which restores the unscoped behavior.
         pr.worktree_path = find_worktree_for_branch(pr.branch, root=root)
 
-        if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
+        if metadata_requested and (
+            bulk_merge_state in ("", "UNKNOWN")
+            or bulk_mergeable in ("", "UNKNOWN")
+        ):
             refetched_state, refetched_mergeable = await asyncio.to_thread(
                 github_api.get_mergeability, num, root
             )
@@ -488,68 +586,149 @@ class Orchestrator:
             if refetched_mergeable:
                 pr.mergeable = refetched_mergeable
 
-        # Get latest commit info
-        previous_commit_sha = pr.latest_commit_sha
-        sha, date = await asyncio.to_thread(
-            github_api.get_latest_commit, num, root
-        )
-        pr.latest_commit_sha = sha
-        pr.latest_commit_date = date
-        if previous_commit_sha and sha and sha != previous_commit_sha:
-            pr.no_push_comment_retry_count = 0
-
-        # Get CI checks
-        checks = await asyncio.to_thread(
-            github_api.get_ci_checks, num, root
-        )
-        pr.ci_checks = checks
-        if any(c.status in {"queued", "in_progress"} for c in checks):
-            queued_jobs, runner_pool_health, runner_execution_summary = await asyncio.to_thread(
-                github_api.get_workflow_queue_health, num, root
+        # Stage requested observations before mutating blocker state. GitHub
+        # boundary failures commonly look like an empty collection; the typed
+        # results below distinguish that from an authoritative clean result.
+        latest_result = None
+        ci_result = None
+        review_result = None
+        latest_commit_date = pr.latest_commit_date
+        if review_requested:
+            latest_value = await asyncio.to_thread(
+                github_api.get_latest_commit, num, root
             )
-            pr.queued_jobs = queued_jobs
-            pr.runner_pool_health = runner_pool_health
-            pr.runner_execution_summary = runner_execution_summary
-        else:
-            pr.queued_jobs = []
-            pr.runner_pool_health = []
-            pr.runner_execution_summary = pr.runner_execution_summary.__class__()
-
-        # Compute failing checks (code only, not infra)
-        pr.failing_checks = [
-            c.name for c in checks
-            if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
-        ]
-
-        # Get unaddressed comments (filtered by commit date!) with per-thread decisions
-        comments, decisions = await asyncio.to_thread(
-            github_api.scan_review_threads, num, date, root
-        )
-        pr.review_comments = comments
-        self._emit(
-            "comment_scan",
-            pr_number=num,
-            repo=root,
-            details={"decisions": [d.model_dump() for d in decisions], "picked": len(comments)},
-        )
-
-        if not pr.review_comments:
-            pr.no_push_comment_retry_count = 0
-
-        # New unaddressed comment IDs unblock a stuck AGENT_FAILED PR.
-        # Otherwise agent_failure_reason only clears on a fresh commit,
-        # which means fresh review feedback can't re-trigger auto-dispatch.
-        current_comment_ids = {c.id for c in comments}
-        new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
-        if new_comment_ids and num not in self._inflight_prs:
-            if pr.agent_failure_reason:
-                self.log(
-                    f"New unaddressed comment(s) on PR #{num} — clearing stuck failure state",
-                    pr_number=num,
+            if (
+                len(latest_value) >= 2
+                and bool(latest_value[0])
+                and bool(latest_value[1])
+            ):
+                latest_result = github_api.ObservationReadResult.observed(
+                    (str(latest_value[0]), str(latest_value[1]))
                 )
-                pr.agent_failure_reason = None
-            pr.no_push_comment_retry_count = 0
-        pr.last_seen_comment_ids = current_comment_ids
+            else:
+                latest_result = github_api.ObservationReadResult.unavailable(
+                    "latest commit observation unavailable"
+                )
+            if latest_result.observable and latest_result.value is not None:
+                _sha, latest_commit_date = latest_result.value
+            review_result = await asyncio.to_thread(
+                github_api.scan_review_threads_observation,
+                num,
+                latest_commit_date,
+                root,
+            )
+        if ci_requested:
+            ci_result = await asyncio.to_thread(
+                github_api.get_ci_checks_observation, num, root
+            )
+
+        requested_results = [
+            result
+            for result in (latest_result, ci_result, review_result)
+            if result is not None
+        ]
+        observation_succeeded = all(
+            result.observable and result.value is not None
+            for result in requested_results
+        )
+        observation_unavailable = False
+        if requested_results and not observation_succeeded:
+            errors = [
+                result.error or "unobservable read"
+                for result in requested_results
+                if not result.observable
+            ]
+            self.log(
+                f"Preserving cached blockers for PR #{num}: {'; '.join(errors)}",
+                pr_number=num,
+                level="warn",
+            )
+            if plan is not None and plan.key not in self._observed_blocker_keys:
+                observation_unavailable = True
+        else:
+            if latest_result is not None and latest_result.value is not None:
+                previous_commit_sha = pr.latest_commit_sha
+                sha, latest_commit_date = latest_result.value
+                pr.latest_commit_sha = sha
+                pr.latest_commit_date = latest_commit_date
+                if previous_commit_sha and sha != previous_commit_sha:
+                    pr.no_push_comment_retry_count = 0
+
+            if ci_result is not None and ci_result.value is not None:
+                checks = ci_result.value
+                pr.ci_checks = checks
+                ci_pending = any(
+                    c.status in {"queued", "in_progress"} for c in checks
+                )
+                if ci_pending and plan is not None and {
+                    ObservationSlice.REVIEW,
+                    ObservationSlice.CI,
+                } <= plan.slices:
+                    queued_jobs, runner_pool_health, runner_execution_summary = (
+                        await asyncio.to_thread(
+                            github_api.get_workflow_queue_health, num, root
+                        )
+                    )
+                    pr.queued_jobs = queued_jobs
+                    pr.runner_pool_health = runner_pool_health
+                    pr.runner_execution_summary = runner_execution_summary
+                elif not ci_pending:
+                    pr.queued_jobs = []
+                    pr.runner_pool_health = []
+                    pr.runner_execution_summary = (
+                        pr.runner_execution_summary.__class__()
+                    )
+                pr.failing_checks = [
+                    c.name
+                    for c in checks
+                    if c.conclusion == "failure"
+                    and not github_api._is_infra_check(c.name)
+                ]
+
+            if review_result is not None and review_result.value is not None:
+                comments, decisions = review_result.value
+                pr.review_comments = comments
+                self._emit(
+                    "comment_scan",
+                    pr_number=num,
+                    repo=root,
+                    details={
+                        "decisions": [d.model_dump() for d in decisions],
+                        "picked": len(comments),
+                    },
+                )
+                if not comments:
+                    pr.no_push_comment_retry_count = 0
+                current_comment_ids = {c.id for c in comments}
+                new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
+                if new_comment_ids and num not in self._inflight_prs:
+                    if pr.agent_failure_reason:
+                        self.log(
+                            f"New unaddressed comment(s) on PR #{num} — "
+                            "clearing stuck failure state",
+                            pr_number=num,
+                        )
+                        pr.agent_failure_reason = None
+                    pr.no_push_comment_retry_count = 0
+                pr.last_seen_comment_ids = current_comment_ids
+
+            if plan is not None:
+                self.observation_controller.record_refresh(
+                    plan,
+                    ci_pending=(
+                        any(
+                            c.status in {"queued", "in_progress"}
+                            for c in pr.ci_checks
+                        )
+                        if ci_requested
+                        else False
+                    ),
+                )
+                if {
+                    ObservationSlice.REVIEW,
+                    ObservationSlice.CI,
+                } <= plan.slices:
+                    self._observed_blocker_keys.add(plan.key)
 
         # Read escalation marker (best-effort): if the maintenance loop has
         # repeatedly failed to fix this PR, flag it so the dashboard can surface
@@ -567,7 +746,11 @@ class Orchestrator:
             pass
 
         # Compute status
-        pr.status = self._compute_status(pr)
+        pr.status = (
+            PRStatus.OBSERVATION_UNAVAILABLE
+            if observation_unavailable
+            else self._compute_status(pr)
+        )
         pr.last_polled = now
 
         if not pr.worktree_path and pr.status == PRStatus.CLEAN:

@@ -123,7 +123,8 @@ KANBAN_COLUMNS = [
         "id": "needs_attention",
         "title": "Needs Attention",
         "statuses": {PRStatus.WAITING_HUMAN_DECISION, PRStatus.CI_FAILING, PRStatus.HAS_COMMENTS,
-                     PRStatus.CI_AND_COMMENTS, PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED},
+                     PRStatus.CI_AND_COMMENTS, PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED,
+                     PRStatus.OBSERVATION_UNAVAILABLE},
     },
     {
         "id": "in_progress",
@@ -1658,6 +1659,7 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
 def status_label(status: PRStatus) -> str:
     return {
         PRStatus.CLEAN: "OK",
+        PRStatus.OBSERVATION_UNAVAILABLE: "GitHub Unavailable",
         PRStatus.NO_PR: "No PR",
         PRStatus.CI_PENDING: "CI Pending",
         PRStatus.CI_FAILING: "CI Failing",
