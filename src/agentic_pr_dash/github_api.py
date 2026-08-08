@@ -1686,23 +1686,46 @@ def _pr_head_owner(pr: dict) -> str:
 
 
 def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
-    """Get the SHA and date of the latest commit on a PR."""
+    """Get the authoritative head SHA and its commit date for a PR.
+
+    Resolve the immutable head from ``pulls/{number}`` first. The commits-list
+    endpoint defaults to 30 entries, so taking its last element returns a stale
+    SHA for larger PRs.
+    """
     repo = _repo_for_cwd(cwd)
     cached = _PR_BATCH_CACHE.get((repo, pr_number)) if repo else None
     if cached is not None and "latest_commit" in cached:
         sha, committed_at = cached["latest_commit"]
         return str(sha), str(committed_at)
-    r = _run(
-        ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/commits",
-         "--jq", ".[-1] | [.sha, .commit.author.date] | @tsv"],
+    head_result = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/pulls/{pr_number}",
+            "--jq",
+            ".head.sha",
+        ],
         cwd=cwd,
     )
-    if r.returncode != 0 or not r.stdout.strip():
+    head_sha = (head_result.stdout or "").strip()
+    if head_result.returncode != 0 or not head_sha:
         return "", ""
-    parts = r.stdout.strip().split("\t")
-    if len(parts) >= 2:
-        return parts[0], parts[1]
-    return parts[0] if parts else "", ""
+    commit_result = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/commits/{head_sha}",
+            "--jq",
+            "[.sha, .commit.author.date] | @tsv",
+        ],
+        cwd=cwd,
+    )
+    if commit_result.returncode != 0 or not commit_result.stdout.strip():
+        return head_sha, ""
+    parts = commit_result.stdout.strip().split("\t")
+    if len(parts) < 2 or parts[0] != head_sha:
+        return head_sha, ""
+    return head_sha, parts[1]
 
 
 def get_mergeability(pr_number: int, cwd: str | None = None) -> tuple[str, str]:
@@ -3137,10 +3160,10 @@ def batch_fetch_pr_review_and_ci(
         fetches page one, so a truncated read here would silently narrow what
         :func:`get_review_threads` promises callers (no dropped pages, ever).
     Callers (``_stop_gate_impl``'s prefetch) treat an omitted PR exactly like a
-    cache miss: :func:`get_review_threads` / :func:`required_checks_pending`
-    fall through to their normal, correctness-preserving per-PR `gh` call for
-    it. This function itself never raises — any failure just means fewer PRs
-    got batched, not a wrong answer for any of them.
+    cache miss. Quota-aware dashboard callers additionally inspect the typed
+    ``denied`` flag: a malformed chunk activates bounded backoff and suppresses
+    immediate per-PR GraphQL fan-out. This function itself never raises — any
+    failure means fewer PRs got batched, never a wrong answer for an entry.
 
     When ``quota_context`` (or ``quota_ledger`` plus attribution arguments) is
     supplied, the top-level GraphQL ``rateLimit`` sample is recorded once for
@@ -3160,6 +3183,22 @@ def batch_fetch_pr_review_and_ci(
         )
 
     results: _BatchObservationDict = _BatchObservationDict()
+
+    def deny_invalid_response(
+        reason: str, *, count_request: bool = True
+    ) -> None:
+        if quota_context is not None:
+            quota_context.ledger.record_failure(
+                reason=reason,
+                count_request=count_request,
+            )
+            quota_context.ledger.record_backoff(
+                BATCH_GRAPHQL_FAILURE_BACKOFF,
+                reason=reason,
+            )
+        results.denied = True
+        results.error = reason
+
     numbers = sorted(set(pr_numbers))
     for start in range(0, len(numbers), _BATCH_CHUNK_SIZE):
         chunk = numbers[start:start + _BATCH_CHUNK_SIZE]
@@ -3240,10 +3279,7 @@ def batch_fetch_pr_review_and_ci(
                 data = json.loads(r.stdout)
                 data_node = data["data"]
             except (json.JSONDecodeError, KeyError, TypeError):
-                if quota_context is not None:
-                    quota_context.ledger.record_failure(
-                        reason="graphql_response_invalid",
-                    )
+                deny_invalid_response("graphql_response_invalid")
                 continue
 
             rate_limit_recorded = False
@@ -3262,26 +3298,22 @@ def batch_fetch_pr_review_and_ci(
                     reservation = None
                     rate_limit_recorded = True
                 except (KeyError, TypeError, ValueError, OverflowError):
-                    quota_context.ledger.record_failure(
-                        reason="graphql_rate_limit_invalid",
-                    )
+                    deny_invalid_response("graphql_rate_limit_invalid")
                     continue
 
             try:
                 repo_node = data_node["repository"]
             except (KeyError, TypeError):
-                if quota_context is not None:
-                    quota_context.ledger.record_failure(
-                        reason="graphql_response_invalid",
-                        count_request=not rate_limit_recorded,
-                    )
+                deny_invalid_response(
+                    "graphql_response_invalid",
+                    count_request=not rate_limit_recorded,
+                )
                 continue
             if not isinstance(repo_node, dict):
-                if quota_context is not None:
-                    quota_context.ledger.record_failure(
-                        reason="graphql_repository_invalid",
-                        count_request=not rate_limit_recorded,
-                    )
+                deny_invalid_response(
+                    "graphql_repository_invalid",
+                    count_request=not rate_limit_recorded,
+                )
                 continue
         finally:
             if quota_context is not None and reservation is not None:

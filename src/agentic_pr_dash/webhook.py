@@ -186,6 +186,8 @@ class GithubWebhookIngress:
         self._deliveries: OrderedDict[str, float] = OrderedDict()
         self._event_tasks: set[asyncio.Task[None]] = set()
         self._refresh_task: asyncio.Task[None] | None = None
+        self._refresh_started = False
+        self._refresh_followup = False
         self._closing = False
 
     def accept(
@@ -265,25 +267,44 @@ class GithubWebhookIngress:
             _LOG.exception("GitHub webhook observation invalidation failed")
 
     def _schedule_refresh(self) -> None:
-        if self._refresh_task is not None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            if self._refresh_started:
+                # The GitHub reads are already in flight. Cancelling an
+                # asyncio.to_thread boundary does not stop its worker and can
+                # strand the associated quota reservation. Coalesce one
+                # follow-up refresh after the active transaction instead.
+                self._refresh_followup = True
+                return
             self._refresh_task.cancel()
         self._refresh_task = asyncio.create_task(self._debounced_refresh())
 
     async def _debounced_refresh(self) -> None:
         try:
             await asyncio.sleep(self._debounce_seconds)
+            self._refresh_started = True
             await self._orchestrator.refresh_prs()
             self._invalidate_dashboard()
         except asyncio.CancelledError:
             raise
         except Exception:
             _LOG.exception("GitHub webhook observation refresh failed")
+        finally:
+            current = asyncio.current_task()
+            if self._refresh_task is current:
+                self._refresh_task = None
+                self._refresh_started = False
+                if self._refresh_followup and not self._closing:
+                    self._refresh_followup = False
+                    self._refresh_task = asyncio.create_task(
+                        self._debounced_refresh()
+                    )
 
     async def shutdown(self) -> None:
         self._closing = True
         tasks = list(self._event_tasks)
         if self._refresh_task is not None:
             tasks.append(self._refresh_task)
+        self._refresh_followup = False
         for task in tasks:
             task.cancel()
         if tasks:

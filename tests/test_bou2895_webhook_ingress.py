@@ -135,6 +135,51 @@ def test_pull_request_webhook_returns_before_observation_and_debounces(monkeypat
     asyncio.run(scenario())
 
 
+def test_webhook_does_not_cancel_an_active_observation_refresh(monkeypatch) -> None:
+    class _BlockingRefreshOrchestrator(_Orchestrator):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_event.set()
+            self.refresh_started = asyncio.Event()
+            self.release_refresh = asyncio.Event()
+            self.refresh_cancellations = 0
+
+        async def refresh_prs(self) -> None:
+            self.refreshes += 1
+            if self.refreshes != 1:
+                return
+            self.refresh_started.set()
+            try:
+                await self.release_refresh.wait()
+            except asyncio.CancelledError:
+                self.refresh_cancellations += 1
+                raise
+
+    async def scenario() -> None:
+        monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")
+        orchestrator = _BlockingRefreshOrchestrator()
+        ingress = GithubWebhookIngress(
+            orchestrator, lambda: None, debounce_seconds=0.01
+        )
+        body = _pull_request_body()
+        signature = _signature("hook-secret", body)
+
+        assert ingress.accept("pull_request", "active-1", signature, body) == 202
+        await asyncio.wait_for(orchestrator.refresh_started.wait(), timeout=0.2)
+        assert ingress.accept("pull_request", "active-2", signature, body) == 202
+        await asyncio.sleep(0.03)
+
+        assert orchestrator.refresh_cancellations == 0
+        assert orchestrator.refreshes == 1
+
+        orchestrator.release_refresh.set()
+        await asyncio.sleep(0.04)
+        assert orchestrator.refreshes == 2
+        await ingress.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_check_event_fans_out_and_delivery_is_deduplicated(monkeypatch) -> None:
     async def scenario() -> None:
         monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")

@@ -127,6 +127,11 @@ ENRICHMENT_CONCURRENCY = 6
 # the same interval for its per-head reconciliation plan; the orchestrator
 # uses it to decide when the cached raw PR list must be replaced.
 METADATA_RECONCILIATION_INTERVAL = timedelta(minutes=15)
+# A conditional REST 304 validates the open-PR list, but not GraphQL-only
+# fields such as reviewDecision or freshly recomputed mergeability. Keep the
+# cheap 15-minute probe while forcing one rich snapshot per hour so those
+# fields cannot remain stale forever behind an unchanged REST validator.
+RICH_METADATA_RECONCILIATION_INTERVAL = timedelta(hours=1)
 # Cold start has no cached projection to fall back on, so the board is simply
 # empty until the first list succeeds. One transient at daemon startup must not
 # hold it empty for a whole reconciliation interval; retry on the next poll tick
@@ -159,6 +164,7 @@ METADATA_GRAPHQL_ESTIMATED_COST = 50
 REVIEW_GRAPHQL_ESTIMATED_COST = 25
 BATCH_GRAPHQL_ESTIMATED_COST = github_api.BATCH_GRAPHQL_ESTIMATED_COST
 REVIEW_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
+METADATA_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
 
 
 def _parse_session_timestamp(value: str | None) -> datetime | None:
@@ -265,6 +271,7 @@ class Orchestrator:
         self._metadata_cache: dict[str | None, list[dict]] = {}
         self._metadata_last_success: dict[str | None, datetime] = {}
         self._metadata_last_attempt: dict[str | None, datetime] = {}
+        self._metadata_last_rich_success: dict[str | None, datetime] = {}
         self._metadata_validators: dict[
             str | None, tuple[str | None, str | None]
         ] = {}
@@ -552,6 +559,7 @@ class Orchestrator:
         self._metadata_cache[root] = cache
         self._metadata_last_success[root] = now
         self._metadata_last_attempt[root] = now
+        self._metadata_last_rich_success[root] = now
 
         slugs = {
             _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
@@ -853,6 +861,11 @@ class Orchestrator:
                 reason="rich_metadata_unavailable"
             )
             failure = github_api.last_list_open_prs_failure()
+            if failure is not None and failure.is_rate_limited:
+                self.quota_ledger.record_backoff(
+                    METADATA_GRAPHQL_FAILURE_BACKOFF,
+                    reason="rich_metadata_rate_limited",
+                )
             detail = f" — {failure.summary()}" if failure else ""
             if list_error is not None:
                 detail = f" — {list_error}"
@@ -956,6 +969,18 @@ class Orchestrator:
                 probe.etag or etag,
                 probe.last_modified or last_modified,
             )
+            last_rich = self._metadata_last_rich_success.get(root)
+            if (
+                last_rich is None
+                or now >= last_rich + RICH_METADATA_RECONCILIATION_INTERVAL
+            ):
+                # The REST validator says the open-PR representation is
+                # unchanged, but it cannot validate GraphQL-only fields such
+                # as reviewDecision or mergeability. Periodically refresh the
+                # rich snapshot independently of that validator.
+                return await self._rich_metadata_list(
+                    root, now, force=force, bootstrap=False
+                )
             self._metadata_last_success[root] = now
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:

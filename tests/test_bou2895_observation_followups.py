@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -39,6 +40,35 @@ class ManualClock:
 
     def advance(self, delta: timedelta) -> None:
         self.current += delta
+
+
+def test_latest_commit_resolves_head_without_unpaginated_pr_commit_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, cwd=None, timeout_s=30):
+        joined = " ".join(cmd)
+        calls.append(joined)
+        if "pulls/7 --jq .head.sha" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="head-40\n", stderr="")
+        if "commits/head-40" in joined:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="head-40\t2026-08-08T01:00:00Z\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected GitHub read: {joined}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    monkeypatch.setattr(github_api, "_repo_for_cwd", lambda cwd: "org/widgets")
+
+    assert github_api.get_latest_commit(7, "/repos/widgets") == (
+        "head-40",
+        "2026-08-08T01:00:00Z",
+    )
+    assert all("pulls/7/commits" not in call for call in calls)
 
 
 def _raw_pr(number: int = 7, *, head: str = "head-1") -> dict:

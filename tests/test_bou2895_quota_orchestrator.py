@@ -176,6 +176,73 @@ async def test_304_reuses_metadata_and_records_cache_hit(
 
 
 @pytest.mark.asyncio
+async def test_304_still_allows_periodic_rich_metadata_reconciliation(
+    monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    calls = {"list": 0, "probe": 0}
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        raw = _raw_pr()
+        if calls["list"] > 1:
+            raw["mergeStateStatus"] = "DIRTY"
+            raw["mergeable"] = "CONFLICTING"
+        return [raw]
+
+    def probe(*args, **kwargs):
+        calls["probe"] += 1
+        return github_api.ConditionalPRListProbe(304, [], etag='"v1"')
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    monkeypatch.setattr(github_api, "probe_open_prs_rest", probe)
+    orch = _orchestrator(clock, ledger)
+
+    await orch.refresh_prs()
+    clock.advance(timedelta(minutes=15))
+    await orch.refresh_prs()
+    assert calls == {"list": 1, "probe": 2}
+
+    clock.advance(timedelta(minutes=45))
+    await orch.refresh_prs()
+
+    assert calls == {"list": 2, "probe": 3}
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.merge_state == "DIRTY"
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_rich_metadata_failure_activates_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    results = [[_raw_pr()], None]
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: results.pop(0))
+    monkeypatch.setattr(
+        github_api,
+        "last_list_open_prs_failure",
+        lambda: github_api.GhFailure(
+            ["gh", "pr", "list"],
+            1,
+            "GraphQL: API rate limit already exceeded",
+            "rate-limit",
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    await orch._rich_metadata_list("/repos/widgets", clock(), force=False)
+    await orch._rich_metadata_list("/repos/widgets", clock(), force=False)
+
+    telemetry = ledger.telemetry()
+    assert telemetry.backoff_active is True
+    assert telemetry.backoff_until == clock.current + timedelta(seconds=30)
+    assert telemetry.backoff_reason == "rich_metadata_rate_limited"
+
+
+@pytest.mark.asyncio
 async def test_event_metadata_invalidation_is_acknowledged_by_304(
     monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
 ) -> None:

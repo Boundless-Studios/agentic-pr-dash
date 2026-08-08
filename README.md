@@ -171,8 +171,9 @@ reverse proxy or tunnel before GitHub can deliver events to it.
 
 Webhooks are optional. Without a reachable webhook, the dashboard still updates
 its local projection every 15 seconds, rechecks nonterminal CI every 30 seconds,
-conditionally reconciles PR metadata every 15 minutes, and performs a full
-review reconciliation every hour. Manual Refresh bypasses those timers.
+conditionally reconciles the open-PR list every 15 minutes, refreshes rich
+GraphQL-only metadata at least hourly, and performs a full review reconciliation
+every hour. Manual Refresh bypasses those timers.
 
 Background GraphQL observation is capped at 500 cost points per rolling hour and
 protects a 1,000-point reserve for explicit operator and maintenance gates.
