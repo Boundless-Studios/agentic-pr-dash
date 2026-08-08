@@ -176,6 +176,41 @@ async def test_304_reuses_metadata_and_records_cache_hit(
 
 
 @pytest.mark.asyncio
+async def test_event_metadata_invalidation_is_acknowledged_by_304(
+    monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock)
+    calls = {"list": 0, "probe": 0}
+    monkeypatch.setattr(
+        github_api,
+        "list_open_prs",
+        lambda cwd=None: calls.__setitem__("list", calls["list"] + 1)
+        or [_raw_pr()],
+    )
+
+    def probe(*args, **kwargs):
+        calls["probe"] += 1
+        return github_api.ConditionalPRListProbe(304, [], etag='"v1"')
+
+    monkeypatch.setattr(github_api, "probe_open_prs_rest", probe)
+    orch = _orchestrator(clock, ledger)
+    await orch.refresh_prs()
+
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="edited"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+
+    assert calls == {"list": 1, "probe": 2}
+    assert orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", now=clock(), ci_pending=False
+    ) is None
+    assert "/repos/widgets" not in orch._metadata_event_due
+
+
+@pytest.mark.asyncio
 async def test_changed_probe_runs_one_rich_relist(
     monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
 ) -> None:

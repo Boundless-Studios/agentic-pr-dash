@@ -146,6 +146,11 @@ _OBSERVATION_DERIVED_STATUSES = frozenset(
         PRStatus.CI_AND_COMMENTS,
     }
 )
+# A positively observed head mismatch also invalidates mergeability metadata:
+# the relist still describes the superseded plan head. Keep this separate from
+# ``_OBSERVATION_DERIVED_STATUSES`` so an unavailable review/CI read does not
+# hide an authoritative current-head merge conflict.
+_STALE_HEAD_DERIVED_STATUSES = _OBSERVATION_DERIVED_STATUSES | {PRStatus.MERGE_CONFLICT}
 # Admission estimates are intentionally conservative until the GraphQL batch
 # returns a real ``rateLimit.cost`` sample. They are only used to decide if a
 # background request may start; successful batch requests reconcile to the
@@ -943,13 +948,19 @@ class Orchestrator:
                 probe.last_modified or last_modified,
             )
             self._metadata_last_success[root] = now
+            event_due = self._metadata_event_due.get(root)
+            if event_due is not None and now >= event_due:
+                self._metadata_event_due.pop(root, None)
             self.quota_ledger.record_cache_hit(
                 QuotaCaller.OPERATOR if force else QuotaCaller.DASHBOARD,
                 QuotaWorkClass.EXPLICIT_OPERATOR
                 if force
                 else QuotaWorkClass.BACKGROUND_OBSERVATION,
             )
-            return self._metadata_cache[root], False
+            # A validator-confirmed 304 is an authoritative metadata
+            # observation. The cached list is unchanged, but the controller
+            # must acknowledge any metadata invalidation carried by this plan.
+            return self._metadata_cache[root], True
 
         if probe.changed:
             raw_prs, rich_read = await self._rich_metadata_list(
@@ -1485,11 +1496,6 @@ class Orchestrator:
         ) or (ci_requested and not ci_observed) or (
             review_requested and not review_observed
         )
-        observation_unavailable = bool(
-            failed_requested_slice
-            and plan is not None
-            and plan.key not in self._observed_blocker_keys
-        )
         if failed_requested_slice:
             errors = [
                 result.error or "unobservable read"
@@ -1652,13 +1658,29 @@ class Orchestrator:
         # launched against work that no longer exists. Fail closed to
         # "unavailable" for every observation-derived status, not only CLEAN.
         # Statuses sourced elsewhere stay authoritative: a pending human
-        # decision and a local agent failure are dashboard state, and merge
-        # conflict comes from the metadata slice's own mergeability refetch.
+        # decision and a local agent failure are dashboard state. Merge
+        # conflict normally comes from the metadata slice, but a positive
+        # latest-head mismatch proves that metadata describes the old head too.
+        current_observation_key = (
+            plan.key
+            if plan is not None
+            else self._observation_keys.get((pr.repo, num))
+        )
+        observation_unavailable = bool(
+            plan_head_changed
+            or (
+                current_observation_key is not None
+                and current_observation_key not in self._observed_blocker_keys
+            )
+        )
         computed_status = self._compute_status(pr)
         pr.status = (
             PRStatus.OBSERVATION_UNAVAILABLE
-            if observation_unavailable
-            and computed_status in _OBSERVATION_DERIVED_STATUSES
+            if (plan_head_changed and computed_status in _STALE_HEAD_DERIVED_STATUSES)
+            or (
+                observation_unavailable
+                and computed_status in _OBSERVATION_DERIVED_STATUSES
+            )
             else computed_status
         )
         pr.last_polled = now

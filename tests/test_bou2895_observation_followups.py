@@ -518,3 +518,107 @@ async def test_legacy_head_review_only_retry_recovers_after_partial_observation(
 
     assert review_calls == 2
     assert pr.status is PRStatus.CLEAN
+
+
+@pytest.mark.asyncio
+async def test_slice_event_cannot_clear_unavailable_until_both_slices_observed(
+    monkeypatch, observation_boundaries
+):
+    """Repeated REVIEW success cannot make a never-observed CI slice look clean."""
+
+    clock = ManualClock()
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [_raw_pr()])
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda number, latest, cwd=None: (
+            github_api.ObservationReadResult.observed(([], []))
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_rest_observation",
+        lambda head, cwd=None, *, pr_number=None: (
+            github_api.ObservationReadResult.unavailable("CI unavailable")
+        ),
+    )
+
+    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    orch.observation_controller = ObservationController(clock=clock)
+    await orch.refresh_prs()
+
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+
+    await orch.handle_github_event(
+        "pull_request_review", "org/widgets", 7, "head-1", action="submitted"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", now=clock(), ci_pending=False
+    ) is not None
+
+
+@pytest.mark.asyncio
+async def test_warm_key_latest_head_race_forces_unavailable_without_clean_release(
+    monkeypatch, observation_boundaries
+):
+    """Old-key authority cannot make a superseded plan actionable."""
+
+    clock = ManualClock()
+    latest_head = {"value": "head-1"}
+    raw = _raw_pr()
+    dispatched: list[int] = []
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw])
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda number, cwd=None: (
+            latest_head["value"],
+            "2026-08-08T01:00:00Z",
+        ),
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "find_worktree_for_branch",
+        lambda branch, root=None: "/wt/widgets",
+    )
+    monkeypatch.setattr(
+        orchestrator.coordinator,
+        "dispatch_decision_for_pr",
+        lambda pr: SimpleNamespace(state="ready", should_dispatch=True, reason="test"),
+    )
+
+    async def record_dispatch(self, pr):
+        dispatched.append(pr.number)
+
+    monkeypatch.setattr(
+        orchestrator.Orchestrator, "dispatch_pr_maintenance", record_dispatch
+    )
+
+    orch = orchestrator.Orchestrator(repo_cwd="/repos/widgets")
+    orch.observation_controller = ObservationController(clock=clock)
+    await orch.refresh_prs()
+
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.CLEAN
+    pr.activity_message = "preserve until the current head is observed"
+
+    raw["mergeStateStatus"] = "DIRTY"
+    raw["mergeable"] = "CONFLICTING"
+    latest_head["value"] = "head-2"
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="synchronize"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert pr.activity_message == "preserve until the current head is observed"
+    assert dispatched == []
