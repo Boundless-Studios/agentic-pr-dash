@@ -33,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import Final, Generic, TypeVar
 
 from .config import load as load_config
 from .models import (
@@ -44,6 +44,7 @@ from .models import (
     RunnerPoolHealth,
     ThreadDecision,
 )
+from .quota import QuotaCaller, QuotaContext, QuotaLedger, QuotaWorkClass
 
 
 ObservationValue = TypeVar("ObservationValue")
@@ -2813,6 +2814,10 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
 # dozens of PRs is not the case this exists for. Chunk conservatively; each
 # chunk is still exactly ONE round trip.
 _BATCH_CHUNK_SIZE = 15
+# The review/CI batch query requests up to 100 threads and 100 contexts per PR.
+# Keep admission conservative before the first rate-limit sample (or after a
+# cheap unrelated query); callers may still provide a higher estimate.
+BATCH_GRAPHQL_ESTIMATED_COST: Final[int] = 50
 
 
 def repo_slug_for_prefetch(cwd: str | None) -> str:
@@ -2858,7 +2863,15 @@ def _batch_ci_checks(contexts: list[dict]) -> list[CICheck]:
 
 
 def batch_fetch_pr_review_and_ci(
-    owner: str, repo: str, pr_numbers: list[int], cwd: str | None = None,
+    owner: str,
+    repo: str,
+    pr_numbers: list[int],
+    cwd: str | None = None,
+    *,
+    quota_context: QuotaContext | None = None,
+    quota_ledger: QuotaLedger | None = None,
+    caller: QuotaCaller = QuotaCaller.DASHBOARD,
+    work_class: QuotaWorkClass = QuotaWorkClass.BACKGROUND_OBSERVATION,
 ) -> dict[int, dict]:
     """Fetch review threads + the required-checks rollup for MANY PRs in as few
     round trips as possible (BOU-2556).
@@ -2884,9 +2897,23 @@ def batch_fetch_pr_review_and_ci(
     fall through to their normal, correctness-preserving per-PR `gh` call for
     it. This function itself never raises — any failure just means fewer PRs
     got batched, not a wrong answer for any of them.
+
+    When ``quota_context`` (or ``quota_ledger`` plus attribution arguments) is
+    supplied, the top-level GraphQL ``rateLimit`` sample is recorded once for
+    every successful chunk. A denied context skips that chunk and returns the
+    successfully observed subset.
     """
     if not owner or not repo or not pr_numbers:
         return {}
+
+    if quota_context is not None and quota_ledger is not None:
+        raise ValueError("pass quota_context or quota_ledger, not both")
+    if quota_context is None and quota_ledger is not None:
+        quota_context = QuotaContext(
+            ledger=quota_ledger,
+            caller=caller,
+            work_class=work_class,
+        )
 
     results: dict[int, dict] = {}
     numbers = sorted(set(pr_numbers))
@@ -2920,6 +2947,7 @@ def batch_fetch_pr_review_and_ci(
             )
         query = (
             "query($owner: String!, $repo: String!) { "
+            "rateLimit { cost remaining resetAt limit } "
             "repository(owner: $owner, name: $repo) { "
             + " ".join(fields) +
             " } }"
@@ -2930,16 +2958,83 @@ def batch_fetch_pr_review_and_ci(
             "-F", f"owner={owner}",
             "-F", f"repo={repo}",
         ]
-        r = _run(cmd, cwd=cwd, timeout_s=45)
-        if r.returncode != 0:
-            continue
+
+        reservation = None
+        if quota_context is not None:
+            estimated_cost = max(
+                quota_context.estimated_cost,
+                BATCH_GRAPHQL_ESTIMATED_COST,
+            )
+            latest = quota_context.ledger.latest
+            if latest is not None and latest.cost > 0:
+                estimated_cost = max(estimated_cost, latest.cost)
+            reservation = quota_context.ledger.reserve(
+                quota_context.caller,
+                quota_context.work_class,
+                estimated_cost=estimated_cost,
+            )
+            if reservation is None:
+                continue
+
         try:
-            data = json.loads(r.stdout)
-            repo_node = data["data"]["repository"]
-        except (json.JSONDecodeError, KeyError, TypeError):
-            continue
-        if not isinstance(repo_node, dict):
-            continue
+            r = _run(cmd, cwd=cwd, timeout_s=45)
+            if r.returncode != 0:
+                if quota_context is not None:
+                    quota_context.ledger.record_failure(
+                        reason="graphql_request_failed",
+                    )
+                continue
+            try:
+                data = json.loads(r.stdout)
+                data_node = data["data"]
+            except (json.JSONDecodeError, KeyError, TypeError):
+                if quota_context is not None:
+                    quota_context.ledger.record_failure(
+                        reason="graphql_response_invalid",
+                    )
+                continue
+
+            rate_limit_recorded = False
+            if quota_context is not None:
+                try:
+                    rate_limit = data_node["rateLimit"]
+                    quota_context.ledger.record_graphql(
+                        caller=quota_context.caller,
+                        work_class=quota_context.work_class,
+                        cost=int(rate_limit["cost"]),
+                        remaining=int(rate_limit["remaining"]),
+                        reset_at=rate_limit["resetAt"],
+                        limit=int(rate_limit["limit"]),
+                        reservation=reservation,
+                    )
+                    reservation = None
+                    rate_limit_recorded = True
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    quota_context.ledger.record_failure(
+                        reason="graphql_rate_limit_invalid",
+                    )
+                    continue
+
+            try:
+                repo_node = data_node["repository"]
+            except (KeyError, TypeError):
+                if quota_context is not None:
+                    quota_context.ledger.record_failure(
+                        reason="graphql_response_invalid",
+                        count_request=not rate_limit_recorded,
+                    )
+                continue
+            if not isinstance(repo_node, dict):
+                if quota_context is not None:
+                    quota_context.ledger.record_failure(
+                        reason="graphql_repository_invalid",
+                        count_request=not rate_limit_recorded,
+                    )
+                continue
+        finally:
+            if quota_context is not None and reservation is not None:
+                quota_context.ledger.release(reservation)
+
         for n in chunk:
             pr_node = repo_node.get(f"pr_{n}")
             if not isinstance(pr_node, dict):
