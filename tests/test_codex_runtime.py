@@ -269,6 +269,58 @@ def test_stop_runner_runs_all_and_forwards_single_json(tmp_path, capsys):
     assert "human text from b" in out.err
 
 
+def test_stop_runner_report_attributes_every_protocol_response(tmp_path, capsys):
+    notice = _hook_script(
+        tmp_path,
+        "notice.py",
+        "import json\nprint(json.dumps({'systemMessage':'notice'}))\n",
+    )
+    stale_block = _hook_script(
+        tmp_path,
+        "stale_block.py",
+        "import json\n"
+        "print(json.dumps({'decision':'block','reason':'stale'}))\n"
+        "raise SystemExit(1)\n",
+    )
+    clean_block = _hook_script(
+        tmp_path,
+        "clean_block.py",
+        "import json\n"
+        "print(json.dumps({'decision':'block','reason':'clean'}))\n",
+    )
+    runner = runners_mod.StopChecksRunner(
+        resolve_path=lambda path: path,
+        is_enabled=lambda _name: True,
+    )
+
+    runner.run(
+        [
+            ("notice", notice),
+            ("stale_block", stale_block),
+            ("clean_block", clean_block),
+        ],
+        payload_text="{}",
+        hook_env=dict(os.environ),
+    )
+
+    capsys.readouterr()
+    assert [response.hook_name for response in runner.last_report.protocol_responses] == [
+        "notice",
+        "stale_block",
+        "clean_block",
+    ]
+    assert [response.exit_code for response in runner.last_report.protocol_responses] == [
+        0,
+        1,
+        0,
+    ]
+    assert [json.loads(response.stdout) for response in runner.last_report.protocol_responses] == [
+        {"systemMessage": "notice"},
+        {"decision": "block", "reason": "stale"},
+        {"decision": "block", "reason": "clean"},
+    ]
+
+
 def test_stop_runner_blocks_when_any_hook_exits_2(tmp_path, capsys):
     a = _hook_script(tmp_path, "a.py", "raise SystemExit(0)\n")
     b = _hook_script(tmp_path, "b.py", "import sys\nprint('blocked', file=sys.stderr)\nraise SystemExit(2)\n")
