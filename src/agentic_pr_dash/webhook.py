@@ -28,6 +28,7 @@ _SUPPORTED_EVENTS = {
     "pull_request_review_thread",
     "check_run",
     "check_suite",
+    "status",
 }
 _LOG = logging.getLogger(__name__)
 
@@ -130,6 +131,13 @@ def _normalize(event_name: str, payload: object) -> tuple[NormalizedGithubEvent,
     action = _string(payload, "action") or None
     if not repo:
         raise WebhookRejected(400, "Malformed GitHub webhook payload")
+
+    if normalized_name == "status":
+        commit = payload.get("commit")
+        head_sha = _string(payload, "sha") or _string(commit, "sha")
+        if not head_sha:
+            raise WebhookRejected(400, "Malformed GitHub webhook payload")
+        return (NormalizedGithubEvent(normalized_name, repo, None, head_sha, action),)
 
     if normalized_name.startswith("pull_request"):
         pull_request = payload.get("pull_request")

@@ -165,6 +165,99 @@ def test_hourly_review_reconciliation_outranks_pending_ci_poll() -> None:
     )
 
 
+def test_failed_review_invalidation_does_not_starve_due_pending_ci() -> None:
+    """An unacknowledged review event must not mask the next CI poll."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    _prime(controller, clock, ci_pending=True)
+
+    controller.handle_event(
+        "pull_request_review", "acme/widgets", 7, "head-1", now=clock()
+    )
+    clock.advance(timedelta(seconds=2))
+    failed_review_plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=True
+    )
+    assert failed_review_plan is not None
+    assert failed_review_plan.slices == frozenset({ObservationSlice.REVIEW})
+
+    # The caller never acknowledges the failed review read. Once CI becomes
+    # independently due, the retained review invalidation must be retried
+    # alongside it instead of masking it.
+    clock.advance(timedelta(seconds=28))
+    retry = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=True
+    )
+
+    assert retry is not None
+    assert retry.slices == frozenset(
+        {ObservationSlice.REVIEW, ObservationSlice.CI}
+    )
+    assert retry.reason is ObservationReason.EVENT
+
+
+def test_metadata_invalidation_unions_independently_due_hourly_work() -> None:
+    """A failed metadata event must not mask hourly review and CI repair."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    _prime(controller, clock, ci_pending=False)
+
+    clock.advance(timedelta(hours=1) - timedelta(seconds=2))
+    controller.handle_event(
+        "pull_request",
+        "acme/widgets",
+        7,
+        "head-1",
+        action="edited",
+        now=clock(),
+    )
+    clock.advance(timedelta(seconds=2))
+
+    plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+
+    assert plan is not None
+    assert plan.slices == frozenset(
+        {
+            ObservationSlice.METADATA,
+            ObservationSlice.REVIEW,
+            ObservationSlice.CI,
+        }
+    )
+    assert plan.reason is ObservationReason.EVENT
+
+
+def test_review_invalidation_unions_independently_due_metadata() -> None:
+    """A failed review event must not mask repository metadata repair."""
+
+    clock = ManualClock()
+    controller = ObservationController(clock=clock)
+    _prime(controller, clock, ci_pending=False)
+
+    clock.advance(timedelta(minutes=15) - timedelta(seconds=2))
+    controller.handle_event(
+        "pull_request_review",
+        "acme/widgets",
+        7,
+        "head-1",
+        now=clock(),
+    )
+    clock.advance(timedelta(seconds=2))
+
+    plan = controller.plan_for(
+        "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+
+    assert plan is not None
+    assert plan.slices == frozenset(
+        {ObservationSlice.METADATA, ObservationSlice.REVIEW}
+    )
+    assert plan.reason is ObservationReason.EVENT
+
+
 def test_review_event_does_not_starve_terminal_ci_reconciliation() -> None:
     """Review freshness must not reset the independent CI deadline."""
 
@@ -181,7 +274,9 @@ def test_review_event_does_not_starve_terminal_ci_reconciliation() -> None:
         "acme/widgets", 7, "head-1", now=clock(), ci_pending=False
     )
     assert review_plan is not None
-    assert review_plan.slices == frozenset({ObservationSlice.REVIEW})
+    assert review_plan.slices == frozenset(
+        {ObservationSlice.METADATA, ObservationSlice.REVIEW}
+    )
     controller.record_refresh(review_plan, now=clock(), ci_pending=False)
 
     clock.advance(timedelta(minutes=29, seconds=58))
@@ -238,6 +333,7 @@ def test_partial_review_ack_retries_never_observed_ci_immediately() -> None:
         ("pull_request_review_thread", ObservationSlice.REVIEW),
         ("check_run", ObservationSlice.CI),
         ("check_suite", ObservationSlice.CI),
+        ("status", ObservationSlice.CI),
     ],
 )
 def test_event_family_invalidates_only_its_slice(

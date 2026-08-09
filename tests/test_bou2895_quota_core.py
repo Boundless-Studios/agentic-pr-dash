@@ -515,6 +515,60 @@ def test_estimated_success_clears_stale_failure_degradation() -> None:
     assert telemetry.backoff_reason is None
 
 
+def test_review_boundary_marks_graphql_spend_before_strict_rest_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_after_graphql(number, latest, cwd=None, *, strict=False):
+        raise github_api._ReviewLevelReadError("REST reviews failed")
+
+    monkeypatch.setattr(github_api, "scan_review_threads", fail_after_graphql)
+
+    result = github_api.scan_review_threads_observation(
+        7,
+        "2026-08-08T00:00:00Z",
+        "/repos/widgets",
+    )
+
+    assert result.observable is False
+    assert result.graphql_observed is True
+
+
+def test_review_boundary_marks_graphql_spend_for_valid_non_object_rest_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agentic_pr_dash._maintenance import deferred_review
+
+    monkeypatch.setattr(
+        deferred_review,
+        "deferred_threads_for_pr",
+        lambda cwd, number: set(),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_threads",
+        lambda number, cwd=None, *, strict=False: [],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda cmd, cwd=None: subprocess.CompletedProcess(
+            cmd,
+            0,
+            stdout="[]\n",
+            stderr="",
+        ),
+    )
+
+    result = github_api.scan_review_threads_observation(
+        7,
+        "2026-08-08T00:00:00Z",
+        "/repos/widgets",
+    )
+
+    assert result.observable is False
+    assert result.graphql_observed is True
+
+
 def test_background_budget_degraded_state_survives_protected_work_and_expires() -> None:
     clock = ManualClock()
     ledger = QuotaLedger(

@@ -162,6 +162,7 @@ _STALE_HEAD_DERIVED_STATUSES = _OBSERVATION_DERIVED_STATUSES | {PRStatus.MERGE_C
 # server-provided cost in github_api.
 METADATA_GRAPHQL_ESTIMATED_COST = 50
 REVIEW_GRAPHQL_ESTIMATED_COST = 25
+MERGEABILITY_GRAPHQL_ESTIMATED_COST = 5
 BATCH_GRAPHQL_ESTIMATED_COST = github_api.BATCH_GRAPHQL_ESTIMATED_COST
 REVIEW_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
 METADATA_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
@@ -259,6 +260,7 @@ class Orchestrator:
         # identity until a successful rich metadata read supersedes it so a
         # failed relist cannot fall back to actionable state from the old head.
         self._event_head_overrides: dict[PRKey, str] = {}
+        self._event_head_override_observed_at: dict[PRKey, datetime] = {}
         self._observed_blocker_keys: set[ObservationKey] = set()
         self._observed_blocker_slices: dict[
             ObservationKey, set[ObservationSlice]
@@ -508,15 +510,63 @@ class Orchestrator:
         if result.observable:
             self._record_estimated_success(context, reservation)
             return result
-        self._record_estimated_failure(reservation)
+        if result.graphql_observed:
+            # The composite read failed only after its GraphQL thread query
+            # completed. Reconcile that consumed work, then record the REST
+            # failure without double-counting the request.
+            self._record_estimated_success(context, reservation)
+            failure_counts_request = False
+        else:
+            self._record_estimated_failure(reservation)
+            failure_counts_request = True
         self.quota_ledger.record_failure(
-            reason="review_fallback_unavailable"
+            reason="review_fallback_unavailable",
+            count_request=failure_counts_request,
         )
         self.quota_ledger.record_backoff(
             REVIEW_GRAPHQL_FAILURE_BACKOFF,
             reason="review_fallback_unavailable",
         )
         return result
+
+    async def _mergeability_fallback(
+        self,
+        pr_number: int,
+        root: str | None,
+        *,
+        force: bool,
+    ) -> tuple[str, str]:
+        """Run a quota-admitted per-PR mergeability recomputation."""
+
+        context, decision = self._quota_allows(
+            force=force,
+            estimated_cost=MERGEABILITY_GRAPHQL_ESTIMATED_COST,
+        )
+        if not decision.allowed:
+            return "", ""
+        reservation = self.quota_ledger.reserve(
+            context.caller,
+            context.work_class,
+            estimated_cost=context.estimated_cost,
+        )
+        if reservation is None:
+            return "", ""
+        try:
+            result = await asyncio.to_thread(
+                github_api.get_mergeability,
+                pr_number,
+                root,
+            )
+        except Exception:  # noqa: BLE001 - preserve last-known mergeability
+            result = ("", "")
+        if any(result):
+            self._record_estimated_success(context, reservation)
+            return result
+        self._record_estimated_failure(reservation)
+        self.quota_ledger.record_failure(
+            reason="mergeability_fallback_unavailable"
+        )
+        return "", ""
 
     def _metadata_refresh_due(self, root: str | None, now: datetime, *, force: bool) -> bool:
         """Whether ``root`` needs a real, successful-capable metadata read."""
@@ -576,8 +626,29 @@ class Orchestrator:
             repo = _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
             key = (repo, number)
             override = self._event_head_overrides.get(key)
-            if override and str(raw.get("headRefOid") or "") == override:
+            listed_head = str(raw.get("headRefOid") or "")
+            if not override or not listed_head:
+                continue
+            if listed_head == override:
                 self._event_head_overrides.pop(key, None)
+                self._event_head_override_observed_at.pop(key, None)
+                continue
+            # A rich list may briefly lag a synchronize delivery, while a
+            # missed later delivery can make the retained override itself
+            # stale. Resolve that ambiguity with the exact REST PR head: keep
+            # failing closed when the event SHA is still current, but let a
+            # newer authoritative listed/current SHA supersede it.
+            latest_sha, _latest_date = await asyncio.to_thread(
+                github_api.get_latest_commit_uncached, number, root
+            )
+            override_observed_at = self._event_head_override_observed_at.get(key)
+            override_matured = (
+                override_observed_at is not None
+                and now >= override_observed_at + self._metadata_interval()
+            )
+            if latest_sha and latest_sha == listed_head and override_matured:
+                self._event_head_overrides.pop(key, None)
+                self._event_head_override_observed_at.pop(key, None)
 
         slugs = {
             _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
@@ -717,6 +788,9 @@ class Orchestrator:
                 and head_sha != observation_key.head_sha
             ):
                 self._event_head_overrides[tracked_key] = head_sha
+                self._event_head_override_observed_at[tracked_key] = (
+                    self.observation_controller.now()
+                )
 
             self.observation_controller.handle_event(
                 normalized_event,
@@ -1103,6 +1177,7 @@ class Orchestrator:
                     self._pr_root.pop(key, None)
                     self._observation_keys.pop(key, None)
                     self._event_head_overrides.pop(key, None)
+                    self._event_head_override_observed_at.pop(key, None)
                     self.log(
                         f"PR #{key[1]} closed/merged: {old.title}",
                         pr_number=key[1],
@@ -1376,15 +1451,23 @@ class Orchestrator:
             bulk_merge_state in ("", "UNKNOWN")
             or bulk_mergeable in ("", "UNKNOWN")
         ):
-            refetched_state, refetched_mergeable = await asyncio.to_thread(
-                github_api.get_mergeability, num, root
-            )
+            primed_mergeability = github_api.get_primed_mergeability(num, root)
+            if primed_mergeability is not None:
+                refetched_state, refetched_mergeable = primed_mergeability
+            else:
+                refetched_state, refetched_mergeable = (
+                    await self._mergeability_fallback(
+                        num,
+                        root,
+                        force=force,
+                    )
+                )
             # A successful refetch is authoritative — it also picks up a
             # conflict that has since been resolved. A failed refetch returns
             # ("","") and leaves the preserved last-known value intact.
-            if refetched_state:
+            if refetched_state and refetched_state.upper() != "UNKNOWN":
                 pr.merge_state = refetched_state
-            if refetched_mergeable:
+            if refetched_mergeable and refetched_mergeable.upper() != "UNKNOWN":
                 pr.mergeable = refetched_mergeable
 
         # Stage requested observations before mutating blocker state. GitHub

@@ -101,7 +101,9 @@ _REVIEW_EVENTS: Final[frozenset[str]] = frozenset(
         "pull_request_review_thread",
     }
 )
-_CI_EVENTS: Final[frozenset[str]] = frozenset({"check_run", "check_suite"})
+_CI_EVENTS: Final[frozenset[str]] = frozenset(
+    {"check_run", "check_suite", "status"}
+)
 _HEAD_CHANGING_ACTIONS: Final[frozenset[str]] = frozenset(
     {"opened", "reopened", "synchronize"}
 )
@@ -191,31 +193,6 @@ class ObservationController:
         if state is None:
             return ObservationPlan(key, _ALL_SLICES, ObservationReason.INITIAL)
 
-        if state.invalidated:
-            invalidated_at = state.invalidated_at
-            if invalidated_at is None:
-                raise RuntimeError("invalidated observation has no debounce timestamp")
-            if observed_at < invalidated_at + self._debounce_window:
-                return None
-            reason = state.invalidation_reason
-            if reason is None:
-                raise RuntimeError("invalidated observation has no reason")
-            if not any(
-                timestamp is not None for timestamp in state.observed_at.values()
-            ):
-                return ObservationPlan(
-                    key,
-                    _ALL_SLICES,
-                    reason,
-                    self._invalidation_snapshot(state, _ALL_SLICES),
-                )
-            return ObservationPlan(
-                key,
-                frozenset(state.invalidated),
-                reason,
-                self._invalidation_snapshot(state, state.invalidated),
-            )
-
         pending = state.ci_pending if ci_pending is None else ci_pending
         ci_observed_at = state.observed_at[ObservationSlice.CI]
         metadata_at = state.observed_at[ObservationSlice.METADATA]
@@ -240,18 +217,48 @@ class ObservationController:
             due_slices.add(ObservationSlice.REVIEW)
         if ci_due:
             due_slices.add(ObservationSlice.CI)
+        due_reason: ObservationReason | None = None
         if due_slices:
             if review_due:
-                reason = ObservationReason.REVIEW_RECONCILIATION
+                due_reason = ObservationReason.REVIEW_RECONCILIATION
             elif ci_due and pending:
-                reason = ObservationReason.CI_POLL
+                due_reason = ObservationReason.CI_POLL
             else:
-                reason = ObservationReason.REVIEW_RECONCILIATION
-            slices = frozenset(due_slices)
+                due_reason = ObservationReason.REVIEW_RECONCILIATION
+
+        if state.invalidated:
+            invalidated_at = state.invalidated_at
+            if invalidated_at is None:
+                raise RuntimeError("invalidated observation has no debounce timestamp")
+            never_observed = not any(
+                timestamp is not None for timestamp in state.observed_at.values()
+            )
+            if observed_at < invalidated_at + self._debounce_window:
+                return None
+            reason = state.invalidation_reason
+            if reason is None:
+                raise RuntimeError("invalidated observation has no reason")
+            independently_due = set(due_slices)
+            if metadata_due:
+                independently_due.add(ObservationSlice.METADATA)
+            slices = (
+                _ALL_SLICES
+                if never_observed
+                else frozenset(state.invalidated | independently_due)
+            )
             return ObservationPlan(
                 key,
                 slices,
                 reason,
+                self._invalidation_snapshot(state, slices),
+            )
+
+        if due_slices and due_reason is not None:
+            slices = frozenset(due_slices)
+            return ObservationPlan(
+                key,
+                slices,
+                due_reason,
                 self._invalidation_snapshot(state, slices),
             )
         if metadata_due:

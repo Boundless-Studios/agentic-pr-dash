@@ -71,6 +71,73 @@ def test_latest_commit_resolves_head_without_unpaginated_pr_commit_list(
     assert all("pulls/7/commits" not in call for call in calls)
 
 
+def test_uncached_latest_commit_ignores_a_primed_previous_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def fake_run(cmd, cwd=None, timeout_s=30):
+        joined = " ".join(cmd)
+        calls.append(joined)
+        if "pulls/7 --jq .head.sha" in joined:
+            return subprocess.CompletedProcess(cmd, 0, stdout="head-2\n", stderr="")
+        if "commits/head-2" in joined:
+            return subprocess.CompletedProcess(
+                cmd,
+                0,
+                stdout="head-2\t2026-08-08T02:00:00Z\n",
+                stderr="",
+            )
+        raise AssertionError(f"unexpected GitHub read: {joined}")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    monkeypatch.setattr(github_api, "_repo_for_cwd", lambda cwd: "org/widgets")
+    github_api.clear_pr_batch_cache()
+    github_api.prime_pr_batch_cache(
+        "org/widgets",
+        {7: {"latest_commit": ("head-1", "2026-08-08T01:00:00Z")}},
+        "/repos/widgets",
+    )
+
+    try:
+        assert github_api.get_latest_commit_uncached(7, "/repos/widgets") == (
+            "head-2",
+            "2026-08-08T02:00:00Z",
+        )
+    finally:
+        github_api.clear_pr_batch_cache()
+
+    assert any("pulls/7 --jq .head.sha" in call for call in calls)
+
+
+def test_primed_unknown_mergeability_is_not_authoritative() -> None:
+    github_api.clear_pr_batch_cache()
+    github_api.prime_pr_batch_cache(
+        "org/widgets",
+        {7: {"merge_state": "UNKNOWN", "mergeable": "UNKNOWN"}},
+        "/repos/widgets",
+    )
+
+    try:
+        assert github_api.get_primed_mergeability(7, "/repos/widgets") is None
+    finally:
+        github_api.clear_pr_batch_cache()
+
+
+def test_partially_unknown_primed_mergeability_forces_a_fresh_read() -> None:
+    github_api.clear_pr_batch_cache()
+    github_api.prime_pr_batch_cache(
+        "org/widgets",
+        {7: {"merge_state": "UNKNOWN", "mergeable": "MERGEABLE"}},
+        "/repos/widgets",
+    )
+
+    try:
+        assert github_api.get_primed_mergeability(7, "/repos/widgets") is None
+    finally:
+        github_api.clear_pr_batch_cache()
+
+
 def _raw_pr(number: int = 7, *, head: str = "head-1") -> dict:
     return {
         "number": number,
@@ -86,6 +153,35 @@ def _raw_pr(number: int = 7, *, head: str = "head-1") -> dict:
         "labels": [],
         "createdAt": "2026-08-08T00:00:00Z",
     }
+
+
+@pytest.mark.asyncio
+async def test_fresh_event_head_override_survives_stale_rest_and_rich_agreement(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_boundaries,
+) -> None:
+    clock = ManualClock()
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    key = ("org/widgets", 7)
+    orch._root_repo_identity["/repos/widgets"] = "org/widgets"
+    orch._event_head_overrides[key] = "head-2"
+    orch._event_head_override_observed_at[key] = clock()
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit_uncached",
+        lambda number, cwd=None: ("head-1", "2026-08-08T00:00:00Z"),
+    )
+
+    await orch._cache_metadata(
+        "/repos/widgets",
+        [_raw_pr(head="head-1")],
+        clock(),
+    )
+
+    assert orch._event_head_overrides[key] == "head-2"
 
 
 @pytest.fixture
@@ -334,6 +430,7 @@ async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatc
         [_raw_pr(head="head-1")],
         None,
         [_raw_pr(head="head-1")],
+        [_raw_pr(head="head-3")],
     ]
     current_head = {"value": "head-1"}
     dispatched: list[int] = []
@@ -344,6 +441,14 @@ async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatc
     monkeypatch.setattr(
         github_api,
         "get_latest_commit",
+        lambda number, cwd=None: (
+            current_head["value"],
+            "2026-08-08T01:00:00Z",
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit_uncached",
         lambda number, cwd=None: (
             current_head["value"],
             "2026-08-08T01:00:00Z",
@@ -424,6 +529,7 @@ async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatc
     assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-2"
     assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
     assert dispatched == []
+
     retry = orch.observation_controller.plan_for(
         "org/widgets", 7, "head-2", now=clock(), ci_pending=False
     )
@@ -453,6 +559,17 @@ async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatc
     assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-2"
     assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
     assert dispatched == []
+
+    # If a later synchronize delivery was missed entirely, REST and the rich
+    # row agree on head-3. That current-head confirmation supersedes the old
+    # event override instead of pinning the dashboard to head-2 forever.
+    current_head["value"] = "head-3"
+    clock.advance(timedelta(minutes=15))
+    await orch.refresh_prs()
+    await asyncio.sleep(0)
+
+    assert ("org/widgets", 7) not in orch._event_head_overrides
+    assert orch._observation_keys[("org/widgets", 7)].head_sha == "head-3"
 
 
 @pytest.mark.asyncio

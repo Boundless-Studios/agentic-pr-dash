@@ -65,20 +65,35 @@ class ObservationReadResult(Generic[ObservationValue]):
     value: ObservationValue | None
     observable: bool
     error: str | None = None
+    graphql_observed: bool = False
 
     @classmethod
     def observed(
-        cls, value: ObservationValue
+        cls,
+        value: ObservationValue,
+        *,
+        graphql_observed: bool = False,
     ) -> ObservationReadResult[ObservationValue]:
-        return cls(value=value, observable=True)
+        return cls(
+            value=value,
+            observable=True,
+            graphql_observed=graphql_observed,
+        )
 
     @classmethod
     def unavailable(
         cls,
         error: str,
         value: ObservationValue | None = None,
+        *,
+        graphql_observed: bool = False,
     ) -> ObservationReadResult[ObservationValue]:
-        return cls(value=value, observable=False, error=error)
+        return cls(
+            value=value,
+            observable=False,
+            error=error,
+            graphql_observed=graphql_observed,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1697,6 +1712,15 @@ def get_latest_commit(pr_number: int, cwd: str | None = None) -> tuple[str, str]
     if cached is not None and "latest_commit" in cached:
         sha, committed_at = cached["latest_commit"]
         return str(sha), str(committed_at)
+    return get_latest_commit_uncached(pr_number, cwd)
+
+
+def get_latest_commit_uncached(
+    pr_number: int,
+    cwd: str | None = None,
+) -> tuple[str, str]:
+    """Read the exact current PR head without consulting the batch cache."""
+
     head_result = _run(
         [
             "gh",
@@ -2094,6 +2118,30 @@ def prime_pr_batch_cache(
     # mapping for it too, so a successful batch is still consumed from cache
     # instead of triggering the old per-PR GraphQL lookup.
     _PR_BATCH_REPO_BY_CWD[str(Path(cwd).resolve()) if cwd else ""] = repo_slug
+
+
+def get_primed_mergeability(
+    pr_number: int,
+    cwd: str | None = None,
+) -> tuple[str, str] | None:
+    """Return mergeability already paid for by the current batch, if any."""
+
+    primed_repo = _batch_repo_for_cwd(cwd)
+    cached = (
+        _PR_BATCH_CACHE.get((primed_repo, pr_number)) if primed_repo else None
+    )
+    if cached is None or "merge_state" not in cached or "mergeable" not in cached:
+        return None
+    merge_state = str(cached["merge_state"] or "")
+    mergeable = str(cached["mergeable"] or "")
+    if (
+        not merge_state
+        or merge_state.upper() == "UNKNOWN"
+        or not mergeable
+        or mergeable.upper() == "UNKNOWN"
+    ):
+        return None
+    return merge_state, mergeable
 
 
 def get_review_threads(
@@ -4240,6 +4288,10 @@ def _thread_is_addressed_or_claimed(replies: list[dict]) -> bool:
     return False
 
 
+class _ReviewLevelReadError(RuntimeError):
+    """Strict review read failed after its GraphQL thread query completed."""
+
+
 def scan_review_threads(
     pr_number: int,
     latest_commit_date: str,
@@ -4385,11 +4437,19 @@ def scan_review_threads(
         ))
 
     # Review-level comments (CHANGES_REQUESTED with body)
-    r2 = _run(
-        ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
-         "--jq", '.[] | select((.state == "APPROVED" or .state == "COMMENTED" or .state == "CHANGES_REQUESTED") and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
-        cwd=cwd,
-    )
+    try:
+        r2 = _run(
+            ["gh", "api", f"repos/{{owner}}/{{repo}}/pulls/{pr_number}/reviews",
+             "--jq", '.[] | select((.state == "APPROVED" or .state == "COMMENTED" or .state == "CHANGES_REQUESTED") and .body != "") | {id, author: .user.login, body, state, submitted_at}'],
+            cwd=cwd,
+        )
+    except Exception as exc:
+        if strict:
+            raise _ReviewLevelReadError(
+                "scan_review_threads: review-level read raised after GraphQL "
+                "threads completed"
+            ) from exc
+        raise
     if r2.returncode == 0:
         for line in r2.stdout.strip().split("\n"):
             if not line.strip():
@@ -4427,15 +4487,15 @@ def scan_review_threads(
                         created_at=submitted,
                         is_inline=False,
                     ))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, AttributeError, TypeError, ValueError):
                 if strict:
-                    raise RuntimeError(
+                    raise _ReviewLevelReadError(
                         "scan_review_threads: malformed review-level response; "
                         "refusing to synthesize a clean review state"
                     )
                 continue
     elif strict:
-        raise RuntimeError(
+        raise _ReviewLevelReadError(
             "scan_review_threads: review-level read failed; refusing to "
             "synthesize a clean review state"
         )
@@ -4462,6 +4522,11 @@ def scan_review_threads_observation(
             # boundary with a three-argument callable. Their return is the
             # explicit observation contract for that adapter.
             value = scan_review_threads(pr_number, latest_commit_date, cwd)
+    except _ReviewLevelReadError as exc:
+        return ObservationReadResult.unavailable(
+            f"review observation unavailable: {exc}",
+            graphql_observed=True,
+        )
     except Exception as exc:  # noqa: BLE001
         return ObservationReadResult.unavailable(
             f"review observation unavailable: {exc}"

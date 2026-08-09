@@ -325,6 +325,67 @@ def test_review_thread_resolution_and_unassociated_check_are_invalidated(
     asyncio.run(scenario())
 
 
+def test_status_webhook_routes_root_sha_without_pull_request_associations(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")
+        orchestrator = _Orchestrator()
+        orchestrator.release_event.set()
+        ingress = GithubWebhookIngress(
+            orchestrator, lambda: None, debounce_seconds=0.01
+        )
+        body = json.dumps(
+            {
+                "state": "success",
+                "sha": "status-sha",
+                "repository": {"full_name": "Acme/Widgets"},
+            }
+        ).encode()
+
+        assert ingress.accept(
+            "status", "delivery-status-root", _signature("hook-secret", body), body
+        ) == 202
+        await asyncio.sleep(0.04)
+
+        assert orchestrator.head_events == [
+            ("status", "Acme/Widgets", "status-sha", None)
+        ]
+        assert orchestrator.refreshes == 1
+        await ingress.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_status_webhook_falls_back_to_commit_sha(monkeypatch) -> None:
+    async def scenario() -> None:
+        monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")
+        orchestrator = _Orchestrator()
+        orchestrator.release_event.set()
+        ingress = GithubWebhookIngress(
+            orchestrator, lambda: None, debounce_seconds=0.01
+        )
+        body = json.dumps(
+            {
+                "state": "pending",
+                "commit": {"sha": "commit-sha"},
+                "repository": {"full_name": "acme/widgets"},
+            }
+        ).encode()
+
+        assert ingress.accept(
+            "STATUS", "delivery-status-commit", _signature("hook-secret", body), body
+        ) == 202
+        await asyncio.sleep(0.04)
+
+        assert orchestrator.head_events == [
+            ("status", "acme/widgets", "commit-sha", None)
+        ]
+        await ingress.shutdown()
+
+    asyncio.run(scenario())
+
+
 def test_malformed_or_unsupported_payload_is_rejected(monkeypatch) -> None:
     async def scenario() -> None:
         monkeypatch.setenv("AGENTIC_PR_DASH_GITHUB_WEBHOOK_SECRET", "hook-secret")

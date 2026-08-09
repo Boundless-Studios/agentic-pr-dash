@@ -802,6 +802,97 @@ async def test_failed_review_fallback_counts_request_without_success_cost(
 
 
 @pytest.mark.asyncio
+async def test_review_fallback_charges_graphql_before_strict_rest_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda number, latest, cwd=None: (
+            github_api.ObservationReadResult.unavailable(
+                "strict REST reviews unavailable",
+                graphql_observed=True,
+            )
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    result = await orch._review_fallback_observation(
+        7,
+        "2026-08-08T00:00:00Z",
+        "/repos/widgets",
+        force=False,
+    )
+
+    assert result.observable is False
+    telemetry = ledger.telemetry()
+    assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == (
+        orchestrator.REVIEW_GRAPHQL_ESTIMATED_COST
+    )
+    assert ledger.reservation_count == 0
+    assert telemetry.backoff_until == clock.current + timedelta(seconds=30)
+
+
+@pytest.mark.asyncio
+async def test_mergeability_fallback_is_quota_admitted_and_accounted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    calls: list[int] = []
+    monkeypatch.setattr(
+        github_api,
+        "get_mergeability",
+        lambda number, cwd=None: (
+            calls.append(number) or ("DIRTY", "CONFLICTING")
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    result = await orch._mergeability_fallback(
+        7,
+        "/repos/widgets",
+        force=False,
+    )
+
+    assert result == ("DIRTY", "CONFLICTING")
+    assert calls == [7]
+    telemetry = ledger.telemetry()
+    assert telemetry.request_count == 1
+    assert telemetry.background_hourly_spend == (
+        orchestrator.MERGEABILITY_GRAPHQL_ESTIMATED_COST
+    )
+    assert ledger.reservation_count == 0
+
+
+@pytest.mark.asyncio
+async def test_mergeability_fallback_does_not_run_while_quota_backoff_is_active(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, maintenance_reserve=0)
+    ledger.record_backoff(timedelta(seconds=30), reason="batch failed")
+    monkeypatch.setattr(
+        github_api,
+        "get_mergeability",
+        lambda number, cwd=None: (_ for _ in ()).throw(
+            AssertionError("quota-denied mergeability refetch ran")
+        ),
+    )
+    orch = _orchestrator(clock, ledger)
+
+    assert await orch._mergeability_fallback(
+        7,
+        "/repos/widgets",
+        force=False,
+    ) == ("", "")
+    assert ledger.telemetry().request_count == 0
+
+
+@pytest.mark.asyncio
 async def test_failed_rich_metadata_counts_request_without_success_cost(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
