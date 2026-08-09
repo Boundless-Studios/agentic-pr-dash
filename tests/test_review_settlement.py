@@ -23,11 +23,13 @@ from agentic_pr_dash.github_api import (
 
 
 def test_review_coordinator_contract_version() -> None:
-    assert __version__ == "0.1.0"
+    assert __version__ == "0.2.0"
 
 
 REPOSITORY = "Boundless-Studios/gaia-free"
 HEAD = "a" * 40
+DELIVERY_ID = "delivery-pr-24"
+REVIEW_CHARTER_VERSION = "review-charter-v1"
 
 
 def _thread(
@@ -71,8 +73,19 @@ def _policy() -> ReviewPolicy:
     )
 
 
+def _exhausted_policy() -> ReviewPolicy:
+    policy = _policy()
+    policy.review.local.max_generation_rounds = 1
+    return policy
+
+
 def _ledger_with_local_result() -> ReviewLedger:
-    ledger = ReviewLedger(repository=REPOSITORY, head_sha=HEAD)
+    ledger = ReviewLedger(
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        delivery_id=DELIVERY_ID,
+        review_charter_version=REVIEW_CHARTER_VERSION,
+    )
     ledger.submit(
         ReviewResult(
             repository=REPOSITORY,
@@ -84,6 +97,21 @@ def _ledger_with_local_result() -> ReviewLedger:
         )
     )
     return ledger
+
+
+def test_overlay_preserves_delivery_identity_through_json_boundary() -> None:
+    loaded = ReviewLedger.model_validate_json(
+        _ledger_with_local_result().model_dump_json()
+    )
+
+    overlaid = overlay_github_findings(
+        loaded,
+        threads=[],
+        deferrals={},
+    )
+
+    assert overlaid.delivery_id == DELIVERY_ID
+    assert overlaid.review_charter_version == REVIEW_CHARTER_VERSION
 
 
 def test_finding_from_thread_normalizes_p1_and_snapshot_identity() -> None:
@@ -150,7 +178,7 @@ def test_thread_deferral_clears_finding_without_synthesizing_review() -> None:
     finding = ledger.current_findings[0]
     assert finding.disposition is Disposition.DEFER
     assert finding.rationale == "Unsupported provider path with no observed occurrence."
-    report = evaluate(policy=_policy(), ledger=ledger)
+    report = evaluate(policy=_exhausted_policy(), ledger=ledger)
     assert report.required_actions == []
     assert report.missing_slots == ["backstop:1"]
 
@@ -209,7 +237,7 @@ def test_thread_and_submission_from_same_review_fill_one_backstop_slot() -> None
             },
         }
     )
-    ledger = overlay_github_findings(
+    ledger = overlay_backstop_evidence(
         _ledger_with_local_result(),
         threads=[_thread(review_id=123)],
         deferrals={
@@ -218,9 +246,6 @@ def test_thread_and_submission_from_same_review_fill_one_backstop_slot() -> None
                 "ticket": "",
             }
         },
-    )
-    ledger = overlay_backstop_results(
-        ledger,
         reviews=[
             ReviewSubmission(
                 review_id=123,
@@ -231,9 +256,9 @@ def test_thread_and_submission_from_same_review_fill_one_backstop_slot() -> None
             )
         ],
         reviewer_count=2,
-        thread_review_ids={123},
     )
 
+    policy.review.local.max_generation_rounds = 1
     report = evaluate(policy=policy, ledger=ledger)
 
     assert not report.settled
@@ -339,6 +364,7 @@ def test_two_threaded_reviews_fill_two_distinct_backstop_slots() -> None:
         reviewer_count=2,
     )
 
+    policy.review.local.max_generation_rounds = 1
     report = evaluate(policy=policy, ledger=ledger)
 
     assert report.settled
@@ -372,7 +398,7 @@ def test_review_body_p2_accepts_review_id_deferral() -> None:
         reviewer_count=1,
     )
 
-    report = evaluate(policy=_policy(), ledger=ledger)
+    report = evaluate(policy=_exhausted_policy(), ledger=ledger)
 
     assert report.settled
     assert ledger.current_findings[0].disposition is Disposition.DEFER

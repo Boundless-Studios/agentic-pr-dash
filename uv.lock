@@ -9,8 +9,8 @@ source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev
 
 [[package]]
 name = "agent-review-coordinator"
-version = "0.1.0"
-source = { git = "https://github.com/Boundless-Studios/agent-review-coordinator.git?rev=665fdb71b8dbe8140512ca113c021b7de263a9c4#665fdb71b8dbe8140512ca113c021b7de263a9c4" }
+version = "0.2.0"
+source = { git = "https://github.com/Boundless-Studios/agent-review-coordinator.git?rev=dcb41bfea275aeefea9cb0417ad8788ba812c9fb#dcb41bfea275aeefea9cb0417ad8788ba812c9fb" }
 dependencies = [
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -46,7 +46,7 @@ serve = [
 [package.metadata]
 requires-dist = [
     { name = "agent-coordinator", git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev=v0.5.0" },
-    { name = "agent-review-coordinator", git = "https://github.com/Boundless-Studios/agent-review-coordinator.git?rev=665fdb71b8dbe8140512ca113c021b7de263a9c4" },
+    { name = "agent-review-coordinator", git = "https://github.com/Boundless-Studios/agent-review-coordinator.git?rev=dcb41bfea275aeefea9cb0417ad8788ba812c9fb" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.110" },
     { name = "fastapi", marker = "extra == 'serve'", specifier = ">=0.110" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },

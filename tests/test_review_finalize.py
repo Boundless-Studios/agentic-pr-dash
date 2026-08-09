@@ -1,5 +1,6 @@
 import pytest
 from agent_review_coordinator import (
+    FindingSettlementState,
     ReviewLedger,
     ReviewPolicy,
     ReviewResult,
@@ -11,11 +12,13 @@ from agentic_pr_dash._maintenance.review_settlement import (
     combine_clean_observations,
     evaluate_pr_snapshot,
 )
-from agentic_pr_dash.models import CICheck, PRData
 from agentic_pr_dash.github_api import ReviewSubmission
+from agentic_pr_dash.models import CICheck, PRData
 
 REPOSITORY = "Boundless-Studios/agentic-pr-dash"
 HEAD = "a" * 40
+DELIVERY_ID = "delivery-pr-24"
+REVIEW_CHARTER_VERSION = "review-charter-v1"
 
 
 def _policy() -> ReviewPolicy:
@@ -34,7 +37,12 @@ def _policy() -> ReviewPolicy:
 
 
 def _ledger() -> ReviewLedger:
-    ledger = ReviewLedger(repository=REPOSITORY, head_sha=HEAD)
+    ledger = ReviewLedger(
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        delivery_id=DELIVERY_ID,
+        review_charter_version=REVIEW_CHARTER_VERSION,
+    )
     for stage in (ReviewStage.LOCAL, ReviewStage.BACKSTOP):
         ledger.submit(
             ReviewResult(
@@ -236,7 +244,7 @@ def test_pr_author_review_does_not_satisfy_backstop_result() -> None:
     assert observation.review.missing_slots == ["backstop:1"]
 
 
-def test_unevaluated_p2_blocks_and_deferral_settles() -> None:
+def test_unevaluated_p2_remains_blocking_before_budget_exhaustion() -> None:
     from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 
     thread = ReviewThread(
@@ -273,7 +281,93 @@ def test_unevaluated_p2_blocks_and_deferral_settles() -> None:
     )
 
     assert blocked.review.required_actions == ["evaluate_p2"]
-    assert deferred.clean
+    assert not deferred.clean
+    assert deferred.review.required_actions == ["evaluate_p2"]
+
+
+def test_exhausted_p2_is_recorded_without_blocking_finalization() -> None:
+    from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+
+    ledger = _ledger()
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-review-round-2",
+            reviewer_provider="round-two-provider",
+        )
+    )
+    thread = ReviewThread(
+        node_id="PRRT_exhausted_p2",
+        is_resolved=False,
+        is_outdated=False,
+        top=ReviewThreadComment(
+            database_id=3,
+            path="src/review.py",
+            line=24,
+            body="[P2] Speculative edge after the review budget is exhausted",
+            author="reviewer",
+            created_at="2026-07-28T00:00:00Z",
+        ),
+    )
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert observation.clean
+    assert observation.review.required_actions == []
+    assert list(observation.review.finding_states.values()) == [
+        FindingSettlementState.DECLINED_WITH_RATIONALE
+    ]
+
+
+def test_exhausted_review_budget_does_not_suppress_p1() -> None:
+    from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+
+    ledger = _ledger()
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-review-round-2",
+            reviewer_provider="round-two-provider",
+        )
+    )
+    thread = ReviewThread(
+        node_id="PRRT_exhausted_p1",
+        is_resolved=False,
+        is_outdated=False,
+        top=ReviewThreadComment(
+            database_id=4,
+            path="src/review.py",
+            line=25,
+            body="[P1] Required status is dropped",
+            author="reviewer",
+            created_at="2026-07-28T00:00:00Z",
+        ),
+    )
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert not observation.clean
+    assert observation.review.required_actions == ["address_p1"]
 
 
 def test_p1_deferral_never_settles() -> None:
