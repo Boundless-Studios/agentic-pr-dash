@@ -55,6 +55,13 @@ def _stub_enrichment(monkeypatch):
         "get_unaddressed_comments",
         lambda num, latest_commit_date, cwd=None: [],
     )
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda num, latest_commit_date, cwd=None: (
+            github_api.ObservationReadResult.observed(([], []))
+        ),
+    )
     # No worktree → no auto-dispatch; keeps the poll a pure read.
     monkeypatch.setattr(orchestrator, "find_worktree_for_branch", lambda branch, root=None: None)
 

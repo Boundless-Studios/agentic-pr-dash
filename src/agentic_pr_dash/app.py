@@ -12,7 +12,7 @@ import subprocess
 import time
 
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -34,7 +34,9 @@ from .models import (
     worktree_started_at,
 )
 from .orchestrator import Orchestrator
+from .quota import QuotaDecisionReason, QuotaTelemetry
 from .runner_monitor import get_runner_fleet_load
+from .webhook import MAX_WEBHOOK_BODY_BYTES, GithubWebhookIngress, WebhookRejected
 from . import session_registry
 from . import worktrees as _worktrees
 from .worktrees import (
@@ -78,7 +80,77 @@ def _asset_version() -> str:
             continue
     return h.hexdigest()[:8]
 
+
+def _quota_context(telemetry: QuotaTelemetry) -> dict[str, object]:
+    latest = telemetry.latest
+    degraded_reason = telemetry.degraded_reason
+    if isinstance(degraded_reason, QuotaDecisionReason):
+        degraded_reason_value: str | None = degraded_reason.value
+    else:
+        degraded_reason_value = degraded_reason
+    last_decision = telemetry.last_decision
+    return {
+        "observed": latest is not None,
+        "label": (
+            f"GitHub {latest.remaining:,} / {latest.limit:,}"
+            if latest is not None
+            else "GitHub quota unobserved"
+        ),
+        "latest_cost": latest.cost if latest is not None else None,
+        "remaining": latest.remaining if latest is not None else None,
+        "limit": latest.limit if latest is not None else None,
+        "reset_at": latest.reset_at.isoformat() if latest is not None else None,
+        "observed_at": latest.observed_at.isoformat() if latest is not None else None,
+        "latest_caller": (
+            latest.caller.value if latest is not None and latest.caller is not None else None
+        ),
+        "latest_work_class": (
+            latest.work_class.value
+            if latest is not None and latest.work_class is not None
+            else None
+        ),
+        "rolling_cost_by_caller": {
+            caller.value: cost
+            for caller, cost in telemetry.rolling_cost_by_caller.items()
+        },
+        "rolling_cost_by_work_class": {
+            work_class.value: cost
+            for work_class, cost in telemetry.rolling_cost_by_work_class.items()
+        },
+        "request_count": telemetry.request_count,
+        "cache_hit_count": telemetry.cache_hit_count,
+        "total_request_count": telemetry.total_request_count,
+        "cache_hit_rate": telemetry.cache_hit_rate,
+        "background_hourly_spend": telemetry.background_hourly_spend,
+        "background_hourly_budget": telemetry.background_hourly_budget,
+        "maintenance_reserve": telemetry.maintenance_reserve,
+        "backoff_active": telemetry.backoff_active,
+        "backoff_until": (
+            telemetry.backoff_until.isoformat()
+            if telemetry.backoff_until is not None
+            else None
+        ),
+        "backoff_reason": telemetry.backoff_reason,
+        "degraded": telemetry.degraded,
+        "degraded_reason": degraded_reason_value,
+        "last_decision": (
+            {
+                "allowed": last_decision.allowed,
+                "reason": last_decision.reason.value,
+                "degraded": last_decision.degraded,
+            }
+            if last_decision is not None
+            else None
+        ),
+        "last_denial_reason": (
+            telemetry.last_denial_reason.value
+            if telemetry.last_denial_reason is not None
+            else None
+        ),
+    }
+
 orchestrator = Orchestrator(repo_cwd=get_main_repo_root())
+webhook_ingress = GithubWebhookIngress(orchestrator, _invalidate_dashboard_context)
 BABYSIT_STATUS_PATH = Path.home() / ".claude" / "babysit-prs-status.json"
 ZERO_COMMIT_STALE_SECS = 86400
 AGENT_STALE_SECS = 3 * 86400
@@ -89,7 +161,10 @@ OTHER_STALE_SECS = 7 * 86400
 async def lifespan(app: FastAPI):
     orchestrator.log("Dashboard starting — background PR polling")
     orchestrator.start()
-    yield
+    try:
+        yield
+    finally:
+        await webhook_ingress.shutdown()
 
 
 app = FastAPI(title="PR Dashboard", lifespan=lifespan)
@@ -123,7 +198,8 @@ KANBAN_COLUMNS = [
         "id": "needs_attention",
         "title": "Needs Attention",
         "statuses": {PRStatus.WAITING_HUMAN_DECISION, PRStatus.CI_FAILING, PRStatus.HAS_COMMENTS,
-                     PRStatus.CI_AND_COMMENTS, PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED},
+                     PRStatus.CI_AND_COMMENTS, PRStatus.MERGE_CONFLICT, PRStatus.AGENT_FAILED,
+                     PRStatus.OBSERVATION_UNAVAILABLE},
     },
     {
         "id": "in_progress",
@@ -1137,6 +1213,7 @@ def _dashboard_context_from_cards(
         "worktrees_tab_url": "/?tab=worktrees&show_agents=1" if show_agent_worktrees else "/?tab=worktrees",
         "worktrees_partial_url": "/partials/worktrees?show_agents=1" if show_agent_worktrees else "/partials/worktrees",
         "no_pr_cards": no_pr_cards(cards),
+        "quota": _quota_context(orchestrator.quota_telemetry),
         "asset_version": _asset_version(),
     }
 
@@ -1649,6 +1726,7 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
         # with live data seconds after it loads (PR #114 review).
         "worktrees_partial_url": f"/proof/pr-dashboard-fixture/{scenario}/worktrees",
         "no_pr_cards": no_pr_cards(cards),
+        "quota": _quota_context(orchestrator.quota_telemetry),
         "asset_version": _asset_version(),
     }
 
@@ -1658,6 +1736,7 @@ def _proof_fixture_context(scenario: str, active_tab: str = "board") -> dict[str
 def status_label(status: PRStatus) -> str:
     return {
         PRStatus.CLEAN: "OK",
+        PRStatus.OBSERVATION_UNAVAILABLE: "GitHub Unavailable",
         PRStatus.NO_PR: "No PR",
         PRStatus.CI_PENDING: "CI Pending",
         PRStatus.CI_FAILING: "CI Failing",
@@ -1685,10 +1764,25 @@ async def dashboard(request: Request):
         active_tab=active_tab,
     )
     context.update(await asyncio.to_thread(runner_fleet_context))
+    context["quota"] = _quota_context(orchestrator.quota_telemetry)
     return templates.TemplateResponse(
         request=request,
         name="dashboard.html",
         context=context,
+    )
+
+
+@app.get("/api/quota")
+async def quota_api():
+    return _quota_context(orchestrator.quota_telemetry)
+
+
+@app.get("/partials/quota", response_class=HTMLResponse)
+async def quota_partial(request: Request):
+    return templates.TemplateResponse(
+        request=request,
+        name="partials/quota_status.html",
+        context={"quota": _quota_context(orchestrator.quota_telemetry)},
     )
 
 
@@ -1860,9 +1954,43 @@ async def retry_ci(pr_number: int, request: Request):
 
 @app.post("/api/refresh")
 async def force_refresh():
-    await orchestrator.refresh_prs()
+    await orchestrator.refresh_prs(force=True)
     _invalidate_dashboard_context()
     return RedirectResponse(url="/", status_code=303)
+
+
+async def _read_webhook_body(request: Request) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_WEBHOOK_BODY_BYTES:
+                raise WebhookRejected(413, "GitHub webhook payload is too large")
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > MAX_WEBHOOK_BODY_BYTES:
+            raise WebhookRejected(413, "GitHub webhook payload is too large")
+    return bytes(body)
+
+
+@app.post("/api/github/webhook")
+async def github_webhook(request: Request):
+    """Accept authenticated GitHub observation events without blocking on refresh."""
+
+    try:
+        body = await _read_webhook_body(request)
+        status_code = webhook_ingress.accept(
+            request.headers.get("x-github-event", ""),
+            request.headers.get("x-github-delivery"),
+            request.headers.get("x-hub-signature-256"),
+            body,
+        )
+    except WebhookRejected as exc:
+        return JSONResponse({"detail": exc.detail}, status_code=exc.status_code)
+    return Response(status_code=status_code)
 
 
 @app.post("/api/cleanup-worktree")

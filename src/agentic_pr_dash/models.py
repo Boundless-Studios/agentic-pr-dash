@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 class PRStatus(str, Enum):
     CLEAN = "clean"
+    OBSERVATION_UNAVAILABLE = "observation_unavailable"
     NO_PR = "no_pr"
     CI_FAILING = "ci_failing"
     CI_PENDING = "ci_pending"
@@ -506,6 +507,8 @@ class WorktreeCard(BaseModel):
             return "ci_failing"
         if self.status == PRStatus.MERGE_CONFLICT:
             return "merge_conflict"
+        if self.status == PRStatus.OBSERVATION_UNAVAILABLE:
+            return "observation_unavailable"
 
         # --- an idle live session outranks the passive PR states ---
         if self.status == PRStatus.AGENT_WAITING or self.session_activity == "waiting":
@@ -531,6 +534,7 @@ class WorktreeCard(BaseModel):
             "ci_failing": "CI Failing",
             "ci_pending": "CI Pending",
             "merge_conflict": "Merge Conflict",
+            "observation_unavailable": "GitHub Unavailable",
             "no_pr": "No PR",
             "clean": "Clean",
         }.get(self.agent_state, "Unknown")

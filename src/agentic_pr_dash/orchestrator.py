@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
@@ -25,12 +26,31 @@ from .models import (
     RunnerExecutionSummary,
 )
 from .observability import ObservabilityEvent, get_event_store
+from .observation import (
+    ObservationController,
+    ObservationKey,
+    ObservationPlan,
+    ObservationReason,
+    ObservationSlice,
+)
+from .quota import (
+    QuotaCaller,
+    QuotaContext,
+    QuotaLedger,
+    QuotaTelemetry,
+    QuotaWorkClass,
+    ledger_from_environment,
+)
 from .worktrees import discover_worktrees, find_worktree_for_branch
 
 # Composite key for the tracked-PR map. The dashboard aggregates PRs across any
 # number of repos (anchor + ``maintenance_repo_roots``), so the PR number alone
 # is not unique — same-number PRs in two repos must be distinct entries.
 PRKey = tuple[str, int]
+
+
+class _EventRepoResolution(Enum):
+    UNKNOWN = "unknown"
 
 
 def _repo_from_url(url: str) -> str:
@@ -52,6 +72,24 @@ def _repo_from_url(url: str) -> str:
     if len(parts) < 2:
         return ""
     return f"{parts[-2]}/{parts[-1]}"
+
+
+def _normalize_repo(repo: str | None) -> str:
+    """Return the case-insensitive GitHub ``owner/name`` identity."""
+
+    return (repo or "").strip().casefold()
+
+
+def _observation_head_matches(plan_head: str, observed_head: str) -> bool:
+    """Match a read to its immutable plan, with one legacy adapter exception."""
+
+    return bool(
+        observed_head
+        and (
+            plan_head.startswith("legacy-head-")
+            or observed_head == plan_head
+        )
+    )
 
 # Rolling "past 7 days" runner usage. The full recompute is heavy (~hundreds of
 # REST calls, several minutes), so it can't run every poll, but 24h left the
@@ -85,6 +123,60 @@ POLL_INTERVAL_SECONDS = 15
 # next. The semaphore bounds in-flight enrichments so a large PR pool doesn't
 # burst the gh API into a rate-limit wall.
 ENRICHMENT_CONCURRENCY = 6
+
+# Metadata is the expensive repository-wide observation.  The controller owns
+# the same interval for its per-head reconciliation plan; the orchestrator
+# uses it to decide when the cached raw PR list must be replaced.
+METADATA_RECONCILIATION_INTERVAL = timedelta(minutes=15)
+# A conditional REST 304 validates the open-PR list, but not GraphQL-only
+# fields such as reviewDecision or freshly recomputed mergeability. Keep the
+# cheap 15-minute probe while forcing one rich snapshot per hour so those
+# fields cannot remain stale forever behind an unchanged REST validator.
+RICH_METADATA_RECONCILIATION_INTERVAL = timedelta(hours=1)
+# Cold start has no cached projection to fall back on, so the board is simply
+# empty until the first list succeeds. One transient at daemon startup must not
+# hold it empty for a whole reconciliation interval; retry on the next poll tick
+# instead. Once a usable cache exists, the long backoff above applies again.
+METADATA_COLD_START_RETRY_INTERVAL = timedelta(seconds=POLL_INTERVAL_SECONDS)
+OPENED_EVENT_DISCOVERY_WINDOW = timedelta(seconds=45)
+EVENT_DEBOUNCE_WINDOW = timedelta(seconds=2)
+# Blocker statuses that are only as current as the last successful review+CI
+# observation of the PR's immutable head. See ``_enrich_pr``'s status
+# computation: when that head has never been observed these describe a previous
+# head and must not be reported (or auto-dispatched) as if they were current.
+_OBSERVATION_DERIVED_STATUSES = frozenset(
+    {
+        PRStatus.CLEAN,
+        PRStatus.CI_PENDING,
+        PRStatus.CI_FAILING,
+        PRStatus.HAS_COMMENTS,
+        PRStatus.CI_AND_COMMENTS,
+    }
+)
+# A positively observed head mismatch also invalidates mergeability metadata:
+# the relist still describes the superseded plan head. Keep this separate from
+# ``_OBSERVATION_DERIVED_STATUSES`` so an unavailable review/CI read does not
+# hide an authoritative current-head merge conflict.
+_STALE_HEAD_DERIVED_STATUSES = _OBSERVATION_DERIVED_STATUSES | {PRStatus.MERGE_CONFLICT}
+_REVIEW_INVALIDATION_EVENTS = frozenset(
+    {
+        "pull_request_review",
+        "pull_request_review_comment",
+        "pull_request_review_thread",
+    }
+)
+_CI_INVALIDATION_EVENTS = frozenset({"check_run", "check_suite", "status"})
+_HEAD_INVALIDATION_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
+# Admission estimates are intentionally conservative until the GraphQL batch
+# returns a real ``rateLimit.cost`` sample. They are only used to decide if a
+# background request may start; successful batch requests reconcile to the
+# server-provided cost in github_api.
+METADATA_GRAPHQL_ESTIMATED_COST = 50
+REVIEW_GRAPHQL_ESTIMATED_COST = 25
+MERGEABILITY_GRAPHQL_ESTIMATED_COST = 5
+BATCH_GRAPHQL_ESTIMATED_COST = github_api.BATCH_GRAPHQL_ESTIMATED_COST
+REVIEW_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
+METADATA_GRAPHQL_FAILURE_BACKOFF = timedelta(seconds=30)
 
 
 def _parse_session_timestamp(value: str | None) -> datetime | None:
@@ -151,8 +243,21 @@ def _has_matching_session_owner(pr: PRData, queued_at: datetime | None = None) -
 
 
 class Orchestrator:
-    def __init__(self, repo_cwd: str | None = None):
+    def __init__(
+        self,
+        repo_cwd: str | None = None,
+        *,
+        observation_controller: ObservationController | None = None,
+        quota_ledger: QuotaLedger | None = None,
+    ):
         self.repo_cwd = repo_cwd
+        self.observation_controller = (
+            observation_controller or ObservationController()
+        )
+        # One process-local ledger owns all dashboard observations.  It is
+        # deliberately shared by every repo root in this orchestrator so a
+        # multi-repo board cannot spend the background allowance once per root.
+        self.quota_ledger = quota_ledger or ledger_from_environment()
         # Keyed by ``(repo, number)`` so PRs aggregated from multiple repos
         # (anchor + ``maintenance_repo_roots``) never collide on PR number.
         self.prs: dict[PRKey, PRData] = {}
@@ -160,7 +265,50 @@ class Orchestrator:
         # only its OWN merged/closed PRs (even when that root returns zero PRs)
         # and never drops another repo's PRs on a transient failure.
         self._pr_root: dict[PRKey, str | None] = {}
+        self._observation_keys: dict[PRKey, ObservationKey] = {}
+        # A synchronize event can advance the immutable head before the
+        # debounced repository listing reflects it.  Retain that event-owned
+        # identity until a successful rich metadata read supersedes it so a
+        # failed relist cannot fall back to actionable state from the old head.
+        self._event_head_overrides: dict[PRKey, str] = {}
+        self._event_head_override_observed_at: dict[PRKey, datetime] = {}
+        self._observed_blocker_keys: set[ObservationKey] = set()
+        self._observed_blocker_slices: dict[
+            ObservationKey, set[ObservationSlice]
+        ] = {}
+        self._mergeability_pending_keys: set[ObservationKey] = set()
+        self._mergeability_retry_after: dict[ObservationKey, datetime] = {}
+        self._metadata_unconfirmed_keys: set[ObservationKey] = set()
+        # The poll loop and manual refresh endpoint share one mutable PR/cache
+        # projection. Serialize complete refresh transactions so an older
+        # GitHub response can never land after a newer one.
+        self._refresh_lock = asyncio.Lock()
         self.observed_roots: set[str | None] = set()
+        # The raw ``gh pr list`` payload is a repository-wide observation.  A
+        # 15-second dashboard tick reuses it and only replaces it after a
+        # successful metadata reconciliation.  Keep attempt timestamps
+        # separate from successful timestamps so a failed relist neither
+        # prunes the old projection nor hammers GitHub on every tick.
+        self._metadata_cache: dict[str | None, list[dict]] = {}
+        self._metadata_last_success: dict[str | None, datetime] = {}
+        self._metadata_last_attempt: dict[str | None, datetime] = {}
+        self._metadata_last_rich_success: dict[str | None, datetime] = {}
+        self._metadata_validators: dict[
+            str | None, tuple[str | None, str | None]
+        ] = {}
+        self._root_repo_identity: dict[str | None, str] = {}
+        self._root_repo_slugs: dict[str | None, set[str]] = {}
+        self._repo_roots_by_slug: dict[str, str | None] = {}
+        # Pull-request events that affect repository metadata are debounced by
+        # the same ManualClock-backed window as ObservationController.  The
+        # next refresh after the deadline relists that root; an event for an
+        # unknown repo never gets to mutate another root's controller state.
+        self._metadata_event_due: dict[str | None, datetime] = {}
+        self._opened_event_prs: dict[str | None, set[int]] = {}
+        self._opened_event_expirations: dict[
+            tuple[str | None, int], datetime
+        ] = {}
+        self._opened_event_retry_due: dict[str | None, datetime] = {}
         self._inflight_prs: set[int] = set()
         self.events: list[EventEntry] = []
         cached_runner_summary = github_api.load_runner_execution_summary_cache()
@@ -260,6 +408,580 @@ class Orchestrator:
             roots = [self.repo_cwd, *roots]
         return roots
 
+    def _metadata_interval(self) -> timedelta:
+        """Read the controller's configured metadata reconciliation interval."""
+
+        # ObservationController intentionally exposes ``now`` as its public
+        # clock boundary.  The interval is immutable configuration, but keep a
+        # defensive fallback for lightweight controller doubles used by callers.
+        return getattr(
+            self.observation_controller,
+            "metadata_reconciliation_interval",
+            getattr(
+                self.observation_controller,
+                "_metadata_reconciliation_interval",
+                METADATA_RECONCILIATION_INTERVAL,
+            ),
+        )
+
+    @property
+    def quota_telemetry(self) -> QuotaTelemetry:
+        """Current dashboard observation quota state for API/UI consumers."""
+
+        return self.quota_ledger.telemetry()
+
+    @property
+    def quota(self) -> QuotaLedger:
+        """Compatibility alias for integrations that expose the ledger itself."""
+
+        return self.quota_ledger
+
+    def _quota_context(self, *, force: bool, estimated_cost: int) -> QuotaContext:
+        if force:
+            return QuotaContext(
+                ledger=self.quota_ledger,
+                caller=QuotaCaller.OPERATOR,
+                work_class=QuotaWorkClass.EXPLICIT_OPERATOR,
+                estimated_cost=estimated_cost,
+            )
+        return QuotaContext(
+            ledger=self.quota_ledger,
+            caller=QuotaCaller.DASHBOARD,
+            work_class=QuotaWorkClass.BACKGROUND_OBSERVATION,
+            estimated_cost=estimated_cost,
+        )
+
+    def _quota_allows(self, *, force: bool, estimated_cost: int):
+        context = self._quota_context(force=force, estimated_cost=estimated_cost)
+        return context, self.quota_ledger.allow(
+            context.caller,
+            context.work_class,
+            estimated_cost=estimated_cost,
+        )
+
+    def _record_estimated_success(
+        self,
+        context: QuotaContext,
+        reservation,
+    ) -> None:
+        self.quota_ledger.record_estimated(
+            context.caller,
+            context.work_class,
+            context.estimated_cost,
+            reservation=reservation,
+        )
+
+    def _record_estimated_failure(self, reservation) -> None:
+        if reservation is not None:
+            self.quota_ledger.release(reservation)
+
+    async def _review_fallback_observation(
+        self,
+        pr_number: int,
+        latest_commit_date: str,
+        root: str | None,
+        *,
+        force: bool,
+    ) -> github_api.ObservationReadResult:
+        """Run an explicitly admitted per-PR review fallback.
+
+        A batch omission is not permission to spend an untracked GraphQL read.
+        Reserve its conservative cost first, account the successful read when
+        the legacy scanner does not expose a ``rateLimit`` sample, and preserve
+        an unavailable result when admission or transport fails.
+        """
+
+        context, decision = self._quota_allows(
+            force=force, estimated_cost=REVIEW_GRAPHQL_ESTIMATED_COST
+        )
+        if not decision.allowed:
+            return github_api.ObservationReadResult.unavailable(
+                f"review fallback deferred: quota {decision.reason.value}"
+            )
+        reservation = self.quota_ledger.reserve(
+            context.caller,
+            context.work_class,
+            estimated_cost=context.estimated_cost,
+        )
+        if reservation is None:
+            return github_api.ObservationReadResult.unavailable(
+                "review fallback deferred: quota admission changed"
+            )
+        try:
+            result = await asyncio.to_thread(
+                github_api.scan_review_threads_observation,
+                pr_number,
+                latest_commit_date,
+                root,
+            )
+        except Exception as exc:  # noqa: BLE001 - keep the PR fail-closed
+            self._record_estimated_failure(reservation)
+            self.quota_ledger.record_failure(
+                reason="review_fallback_failed"
+            )
+            self.quota_ledger.record_backoff(
+                REVIEW_GRAPHQL_FAILURE_BACKOFF,
+                reason="review_fallback_failed",
+            )
+            return github_api.ObservationReadResult.unavailable(
+                f"review fallback raised: {exc}"
+            )
+        if result.observable:
+            self._record_estimated_success(context, reservation)
+            return result
+        if result.graphql_observed:
+            # The composite read failed only after its GraphQL thread query
+            # completed. Reconcile that consumed work, then record the REST
+            # failure without double-counting the request.
+            self._record_estimated_success(context, reservation)
+            failure_counts_request = False
+        else:
+            self._record_estimated_failure(reservation)
+            failure_counts_request = True
+        self.quota_ledger.record_failure(
+            reason="review_fallback_unavailable",
+            count_request=failure_counts_request,
+        )
+        self.quota_ledger.record_backoff(
+            REVIEW_GRAPHQL_FAILURE_BACKOFF,
+            reason="review_fallback_unavailable",
+        )
+        return result
+
+    async def _mergeability_fallback(
+        self,
+        pr_number: int,
+        root: str | None,
+        *,
+        force: bool,
+    ) -> tuple[str, str]:
+        """Run a quota-admitted per-PR mergeability recomputation."""
+
+        context, decision = self._quota_allows(
+            force=force,
+            estimated_cost=MERGEABILITY_GRAPHQL_ESTIMATED_COST,
+        )
+        if not decision.allowed:
+            return "", ""
+        reservation = self.quota_ledger.reserve(
+            context.caller,
+            context.work_class,
+            estimated_cost=context.estimated_cost,
+        )
+        if reservation is None:
+            return "", ""
+        try:
+            result = await asyncio.to_thread(
+                github_api.get_mergeability,
+                pr_number,
+                root,
+            )
+        except Exception:  # noqa: BLE001 - preserve last-known mergeability
+            result = ("", "")
+        if any(result):
+            self._record_estimated_success(context, reservation)
+            return result
+        self._record_estimated_failure(reservation)
+        self.quota_ledger.record_failure(
+            reason="mergeability_fallback_unavailable"
+        )
+        return "", ""
+
+    def _metadata_refresh_due(self, root: str | None, now: datetime, *, force: bool) -> bool:
+        """Whether ``root`` needs a real, successful-capable metadata read."""
+
+        if force:
+            return True
+
+        if not self._has_pending_opened(root, now):
+            self._opened_event_retry_due.pop(root, None)
+        event_due = self._metadata_event_due.get(root)
+        opened_retry_due = self._opened_event_retry_due.get(root)
+        if any(
+            due_at is not None and now >= due_at
+            for due_at in (event_due, opened_retry_due)
+        ):
+            return True
+        if event_due is not None or opened_retry_due is not None:
+            return False
+
+        interval = self._metadata_interval()
+        last_attempt = self._metadata_last_attempt.get(root)
+        if root not in self._metadata_cache:
+            # Cold start: nothing has ever been loaded for this root, so a
+            # failed first attempt leaves the board blank rather than merely
+            # stale. Retry on the next poll tick instead of sitting out the
+            # full reconciliation interval. ``min`` keeps a deliberately short
+            # configured interval from being lengthened by this floor.
+            if last_attempt is None:
+                return True
+            retry = min(interval, METADATA_COLD_START_RETRY_INTERVAL)
+            return now >= last_attempt + retry
+
+        last_success = self._metadata_last_success.get(root)
+        references = [
+            timestamp
+            for timestamp in (last_success, last_attempt)
+            if timestamp is not None
+        ]
+        reference = max(references) if references else None
+        return reference is None or now >= reference + interval
+
+    def _has_pending_opened(self, root: str | None, now: datetime) -> bool:
+        """Whether an undiscovered opened PR is still in its bounded fast retry."""
+
+        pending = self._opened_event_prs.get(root)
+        if not pending:
+            return False
+        for number in tuple(pending):
+            expires_at = self._opened_event_expirations.get((root, number))
+            if expires_at is not None and now >= expires_at:
+                pending.discard(number)
+                self._opened_event_expirations.pop((root, number), None)
+        if not pending:
+            self._opened_event_prs.pop(root, None)
+            return False
+        return True
+
+    async def _cache_metadata(
+        self, root: str | None, raw_prs: list[dict], now: datetime
+    ) -> None:
+        """Replace one root's metadata cache and its normalized repo mapping."""
+
+        old_slugs = self._root_repo_slugs.get(root, set())
+        for slug in old_slugs:
+            if self._repo_roots_by_slug.get(slug) == root:
+                self._repo_roots_by_slug.pop(slug, None)
+
+        cache = [dict(raw) for raw in raw_prs if isinstance(raw, dict)]
+        self._metadata_cache[root] = cache
+        self._metadata_last_success[root] = now
+        self._metadata_last_attempt[root] = now
+        self._metadata_last_rich_success[root] = now
+
+        # A successful rich list is the authoritative repository/head
+        # projection.  It supersedes any temporary head identity learned from
+        # a webhook while the cached list was stale.
+        for raw in cache:
+            number = raw.get("number")
+            if not isinstance(number, int):
+                continue
+            repo = _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
+            key = (repo, number)
+            override = self._event_head_overrides.get(key)
+            listed_head = str(raw.get("headRefOid") or "")
+            if not override or not listed_head:
+                continue
+            if listed_head == override:
+                self._event_head_overrides.pop(key, None)
+                self._event_head_override_observed_at.pop(key, None)
+                continue
+            # A rich list may briefly lag a synchronize delivery, while a
+            # missed later delivery can make the retained override itself
+            # stale. Resolve that ambiguity with the exact REST PR head: keep
+            # failing closed when the event SHA is still current, but let a
+            # newer authoritative listed/current SHA supersede it.
+            latest_sha, _latest_date = await asyncio.to_thread(
+                github_api.get_latest_commit_uncached, number, root
+            )
+            override_observed_at = self._event_head_override_observed_at.get(key)
+            override_matured = (
+                override_observed_at is not None
+                and now >= override_observed_at + self._metadata_interval()
+            )
+            if latest_sha and latest_sha == listed_head and override_matured:
+                self._event_head_overrides.pop(key, None)
+                self._event_head_override_observed_at.pop(key, None)
+
+        slugs = {
+            _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
+            for raw in cache
+        }
+        slugs.discard("")
+        if root not in self._root_repo_identity:
+            identity = next(iter(slugs), "")
+            if not identity:
+                owner, repo_name = await asyncio.to_thread(
+                    github_api.get_repo_info, root
+                )
+                identity = _normalize_repo(
+                    f"{owner}/{repo_name}" if owner and repo_name else ""
+                )
+            if identity:
+                self._root_repo_identity[root] = identity
+        if identity := self._root_repo_identity.get(root):
+            slugs.add(identity)
+        self._root_repo_slugs[root] = slugs
+        for slug in slugs:
+            self._repo_roots_by_slug[slug] = root
+
+        event_due = self._metadata_event_due.get(root)
+        if event_due is not None and now >= event_due:
+            self._metadata_event_due.pop(root, None)
+        discovered = {
+            raw["number"]
+            for raw in cache
+            if isinstance(raw.get("number"), int)
+        }
+        pending_opened = self._opened_event_prs.get(root)
+        if pending_opened is not None:
+            pending_opened.difference_update(discovered)
+            for number in discovered:
+                self._opened_event_expirations.pop((root, number), None)
+            if not pending_opened:
+                self._opened_event_prs.pop(root, None)
+                pending_opened = None
+        if pending_opened and self._has_pending_opened(root, now):
+            self._opened_event_retry_due[root] = (
+                now + METADATA_COLD_START_RETRY_INTERVAL
+            )
+        else:
+            self._opened_event_retry_due.pop(root, None)
+
+    def _known_event_root(self, repo: str) -> str | None | _EventRepoResolution:
+        """Resolve an event repo without conflating a mapped ``None`` root."""
+
+        normalized = _normalize_repo(repo)
+        if normalized in self._repo_roots_by_slug:
+            return self._repo_roots_by_slug[normalized]
+
+        # A fixture or legacy caller may seed ``prs`` directly, bypassing the
+        # metadata cache.  Resolve only an exact repo match; never fall back to
+        # PR number alone, which could invalidate a sibling repository.
+        roots = {
+            self._pr_root.get(key)
+            for key, pr in self.prs.items()
+            if _normalize_repo(pr.repo) == normalized
+        }
+        if len(roots) == 1:
+            return next(iter(roots))
+        return _EventRepoResolution.UNKNOWN
+
+    def _event_observation_target(
+        self, root: str | None, repo: str, number: int
+    ) -> tuple[PRKey, ObservationKey] | None:
+        normalized = _normalize_repo(repo)
+        for key, observation_key in self._observation_keys.items():
+            if key[1] != number or self._pr_root.get(key) != root:
+                continue
+            if _normalize_repo(key[0]) == normalized:
+                return key, observation_key
+        return None
+
+    def _plan_for_available_slices(
+        self,
+        plan: ObservationPlan | None,
+        *,
+        metadata_read: bool,
+    ) -> ObservationPlan | None:
+        """Drop an unobservable metadata slice without acknowledging it."""
+
+        if plan is None or metadata_read or ObservationSlice.METADATA not in plan.slices:
+            return plan
+        if (
+            plan.reason is ObservationReason.METADATA_RECONCILIATION
+            and plan.key in self._mergeability_pending_keys
+        ):
+            # Cached GraphQL metadata cannot prove repository-wide additions or
+            # removals, but it can retry the quota-admitted per-PR mergeability
+            # prerequisite that left this immutable key unacknowledged.
+            return plan
+        slices = frozenset(
+            observation_slice
+            for observation_slice in plan.slices
+            if observation_slice is not ObservationSlice.METADATA
+        )
+        if not slices:
+            return None
+        generations = frozenset(
+            (observation_slice, generation)
+            for observation_slice, generation in plan.invalidation_generations
+            if observation_slice in slices
+        )
+        return ObservationPlan(plan.key, slices, plan.reason, generations)
+
+    async def handle_github_event(
+        self,
+        event_name: str,
+        repo: str,
+        number: int,
+        head_sha: str,
+        action: str | None = None,
+    ) -> None:
+        """Apply a GitHub event after any in-flight refresh transaction.
+
+        The webhook route deliberately hands this method the normalized event
+        fields rather than mutating dashboard state itself.  Waiting on the
+        same lock as ``refresh_prs`` guarantees a blocked refresh cannot land
+        after the event and erase its invalidation.
+        """
+
+        normalized_event = event_name.strip().casefold()
+        normalized_action = action.strip().casefold() if action is not None else None
+        async with self._refresh_lock:
+            root = self._known_event_root(repo)
+            if root is _EventRepoResolution.UNKNOWN:
+                self.log(
+                    f"Ignoring event for unknown GitHub repo {repo!r}",
+                    pr_number=number,
+                    level="warn",
+                )
+                return
+
+            is_pull_request = normalized_event == "pull_request"
+            is_metadata_change = is_pull_request
+
+            observation_target = self._event_observation_target(root, repo, number)
+            if observation_target is None and not is_pull_request:
+                self.log(
+                    f"Ignoring event for untracked PR #{number} in {repo}",
+                    pr_number=number,
+                    level="info",
+                )
+                return
+
+            if is_metadata_change:
+                due_at = self.observation_controller.now() + EVENT_DEBOUNCE_WINDOW
+                self._metadata_event_due[root] = due_at
+
+            if observation_target is None:
+                # A known repo can receive ``opened`` for a PR absent from the
+                # cache.  The debounced metadata relist above will discover it;
+                # there is no immutable key to invalidate yet.
+                if (
+                    is_pull_request
+                    and normalized_action in {"opened", "reopened"}
+                ):
+                    event_now = self.observation_controller.now()
+                    self._opened_event_prs.setdefault(root, set()).add(number)
+                    self._opened_event_expirations[(root, number)] = (
+                        event_now + OPENED_EVENT_DISCOVERY_WINDOW
+                    )
+                    # A previous missed terminal event may have expired this
+                    # PR's fast-discovery window and moved the root back to the
+                    # normal reconciliation cadence. A fresh open/reopen event
+                    # starts a new bounded window rather than inheriting that
+                    # stale long deadline.
+                    self._metadata_event_due[root] = (
+                        event_now + EVENT_DEBOUNCE_WINDOW
+                    )
+                    self._opened_event_retry_due[root] = (
+                        event_now + EVENT_DEBOUNCE_WINDOW
+                    )
+                elif is_pull_request and normalized_action == "closed":
+                    pending_opened = self._opened_event_prs.get(root)
+                    if pending_opened is not None:
+                        pending_opened.discard(number)
+                        self._opened_event_expirations.pop(
+                            (root, number), None
+                        )
+                        if not pending_opened:
+                            self._opened_event_prs.pop(root, None)
+                            self._opened_event_retry_due.pop(root, None)
+                return
+
+            tracked_key, observation_key = observation_target
+            if is_pull_request and (
+                not head_sha or head_sha == observation_key.head_sha
+            ):
+                self._metadata_unconfirmed_keys.add(observation_key)
+            if (
+                is_pull_request
+                and normalized_action in _HEAD_INVALIDATION_ACTIONS
+                and head_sha
+                and head_sha != observation_key.head_sha
+            ):
+                self._event_head_overrides[tracked_key] = head_sha
+                self._event_head_override_observed_at[tracked_key] = (
+                    self.observation_controller.now()
+                )
+
+            self.observation_controller.handle_event(
+                normalized_event,
+                observation_key.repo,
+                observation_key.number,
+                head_sha,
+                action=normalized_action,
+                now=self.observation_controller.now(),
+            )
+            if not head_sha or head_sha == observation_key.head_sha:
+                self._revoke_event_blocker_authority(
+                    observation_key,
+                    normalized_event,
+                    normalized_action,
+                )
+
+    def _revoke_event_blocker_authority(
+        self,
+        key: ObservationKey,
+        event_name: str,
+        action: str | None,
+    ) -> None:
+        """Make event-invalidated blocker slices non-authoritative until read."""
+
+        invalidated: set[ObservationSlice] = set()
+        if event_name in _REVIEW_INVALIDATION_EVENTS:
+            invalidated.add(ObservationSlice.REVIEW)
+        elif event_name in _CI_INVALIDATION_EVENTS:
+            invalidated.add(ObservationSlice.CI)
+        elif event_name == "pull_request" and action in _HEAD_INVALIDATION_ACTIONS:
+            invalidated.update({ObservationSlice.REVIEW, ObservationSlice.CI})
+        if not invalidated:
+            return
+        observed = self._observed_blocker_slices.get(key)
+        if observed is not None:
+            observed.difference_update(invalidated)
+        self._observed_blocker_keys.discard(key)
+
+    async def handle_github_check_event(
+        self,
+        event_name: str,
+        repo: str,
+        head_sha: str,
+        action: str | None = None,
+    ) -> None:
+        """Invalidate CI by immutable head when GitHub omits PR associations."""
+
+        normalized_repo = _normalize_repo(repo)
+        normalized_event = event_name.strip().casefold()
+        normalized_action = action.strip().casefold() if action is not None else None
+        async with self._refresh_lock:
+            root = self._known_event_root(repo)
+            if root is _EventRepoResolution.UNKNOWN:
+                self.log(
+                    f"Ignoring check event for unknown GitHub repo {repo!r}",
+                    level="warn",
+                )
+                return
+
+            matched = False
+            for key, observation_key in self._observation_keys.items():
+                if self._pr_root.get(key) != root:
+                    continue
+                if _normalize_repo(key[0]) != normalized_repo:
+                    continue
+                if observation_key.head_sha != head_sha:
+                    continue
+                matched = True
+                self.observation_controller.handle_event(
+                    normalized_event,
+                    observation_key.repo,
+                    observation_key.number,
+                    observation_key.head_sha,
+                    action=normalized_action,
+                    now=self.observation_controller.now(),
+                )
+                self._revoke_event_blocker_authority(
+                    observation_key,
+                    normalized_event,
+                    normalized_action,
+                )
+            if not matched:
+                self.log(
+                    f"Ignoring check event for untracked head {head_sha[:12]} in {repo}",
+                    level="info",
+                )
+
     def start(self) -> None:
         if self._poll_task is None or self._poll_task.done():
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -277,17 +999,23 @@ class Orchestrator:
             elapsed = asyncio.get_running_loop().time() - started
             await asyncio.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
 
-    async def refresh_prs(self) -> list[PRData]:
-        """Fetch all open PRs across every configured repo and update state.
+    async def refresh_prs(self, force: bool = False) -> list[PRData]:
+        """Refresh cached PR metadata and due review/CI observations.
 
         The dashboard covers ``[anchor] + maintenance_repo_roots`` (BOU-1598):
         the same root list the maintenance loop honors. Each root is polled with
         that root as the ``github_api.*`` cwd, sequentially, with per-repo error
         isolation — a single repo's poll failing (gh error or exception) must not
-        drop another repo's PRs. With no extra roots configured this reduces to
-        exactly today's single-repo behavior.
+        drop another repo's PRs. By default, successful metadata is reused until
+        its 15-minute reconciliation is due; ``force=True`` bypasses that cache
+        and refreshes every observation slice immediately.
         """
-        now = datetime.now(timezone.utc)
+        async with self._refresh_lock:
+            return await self._refresh_prs_locked(force=force)
+
+    async def _refresh_prs_locked(self, *, force: bool = False) -> list[PRData]:
+        """Run one refresh transaction while :attr:`_refresh_lock` is held."""
+        now = self.observation_controller.now()
 
         # Runner-execution summary is a fleet-wide stat — poll it once (anchor),
         # not per-repo.
@@ -305,14 +1033,264 @@ class Orchestrator:
 
         for root in self._repo_roots():
             try:
-                await self._refresh_repo(root, now)
+                await self._refresh_repo(root, now, force=force)
             except Exception as exc:
                 # Per-repo isolation: one bad repo must not sink the dashboard.
                 self.log(f"Poll error for repo root {root}: {exc}", level="error")
 
+        active_observation_keys = set(self._observation_keys.values())
+        self.observation_controller.prune(active_observation_keys)
+        self._observed_blocker_keys.intersection_update(active_observation_keys)
+        self._observed_blocker_slices = {
+            key: slices
+            for key, slices in self._observed_blocker_slices.items()
+            if key in active_observation_keys
+        }
+        self._mergeability_pending_keys.intersection_update(
+            active_observation_keys
+        )
+        self._mergeability_retry_after = {
+            key: retry_after
+            for key, retry_after in self._mergeability_retry_after.items()
+            if key in active_observation_keys
+        }
+        self._metadata_unconfirmed_keys.intersection_update(
+            active_observation_keys
+        )
+
         return list(self.prs.values())
 
-    async def _refresh_repo(self, root: str | None, now: datetime) -> None:
+    async def _rich_metadata_list(
+        self,
+        root: str | None,
+        now: datetime,
+        *,
+        force: bool,
+        bootstrap: bool = True,
+    ) -> tuple[list[dict] | None, bool]:
+        """Run the expensive rich PR list only after quota admission."""
+
+        context, decision = self._quota_allows(
+            force=force, estimated_cost=METADATA_GRAPHQL_ESTIMATED_COST
+        )
+        if not decision.allowed:
+            self.log(
+                f"Deferring rich metadata for {root}: quota {decision.reason.value}",
+                level="warn",
+            )
+            self._metadata_last_attempt[root] = now
+            return self._metadata_cache.get(root), False
+
+        reservation = self.quota_ledger.reserve(
+            context.caller,
+            context.work_class,
+            estimated_cost=context.estimated_cost,
+        )
+        if reservation is None:
+            self.log(
+                f"Deferring rich metadata for {root}: quota admission changed",
+                level="warn",
+            )
+            self._metadata_last_attempt[root] = now
+            return self._metadata_cache.get(root), False
+
+        list_error: Exception | None = None
+        invalid_list_result = False
+        try:
+            listed_prs = await asyncio.to_thread(github_api.list_open_prs, root)
+        except Exception as exc:  # noqa: BLE001 - preserve cached metadata
+            listed_prs = None
+            list_error = exc
+        if listed_prs is not None and not isinstance(listed_prs, list):
+            listed_prs = None
+            invalid_list_result = True
+            list_error = TypeError("list_open_prs returned a non-list result")
+        self._metadata_last_attempt[root] = now
+        if listed_prs is None:
+            failure = github_api.last_list_open_prs_failure()
+            completed_unparseable = (
+                failure is not None
+                and failure.reason in {"invalid-json", "not-a-list"}
+            ) or invalid_list_result
+            if completed_unparseable:
+                # GitHub completed this GraphQL-backed command and consumed
+                # quota even though its payload could not be projected. Charge
+                # the conservative reservation once, then retain degradation
+                # below because the observation itself was unusable.
+                self._record_estimated_success(context, reservation)
+            else:
+                self._record_estimated_failure(reservation)
+            self.quota_ledger.record_failure(
+                reason="rich_metadata_unavailable",
+                count_request=not completed_unparseable,
+            )
+            if failure is not None and failure.is_rate_limited:
+                self.quota_ledger.record_backoff(
+                    METADATA_GRAPHQL_FAILURE_BACKOFF,
+                    reason="rich_metadata_rate_limited",
+                )
+            detail = f" — {failure.summary()}" if failure else ""
+            if list_error is not None:
+                detail = f" — {list_error}"
+            self.log(
+                f"Skipping metadata refresh for {root}: could not list open PRs"
+                f" (GitHub API unavailable{detail})",
+                level="error",
+            )
+            return self._metadata_cache.get(root), False
+
+        raw_prs = [raw for raw in listed_prs if isinstance(raw, dict)]
+        self._record_estimated_success(context, reservation)
+        await self._cache_metadata(root, raw_prs, now)
+        if bootstrap:
+            await self._bootstrap_metadata_validator(root)
+        self.observed_roots.add(root)
+        return raw_prs, True
+
+    async def _bootstrap_metadata_validator(self, root: str | None) -> None:
+        """Capture a REST validator after the first rich discovery.
+
+        ``gh pr list`` does not expose response headers, so the first rich
+        discovery cannot itself provide an ETag.  A one-time body-bearing REST
+        request captures the validator for the next 15-minute reconciliation;
+        later probes can then receive a cheap 304.  Failure is harmless: the
+        next scheduled probe is an ordinary 200 and will establish it.
+        """
+
+        if root in self._metadata_validators:
+            return
+        identity = self._root_repo_identity.get(root, "")
+        if "/" not in identity:
+            return
+        # Avoid surprising old lightweight adapters that replace only the rich
+        # list boundary. Production and explicit probe adapters still get the
+        # validator bootstrap.
+        if (
+            github_api.list_open_prs.__module__ != github_api.__name__
+            and github_api.probe_open_prs_rest.__module__ == github_api.__name__
+        ):
+            return
+        owner, repo_name = identity.split("/", 1)
+        try:
+            probe = await asyncio.to_thread(
+                github_api.probe_open_prs_rest,
+                owner,
+                repo_name,
+                cwd=root,
+            )
+        except Exception:  # noqa: BLE001 - validator is an optimization
+            return
+        if probe.observable and (probe.etag or probe.last_modified):
+            self._metadata_validators[root] = (probe.etag, probe.last_modified)
+
+    async def _read_metadata(
+        self,
+        root: str | None,
+        now: datetime,
+        *,
+        force: bool,
+    ) -> tuple[list[dict] | None, bool]:
+        """Read metadata using rich discovery or a conditional REST validator."""
+
+        if force or root not in self._metadata_cache:
+            return await self._rich_metadata_list(root, now, force=force)
+
+        # Lightweight test/embedding adapters historically replace the rich
+        # list boundary but do not provide a REST probe. Preserve that adapter
+        # contract; production functions live in ``github_api`` and always use
+        # the conditional path below.
+        if (
+            github_api.list_open_prs.__module__ != github_api.__name__
+            and github_api.probe_open_prs_rest.__module__ == github_api.__name__
+        ):
+            return await self._rich_metadata_list(root, now, force=force)
+
+        identity = self._root_repo_identity.get(root, "")
+        if "/" not in identity:
+            # A legacy fixture may have supplied metadata without a URL.  The
+            # rich list is the only way to establish a REST repository target.
+            return await self._rich_metadata_list(root, now, force=force)
+
+        owner, repo_name = identity.split("/", 1)
+        etag, last_modified = self._metadata_validators.get(root, (None, None))
+        try:
+            probe = await asyncio.to_thread(
+                github_api.probe_open_prs_rest,
+                owner,
+                repo_name,
+                etag=etag,
+                last_modified=last_modified,
+                cwd=root,
+            )
+        except Exception as exc:  # noqa: BLE001 - retain the last good cache
+            probe = github_api.ConditionalPRListProbe(
+                None, [], etag=etag, last_modified=last_modified, error=str(exc)
+            )
+        self._metadata_last_attempt[root] = now
+        if probe.not_modified:
+            self._metadata_validators[root] = (
+                probe.etag or etag,
+                probe.last_modified or last_modified,
+            )
+            last_rich = self._metadata_last_rich_success.get(root)
+            if (
+                last_rich is None
+                or now >= last_rich + RICH_METADATA_RECONCILIATION_INTERVAL
+            ):
+                # The REST validator says the open-PR representation is
+                # unchanged, but it cannot validate GraphQL-only fields such
+                # as reviewDecision or mergeability. Periodically refresh the
+                # rich snapshot independently of that validator.
+                return await self._rich_metadata_list(
+                    root, now, force=force, bootstrap=False
+                )
+            self._metadata_last_success[root] = now
+            event_due = self._metadata_event_due.get(root)
+            if event_due is not None and now >= event_due:
+                self._metadata_event_due.pop(root, None)
+            if self._has_pending_opened(root, now):
+                self._opened_event_retry_due[root] = (
+                    now + METADATA_COLD_START_RETRY_INTERVAL
+                )
+            else:
+                self._opened_event_retry_due.pop(root, None)
+            self.quota_ledger.record_cache_hit(
+                QuotaCaller.OPERATOR if force else QuotaCaller.DASHBOARD,
+                QuotaWorkClass.EXPLICIT_OPERATOR
+                if force
+                else QuotaWorkClass.BACKGROUND_OBSERVATION,
+            )
+            # A validator-confirmed 304 is an authoritative metadata
+            # observation. The cached list is unchanged, but the controller
+            # must acknowledge any metadata invalidation carried by this plan.
+            return self._metadata_cache[root], True
+
+        if probe.changed:
+            raw_prs, rich_read = await self._rich_metadata_list(
+                root, now, force=force, bootstrap=False
+            )
+            if rich_read:
+                self._metadata_validators[root] = (
+                    probe.etag or etag,
+                    probe.last_modified or last_modified,
+                )
+            return raw_prs, rich_read
+
+        # Keep the old validator when the probe failed.  Reusing a new ETag
+        # from a failed/partial response could turn a temporary outage into a
+        # permanent 304 and leave the dashboard stale forever.
+        detail = probe.error or "REST open-PR probe unavailable"
+        self.log(
+            f"Skipping metadata reconciliation for {root}: {detail}",
+            level="warn",
+        )
+        # ``_metadata_last_attempt`` is the 15-minute backoff clock.  The raw
+        # cache remains authoritative for projection but cannot prove pruning.
+        return self._metadata_cache[root], False
+
+    async def _refresh_repo(
+        self, root: str | None, now: datetime, *, force: bool = False
+    ) -> None:
         """Poll and enrich every open PR for a single repo root.
 
         ``root`` is the cwd passed to every ``github_api.*`` call so the poll is
@@ -320,78 +1298,74 @@ class Orchestrator:
         discovered are eligible to be pruned, so another repo's PRs (or a repo
         whose poll just failed) are never dropped.
         """
-        raw_prs = await asyncio.to_thread(github_api.list_open_prs, root)
-
-        # A None result means the GitHub API call failed (rate-limited or
-        # unreachable) rather than "no open PRs". Skip THIS repo's cycle so a
-        # transient failure can neither prune its tracked PRs nor, by aborting
-        # mid-enrichment, leave merged PRs pinned on the board. Other repos are
-        # untouched (per-repo isolation).
-        if raw_prs is None:
-            # Name the failure class (auth vs network vs rate-limit) instead of
-            # the bare "unavailable" — during BOU-1987 the undifferentiated
-            # message hid an expired-token 401 behind a network-looking outage.
-            failure = github_api.last_list_open_prs_failure()
-            detail = f" — {failure.summary()}" if failure else ""
-            self.log(
-                f"Skipping refresh for {root}: could not list open PRs "
-                f"(GitHub API unavailable{detail})",
-                level="error",
+        metadata_due = self._metadata_refresh_due(root, now, force=force)
+        raw_prs: list[dict] | None
+        metadata_read = False
+        if metadata_due:
+            raw_prs, metadata_read = await self._read_metadata(
+                root, now, force=force
             )
-            return
-        self.observed_roots.add(root)
+            if raw_prs is None:
+                return
+            event_due = self._metadata_event_due.get(root)
+            if (
+                not metadata_read
+                and event_due is not None
+                and now >= event_due
+            ):
+                self._metadata_event_due[root] = now + self._metadata_interval()
+            if not metadata_read:
+                if self._has_pending_opened(root, now):
+                    self._opened_event_retry_due[root] = (
+                        now + METADATA_COLD_START_RETRY_INTERVAL
+                    )
+                else:
+                    self._opened_event_retry_due.pop(root, None)
+        else:
+            raw_prs = self._metadata_cache.get(root)
+            if raw_prs is None:
+                return
 
-        # Prune merged/closed PRs FIRST, straight from the cheap open-PR list,
-        # so a failure in the per-PR enrichment below can never leave a merged
-        # PR pinned. Scope the prune to PRs THIS root discovered so a sibling
-        # repo's PRs are never collaterally dropped.
-        open_numbers = {
-            raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
-        }
-        for key in list(self.prs.keys()):
-            if self._pr_root.get(key) != root:
-                continue
-            if key[1] not in open_numbers:
-                old = self.prs.pop(key)
-                self._pr_root.pop(key, None)
-                self.log(
-                    f"PR #{key[1]} closed/merged: {old.title}",
-                    pr_number=key[1],
-                    level="success",
-                )
+        # Prune merged/closed PRs FIRST, but only after a successful metadata
+        # list. A cached list is observationally useful yet cannot prove that a
+        # missing PR is closed, so it must never prune current state.
+        if metadata_read:
+            open_numbers = {
+                raw["number"]
+                for raw in raw_prs
+                if isinstance(raw.get("number"), int)
+            }
+            for key in list(self.prs.keys()):
+                if self._pr_root.get(key) != root:
+                    continue
+                if key[1] not in open_numbers:
+                    old = self.prs.pop(key)
+                    self._pr_root.pop(key, None)
+                    self._observation_keys.pop(key, None)
+                    self._event_head_overrides.pop(key, None)
+                    self._event_head_override_observed_at.pop(key, None)
+                    self.log(
+                        f"PR #{key[1]} closed/merged: {old.title}",
+                        pr_number=key[1],
+                        level="success",
+                    )
 
-        # Prime the existing per-PR accessors from one immutable-head GraphQL
-        # observation before enrichment. Without this, every dashboard poll
-        # performs latest-commit, CI, and review-thread requests separately for
-        # every PR; a nominal 60-second poll then takes several minutes for a
-        # busy repository and the board serves stale state between completions.
-        # Missing/paginated entries deliberately fall through to the original
-        # per-PR accessors, preserving their correctness behavior.
+        # Drop the previous tick's batch entries before planning. A CI-only
+        # refresh must reach the live CI accessor rather than reusing a stale
+        # full-observation cache entry.
         github_api.clear_pr_batch_cache()
-        owner, repo_name = await asyncio.to_thread(github_api.get_repo_info, root)
-        if owner and repo_name and open_numbers:
-            entries = await asyncio.to_thread(
-                github_api.batch_fetch_pr_review_and_ci,
-                owner,
-                repo_name,
-                sorted(open_numbers),
-                root,
-            )
-            github_api.prime_pr_batch_cache(
-                f"{owner}/{repo_name}", entries, cwd=root
-            )
 
         # Get-or-create every PR object up front (cheap, mutates the shared
         # ``self.prs`` map serially to avoid races), then enrich the independent
         # per-PR REST/GraphQL work CONCURRENTLY below (BOU-1637 #4). Each PR's
         # enrichment only touches its own ``PRData``, so gathering them is safe.
-        to_enrich: list[tuple[PRData, dict]] = []
+        to_enrich: list[tuple[PRData, dict, ObservationPlan | None]] = []
         for raw in raw_prs:
             num = raw.get("number")
             if not isinstance(num, int):
                 continue
 
-            repo = _repo_from_url(raw.get("url", ""))
+            repo = _normalize_repo(_repo_from_url(str(raw.get("url", ""))))
             key: PRKey = (repo, num)
 
             # Get or create PR data
@@ -410,22 +1384,157 @@ class Orchestrator:
                 self.prs[key] = pr
                 self.log(f"Discovered PR #{num}: {pr.title}", pr_number=num)
             self._pr_root[key] = root
-            to_enrich.append((pr, raw))
+
+            # GitHub's bulk PR listing exposes the immutable head directly.
+            # Keep that value as the observation identity: the latest-commit
+            # accessor is a requested read, not the identity that decides
+            # whether a plan is due.
+            head_sha = self._event_head_overrides.get(key) or str(
+                raw.get("headRefOid") or ""
+            )
+            if not head_sha:
+                # Older test/fixture payloads and degraded REST fallbacks may
+                # omit headRefOid. Keep those callers on a stable legacy key;
+                # real GitHub list payloads always take the branch above.
+                head_sha = f"legacy-head-{num}"
+            observation_repo = pr.repo or root or "legacy-repo"
+            observation_number = num
+            if num <= 0:
+                # ObservationKey models real GitHub PR identities, whose
+                # numbers are positive. Keep malformed fixture/REST entries
+                # isolated without letting one bad number abort this repo's
+                # enrichment batch.
+                observation_repo = f"{observation_repo}:legacy-{num}"
+                observation_number = 1
+            observation_key = ObservationKey(
+                observation_repo, observation_number, head_sha
+            )
+            self._observation_keys[key] = observation_key
+            plan = self.observation_controller.plan_for(
+                observation_key.repo,
+                observation_key.number,
+                observation_key.head_sha,
+                now=now,
+                force=force,
+            )
+            plan = self._plan_for_available_slices(
+                plan,
+                metadata_read=metadata_read,
+            )
+            to_enrich.append((pr, raw, plan))
+
+        # Prime the existing per-PR accessors from one immutable-head GraphQL
+        # observation, but only when at least one PR needs BOTH review and CI.
+        # Missing/paginated entries deliberately fall through to the original
+        # per-PR accessors, preserving their correctness behavior.
+        batch_numbers = sorted(
+            {
+                pr.number
+                for pr, raw, plan in to_enrich
+                if plan is not None
+                and bool(raw.get("headRefOid"))
+                and ObservationSlice.REVIEW in plan.slices
+                and ObservationSlice.CI in plan.slices
+            }
+        )
+        batch_denied_numbers: set[int] = set()
+        batch_observed_numbers: set[int] = set()
+        batch_fallback_numbers: set[int] = set()
+        if batch_numbers:
+            batch_context, batch_decision = self._quota_allows(
+                force=force, estimated_cost=BATCH_GRAPHQL_ESTIMATED_COST
+            )
+            if not batch_decision.allowed:
+                # A denied batch is an unobservable full read. Do not let the
+                # per-PR fallback accessors issue unmetered GraphQL requests.
+                batch_denied_numbers.update(batch_numbers)
+                self.log(
+                    f"Deferring review/CI batch for {root}: quota "
+                    f"{batch_decision.reason.value}",
+                    level="warn",
+                )
+            else:
+                # Until the result proves otherwise, every requested PR needs
+                # an explicitly accounted fallback. A partial/failed batch
+                # must not silently reach the old unmetered GraphQL accessors.
+                batch_fallback_numbers.update(batch_numbers)
+                try:
+                    identity = self._root_repo_identity.get(root)
+                    if identity and "/" in identity:
+                        owner, repo_name = identity.split("/", 1)
+                    else:
+                        owner, repo_name = await asyncio.to_thread(
+                            github_api.get_repo_info, root
+                        )
+                    if owner and repo_name:
+                        try:
+                            entries = await asyncio.to_thread(
+                                github_api.batch_fetch_pr_review_and_ci,
+                                owner,
+                                repo_name,
+                                batch_numbers,
+                                root,
+                                quota_context=batch_context,
+                            )
+                        except TypeError as exc:
+                            # Preserve the old four-argument adapter contract
+                            # used by embedding callers and focused tests.
+                            if "quota_context" not in str(exc):
+                                raise
+                            entries = await asyncio.to_thread(
+                                github_api.batch_fetch_pr_review_and_ci,
+                                owner,
+                                repo_name,
+                                batch_numbers,
+                                root,
+                            )
+                        github_api.prime_pr_batch_cache(
+                            f"{owner}/{repo_name}", entries, cwd=root
+                        )
+                        batch_observed_numbers.update(
+                            number
+                            for number in entries
+                            if number in batch_numbers
+                        )
+                        batch_fallback_numbers.difference_update(
+                            batch_observed_numbers
+                        )
+                        if getattr(entries, "denied", False):
+                            denied_numbers = set(batch_numbers) - batch_observed_numbers
+                            batch_denied_numbers.update(denied_numbers)
+                            batch_fallback_numbers.difference_update(denied_numbers)
+                except Exception as exc:  # noqa: BLE001
+                    self.log(
+                        f"Batch observation failed for repo root {root}: {exc}",
+                        level="warn",
+                    )
 
         # Enrich each PR concurrently, bounded by a modest semaphore so a large
         # pool doesn't hammer the gh API into a rate-limit wall. Per-PR error
         # isolation: one PR's failed enrichment must not drop the others.
         sem = asyncio.Semaphore(ENRICHMENT_CONCURRENCY)
 
-        async def _guarded(pr: PRData, raw: dict) -> None:
+        async def _guarded(
+            pr: PRData, raw: dict, plan: ObservationPlan | None
+        ) -> None:
             async with sem:
-                await self._enrich_pr(pr, raw, root, now)
+                await self._enrich_pr(
+                    pr,
+                    raw,
+                    root,
+                    now,
+                    plan,
+                    batch_denied=pr.number in batch_denied_numbers,
+                    batch_observed=pr.number in batch_observed_numbers,
+                    batch_fallback=pr.number in batch_fallback_numbers,
+                    force=force,
+                )
 
         results = await asyncio.gather(
-            *(_guarded(pr, raw) for pr, raw in to_enrich),
+            *(_guarded(pr, raw, plan) for pr, raw, plan in to_enrich),
             return_exceptions=True,
         )
-        for (pr, _raw), result in zip(to_enrich, results):
+        for (pr, _raw, _plan), result in zip(to_enrich, results):
             if isinstance(result, Exception):
                 self.log(
                     f"Enrichment failed for PR #{pr.number}: {result}",
@@ -434,19 +1543,48 @@ class Orchestrator:
                 )
 
     async def _enrich_pr(
-        self, pr: PRData, raw: dict, root: str | None, now: datetime
+        self,
+        pr: PRData,
+        raw: dict,
+        root: str | None,
+        now: datetime,
+        plan: ObservationPlan | None = None,
+        *,
+        batch_denied: bool = False,
+        batch_observed: bool = False,
+        batch_fallback: bool = False,
+        force: bool = False,
     ) -> None:
         """Enrich a single PR with its per-PR REST/GraphQL state.
 
         Only ``pr``'s own fields are mutated here, so multiple ``_enrich_pr``
         calls run concurrently without sharing state (BOU-1637 #4). ``root`` is
         the repo cwd passed to every ``github_api.*`` call so the enrichment is
-        scoped to that PR's repo.
+        scoped to that PR's repo. ``plan`` controls the expensive review and CI
+        reads; ``None`` refreshes cheap list metadata and projects status from
+        the already-cached observation.
         """
         num = pr.number
+        review_requested = (
+            plan is not None and ObservationSlice.REVIEW in plan.slices
+        )
+        ci_requested = plan is not None and ObservationSlice.CI in plan.slices
+        metadata_requested = (
+            plan is not None and ObservationSlice.METADATA in plan.slices
+        )
+        full_observation_requested = (
+            plan is not None
+            and ObservationSlice.REVIEW in plan.slices
+            and ObservationSlice.CI in plan.slices
+        )
 
         # Update metadata
         pr.title = raw.get("title", pr.title)
+        pr.branch = raw.get("headRefName", pr.branch) or pr.branch
+        pr.url = raw.get("url", pr.url) or pr.url
+        draft_value = raw.get("isDraft")
+        if isinstance(draft_value, bool):
+            pr.is_draft = draft_value
         pr.base_branch = raw.get("baseRefName", pr.base_branch) or pr.base_branch
         pr.review_decision = raw.get("reviewDecision", "") or "none"
         pr.labels = [
@@ -465,10 +1603,26 @@ class Orchestrator:
         # to "unknown" and, if the refetch then failed, slide back to Clean.
         bulk_merge_state = raw.get("mergeStateStatus") or ""
         bulk_mergeable = raw.get("mergeable") or ""
+        metadata_mergeability_observed = True
+        mergeability_key = (
+            plan.key
+            if plan is not None
+            else self._observation_keys.get((pr.repo, num))
+        )
         if bulk_merge_state and bulk_merge_state != "UNKNOWN":
             pr.merge_state = bulk_merge_state
         if bulk_mergeable and bulk_mergeable != "UNKNOWN":
             pr.mergeable = bulk_mergeable
+        if (
+            metadata_requested
+            and mergeability_key is not None
+            and bulk_merge_state
+            and bulk_merge_state != "UNKNOWN"
+            and bulk_mergeable
+            and bulk_mergeable != "UNKNOWN"
+        ):
+            self._mergeability_pending_keys.discard(mergeability_key)
+            self._mergeability_retry_after.pop(mergeability_key, None)
 
         # Find worktree — scoped to THIS repo's root so a same-named branch
         # in a sibling repo can't resolve a multi-repo PR to the wrong
@@ -476,80 +1630,407 @@ class Orchestrator:
         # single-repo/no-cwd path, which restores the unscoped behavior.
         pr.worktree_path = find_worktree_for_branch(pr.branch, root=root)
 
-        if bulk_merge_state in ("", "UNKNOWN") or bulk_mergeable in ("", "UNKNOWN"):
-            refetched_state, refetched_mergeable = await asyncio.to_thread(
-                github_api.get_mergeability, num, root
+        mergeability_fields_present = (
+            "mergeStateStatus" in raw or "mergeable" in raw
+        )
+        if metadata_requested and mergeability_fields_present and (
+            bulk_merge_state in ("", "UNKNOWN")
+            or bulk_mergeable in ("", "UNKNOWN")
+        ):
+            fallback_attempted = False
+            primed_mergeability = github_api.get_primed_mergeability(num, root)
+            if primed_mergeability is not None:
+                refetched_state, refetched_mergeable = primed_mergeability
+            else:
+                retry_after = (
+                    self._mergeability_retry_after.get(mergeability_key)
+                    if mergeability_key is not None
+                    else None
+                )
+                if not force and retry_after is not None and now < retry_after:
+                    refetched_state, refetched_mergeable = "", ""
+                else:
+                    fallback_attempted = True
+                    refetched_state, refetched_mergeable = (
+                        await self._mergeability_fallback(
+                            num,
+                            root,
+                            force=force,
+                        )
+                    )
+            metadata_mergeability_observed = bool(
+                refetched_state
+                and refetched_state.upper() != "UNKNOWN"
+                and refetched_mergeable
+                and refetched_mergeable.upper() != "UNKNOWN"
             )
+            if mergeability_key is not None:
+                if metadata_mergeability_observed:
+                    self._mergeability_pending_keys.discard(mergeability_key)
+                    self._mergeability_retry_after.pop(mergeability_key, None)
+                else:
+                    self._mergeability_pending_keys.add(mergeability_key)
+                    if fallback_attempted:
+                        self._mergeability_retry_after[mergeability_key] = (
+                            now + METADATA_RECONCILIATION_INTERVAL
+                        )
             # A successful refetch is authoritative — it also picks up a
             # conflict that has since been resolved. A failed refetch returns
             # ("","") and leaves the preserved last-known value intact.
-            if refetched_state:
+            if refetched_state and refetched_state.upper() != "UNKNOWN":
                 pr.merge_state = refetched_state
-            if refetched_mergeable:
+            if refetched_mergeable and refetched_mergeable.upper() != "UNKNOWN":
                 pr.mergeable = refetched_mergeable
 
-        # Get latest commit info
-        previous_commit_sha = pr.latest_commit_sha
-        sha, date = await asyncio.to_thread(
-            github_api.get_latest_commit, num, root
-        )
-        pr.latest_commit_sha = sha
-        pr.latest_commit_date = date
-        if previous_commit_sha and sha and sha != previous_commit_sha:
-            pr.no_push_comment_retry_count = 0
-
-        # Get CI checks
-        checks = await asyncio.to_thread(
-            github_api.get_ci_checks, num, root
-        )
-        pr.ci_checks = checks
-        if any(c.status in {"queued", "in_progress"} for c in checks):
-            queued_jobs, runner_pool_health, runner_execution_summary = await asyncio.to_thread(
-                github_api.get_workflow_queue_health, num, root
+        # Stage requested observations before mutating blocker state. GitHub
+        # boundary failures commonly look like an empty collection; the typed
+        # results below distinguish that from an authoritative clean result.
+        latest_result = None
+        ci_result = None
+        ci_from_rest = False
+        ci_rest_head = ""
+        cached_ci_head = pr.latest_commit_sha
+        review_result = None
+        latest_commit_date = pr.latest_commit_date
+        plan_head_changed = False
+        if full_observation_requested:
+            plan_head = plan.key.head_sha if plan is not None else ""
+            latest_value = await asyncio.to_thread(
+                github_api.get_latest_commit, num, root
             )
-            pr.queued_jobs = queued_jobs
-            pr.runner_pool_health = runner_pool_health
-            pr.runner_execution_summary = runner_execution_summary
-        else:
-            pr.queued_jobs = []
-            pr.runner_pool_health = []
-            pr.runner_execution_summary = pr.runner_execution_summary.__class__()
-
-        # Compute failing checks (code only, not infra)
-        pr.failing_checks = [
-            c.name for c in checks
-            if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
-        ]
-
-        # Get unaddressed comments (filtered by commit date!) with per-thread decisions
-        comments, decisions = await asyncio.to_thread(
-            github_api.scan_review_threads, num, date, root
-        )
-        pr.review_comments = comments
-        self._emit(
-            "comment_scan",
-            pr_number=num,
-            repo=root,
-            details={"decisions": [d.model_dump() for d in decisions], "picked": len(comments)},
-        )
-
-        if not pr.review_comments:
-            pr.no_push_comment_retry_count = 0
-
-        # New unaddressed comment IDs unblock a stuck AGENT_FAILED PR.
-        # Otherwise agent_failure_reason only clears on a fresh commit,
-        # which means fresh review feedback can't re-trigger auto-dispatch.
-        current_comment_ids = {c.id for c in comments}
-        new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
-        if new_comment_ids and num not in self._inflight_prs:
-            if pr.agent_failure_reason:
-                self.log(
-                    f"New unaddressed comment(s) on PR #{num} — clearing stuck failure state",
+            if (
+                len(latest_value) >= 2
+                and bool(latest_value[0])
+                and bool(latest_value[1])
+                and _observation_head_matches(
+                    plan_head, str(latest_value[0])
+                )
+            ):
+                latest_result = github_api.ObservationReadResult.observed(
+                    (str(latest_value[0]), str(latest_value[1]))
+                )
+            else:
+                plan_head_changed = bool(
+                    len(latest_value) >= 1
+                    and latest_value[0]
+                    and plan_head
+                    and not _observation_head_matches(
+                        plan_head, str(latest_value[0])
+                    )
+                )
+                latest_result = github_api.ObservationReadResult.unavailable(
+                    "latest commit observation unavailable"
+                )
+            if latest_result.observable and latest_result.value is not None:
+                _sha, latest_commit_date = latest_result.value
+            if plan_head_changed:
+                review_result = github_api.ObservationReadResult.unavailable(
+                    "review observation unavailable: observation plan head "
+                    "is no longer current"
+                )
+            elif batch_denied:
+                review_result = github_api.ObservationReadResult.unavailable(
+                    "review observation deferred: dashboard quota denied batch"
+                )
+            elif batch_observed:
+                # The batch already paid for and populated the immutable-head
+                # review cache. Consume that authoritative slice directly;
+                # the post-response remaining value may now protect the
+                # reserve, but it must not invalidate a successful read.
+                review_result = await asyncio.to_thread(
+                    github_api.scan_review_threads_observation,
+                    num,
+                    latest_commit_date,
+                    root,
+                )
+            else:
+                review_result = await self._review_fallback_observation(
+                    num,
+                    latest_commit_date,
+                    root,
+                    force=force,
+                )
+        elif review_requested:
+            # Review-only events must not spend another latest-commit read. The
+            # cached commit date is reusable only when it belongs to this
+            # plan's immutable head. A partial head-change observation can
+            # leave the previous head's date on ``pr``; refetch the prerequisite
+            # before scanning rather than applying stale review history.
+            plan_head = plan.key.head_sha if plan is not None else ""
+            if (
+                pr.latest_commit_date
+                and pr.latest_commit_sha
+                and _observation_head_matches(
+                    plan_head, pr.latest_commit_sha
+                )
+            ):
+                review_result = await self._review_fallback_observation(
+                    num,
+                    pr.latest_commit_date,
+                    root,
+                    force=force,
+                )
+            else:
+                latest_value = await asyncio.to_thread(
+                    github_api.get_latest_commit, num, root
+                )
+                if (
+                    len(latest_value) >= 2
+                    and bool(latest_value[0])
+                    and bool(latest_value[1])
+                    and _observation_head_matches(
+                        plan_head, str(latest_value[0])
+                    )
+                ):
+                    latest_result = github_api.ObservationReadResult.observed(
+                        (str(latest_value[0]), str(latest_value[1]))
+                    )
+                    latest_commit_date = str(latest_value[1])
+                    review_result = await self._review_fallback_observation(
+                        num,
+                        latest_commit_date,
+                        root,
+                        force=force,
+                    )
+                else:
+                    latest_result = github_api.ObservationReadResult.unavailable(
+                        "latest commit observation unavailable for review retry"
+                    )
+                    review_result = github_api.ObservationReadResult.unavailable(
+                    "review observation unavailable: current-head latest "
+                    "commit date missing"
+                    )
+        if ci_requested:
+            if full_observation_requested and plan_head_changed:
+                ci_result = github_api.ObservationReadResult.unavailable(
+                    "CI observation unavailable: observation plan head is no "
+                    "longer current"
+                )
+            elif (
+                batch_denied
+                or batch_fallback
+                or (not review_requested and not full_observation_requested)
+            ):
+                # A pending/check-event-only poll, and the CI half of a denied
+                # full batch, must stay on REST and use the cached immutable
+                # head. It is intentionally outside the GraphQL background
+                # budget, so a depleted review budget does not hide runner
+                # progress or fall through to an unmetered ``gh pr checks``.
+                # REST CI must be keyed to this refresh's immutable head. A
+                # cached PR object can still carry the prior head while a
+                # plan/raw metadata read has already advanced to a new one.
+                # Prefer the plan identity, then a validated latest-commit
+                # result, then raw metadata; consult the cached PR only for
+                # legacy callers that have none of those current-head values.
+                cached_head = ""
+                if (
+                    plan is not None
+                    and plan.key.head_sha
+                    and not plan.key.head_sha.startswith("legacy-head-")
+                ):
+                    cached_head = str(plan.key.head_sha)
+                if (
+                    not cached_head
+                    and latest_result is not None
+                    and latest_result.observable
+                    and latest_result.value is not None
+                ):
+                    cached_head = str(latest_result.value[0] or "")
+                if not cached_head:
+                    cached_head = str(raw.get("headRefOid") or "")
+                if not cached_head:
+                    cached_head = pr.latest_commit_sha
+                ci_from_rest = True
+                ci_rest_head = cached_head
+                ci_result = await asyncio.to_thread(
+                    github_api.get_ci_checks_rest_observation,
+                    cached_head,
+                    root,
                     pr_number=num,
                 )
-                pr.agent_failure_reason = None
-            pr.no_push_comment_retry_count = 0
-        pr.last_seen_comment_ids = current_comment_ids
+            else:
+                ci_result = await asyncio.to_thread(
+                    github_api.get_ci_checks_observation, num, root
+                )
+
+        latest_observed = (
+            latest_result is not None
+            and latest_result.observable
+            and latest_result.value is not None
+        )
+        ci_observed = (
+            ci_result is not None
+            and ci_result.observable
+            and ci_result.value is not None
+        )
+        review_observed = (
+            review_result is not None
+            and review_result.observable
+            and review_result.value is not None
+            and (not full_observation_requested or latest_observed)
+        )
+        failed_requested_slice = (
+            metadata_requested
+            and (
+                not metadata_mergeability_observed
+                or (full_observation_requested and not latest_observed)
+            )
+        ) or (ci_requested and not ci_observed) or (
+            review_requested and not review_observed
+        )
+        if failed_requested_slice:
+            errors = [
+                result.error or "unobservable read"
+                for result in (latest_result, ci_result, review_result)
+                if result is not None
+                and (not result.observable or result.value is None)
+            ]
+            if (
+                full_observation_requested
+                and review_result is not None
+                and review_result.observable
+                and not latest_observed
+            ):
+                errors.append(
+                    "review observation unavailable: latest commit prerequisite "
+                    "unavailable"
+                )
+            if metadata_requested and not metadata_mergeability_observed:
+                errors.append("mergeability observation unavailable")
+            self.log(
+                f"Preserving cached blockers for PR #{num}: {'; '.join(errors)}",
+                pr_number=num,
+                level="warn",
+            )
+
+        if latest_observed and latest_result is not None:
+            previous_commit_sha = pr.latest_commit_sha
+            sha, latest_commit_date = latest_result.value
+            pr.latest_commit_sha = sha
+            pr.latest_commit_date = latest_commit_date
+            if previous_commit_sha and sha != previous_commit_sha:
+                pr.no_push_comment_retry_count = 0
+
+        if ci_observed and ci_result is not None:
+            checks = list(ci_result.value)
+            if (
+                ci_from_rest
+                and cached_ci_head
+                and ci_rest_head == cached_ci_head
+            ):
+                observed_names = {check.name for check in checks}
+                checks.extend(
+                    check
+                    for check in pr.ci_checks
+                    if check.status in {"queued", "in_progress"}
+                    and check.name not in observed_names
+                )
+            pr.ci_checks = checks
+            ci_pending = any(
+                c.status in {"queued", "in_progress"} for c in checks
+            )
+            # Queue diagnostics belong to the CI slice, not the full
+            # observation. A PR that stays pending after its first full read
+            # is polled every 30s with a CI-only plan.
+            if ci_pending:
+                queued_jobs, runner_pool_health, runner_execution_summary = (
+                    await asyncio.to_thread(
+                        github_api.get_workflow_queue_health, num, root
+                    )
+                )
+                pr.queued_jobs = queued_jobs
+                pr.runner_pool_health = runner_pool_health
+                pr.runner_execution_summary = runner_execution_summary
+            else:
+                pr.queued_jobs = []
+                pr.runner_pool_health = []
+                pr.runner_execution_summary = (
+                    pr.runner_execution_summary.__class__()
+                )
+            pr.failing_checks = [
+                c.name
+                for c in checks
+                if c.conclusion == "failure"
+                and not github_api._is_infra_check(c.name)
+            ]
+
+        if review_observed and review_result is not None:
+            comments, decisions = review_result.value
+            pr.review_comments = comments
+            self._emit(
+                "comment_scan",
+                pr_number=num,
+                repo=root,
+                details={
+                    "decisions": [d.model_dump() for d in decisions],
+                    "picked": len(comments),
+                },
+            )
+            if not comments:
+                pr.no_push_comment_retry_count = 0
+            current_comment_ids = {c.id for c in comments}
+            new_comment_ids = current_comment_ids - pr.last_seen_comment_ids
+            if new_comment_ids and num not in self._inflight_prs:
+                if pr.agent_failure_reason:
+                    self.log(
+                        f"New unaddressed comment(s) on PR #{num} — "
+                        "clearing stuck failure state",
+                        pr_number=num,
+                    )
+                    pr.agent_failure_reason = None
+                pr.no_push_comment_retry_count = 0
+            pr.last_seen_comment_ids = current_comment_ids
+
+        if plan is not None:
+            observed_slices: set[ObservationSlice] = set()
+            if metadata_requested and (
+                metadata_mergeability_observed
+                and (not full_observation_requested or latest_observed)
+            ):
+                observed_slices.add(ObservationSlice.METADATA)
+            if ci_requested and ci_observed:
+                observed_slices.add(ObservationSlice.CI)
+            if review_requested and review_observed:
+                observed_slices.add(ObservationSlice.REVIEW)
+            if observed_slices:
+                acknowledged_slices = frozenset(observed_slices)
+                acknowledged_plan = ObservationPlan(
+                    plan.key,
+                    acknowledged_slices,
+                    plan.reason,
+                    frozenset(
+                        (observation_slice, generation)
+                        for observation_slice, generation in (
+                            plan.invalidation_generations
+                        )
+                        if observation_slice in acknowledged_slices
+                    ),
+                )
+                self.observation_controller.record_refresh(
+                    acknowledged_plan,
+                    ci_pending=(
+                        any(
+                            c.status in {"queued", "in_progress"}
+                            for c in pr.ci_checks
+                        )
+                        if ObservationSlice.CI in acknowledged_slices
+                        else False
+                    ),
+                )
+                if ObservationSlice.METADATA in acknowledged_slices:
+                    self._metadata_unconfirmed_keys.discard(plan.key)
+                blocker_slices = observed_slices.intersection(
+                    {ObservationSlice.REVIEW, ObservationSlice.CI}
+                )
+                if blocker_slices:
+                    self._observed_blocker_slices.setdefault(
+                        plan.key, set()
+                    ).update(blocker_slices)
+                if {
+                    ObservationSlice.REVIEW,
+                    ObservationSlice.CI,
+                } <= self._observed_blocker_slices.get(plan.key, set()):
+                    self._observed_blocker_keys.add(plan.key)
 
         # Read escalation marker (best-effort): if the maintenance loop has
         # repeatedly failed to fix this PR, flag it so the dashboard can surface
@@ -567,7 +2048,60 @@ class Orchestrator:
             pass
 
         # Compute status
-        pr.status = self._compute_status(pr)
+        #
+        # ``observation_unavailable`` means THIS immutable head has never had a
+        # successful review+CI read, so every blocker below came from a previous
+        # head — the very push we could not observe may already have fixed it.
+        # Reporting that stale verdict is not just cosmetic: CI_FAILING and the
+        # comment statuses are auto-dispatch triggers, so maintenance would be
+        # launched against work that no longer exists. Fail closed to
+        # "unavailable" for every observation-derived status, not only CLEAN.
+        # Statuses sourced elsewhere stay authoritative: a pending human
+        # decision and a local agent failure are dashboard state. Merge
+        # conflict normally comes from the metadata slice, but a positive
+        # latest-head mismatch proves that metadata describes the old head too.
+        current_observation_key = (
+            plan.key
+            if plan is not None
+            else self._observation_keys.get((pr.repo, num))
+        )
+        raw_head = str(raw.get("headRefOid") or "")
+        pending_event_head = self._event_head_overrides.get((pr.repo, num), "")
+        metadata_head_unconfirmed = bool(
+            pending_event_head and raw_head != pending_event_head
+        )
+        metadata_projection_unavailable = bool(
+            metadata_head_unconfirmed
+            or (metadata_requested and not metadata_mergeability_observed)
+            or (
+                current_observation_key is not None
+                and (
+                    current_observation_key in self._mergeability_pending_keys
+                    or current_observation_key in self._metadata_unconfirmed_keys
+                )
+            )
+        )
+        observation_unavailable = bool(
+            plan_head_changed
+            or metadata_projection_unavailable
+            or (
+                current_observation_key is not None
+                and current_observation_key not in self._observed_blocker_keys
+            )
+        )
+        computed_status = self._compute_status(pr)
+        pr.status = (
+            PRStatus.OBSERVATION_UNAVAILABLE
+            if (
+                (plan_head_changed or metadata_projection_unavailable)
+                and computed_status in _STALE_HEAD_DERIVED_STATUSES
+            )
+            or (
+                observation_unavailable
+                and computed_status in _OBSERVATION_DERIVED_STATUSES
+            )
+            else computed_status
+        )
         pr.last_polled = now
 
         if not pr.worktree_path and pr.status == PRStatus.CLEAN:
@@ -631,6 +2165,7 @@ class Orchestrator:
         can_dispatch = (
             num not in self._inflight_prs
             and pr.worktree_path
+            and not pr.is_draft
             and not pr.agent_failure_reason
         )
         if can_dispatch:
