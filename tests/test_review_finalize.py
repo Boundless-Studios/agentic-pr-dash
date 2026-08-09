@@ -1,6 +1,8 @@
 import pytest
 from agent_review_coordinator import (
     FindingSettlementState,
+    HeadAttestation,
+    HeadAttestationKind,
     ReviewLedger,
     ReviewPolicy,
     ReviewResult,
@@ -99,6 +101,85 @@ def test_clean_snapshot_is_ready_but_not_final_until_reobserved() -> None:
     assert first.clean
     assert not combine_clean_observations(first, None).settled
     assert combine_clean_observations(first, first).settled
+
+
+def test_exhausted_descendant_attestation_does_not_report_local_slot() -> None:
+    first_head = "c" * 40
+    reviewed_head = "b" * 40
+    ledger = ReviewLedger(
+        repository=REPOSITORY,
+        head_sha=first_head,
+        delivery_id=DELIVERY_ID,
+        review_charter_version=REVIEW_CHARTER_VERSION,
+    )
+    policy = _policy().model_copy(
+        update={
+            "review": _policy().review.model_copy(
+                update={
+                    "local": _policy().review.local.model_copy(
+                        update={"max_generation_rounds": 2}
+                    )
+                }
+            )
+        }
+    )
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=first_head,
+            stage=ReviewStage.LOCAL,
+            round_number=1,
+            slot_number=1,
+            reviewer_execution_id="local-r1",
+        )
+    )
+    ledger.advance_head(reviewed_head)
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=reviewed_head,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-r2",
+        )
+    )
+    ledger.advance_head(HEAD)
+    ledger.record_head_attestation(
+        HeadAttestation(
+            repository=REPOSITORY,
+            delivery_id=DELIVERY_ID,
+            review_charter_version=REVIEW_CHARTER_VERSION,
+            reviewed_head_sha=reviewed_head,
+            head_sha=HEAD,
+            kind=HeadAttestationKind.EXHAUSTED_DELIVERY_CONTINUITY,
+            delta_sha256="a" * 64,
+            evidence=["ci:tests-success"],
+            attested_by="gaia-review-local",
+        ),
+        stage_policy=policy.review.local,
+    )
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.BACKSTOP,
+            round_number=1,
+            slot_number=1,
+            reviewer_execution_id="backstop-current-head",
+        )
+    )
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=policy,
+        ledger=ledger,
+        threads=[],
+        deferrals={},
+    )
+
+    assert observation.review.missing_slots == []
+    assert observation.review.settled
 
 
 def test_required_ci_pending_blocks() -> None:

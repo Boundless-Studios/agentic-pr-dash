@@ -31,7 +31,7 @@ def test_review_coordinator_contract_version() -> None:
         review_charter_version="review-charter-v1",
     )
 
-    assert __version__ == "0.3.0"
+    assert __version__ == "0.4.0"
     assert ledger.version == 2
 
 
