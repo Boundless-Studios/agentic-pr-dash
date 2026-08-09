@@ -260,6 +260,7 @@ def _observe_finalization(args, policy, ledger):
 _LOCAL_REVIEW_ITEMS = frozenset(
     {
         "verify_fix",
+        "address_p0",
         "address_p1",
         "evaluate_p2",
         "fix_p2",
