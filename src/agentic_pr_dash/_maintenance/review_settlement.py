@@ -24,7 +24,7 @@ from agentic_pr_dash.maintenance import terminal_clean_blockers
 from agentic_pr_dash.models import PRData
 
 _SEVERITY_PREFIX = re.compile(
-    r"^\s*(?:\*\*)?\[(P[12])\]\s*",
+    r"^\s*(?:\*\*)?\[(P[0-3])\]\s*",
     re.IGNORECASE,
 )
 
@@ -62,7 +62,7 @@ def _thread_title(body: str) -> str:
 
 
 def declared_review_body_lines(body: str) -> list[str]:
-    """Return each explicitly declared P1/P2 line from a review body."""
+    """Return each line with a severity declared by the typed contract."""
 
     return [
         line.strip()
@@ -97,8 +97,8 @@ def finding_from_thread(
         reviewer_execution_id=reviewer_execution_id,
         reviewer_provider=thread.top.author or None,
         severity=(
-            Severity.P1
-            if declared and declared.group(1).upper() == "P1"
+            Severity(declared.group(1).lower())
+            if declared
             else Severity.P2
         ),
         title=_thread_title(body),
@@ -120,7 +120,7 @@ def findings_from_review_submission(
     head_sha: str,
     reviewer_execution_id: str,
 ) -> list[Finding]:
-    """Translate each declared P1/P2 in a top-level GitHub review body."""
+    """Translate each typed severity declaration in a GitHub review body."""
 
     declared_lines = [
         (line, _SEVERITY_PREFIX.match(line))
@@ -132,11 +132,7 @@ def findings_from_review_submission(
             head_sha=head_sha,
             reviewer_execution_id=reviewer_execution_id,
             reviewer_provider=review.author or None,
-            severity=(
-                Severity.P1
-                if match.group(1).upper() == "P1"
-                else Severity.P2
-            ),
+            severity=Severity(match.group(1).lower()),
             title=_thread_title(line),
             explanation=line,
             path=".github/pull-request",

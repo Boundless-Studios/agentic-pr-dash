@@ -370,6 +370,47 @@ def test_exhausted_review_budget_does_not_suppress_p1() -> None:
     assert observation.review.required_actions == ["address_p1"]
 
 
+def test_exhausted_review_budget_does_not_suppress_p0() -> None:
+    from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+
+    ledger = _ledger()
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-review-round-2",
+            reviewer_provider="round-two-provider",
+        )
+    )
+    thread = ReviewThread(
+        node_id="PRRT_exhausted_p0",
+        is_resolved=False,
+        is_outdated=False,
+        top=ReviewThreadComment(
+            database_id=5,
+            path="src/review.py",
+            line=26,
+            body="[P0] Irreversible data loss",
+            author="reviewer",
+            created_at="2026-07-28T00:00:00Z",
+        ),
+    )
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert not observation.clean
+    assert observation.review.required_actions == ["address_p0"]
+
+
 def test_p1_deferral_never_settles() -> None:
     from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 

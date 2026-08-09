@@ -11,6 +11,7 @@ from agent_review_coordinator import (
 
 from agentic_pr_dash._maintenance.review_settlement import (
     finding_from_thread,
+    findings_from_review_submission,
     overlay_backstop_evidence,
     overlay_backstop_results,
     overlay_github_findings,
@@ -128,6 +129,46 @@ def test_finding_from_thread_normalizes_p1_and_snapshot_identity() -> None:
     assert finding.path == "scripts/review.py"
     assert finding.line == 10
     assert "PRRT_one" in (finding.evidence or "")
+
+
+def test_finding_from_thread_preserves_declared_p0() -> None:
+    finding = finding_from_thread(
+        _thread(body="[P0] Prevent irreversible data loss"),
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="github-backstop",
+    )
+
+    assert finding.severity is Severity.P0
+
+
+def test_top_level_review_preserves_declared_p0() -> None:
+    findings = findings_from_review_submission(
+        ReviewSubmission(
+            review_id=123,
+            author="review-bot",
+            state="COMMENTED",
+            commit_id=HEAD,
+            submitted_at="2026-07-28T00:00:00Z",
+            body="[P0] Prevent irreversible data loss",
+        ),
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="github-review-123",
+    )
+
+    assert [finding.severity for finding in findings] == [Severity.P0]
+
+
+def test_declared_p3_preserves_nonblocking_typed_severity() -> None:
+    finding = finding_from_thread(
+        _thread(body="[P3] Optional readability improvement"),
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="github-backstop",
+    )
+
+    assert finding.severity is Severity.P3
 
 
 def test_declared_p2_stays_p2_when_explanation_mentions_p1() -> None:
