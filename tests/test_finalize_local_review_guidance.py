@@ -20,6 +20,7 @@ from agentic_pr_dash.maintenance_check import _render_unsettled_message
 # Local-review items — resolved by a local commit + re-running review_local.py.
 LOCAL_REVIEW_ITEMS = [
     "verify_fix",
+    "address_p0",
     "address_p1",
     "evaluate_p2",
     "fix_p2",
