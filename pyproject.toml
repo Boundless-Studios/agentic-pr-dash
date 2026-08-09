@@ -19,7 +19,7 @@ dependencies = [
     # Provider-neutral review topology, finding normalization, and settlement.
     # Keep this immutable; downstream Gaia pins APD only after this reviewed
     # contract is available from a tagged release.
-    "agent-review-coordinator @ git+https://github.com/Boundless-Studios/agent-review-coordinator.git@fb1ec2288cb3eff495869c8bebca199a40b09b76",
+    "agent-review-coordinator @ git+https://github.com/Boundless-Studios/agent-review-coordinator.git@6a4de5fe9854d76b0e4ede0091de6478b566c2f4",
     # Pinned to an immutable commit (BOU-1812 CI fix): a mutable ``@main`` ref
     # makes CI non-reproducible and can silently adopt a breaking change. Bump
     # this sha deliberately, together with the call sites.
