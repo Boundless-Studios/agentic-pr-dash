@@ -197,6 +197,42 @@ async def test_failed_metadata_relist_backoff_uses_latest_attempt(
 
 
 @pytest.mark.asyncio
+async def test_metadata_interval_does_not_bypass_event_debounce(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    raw = [_raw_pr()]
+    calls = {"list": 0}
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return list(raw)
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+
+    clock.advance(timedelta(minutes=14, seconds=59))
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="labeled"
+    )
+    clock.advance(timedelta(seconds=1))
+    await orch.refresh_prs()
+    assert calls["list"] == 1
+    assert orch._metadata_event_due["/repos/widgets"] == (
+        clock() + timedelta(seconds=1)
+    )
+
+    clock.advance(timedelta(seconds=1))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+    assert "/repos/widgets" not in orch._metadata_event_due
+
+
+@pytest.mark.asyncio
 async def test_opened_event_uses_cached_empty_root_identity(
     monkeypatch, observation_boundaries
 ):
@@ -229,6 +265,189 @@ async def test_opened_event_uses_cached_empty_root_identity(
 
     assert calls == {"list": 2, "repo_info": 1}
     assert orch.get_pr(7, repo="org/widgets") is not None
+
+
+@pytest.mark.asyncio
+async def test_failed_opened_event_relist_retries_on_poll_cadence(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    calls = {"list": 0}
+    raw = [_raw_pr()]
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return [[], None, raw][calls["list"] - 1]
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="opened"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+    assert orch.get_pr(7, repo="org/widgets") is None
+
+    clock.advance(timedelta(seconds=14))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+
+    clock.advance(timedelta(seconds=1))
+    await orch.refresh_prs()
+    assert calls["list"] == 3
+    assert orch.get_pr(7, repo="org/widgets") is not None
+
+
+@pytest.mark.asyncio
+async def test_closed_event_cancels_pending_undiscovered_pr_retry(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    calls = {"list": 0}
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return [] if calls["list"] == 1 else None
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="opened"
+    )
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="closed"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+    assert orch._opened_event_prs == {}
+
+    clock.advance(timedelta(seconds=15))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+
+
+@pytest.mark.asyncio
+async def test_undiscovered_opened_event_fast_retry_expires(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    calls = {"list": 0}
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return [] if calls["list"] == 1 else None
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="opened"
+    )
+
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    assert calls["list"] == 2
+
+    for expected_calls in (3, 4):
+        clock.advance(timedelta(seconds=15))
+        await orch.refresh_prs()
+        assert calls["list"] == expected_calls
+
+    clock.advance(timedelta(seconds=15))
+    await orch.refresh_prs()
+    assert calls["list"] == 4
+    assert orch._opened_event_prs == {}
+    assert orch._opened_event_expirations == {}
+
+
+@pytest.mark.asyncio
+async def test_reopened_event_restarts_expired_discovery_window(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    calls = {"list": 0}
+    raw = [_raw_pr()]
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return raw if calls["list"] == 5 else ([] if calls["list"] == 1 else None)
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="opened"
+    )
+
+    for advance in (2, 15, 15):
+        clock.advance(timedelta(seconds=advance))
+        await orch.refresh_prs()
+    assert calls["list"] == 4
+
+    clock.advance(timedelta(seconds=15))
+    await orch.refresh_prs()
+    assert calls["list"] == 4
+    assert orch._opened_event_prs == {}
+
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="reopened"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    assert calls["list"] == 5
+    assert orch.get_pr(7, repo="org/widgets") is not None
+
+
+@pytest.mark.asyncio
+async def test_expired_open_discovery_does_not_delay_new_metadata_event(
+    monkeypatch, observation_boundaries
+):
+    clock = ManualClock()
+    calls = {"list": 0}
+
+    def list_open_prs(cwd=None):
+        calls["list"] += 1
+        return [_raw_pr()] if calls["list"] == 1 else None
+
+    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 8, "head-8", action="opened"
+    )
+
+    for advance in (2, 15, 15, 15):
+        clock.advance(timedelta(seconds=advance))
+        await orch.refresh_prs()
+    assert calls["list"] == 4
+    assert orch._opened_event_prs == {}
+
+    await orch.handle_github_event(
+        "pull_request", "org/widgets", 7, "head-1", action="labeled"
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+    assert calls["list"] == 5
 
 
 @pytest.mark.asyncio

@@ -71,6 +71,24 @@ def _graphql_payload(numbers: list[int], *, cost: int = 37) -> dict:
     }
 
 
+@pytest.mark.parametrize("status", ["WAITING", "REQUESTED", "PENDING"])
+def test_batch_checkrun_normalizes_every_nonterminal_status(status: str) -> None:
+    checks = github_api._batch_ci_checks(
+        [
+            {
+                "__typename": "CheckRun",
+                "name": "build",
+                "status": status,
+                "conclusion": None,
+            }
+        ]
+    )
+
+    assert len(checks) == 1
+    assert checks[0].status == "in_progress"
+    assert checks[0].conclusion is None
+
+
 def test_quota_ledger_records_rate_limit_costs_and_telemetry() -> None:
     now = datetime(2026, 8, 8, tzinfo=timezone.utc)
     ledger = QuotaLedger(

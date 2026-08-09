@@ -138,6 +138,7 @@ RICH_METADATA_RECONCILIATION_INTERVAL = timedelta(hours=1)
 # hold it empty for a whole reconciliation interval; retry on the next poll tick
 # instead. Once a usable cache exists, the long backoff above applies again.
 METADATA_COLD_START_RETRY_INTERVAL = timedelta(seconds=POLL_INTERVAL_SECONDS)
+OPENED_EVENT_DISCOVERY_WINDOW = timedelta(seconds=45)
 EVENT_DEBOUNCE_WINDOW = timedelta(seconds=2)
 # Blocker statuses that are only as current as the last successful review+CI
 # observation of the PR's immutable head. See ``_enrich_pr``'s status
@@ -303,6 +304,11 @@ class Orchestrator:
         # next refresh after the deadline relists that root; an event for an
         # unknown repo never gets to mutate another root's controller state.
         self._metadata_event_due: dict[str | None, datetime] = {}
+        self._opened_event_prs: dict[str | None, set[int]] = {}
+        self._opened_event_expirations: dict[
+            tuple[str | None, int], datetime
+        ] = {}
+        self._opened_event_retry_due: dict[str | None, datetime] = {}
         self._inflight_prs: set[int] = set()
         self.events: list[EventEntry] = []
         cached_runner_summary = github_api.load_runner_execution_summary_cache()
@@ -587,9 +593,17 @@ class Orchestrator:
         if force:
             return True
 
+        if not self._has_pending_opened(root, now):
+            self._opened_event_retry_due.pop(root, None)
         event_due = self._metadata_event_due.get(root)
-        if event_due is not None:
-            return now >= event_due
+        opened_retry_due = self._opened_event_retry_due.get(root)
+        if any(
+            due_at is not None and now >= due_at
+            for due_at in (event_due, opened_retry_due)
+        ):
+            return True
+        if event_due is not None or opened_retry_due is not None:
+            return False
 
         interval = self._metadata_interval()
         last_attempt = self._metadata_last_attempt.get(root)
@@ -612,6 +626,22 @@ class Orchestrator:
         ]
         reference = max(references) if references else None
         return reference is None or now >= reference + interval
+
+    def _has_pending_opened(self, root: str | None, now: datetime) -> bool:
+        """Whether an undiscovered opened PR is still in its bounded fast retry."""
+
+        pending = self._opened_event_prs.get(root)
+        if not pending:
+            return False
+        for number in tuple(pending):
+            expires_at = self._opened_event_expirations.get((root, number))
+            if expires_at is not None and now >= expires_at:
+                pending.discard(number)
+                self._opened_event_expirations.pop((root, number), None)
+        if not pending:
+            self._opened_event_prs.pop(root, None)
+            return False
+        return True
 
     async def _cache_metadata(
         self, root: str | None, raw_prs: list[dict], now: datetime
@@ -688,6 +718,25 @@ class Orchestrator:
         event_due = self._metadata_event_due.get(root)
         if event_due is not None and now >= event_due:
             self._metadata_event_due.pop(root, None)
+        discovered = {
+            raw["number"]
+            for raw in cache
+            if isinstance(raw.get("number"), int)
+        }
+        pending_opened = self._opened_event_prs.get(root)
+        if pending_opened is not None:
+            pending_opened.difference_update(discovered)
+            for number in discovered:
+                self._opened_event_expirations.pop((root, number), None)
+            if not pending_opened:
+                self._opened_event_prs.pop(root, None)
+                pending_opened = None
+        if pending_opened and self._has_pending_opened(root, now):
+            self._opened_event_retry_due[root] = (
+                now + METADATA_COLD_START_RETRY_INTERVAL
+            )
+        else:
+            self._opened_event_retry_due.pop(root, None)
 
     def _known_event_root(self, repo: str) -> str | None | _EventRepoResolution:
         """Resolve an event repo without conflating a mapped ``None`` root."""
@@ -793,15 +842,42 @@ class Orchestrator:
 
             if is_metadata_change:
                 due_at = self.observation_controller.now() + EVENT_DEBOUNCE_WINDOW
-                existing_due = self._metadata_event_due.get(root)
-                self._metadata_event_due[root] = (
-                    due_at if existing_due is None else max(existing_due, due_at)
-                )
+                self._metadata_event_due[root] = due_at
 
             if observation_target is None:
                 # A known repo can receive ``opened`` for a PR absent from the
                 # cache.  The debounced metadata relist above will discover it;
                 # there is no immutable key to invalidate yet.
+                if (
+                    is_pull_request
+                    and normalized_action in {"opened", "reopened"}
+                ):
+                    event_now = self.observation_controller.now()
+                    self._opened_event_prs.setdefault(root, set()).add(number)
+                    self._opened_event_expirations[(root, number)] = (
+                        event_now + OPENED_EVENT_DISCOVERY_WINDOW
+                    )
+                    # A previous missed terminal event may have expired this
+                    # PR's fast-discovery window and moved the root back to the
+                    # normal reconciliation cadence. A fresh open/reopen event
+                    # starts a new bounded window rather than inheriting that
+                    # stale long deadline.
+                    self._metadata_event_due[root] = (
+                        event_now + EVENT_DEBOUNCE_WINDOW
+                    )
+                    self._opened_event_retry_due[root] = (
+                        event_now + EVENT_DEBOUNCE_WINDOW
+                    )
+                elif is_pull_request and normalized_action == "closed":
+                    pending_opened = self._opened_event_prs.get(root)
+                    if pending_opened is not None:
+                        pending_opened.discard(number)
+                        self._opened_event_expirations.pop(
+                            (root, number), None
+                        )
+                        if not pending_opened:
+                            self._opened_event_prs.pop(root, None)
+                            self._opened_event_retry_due.pop(root, None)
                 return
 
             tracked_key, observation_key = observation_target
@@ -811,7 +887,7 @@ class Orchestrator:
                 self._metadata_unconfirmed_keys.add(observation_key)
             if (
                 is_pull_request
-                and normalized_action == "synchronize"
+                and normalized_action in _HEAD_INVALIDATION_ACTIONS
                 and head_sha
                 and head_sha != observation_key.head_sha
             ):
@@ -1172,6 +1248,12 @@ class Orchestrator:
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:
                 self._metadata_event_due.pop(root, None)
+            if self._has_pending_opened(root, now):
+                self._opened_event_retry_due[root] = (
+                    now + METADATA_COLD_START_RETRY_INTERVAL
+                )
+            else:
+                self._opened_event_retry_due.pop(root, None)
             self.quota_ledger.record_cache_hit(
                 QuotaCaller.OPERATOR if force else QuotaCaller.DASHBOARD,
                 QuotaWorkClass.EXPLICIT_OPERATOR
@@ -1225,8 +1307,20 @@ class Orchestrator:
             )
             if raw_prs is None:
                 return
-            if not metadata_read and root in self._metadata_event_due:
+            event_due = self._metadata_event_due.get(root)
+            if (
+                not metadata_read
+                and event_due is not None
+                and now >= event_due
+            ):
                 self._metadata_event_due[root] = now + self._metadata_interval()
+            if not metadata_read:
+                if self._has_pending_opened(root, now):
+                    self._opened_event_retry_due[root] = (
+                        now + METADATA_COLD_START_RETRY_INTERVAL
+                    )
+                else:
+                    self._opened_event_retry_due.pop(root, None)
         else:
             raw_prs = self._metadata_cache.get(root)
             if raw_prs is None:

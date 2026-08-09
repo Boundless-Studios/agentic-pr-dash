@@ -3154,6 +3154,9 @@ def _batch_ci_checks(contexts: list[dict]) -> list[CICheck]:
             status = str(context.get("status") or "unknown").lower()
             conclusion_raw = str(context.get("conclusion") or "").lower()
             conclusion = conclusion_raw or None
+            if status != "completed":
+                status = "in_progress"
+                conclusion = None
             if conclusion in _REST_FAIL_CONCLUSIONS:
                 conclusion = "failure"
             checks.append(CICheck(

@@ -422,8 +422,9 @@ async def test_unobserved_new_head_is_unavailable_and_not_dispatched(
 
 
 @pytest.mark.asyncio
-async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatch(
-    monkeypatch, observation_boundaries
+@pytest.mark.parametrize("head_action", ["synchronize", "reopened"])
+async def test_failed_head_change_relist_retains_new_head_and_suppresses_dispatch(
+    monkeypatch, observation_boundaries, head_action
 ):
     clock = ManualClock()
     list_results = [
@@ -516,7 +517,7 @@ async def test_failed_synchronize_relist_retains_new_head_and_suppresses_dispatc
 
     current_head["value"] = "head-2"
     await orch.handle_github_event(
-        "pull_request", "org/widgets", 7, "head-2", action="synchronize"
+        "pull_request", "org/widgets", 7, "head-2", action=head_action
     )
     await orch.handle_github_event(
         "pull_request", "org/widgets", 7, "head-1", action="labeled"
