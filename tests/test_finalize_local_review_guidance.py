@@ -128,3 +128,16 @@ def test_empty_work_never_renders_local_guidance():
     guidance for nothing."""
     with pytest.raises(ValueError):
         _render_unsettled_message([])
+
+
+@pytest.mark.parametrize(
+    "item",
+    ["architecture_reevaluation_required", "architecture_core_fix_required"],
+)
+def test_architecture_recurrence_pauses_automatic_work(item):
+    message = _render_unsettled_message([item])
+
+    assert message.startswith("PR not settled:")
+    assert "human must record one decision" in message
+    assert "Do not edit, push, or re-run review" in message
+    assert item in message

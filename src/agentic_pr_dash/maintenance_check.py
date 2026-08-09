@@ -290,6 +290,13 @@ _CI_REMOTE_ITEMS = frozenset(
     }
 )
 
+_ARCHITECTURE_DECISION_ITEMS = frozenset(
+    {
+        "architecture_reevaluation_required",
+        "architecture_core_fix_required",
+    }
+)
+
 
 def _is_local_review_item(item: str) -> bool:
     """True when ``item`` is settled by a local commit + re-review, not a push."""
@@ -311,6 +318,14 @@ def _render_unsettled_message(work: list[str]) -> str:
     if not work:
         raise ValueError("unsettled work list must not be empty")
     items = ", ".join(work)
+    if any(item in _ARCHITECTURE_DECISION_ITEMS for item in work):
+        return (
+            f"PR not settled: {items}. Automatic review work is paused because "
+            "the same architectural problem recurred. A human must record one "
+            "decision: plan a core fix as a new delivery, explicitly defer it with "
+            "rationale, or reject it with evidence. Do not edit, push, or re-run "
+            "review until that decision is recorded."
+        )
     if any(not _is_local_review_item(item) for item in work):
         return (
             f"PR not settled: {items}. Address the pending review/CI work and push "
