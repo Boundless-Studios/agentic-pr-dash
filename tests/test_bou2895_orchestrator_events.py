@@ -9,8 +9,13 @@ from types import SimpleNamespace
 import pytest
 
 from agentic_pr_dash import github_api, orchestrator
-from agentic_pr_dash.models import CICheck, ReviewComment, RunnerExecutionSummary
-from agentic_pr_dash.observation import ObservationController
+from agentic_pr_dash.models import (
+    CICheck,
+    PRStatus,
+    ReviewComment,
+    RunnerExecutionSummary,
+)
+from agentic_pr_dash.observation import ObservationController, ObservationSlice
 
 
 class ManualClock:
@@ -554,6 +559,103 @@ async def test_draft_events_project_mutable_metadata_and_suppress_dispatch(
     assert pr.branch == "feature/widgets-ready"
     assert pr.url.endswith("revision=3")
     assert len(dispatched) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mergeability_case", ["clean", "unknown", "conflict"])
+async def test_failed_draft_relist_keeps_cached_metadata_non_actionable(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_boundaries,
+    mergeability_case: str,
+) -> None:
+    clock = ManualClock()
+    raw = _raw_pr()
+    if mergeability_case == "unknown":
+        raw["mergeStateStatus"] = "UNKNOWN"
+        raw["mergeable"] = "UNKNOWN"
+    elif mergeability_case == "conflict":
+        raw["mergeStateStatus"] = "DIRTY"
+        raw["mergeable"] = "CONFLICTING"
+    list_results = [[raw], None]
+    monkeypatch.setattr(
+        github_api,
+        "list_open_prs",
+        lambda cwd=None: list_results.pop(0),
+    )
+    fallback_calls: list[int] = []
+
+    async def unavailable_mergeability(self, number, root, *, force):
+        fallback_calls.append(number)
+        return "", ""
+
+    monkeypatch.setattr(
+        orchestrator.Orchestrator,
+        "_mergeability_fallback",
+        unavailable_mergeability,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "find_worktree_for_branch",
+        lambda branch, root=None: "/worktree",
+    )
+    monkeypatch.setattr(
+        orchestrator.coordinator,
+        "dispatch_decision_for_pr",
+        lambda pr: SimpleNamespace(
+            should_dispatch=True,
+            state="dispatch",
+            reason="",
+        ),
+    )
+    dispatched: list[object] = []
+
+    def capture_task(coro):
+        dispatched.append(coro)
+        coro.close()
+
+    monkeypatch.setattr(orchestrator.asyncio, "create_task", capture_task)
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    pr = orch.get_pr(7, repo="org/widgets")
+    assert pr is not None
+    expected_initial_status = {
+        "clean": PRStatus.CLEAN,
+        "unknown": PRStatus.OBSERVATION_UNAVAILABLE,
+        "conflict": PRStatus.MERGE_CONFLICT,
+    }[mergeability_case]
+    assert pr.status is expected_initial_status
+    dispatched.clear()
+    pr.review_comments = [
+        ReviewComment(
+            id=1,
+            author="reviewer",
+            body="Please fix this",
+            created_at="2026-08-08T00:00:00Z",
+        )
+    ]
+
+    await orch.handle_github_event(
+        "pull_request",
+        "org/widgets",
+        7,
+        "head-1",
+        action="converted_to_draft",
+    )
+    clock.advance(timedelta(seconds=2))
+    await orch.refresh_prs()
+
+    assert pr.is_draft is False
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    assert fallback_calls == ([7] if mergeability_case == "unknown" else [])
+    assert dispatched == []
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert retry is not None
+    assert ObservationSlice.METADATA in retry.slices
 
 
 @pytest.mark.asyncio

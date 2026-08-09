@@ -697,14 +697,120 @@ async def test_partial_observation_applies_and_acknowledges_ci_independently(
     clock.advance(timedelta(seconds=30))
     await orch.refresh_prs()
     assert pr.status is PRStatus.CI_FAILING
+    observation_key = orch._observation_keys[("org/widgets", 7)]
+    assert observation_key in orch._observed_blocker_keys
 
-    # A later transient CI outage must preserve the now-authoritative current
-    # head state instead of returning to OBSERVATION_UNAVAILABLE.
+    # A same-head CI event says the cached blocker projection may have changed.
+    # Revoke that slice's authority until the event-triggered read succeeds.
     ci_available["value"] = False
     await orch.handle_github_event("check_suite", "org/widgets", 7, "head-1")
+    assert observation_key not in orch._observed_blocker_keys
     clock.advance(timedelta(seconds=2))
     await orch.refresh_prs()
-    assert pr.status is PRStatus.CI_FAILING
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+
+
+@pytest.mark.asyncio
+async def test_unknown_mergeability_fallback_failure_keeps_metadata_due(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_boundaries,
+) -> None:
+    clock = ManualClock()
+    raw = _raw_pr()
+    raw["mergeStateStatus"] = "UNKNOWN"
+    raw["mergeable"] = "UNKNOWN"
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw])
+    monkeypatch.setattr(
+        github_api,
+        "get_primed_mergeability",
+        lambda number, cwd=None: None,
+    )
+
+    fallback_calls: list[int] = []
+
+    async def unavailable_mergeability(self, number, root, *, force):
+        fallback_calls.append(number)
+        return "", ""
+
+    monkeypatch.setattr(
+        orchestrator.Orchestrator,
+        "_mergeability_fallback",
+        unavailable_mergeability,
+    )
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+
+    await orch.refresh_prs()
+
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert retry is not None
+    assert ObservationSlice.METADATA in retry.slices
+
+    await orch.refresh_prs()
+
+    assert fallback_calls == [7]
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+    retry = orch.observation_controller.plan_for(
+        "org/widgets", 7, "head-1", now=clock(), ci_pending=False
+    )
+    assert retry is not None
+    assert ObservationSlice.METADATA in retry.slices
+
+    clock.advance(timedelta(minutes=15))
+    await orch.refresh_prs()
+    assert fallback_calls == [7, 7]
+
+    clock.advance(timedelta(seconds=15))
+    await orch.refresh_prs()
+    assert fallback_calls == [7, 7]
+
+
+@pytest.mark.asyncio
+async def test_definite_bulk_mergeability_clears_pending_unavailable_state(
+    monkeypatch: pytest.MonkeyPatch,
+    observation_boundaries,
+) -> None:
+    clock = ManualClock()
+    raw = _raw_pr()
+    raw["mergeStateStatus"] = "UNKNOWN"
+    raw["mergeable"] = "UNKNOWN"
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: [raw])
+    fallback_calls: list[int] = []
+
+    async def unavailable_mergeability(self, number, root, *, force):
+        fallback_calls.append(number)
+        return "", ""
+
+    monkeypatch.setattr(
+        orchestrator.Orchestrator,
+        "_mergeability_fallback",
+        unavailable_mergeability,
+    )
+    orch = orchestrator.Orchestrator(
+        repo_cwd="/repos/widgets",
+        observation_controller=ObservationController(clock=clock),
+    )
+    await orch.refresh_prs()
+    pr = orch.get_pr(7)
+    assert pr is not None
+    assert pr.status is PRStatus.OBSERVATION_UNAVAILABLE
+
+    raw["mergeStateStatus"] = "CLEAN"
+    raw["mergeable"] = "MERGEABLE"
+    clock.advance(timedelta(minutes=15))
+    await orch.refresh_prs()
+
+    assert fallback_calls == [7]
+    assert pr.status is PRStatus.CLEAN
+    key = orch._observation_keys[("org/widgets", 7)]
+    assert key not in orch._mergeability_pending_keys
 
 
 @pytest.mark.asyncio

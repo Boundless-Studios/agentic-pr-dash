@@ -154,7 +154,7 @@ For near-real-time review and CI updates, configure a GitHub repository webhook
 whose payload URL is the dashboard's externally reachable
 `/api/github/webhook` endpoint. Subscribe to `pull_request`,
 `pull_request_review`, `pull_request_review_comment`,
-`pull_request_review_thread`, `check_suite`, and `check_run`. Set the same
+`pull_request_review_thread`, `check_suite`, `check_run`, and `status`. Set the same
 random secret through one of these process environment variables:
 
 ```bash

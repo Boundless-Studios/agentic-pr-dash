@@ -30,6 +30,7 @@ from .observation import (
     ObservationController,
     ObservationKey,
     ObservationPlan,
+    ObservationReason,
     ObservationSlice,
 )
 from .quota import (
@@ -156,6 +157,15 @@ _OBSERVATION_DERIVED_STATUSES = frozenset(
 # ``_OBSERVATION_DERIVED_STATUSES`` so an unavailable review/CI read does not
 # hide an authoritative current-head merge conflict.
 _STALE_HEAD_DERIVED_STATUSES = _OBSERVATION_DERIVED_STATUSES | {PRStatus.MERGE_CONFLICT}
+_REVIEW_INVALIDATION_EVENTS = frozenset(
+    {
+        "pull_request_review",
+        "pull_request_review_comment",
+        "pull_request_review_thread",
+    }
+)
+_CI_INVALIDATION_EVENTS = frozenset({"check_run", "check_suite", "status"})
+_HEAD_INVALIDATION_ACTIONS = frozenset({"opened", "reopened", "synchronize"})
 # Admission estimates are intentionally conservative until the GraphQL batch
 # returns a real ``rateLimit.cost`` sample. They are only used to decide if a
 # background request may start; successful batch requests reconcile to the
@@ -265,6 +275,9 @@ class Orchestrator:
         self._observed_blocker_slices: dict[
             ObservationKey, set[ObservationSlice]
         ] = {}
+        self._mergeability_pending_keys: set[ObservationKey] = set()
+        self._mergeability_retry_after: dict[ObservationKey, datetime] = {}
+        self._metadata_unconfirmed_keys: set[ObservationKey] = set()
         # The poll loop and manual refresh endpoint share one mutable PR/cache
         # projection. Serialize complete refresh transactions so an older
         # GitHub response can never land after a newer one.
@@ -707,11 +720,22 @@ class Orchestrator:
         return None
 
     def _plan_for_available_slices(
-        self, plan: ObservationPlan | None, *, metadata_read: bool
+        self,
+        plan: ObservationPlan | None,
+        *,
+        metadata_read: bool,
     ) -> ObservationPlan | None:
         """Drop an unobservable metadata slice without acknowledging it."""
 
         if plan is None or metadata_read or ObservationSlice.METADATA not in plan.slices:
+            return plan
+        if (
+            plan.reason is ObservationReason.METADATA_RECONCILIATION
+            and plan.key in self._mergeability_pending_keys
+        ):
+            # Cached GraphQL metadata cannot prove repository-wide additions or
+            # removals, but it can retry the quota-admitted per-PR mergeability
+            # prerequisite that left this immutable key unacknowledged.
             return plan
         slices = frozenset(
             observation_slice
@@ -781,6 +805,10 @@ class Orchestrator:
                 return
 
             tracked_key, observation_key = observation_target
+            if is_pull_request and (
+                not head_sha or head_sha == observation_key.head_sha
+            ):
+                self._metadata_unconfirmed_keys.add(observation_key)
             if (
                 is_pull_request
                 and normalized_action == "synchronize"
@@ -800,6 +828,34 @@ class Orchestrator:
                 action=normalized_action,
                 now=self.observation_controller.now(),
             )
+            if not head_sha or head_sha == observation_key.head_sha:
+                self._revoke_event_blocker_authority(
+                    observation_key,
+                    normalized_event,
+                    normalized_action,
+                )
+
+    def _revoke_event_blocker_authority(
+        self,
+        key: ObservationKey,
+        event_name: str,
+        action: str | None,
+    ) -> None:
+        """Make event-invalidated blocker slices non-authoritative until read."""
+
+        invalidated: set[ObservationSlice] = set()
+        if event_name in _REVIEW_INVALIDATION_EVENTS:
+            invalidated.add(ObservationSlice.REVIEW)
+        elif event_name in _CI_INVALIDATION_EVENTS:
+            invalidated.add(ObservationSlice.CI)
+        elif event_name == "pull_request" and action in _HEAD_INVALIDATION_ACTIONS:
+            invalidated.update({ObservationSlice.REVIEW, ObservationSlice.CI})
+        if not invalidated:
+            return
+        observed = self._observed_blocker_slices.get(key)
+        if observed is not None:
+            observed.difference_update(invalidated)
+        self._observed_blocker_keys.discard(key)
 
     async def handle_github_check_event(
         self,
@@ -838,6 +894,11 @@ class Orchestrator:
                     observation_key.head_sha,
                     action=normalized_action,
                     now=self.observation_controller.now(),
+                )
+                self._revoke_event_blocker_authority(
+                    observation_key,
+                    normalized_event,
+                    normalized_action,
                 )
             if not matched:
                 self.log(
@@ -909,6 +970,17 @@ class Orchestrator:
             for key, slices in self._observed_blocker_slices.items()
             if key in active_observation_keys
         }
+        self._mergeability_pending_keys.intersection_update(
+            active_observation_keys
+        )
+        self._mergeability_retry_after = {
+            key: retry_after
+            for key, retry_after in self._mergeability_retry_after.items()
+            if key in active_observation_keys
+        }
+        self._metadata_unconfirmed_keys.intersection_update(
+            active_observation_keys
+        )
 
         return list(self.prs.values())
 
@@ -1252,7 +1324,8 @@ class Orchestrator:
                 force=force,
             )
             plan = self._plan_for_available_slices(
-                plan, metadata_read=metadata_read
+                plan,
+                metadata_read=metadata_read,
             )
             to_enrich.append((pr, raw, plan))
 
@@ -1436,10 +1509,26 @@ class Orchestrator:
         # to "unknown" and, if the refetch then failed, slide back to Clean.
         bulk_merge_state = raw.get("mergeStateStatus") or ""
         bulk_mergeable = raw.get("mergeable") or ""
+        metadata_mergeability_observed = True
+        mergeability_key = (
+            plan.key
+            if plan is not None
+            else self._observation_keys.get((pr.repo, num))
+        )
         if bulk_merge_state and bulk_merge_state != "UNKNOWN":
             pr.merge_state = bulk_merge_state
         if bulk_mergeable and bulk_mergeable != "UNKNOWN":
             pr.mergeable = bulk_mergeable
+        if (
+            metadata_requested
+            and mergeability_key is not None
+            and bulk_merge_state
+            and bulk_merge_state != "UNKNOWN"
+            and bulk_mergeable
+            and bulk_mergeable != "UNKNOWN"
+        ):
+            self._mergeability_pending_keys.discard(mergeability_key)
+            self._mergeability_retry_after.pop(mergeability_key, None)
 
         # Find worktree — scoped to THIS repo's root so a same-named branch
         # in a sibling repo can't resolve a multi-repo PR to the wrong
@@ -1447,21 +1536,50 @@ class Orchestrator:
         # single-repo/no-cwd path, which restores the unscoped behavior.
         pr.worktree_path = find_worktree_for_branch(pr.branch, root=root)
 
-        if metadata_requested and (
+        mergeability_fields_present = (
+            "mergeStateStatus" in raw or "mergeable" in raw
+        )
+        if metadata_requested and mergeability_fields_present and (
             bulk_merge_state in ("", "UNKNOWN")
             or bulk_mergeable in ("", "UNKNOWN")
         ):
+            fallback_attempted = False
             primed_mergeability = github_api.get_primed_mergeability(num, root)
             if primed_mergeability is not None:
                 refetched_state, refetched_mergeable = primed_mergeability
             else:
-                refetched_state, refetched_mergeable = (
-                    await self._mergeability_fallback(
-                        num,
-                        root,
-                        force=force,
-                    )
+                retry_after = (
+                    self._mergeability_retry_after.get(mergeability_key)
+                    if mergeability_key is not None
+                    else None
                 )
+                if not force and retry_after is not None and now < retry_after:
+                    refetched_state, refetched_mergeable = "", ""
+                else:
+                    fallback_attempted = True
+                    refetched_state, refetched_mergeable = (
+                        await self._mergeability_fallback(
+                            num,
+                            root,
+                            force=force,
+                        )
+                    )
+            metadata_mergeability_observed = bool(
+                refetched_state
+                and refetched_state.upper() != "UNKNOWN"
+                and refetched_mergeable
+                and refetched_mergeable.upper() != "UNKNOWN"
+            )
+            if mergeability_key is not None:
+                if metadata_mergeability_observed:
+                    self._mergeability_pending_keys.discard(mergeability_key)
+                    self._mergeability_retry_after.pop(mergeability_key, None)
+                else:
+                    self._mergeability_pending_keys.add(mergeability_key)
+                    if fallback_attempted:
+                        self._mergeability_retry_after[mergeability_key] = (
+                            now + METADATA_RECONCILIATION_INTERVAL
+                        )
             # A successful refetch is authoritative — it also picks up a
             # conflict that has since been resolved. A failed refetch returns
             # ("","") and leaves the preserved last-known value intact.
@@ -1659,8 +1777,10 @@ class Orchestrator:
         )
         failed_requested_slice = (
             metadata_requested
-            and full_observation_requested
-            and not latest_observed
+            and (
+                not metadata_mergeability_observed
+                or (full_observation_requested and not latest_observed)
+            )
         ) or (ci_requested and not ci_observed) or (
             review_requested and not review_observed
         )
@@ -1681,6 +1801,8 @@ class Orchestrator:
                     "review observation unavailable: latest commit prerequisite "
                     "unavailable"
                 )
+            if metadata_requested and not metadata_mergeability_observed:
+                errors.append("mergeability observation unavailable")
             self.log(
                 f"Preserving cached blockers for PR #{num}: {'; '.join(errors)}",
                 pr_number=num,
@@ -1768,7 +1890,8 @@ class Orchestrator:
         if plan is not None:
             observed_slices: set[ObservationSlice] = set()
             if metadata_requested and (
-                not full_observation_requested or latest_observed
+                metadata_mergeability_observed
+                and (not full_observation_requested or latest_observed)
             ):
                 observed_slices.add(ObservationSlice.METADATA)
             if ci_requested and ci_observed:
@@ -1800,6 +1923,8 @@ class Orchestrator:
                         else False
                     ),
                 )
+                if ObservationSlice.METADATA in acknowledged_slices:
+                    self._metadata_unconfirmed_keys.discard(plan.key)
                 blocker_slices = observed_slices.intersection(
                     {ObservationSlice.REVIEW, ObservationSlice.CI}
                 )
@@ -1851,9 +1976,20 @@ class Orchestrator:
         metadata_head_unconfirmed = bool(
             pending_event_head and raw_head != pending_event_head
         )
+        metadata_projection_unavailable = bool(
+            metadata_head_unconfirmed
+            or (metadata_requested and not metadata_mergeability_observed)
+            or (
+                current_observation_key is not None
+                and (
+                    current_observation_key in self._mergeability_pending_keys
+                    or current_observation_key in self._metadata_unconfirmed_keys
+                )
+            )
+        )
         observation_unavailable = bool(
             plan_head_changed
-            or metadata_head_unconfirmed
+            or metadata_projection_unavailable
             or (
                 current_observation_key is not None
                 and current_observation_key not in self._observed_blocker_keys
@@ -1863,7 +1999,7 @@ class Orchestrator:
         pr.status = (
             PRStatus.OBSERVATION_UNAVAILABLE
             if (
-                (plan_head_changed or metadata_head_unconfirmed)
+                (plan_head_changed or metadata_projection_unavailable)
                 and computed_status in _STALE_HEAD_DERIVED_STATUSES
             )
             or (
