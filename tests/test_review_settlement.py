@@ -24,7 +24,15 @@ from agentic_pr_dash.github_api import (
 
 
 def test_review_coordinator_contract_version() -> None:
-    assert __version__ == "0.2.0"
+    ledger = ReviewLedger(
+        repository="Boundless-Studios/gaia-free",
+        head_sha="a" * 40,
+        delivery_id="delivery-pr-24",
+        review_charter_version="review-charter-v1",
+    )
+
+    assert __version__ == "0.3.0"
+    assert ledger.version == 2
 
 
 REPOSITORY = "Boundless-Studios/gaia-free"
