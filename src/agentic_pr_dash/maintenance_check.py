@@ -290,10 +290,16 @@ _CI_REMOTE_ITEMS = frozenset(
     }
 )
 
-_ARCHITECTURE_DECISION_ITEMS = frozenset(
+# Observation errors mean the snapshot itself is unreliable, and they may only
+# clear on ANOTHER observation — so they outrank the architecture pause below,
+# whose message forbids exactly the re-run that would clear them.
+_OBSERVATION_ERROR_ITEMS = frozenset(
     {
-        "architecture_reevaluation_required",
-        "architecture_core_fix_required",
+        "repository_unknown",
+        "ledger_repository_mismatch",
+        "head_unknown",
+        "stabilization_pending",
+        "unstable_observation",
     }
 )
 
@@ -318,14 +324,27 @@ def _render_unsettled_message(work: list[str]) -> str:
     if not work:
         raise ValueError("unsettled work list must not be empty")
     items = ", ".join(work)
-    if any(item in _ARCHITECTURE_DECISION_ITEMS for item in work):
-        return (
-            f"PR not settled: {items}. Automatic review work is paused because "
-            "the same architectural problem recurred. A human must record one "
-            "decision: plan a core fix as a new delivery, explicitly defer it with "
-            "rationale, or reject it with evidence. Do not edit, push, or re-run "
-            "review until that decision is recorded."
-        )
+    # An architecture state read through an unreliable snapshot must not pin the
+    # caller to "do not re-run review" — only another observation can clear the
+    # blocker, so the observation-error guidance keeps precedence.
+    if not any(item in _OBSERVATION_ERROR_ITEMS for item in work):
+        if "architecture_reevaluation_required" in work:
+            return (
+                f"PR not settled: {items}. Automatic review work is paused "
+                "because the same architectural problem recurred. A human must "
+                "record one decision: plan a core fix as a new delivery, "
+                "explicitly defer it with rationale, or reject it with evidence. "
+                "Do not edit, push, or re-run review until that decision is "
+                "recorded."
+            )
+        if "architecture_core_fix_required" in work:
+            return (
+                f"PR not settled: {items}. A human already recorded the "
+                "core-fix decision for the recurring architectural problem; "
+                "recording it again cannot clear this gate. Plan and start the "
+                "core fix as a new delivery. Do not edit, push, or re-run "
+                "review on this PR in the meantime."
+            )
     if any(not _is_local_review_item(item) for item in work):
         return (
             f"PR not settled: {items}. Address the pending review/CI work and push "

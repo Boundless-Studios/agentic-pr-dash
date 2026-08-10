@@ -9,7 +9,7 @@ source = { git = "https://github.com/Boundless-Studios/agent-coordinator.git?rev
 
 [[package]]
 name = "agent-review-coordinator"
-version = "0.3.0"
+version = "0.4.0"
 source = { git = "https://github.com/Boundless-Studios/agent-review-coordinator.git?rev=41eaafe6d27d8a0fbb4d75115682740bd2e52095#41eaafe6d27d8a0fbb4d75115682740bd2e52095" }
 dependencies = [
     { name = "pydantic" },
