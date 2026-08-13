@@ -128,3 +128,54 @@ def test_empty_work_never_renders_local_guidance():
     guidance for nothing."""
     with pytest.raises(ValueError):
         _render_unsettled_message([])
+
+
+def test_architecture_reevaluation_waits_for_recorded_decision():
+    """No decision exists yet for the recurring lineage — the payload demands one."""
+    message = _render_unsettled_message(["architecture_reevaluation_required"])
+
+    assert message.startswith("PR not settled:")
+    assert "human must record one decision" in message
+    assert "Do not edit, push, or re-run review" in message
+    assert "architecture_reevaluation_required" in message
+
+
+def test_architecture_core_fix_directs_the_new_delivery():
+    """core_fix_planned is already recorded — demanding another decision would wedge
+    the agent; the payload must direct starting the core-fix delivery instead."""
+    message = _render_unsettled_message(["architecture_core_fix_required"])
+
+    assert message.startswith("PR not settled:")
+    assert "architecture_core_fix_required" in message
+    assert "already recorded" in message
+    assert "new delivery" in message
+    assert "human must record one decision" not in message
+    assert "Do not edit, push, or re-run review on this PR" in message
+
+
+def test_architecture_reevaluation_outranks_core_fix():
+    """An undecided recurring lineage still needs its decision even when another
+    lineage already selected the core fix."""
+    message = _render_unsettled_message(
+        ["architecture_core_fix_required", "architecture_reevaluation_required"]
+    )
+
+    assert "human must record one decision" in message
+
+
+@pytest.mark.parametrize("observation_item", OBSERVATION_ITEMS)
+@pytest.mark.parametrize(
+    "architecture_item",
+    ["architecture_reevaluation_required", "architecture_core_fix_required"],
+)
+def test_observation_error_outranks_architecture_pause(
+    architecture_item, observation_item
+):
+    """An architecture state observed through a broken snapshot is not trustworthy,
+    and the pause message forbids the re-run that would clear the observation
+    blocker — so the observation-error guidance must win."""
+    message = _render_unsettled_message([architecture_item, observation_item])
+
+    _assert_push_guidance(message)
+    assert "human must record one decision" not in message
+    assert "Do not edit, push, or re-run review" not in message
