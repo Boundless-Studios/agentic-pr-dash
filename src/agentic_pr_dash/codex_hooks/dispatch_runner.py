@@ -371,6 +371,9 @@ def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
     except ValueError:
         return False
 
+    if any(token in {"&&", "||", "&"} for token in tokens):
+        return False
+
     at_command_start = True
     for index, token in enumerate(tokens):
         if token and all(character in ";&|\n" for character in token):
@@ -381,8 +384,12 @@ def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
             continue
         at_command_start = False
-        if Path(token).name == executable:
-            return index + 1 < len(tokens) and tokens[index + 1] == subcommand
+        if (
+            Path(token).name == executable
+            and index + 1 < len(tokens)
+            and tokens[index + 1] == subcommand
+        ):
+            return True
     return False
 
 

@@ -313,6 +313,40 @@ def test_provider_words_used_as_arguments_cannot_reach_policy(tmp_path: Path) ->
     assert callbacks == []
 
 
+def test_unexecuted_conditional_provider_cannot_reach_policy(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="true || codex exec review",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+
+
+def test_later_provider_dispatch_segment_keeps_classification(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex --version; codex exec review",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.additional_context == "policy ran"
+
+
 def test_typed_classification_survives_newline_separated_setup(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
