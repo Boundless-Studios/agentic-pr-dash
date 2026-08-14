@@ -250,8 +250,9 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     * **Live PR.** An owned, non-draft open PR exists for the pushed branch.
     * **No duplicate.** No waiter is already alive for this session.
     """
-    is_codex = raw_tool_name == "exec_command" or os.environ.get("PR_WATCH_NO_WAITER") == "1"
-    if raw_tool_name not in ("Bash", "exec_command"):
+    codex_tool_names = {"exec_command", "functions.exec_command"}
+    is_codex = raw_tool_name in codex_tool_names or os.environ.get("PR_WATCH_NO_WAITER") == "1"
+    if raw_tool_name not in ("Bash", *codex_tool_names):
         return None
     branch = current_branch(Path(push_cwd))
     if branch in ("", "main", "master"):
@@ -279,6 +280,8 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     if is_codex:
         monitor_python = shlex.quote(sys.executable)
         policy_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_POLICY", "")
+        if policy_path and not os.path.isabs(policy_path):
+            policy_path = str(Path(push_cwd) / policy_path)
         if not policy_path:
             for filename in ("review-policy.yaml", "agent-review-policy.yaml"):
                 candidate = Path(push_cwd) / "config" / filename

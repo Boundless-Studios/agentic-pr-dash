@@ -208,6 +208,7 @@ def _observe_finalization(args, policy, ledger):
     )
 
     cwd = os.path.abspath(args.cwd)
+    github_api.reset_checks_probe_failure_seen()
     if args.pr is not None:
         pr = _resolve_pr_by_number(args.pr, cwd, force=True)
     else:
@@ -219,7 +220,6 @@ def _observe_finalization(args, policy, ledger):
 
     repository = pr.repo or _repo_slug(cwd)
     pr = pr.model_copy(update={"repo": repository}, deep=True)
-    github_api.reset_checks_probe_failure_seen()
     pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
     if github_api.checks_probe_failure_seen():
         raise RuntimeError(
@@ -474,8 +474,10 @@ def _release_foreground_ownership(args: argparse.Namespace) -> None:
 def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     """Observe one explicit PR; resolution failure is never a clean result."""
     from agentic_pr_dash import maintenance  # noqa: PLC0415
+    from agentic_pr_dash import github_api  # noqa: PLC0415
 
     cwd = os.path.abspath(args.cwd)
+    github_api.reset_checks_probe_failure_seen()
     pr = _resolve_pr_by_number(args.pr, cwd, force=True)
     if pr is _GH_UNAVAILABLE or pr is None:
         print(f"PR #{args.pr} could not be observed", file=sys.stderr)
@@ -511,8 +513,6 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     if blockers:
         print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
         return 10, pr.latest_commit_sha
-    from agentic_pr_dash import github_api  # noqa: PLC0415
-    github_api.reset_checks_probe_failure_seen()
     if github_api.required_checks_pending(args.pr, cwd):
         print(f"PR #{args.pr} required CI is still pending")
         return 11, pr.latest_commit_sha
