@@ -383,6 +383,8 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    head = {"sha": "head-1"}
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: head["sha"])
 
     # First two calls → exit 2
     r1 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -399,6 +401,13 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     r4 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     assert r4 == 0
     assert capsys.readouterr().err == ""
+
+    # A new immutable PR head is new observation state even though the open PR
+    # number and waiter requirement are otherwise identical.
+    head["sha"] = "head-2"
+    r5 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert r5 == 2
+    assert "42" in capsys.readouterr().err
 
 
 def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):

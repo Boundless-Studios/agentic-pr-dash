@@ -356,6 +356,19 @@ def test_stop_gate_budget_exhausted_marks_remaining_worktrees_unknown(
     # the crash wording.
     assert "CRASHED" not in err
 
+    # Unknown observations get only a bounded release: they may escape after
+    # the configured strike count, but must be retried after the cache window.
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 0
+    capsys.readouterr()
+    state = _stop_gate_mod._load_stop_state(str(tmp_path))
+    assert state["released_until"] > state["ts"]
+    _stop_gate_mod._save_stop_state(
+        str(tmp_path), {**state, "released_until": 0}
+    )
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert "BUDGET-UNKNOWN" in capsys.readouterr().err
+
 
 def test_stop_gate_crash_message_distinct_from_budget_message(monkeypatch, tmp_path, capsys):
     """A genuine internal exception must be labeled a CRASH, never confused

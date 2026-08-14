@@ -228,6 +228,26 @@ def test_released_fingerprint_does_not_rearm_until_state_changes(
     assert SUMMARY in capsys.readouterr().err
 
 
+def test_escalation_invalidates_a_released_blocker_fingerprint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _patch_pending_stop(monkeypatch, tmp_path)
+    assert [stop_gate._stop_gate_impl(args) for _ in range(3)] == [2, 2, 0]
+    capsys.readouterr()
+
+    monkeypatch.setattr(
+        stop_gate, "_owned_open_pr_pairs", lambda owned: [(str(tmp_path), 62)]
+    )
+    monkeypatch.setattr(
+        stop_gate,
+        "_read_escalation_marker",
+        lambda cwd: {"62": {"count": 3, "last_error": "executor failed"}},
+    )
+
+    assert stop_gate._stop_gate_impl(args) == 2
+    assert "executor failed" in capsys.readouterr().err
+
+
 class TestBuildMaintenanceSummary:
     @staticmethod
     def _summary_fn() -> Callable[[PRData], str]:

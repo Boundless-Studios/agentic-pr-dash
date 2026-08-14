@@ -815,7 +815,16 @@ def _stop_gate_impl(args) -> int:
                     ):
                         _save_stop_state(cwd, {"ts": now})
                         return 0
-                fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
+                waiter_identities = {
+                    f"{_slug(wt)}#{n}@{_local_head_sha(wt) or 'unknown'}"
+                    for n in open_prs
+                    for wt in _live_wts_for(n)
+                } | {
+                    f"{r.get('repo', '')}#{r['pr']}@{r.get('head_sha') or 'unknown'}"
+                    for r in open_detached_records
+                    if r["pr"] in open_prs
+                }
+                fingerprint = "need-waiter:" + ",".join(sorted(waiter_identities))
                 if state.get("released_fingerprint") == fingerprint:
                     _save_stop_state(cwd, {**state, "ts": now})
                     return 0
@@ -837,9 +846,17 @@ def _stop_gate_impl(args) -> int:
     # pending work. Sorted so the fingerprint is stable regardless of dict/set
     # iteration order.
     fingerprint = _stop_fingerprint(pending)
+    if escalated_owned:
+        escalation_state = json.dumps(escalated_owned, sort_keys=True, separators=(",", ":"))
+        fingerprint += "|escalated:" + hashlib.sha256(
+            escalation_state.encode("utf-8")
+        ).hexdigest()
     if unknown_worktrees:
         fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
-    if state.get("released_fingerprint") == fingerprint:
+    released_until = float(state.get("released_until", 0) or 0)
+    if state.get("released_fingerprint") == fingerprint and (
+        not unknown_worktrees or now < released_until
+    ):
         _save_stop_state(cwd, {**state, "ts": now})
         return 0
     count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
@@ -903,7 +920,16 @@ def _stop_gate_impl(args) -> int:
             f"PR head or actionable review/CI state changes.",
             file=sys.stderr,
         )
-        _save_stop_state(cwd, {"ts": now, "released_fingerprint": fingerprint})
+        released_state: dict[str, object] = {
+            "ts": now,
+            "released_fingerprint": fingerprint,
+        }
+        if unknown_worktrees:
+            # Unknown is not an exact actionable observation. Suppress only for
+            # one bounded cache window, then force another attempt so changed
+            # review/CI state on an unchecked PR cannot remain hidden forever.
+            released_state["released_until"] = now + max(interval, 1)
+        _save_stop_state(cwd, released_state)
         return 0
 
     if pending:
