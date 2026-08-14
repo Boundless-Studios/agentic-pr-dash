@@ -924,6 +924,59 @@ def _cmd_complete_sweep_p2(args: argparse.Namespace) -> int:
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
+    """Fence every completion mutation to one actor for the exact PR head."""
+
+    from .finalization_lease import (
+        FinalizationActor,
+        FinalizationKey,
+        run_with_finalization_lease,
+    )
+
+    cwd = os.path.abspath(args.cwd)
+    pr = _complete_resolve_target_pr(args, cwd)
+    if pr is _GH_UNAVAILABLE:
+        print(_gh_unavailable_message(cwd))
+        return 2
+    if pr is None:
+        print("no open PR for this branch")
+        return 0
+    head_sha = str(pr.latest_commit_sha or "").strip()
+    if not head_sha:
+        print(
+            f"cannot acquire finalization authority for PR #{pr.number}: "
+            "head SHA is unavailable",
+            file=sys.stderr,
+        )
+        return 2
+    session_id = str(getattr(args, "session_id", "") or "").strip()
+    if not session_id:
+        session_id = f"maintenance-complete:{os.getppid()}"
+    result = run_with_finalization_lease(
+        key=FinalizationKey(
+            repository=str(pr.repo or "unknown/unknown"),
+            pr_number=pr.number,
+            head_sha=head_sha,
+        ),
+        actor=FinalizationActor(
+            session_id=session_id,
+            pid=os.getpid(),
+            agent="maintenance-complete",
+            worktree_path=cwd,
+        ),
+        operation=lambda: _cmd_complete_unleased(args),
+    )
+    if not result.executed:
+        print(
+            f"finalization deferred for PR #{pr.number} at {head_sha}: "
+            f"{result.reason}",
+            file=sys.stderr,
+        )
+    elif result.exit_code == 2 and result.reason != "completed":
+        print(result.reason, file=sys.stderr)
+    return result.exit_code
+
+
+def _cmd_complete_unleased(args: argparse.Namespace) -> int:
     if getattr(args, "defer", None):
         return _cmd_complete_defer(args)
     if getattr(args, "sweep_p2", False):
