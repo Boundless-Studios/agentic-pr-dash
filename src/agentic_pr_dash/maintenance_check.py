@@ -963,7 +963,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             agent="maintenance-complete",
             worktree_path=cwd,
         ),
-        operation=lambda: _cmd_complete_unleased(args),
+        operation=lambda: _cmd_complete_unleased(args, resolved_pr=pr),
     )
     if not result.executed:
         print(
@@ -976,7 +976,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     return result.exit_code
 
 
-def _cmd_complete_unleased(args: argparse.Namespace) -> int:
+def _cmd_complete_unleased(
+    args: argparse.Namespace,
+    *,
+    resolved_pr=None,
+) -> int:
     if getattr(args, "defer", None):
         return _cmd_complete_defer(args)
     if getattr(args, "sweep_p2", False):
@@ -995,7 +999,9 @@ def _cmd_complete_unleased(args: argparse.Namespace) -> int:
     # mutation. The freshness cost here is one extra `gh` call per completion
     # run, not per Stop-hook/poll-tick, so it does not reintroduce the
     # fan-out the cache exists to collapse.
-    if pr_number_arg is not None:
+    if resolved_pr is not None:
+        pr = resolved_pr
+    elif pr_number_arg is not None:
         pr = _resolve_pr_by_number(int(pr_number_arg), cwd, force=True)
     else:
         pr = _resolve_pr_for_branch(cwd, force=True)
