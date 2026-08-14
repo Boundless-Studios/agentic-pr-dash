@@ -512,7 +512,7 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
                 slot.startswith("backstop:") for slot in snapshot.review.missing_slots
             )
             if (
-                set(snapshot.blockers) <= {"ci_pending"}
+                set(snapshot.blockers) <= {"ci_pending", "ci_unavailable", "not_mergeable"}
                 and not snapshot.review.required_actions
                 and missing_only_backstop
             ):

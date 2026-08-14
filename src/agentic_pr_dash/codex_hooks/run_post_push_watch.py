@@ -289,6 +289,14 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
                     policy_path = str(candidate)
                     break
         policy_arg = f" --policy {shlex.quote(policy_path)}" if policy_path else ""
+        ledger_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_LEDGER", "")
+        if ledger_path and not os.path.isabs(ledger_path):
+            ledger_path = str(Path(push_cwd) / ledger_path)
+        if not ledger_path:
+            candidate = Path(push_cwd) / ".agentic-review" / "ledger.json"
+            if candidate.is_file():
+                ledger_path = str(candidate)
+        ledger_arg = f" --ledger {shlex.quote(ledger_path)}" if policy_path and ledger_path else ""
         return (
             f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "
             "no asynchronous wake/resumption channel. Poll settlement in the "
@@ -297,7 +305,7 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
             f"monitor --cwd {shlex.quote(push_cwd)} --session-id {shlex.quote(session_id)} "
             f"--pr {pr_number} "
             "--max-wait 1800 "
-            f"--poll-interval 30{policy_arg}"
+            f"--poll-interval 30{policy_arg}{ledger_arg}"
         )
     await_cmd = load_config(push_cwd).await_command.format(
         cwd=push_cwd, session_id=session_id
