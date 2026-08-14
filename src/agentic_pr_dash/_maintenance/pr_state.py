@@ -227,7 +227,13 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     )
 
 
-def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
+def _resolve_pr_by_number(
+    pr_number: int,
+    cwd: str,
+    *,
+    force: bool = False,
+    include_reviews: bool = True,
+):
     """Resolve a PR by explicit number (for --pr override).
 
     See :func:`_resolve_pr_for_branch` for the ``force`` semantics."""
@@ -250,10 +256,14 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
                 raw = entry
                 break
     if prs is not None and raw is None:
-        # The authoritative open-PR snapshot answered successfully and the
-        # requested PR is absent.  Do not synthesize a clean PR from detail
-        # probes: it may have been closed while a foreground monitor waited.
-        return None
+        # The configured author snapshot is not authoritative for an explicit
+        # PR number: shared/fork PRs may belong to another author. Verify the
+        # named PR directly, and require positive evidence that it remains open.
+        raw = github_api._rest_pr_payload(pr_number, cwd=cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+        if str(raw.get("state") or "").lower() != "open":
+            return None
 
     # See _resolve_pr_for_branch: keep a live gh-availability signal across the
     # detail fetch so a warm snapshot (or REST-fallback resolution) + a
@@ -270,7 +280,11 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
         if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
         and not github_api._is_infra_check(c.name)
     ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    review_comments = (
+        github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        if include_reviews
+        else []
+    )
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")

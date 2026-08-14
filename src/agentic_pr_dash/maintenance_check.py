@@ -487,7 +487,7 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
 
     cwd = os.path.abspath(args.cwd)
     github_api.reset_checks_probe_failure_seen()
-    pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+    pr = _resolve_pr_by_number(args.pr, cwd, force=True, include_reviews=False)
     if pr is _GH_UNAVAILABLE or pr is None:
         print(f"PR #{args.pr} could not be observed", file=sys.stderr)
         return 2, ""
@@ -533,9 +533,16 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     if not review_observation.observable:
         print(f"PR #{args.pr} review feedback is unobservable")
         return 11, pr.latest_commit_sha
-    strict_comments, _decisions = review_observation.value or ([], [])
+    strict_comments, decisions = review_observation.value or ([], [])
     blockers = maintenance.blockers_for_pr(pr)
     if strict_comments and "review_comments" not in blockers:
+        blockers.append("review_comments")
+    unresolved = [
+        decision
+        for decision in decisions
+        if decision.decision not in {"SKIP_RESOLVED", "SKIP_DEFERRED"}
+    ]
+    if unresolved and "review_comments" not in blockers:
         blockers.append("review_comments")
     if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
         blockers.append("changes_requested")
@@ -545,6 +552,22 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     if str(pr.mergeable).upper() in {"", "UNKNOWN"}:
         print(f"PR #{args.pr} mergeability is still being computed")
         return 11, pr.latest_commit_sha
+    if str(pr.review_decision).upper() == "REVIEW_REQUIRED":
+        print(f"PR #{args.pr} is waiting for a required approval")
+        return 11, pr.latest_commit_sha
+    if not pr.ci_checks:
+        from agentic_pr_dash._ci_watch.config import NO_CHECKS_GRACE_S  # noqa: PLC0415
+
+        now = time.monotonic()
+        first_empty = getattr(args, "_no_checks_first_seen_at", None)
+        if first_empty is None:
+            args._no_checks_first_seen_at = now
+            first_empty = now
+        if now - first_empty < NO_CHECKS_GRACE_S:
+            print(f"PR #{args.pr} is waiting for CI checks to register")
+            return 11, pr.latest_commit_sha
+    else:
+        args._no_checks_first_seen_at = None
     if github_api.required_checks_pending(args.pr, cwd):
         print(f"PR #{args.pr} required CI is still pending")
         return 11, pr.latest_commit_sha
