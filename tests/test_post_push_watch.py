@@ -344,6 +344,17 @@ def test_codex_push_requires_bounded_foreground_settlement(monkeypatch, tmp_path
     assert "--pr 2290" in ctx
     assert "BACKGROUND" not in ctx
     assert "await" not in ctx
+    assert sys.executable in ctx
+
+
+def test_live_waiter_does_not_suppress_codex_foreground_monitor(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    monkeypatch.setattr(hook, "_await_alive", lambda c, s: True)
+    payload = {"tool_name": "exec_command", "tool_input": {"cmd": "git push"},
+               "cwd": str(tmp_path)}
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0
+    assert "FOREGROUND" in out["hookSpecificOutput"]["additionalContext"]
 
 
 def test_no_nudge_for_draft_pr(monkeypatch, tmp_path, capsys):

@@ -483,13 +483,41 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     if pr.is_draft:
         print(f"PR #{args.pr} is draft; settlement is not complete")
         return 10, pr.latest_commit_sha
+    policy_path = getattr(args, "policy", None)
+    if policy_path:
+        from pathlib import Path  # noqa: PLC0415
+        from agent_review_coordinator import ReviewLedger, ReviewPolicy  # noqa: PLC0415
+
+        ledger_path = Path(
+            getattr(args, "ledger", None)
+            or os.path.join(cwd, ".agentic-pr-dash", "review-ledger.json")
+        )
+        if not ledger_path.is_file():
+            print(f"PR #{args.pr} not settled: review_ledger_missing")
+            return 10, pr.latest_commit_sha
+        try:
+            policy = ReviewPolicy.from_yaml(Path(policy_path).read_text(encoding="utf-8"))
+            ledger = ReviewLedger.model_validate_json(ledger_path.read_text(encoding="utf-8"))
+            snapshot = _observe_finalization(args, policy, ledger)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"PR #{args.pr} settlement is unobservable: {exc}")
+            return 11, pr.latest_commit_sha
+        if not snapshot.clean:
+            work = [*snapshot.blockers, *snapshot.review.required_actions, *snapshot.review.missing_slots]
+            print(_render_unsettled_message(work))
+            return 10, pr.latest_commit_sha
+        return 0, snapshot.head_sha
     blockers = maintenance.blockers_for_pr(pr)
     if blockers:
         print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
         return 10, pr.latest_commit_sha
     from agentic_pr_dash import github_api  # noqa: PLC0415
+    github_api.reset_checks_probe_failure_seen()
     if github_api.required_checks_pending(args.pr, cwd):
         print(f"PR #{args.pr} required CI is still pending")
+        return 11, pr.latest_commit_sha
+    if github_api.checks_probe_failure_seen():
+        print(f"PR #{args.pr} required CI status is unobservable")
         return 11, pr.latest_commit_sha
     return 0, pr.latest_commit_sha
 
@@ -2008,6 +2036,8 @@ def main(argv: list[str] | None = None) -> int:
     monitor_p.add_argument("--pr", type=int, required=True)
     monitor_p.add_argument("--max-wait", type=float, default=1800.0)
     monitor_p.add_argument("--poll-interval", type=float, default=30.0)
+    monitor_p.add_argument("--policy", default=None)
+    monitor_p.add_argument("--ledger", default=None)
 
     # --- complete ---
     complete_p = subparsers.add_parser(

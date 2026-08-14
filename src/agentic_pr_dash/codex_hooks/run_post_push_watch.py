@@ -273,19 +273,26 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
         return None
     if _pr_is_draft(pr_number, push_cwd):
         return None
-    if _await_alive(push_cwd, session_id):
+    if not is_codex and _await_alive(push_cwd, session_id):
         return None
     sha = head_sha(Path(push_cwd))
     if is_codex:
+        monitor_python = shlex.quote(sys.executable)
+        policy_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_POLICY", "")
+        if not policy_path:
+            candidate = Path(push_cwd) / "config" / "agent-review-policy.yaml"
+            if candidate.is_file():
+                policy_path = str(candidate)
+        policy_arg = f" --policy {shlex.quote(policy_path)}" if policy_path else ""
         return (
             f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "
             "no asynchronous wake/resumption channel. Poll settlement in the "
             "FOREGROUND now until two clean observations 30 seconds apart or the "
-            "exact 30-minute bound:\n  python3 -m agentic_pr_dash.maintenance_check "
+            f"exact 30-minute bound:\n  {monitor_python} -m agentic_pr_dash.maintenance_check "
             f"monitor --cwd {shlex.quote(push_cwd)} --session-id {shlex.quote(session_id)} "
             f"--pr {pr_number} "
             "--max-wait 1800 "
-            "--poll-interval 30"
+            f"--poll-interval 30{policy_arg}"
         )
     await_cmd = load_config(push_cwd).await_command.format(
         cwd=push_cwd, session_id=session_id

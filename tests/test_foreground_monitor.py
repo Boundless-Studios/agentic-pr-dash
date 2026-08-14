@@ -4,7 +4,8 @@ from agentic_pr_dash import maintenance_check
 
 
 def _args(tmp_path):
-    return Namespace(cwd=str(tmp_path), pr=42, session_id="sess", max_wait=1800.0, poll_interval=30.0)
+    return Namespace(cwd=str(tmp_path), pr=42, session_id="sess", max_wait=1800.0,
+                     poll_interval=30.0, policy=None, ledger=None)
 
 
 def test_pending_then_red_never_reports_settled(monkeypatch, tmp_path):
