@@ -6,6 +6,7 @@ import importlib.util
 import inspect
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +152,7 @@ class FinalizationLeaseContractTests(unittest.TestCase):
         def run_lease(**kwargs):
             captured.update(kwargs)
             return finalization_lease.FinalizationRun(
-                executed=True,
+                state=finalization_lease.FinalizationRunState.COMPLETED,
                 exit_code=7,
                 reason="completed",
             )
@@ -172,7 +173,105 @@ class FinalizationLeaseContractTests(unittest.TestCase):
 
         self.assertEqual(result, 7)
         self.assertEqual(captured["key"].head_sha, "a" * 40)
-        self.assertEqual(captured["actor"].session_id, "session-a")
+        self.assertEqual(captured["actor"].caller_session_id, "session-a")
+        self.assertTrue(captured["actor"].session_id.startswith("session-a:"))
+
+    def test_invocations_never_share_lease_owner_identity(self) -> None:
+        first = finalization_lease.invocation_actor(
+            caller_session_id="caller", pid=123, agent="codex", worktree_path="/tmp"
+        )
+        second = finalization_lease.invocation_actor(
+            caller_session_id="caller", pid=123, agent="codex", worktree_path="/tmp"
+        )
+
+        self.assertNotEqual(first.session_id, second.session_id)
+        self.assertEqual(first.caller_session_id, "caller")
+
+    def test_complete_derives_repository_when_pr_snapshot_omits_it(self) -> None:
+        args = SimpleNamespace(cwd="/tmp/gaia", pr=42, session_id="caller")
+        pr = SimpleNamespace(
+            number=42,
+            repo="",
+            latest_commit_sha="a" * 40,
+        )
+        captured = {}
+
+        def run_lease(**kwargs):
+            captured.update(kwargs)
+            return finalization_lease.FinalizationRun(
+                state=finalization_lease.FinalizationRunState.COMPLETED,
+                exit_code=0,
+                reason="completed",
+            )
+
+        with (
+            patch.object(
+                maintenance_check, "_complete_resolve_target_pr", return_value=pr
+            ),
+            patch.object(
+                maintenance_check, "_repo_slug", return_value="boundless/gaia"
+            ),
+            patch.object(
+                finalization_lease,
+                "run_with_finalization_lease",
+                side_effect=run_lease,
+            ),
+        ):
+            result = maintenance_check._cmd_complete(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(captured["key"].repository, "boundless/gaia")
+
+    def test_claim_store_failure_is_typed_unavailable(self) -> None:
+        service = self._service()
+        with patch.object(
+            service._coordinator, "claim_task", side_effect=OSError("offline")
+        ):
+            result = service.acquire(self._key(), self._actor("caller"))
+
+        self.assertEqual(
+            result.state, finalization_lease.LeaseAcquisitionState.UNAVAILABLE
+        )
+        self.assertIsNone(result.lease)
+
+    def test_long_operation_renews_lease_before_expiry(self) -> None:
+        store = JsonlClaimStore(Path(self._temporary.name) / "renewals.jsonl")
+        service = finalization_lease.FinalizationLeaseService(store, lease_seconds=1)
+        competitor = finalization_lease.FinalizationLeaseService(store, lease_seconds=1)
+        competing_results = []
+
+        def operation() -> int:
+            time.sleep(1.2)
+            competing_results.append(
+                competitor.acquire(self._key(), self._actor("competitor"))
+            )
+            return 0
+
+        result = finalization_lease.run_with_finalization_lease(
+            key=self._key(),
+            actor=self._actor("owner"),
+            operation=operation,
+            service=service,
+        )
+
+        self.assertEqual(
+            result.state, finalization_lease.FinalizationRunState.COMPLETED
+        )
+        self.assertEqual(
+            competing_results[0].state,
+            finalization_lease.LeaseAcquisitionState.CONTENDED,
+        )
+
+    def test_sweep_refuses_before_resolving_pr(self) -> None:
+        args = SimpleNamespace(cwd="/tmp/gaia", sweep_p2=True)
+        with patch.object(
+            maintenance_check,
+            "_complete_resolve_target_pr",
+            side_effect=AssertionError("must not resolve"),
+        ):
+            result = maintenance_check._cmd_complete(args)
+
+        self.assertEqual(result, 1)
 
 
 if __name__ == "__main__":

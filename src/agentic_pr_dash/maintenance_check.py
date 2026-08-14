@@ -926,9 +926,12 @@ def _cmd_complete_sweep_p2(args: argparse.Namespace) -> int:
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Fence every completion mutation to one actor for the exact PR head."""
 
+    if getattr(args, "sweep_p2", False):
+        return _cmd_complete_sweep_p2(args)
+
     from .finalization_lease import (
-        FinalizationActor,
         FinalizationKey,
+        invocation_actor,
         run_with_finalization_lease,
     )
 
@@ -948,17 +951,23 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    session_id = str(getattr(args, "session_id", "") or "").strip()
-    if not session_id:
-        session_id = f"maintenance-complete:{os.getppid()}"
+    repository = str(pr.repo or _repo_slug(cwd)).strip()
+    if not repository:
+        print(
+            f"cannot acquire finalization authority for PR #{pr.number}: "
+            "repository is unavailable",
+            file=sys.stderr,
+        )
+        return 2
+    caller_session_id = str(getattr(args, "session_id", "") or "").strip() or None
     result = run_with_finalization_lease(
         key=FinalizationKey(
-            repository=str(pr.repo or "unknown/unknown"),
+            repository=repository,
             pr_number=pr.number,
             head_sha=head_sha,
         ),
-        actor=FinalizationActor(
-            session_id=session_id,
+        actor=invocation_actor(
+            caller_session_id=caller_session_id,
             pid=os.getpid(),
             agent="maintenance-complete",
             worktree_path=cwd,

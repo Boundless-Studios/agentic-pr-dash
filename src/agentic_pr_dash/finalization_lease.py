@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import threading
+import uuid
 from collections.abc import Callable
+from enum import StrEnum
 
 from agent_coordinator.models import OwnerIdentity, TaskIdentity
 from agent_coordinator.service import ClaimConflictError, TaskCoordinator
@@ -10,6 +13,24 @@ from agent_coordinator.store import JsonlClaimStore
 from pydantic import BaseModel, ConfigDict, Field
 
 FINALIZATION_TASK_TYPE = "pr-finalization"
+
+
+class LeaseAcquisitionState(StrEnum):
+    ACQUIRED = "acquired"
+    CONTENDED = "contended"
+    UNAVAILABLE = "unavailable"
+
+
+class LeaseReleaseState(StrEnum):
+    RELEASED = "released"
+    STALE = "stale"
+    UNAVAILABLE = "unavailable"
+
+
+class FinalizationRunState(StrEnum):
+    COMPLETED = "completed"
+    DEFERRED = "deferred"
+    LEASE_LOST = "lease_lost"
 
 
 class FinalizationKey(BaseModel):
@@ -31,6 +52,7 @@ class FinalizationActor(BaseModel):
     pid: int | None = Field(default=None, gt=0)
     agent: str = Field(min_length=1)
     worktree_path: str | None = None
+    caller_session_id: str | None = None
 
 
 class FinalizationLease(BaseModel):
@@ -49,10 +71,14 @@ class LeaseAcquisition(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    acquired: bool
+    state: LeaseAcquisitionState
     lease: FinalizationLease | None = None
     conflict_session_id: str | None = None
     reason: str = ""
+
+    @property
+    def acquired(self) -> bool:
+        return self.state is LeaseAcquisitionState.ACQUIRED
 
 
 class LeaseRelease(BaseModel):
@@ -60,8 +86,12 @@ class LeaseRelease(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    released: bool
+    state: LeaseReleaseState
     reason: str = ""
+
+    @property
+    def released(self) -> bool:
+        return self.state is LeaseReleaseState.RELEASED
 
 
 class FinalizationRun(BaseModel):
@@ -69,9 +99,28 @@ class FinalizationRun(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    executed: bool
+    state: FinalizationRunState
     exit_code: int
     reason: str = ""
+
+    @property
+    def executed(self) -> bool:
+        return self.state is not FinalizationRunState.DEFERRED
+
+
+def invocation_actor(
+    *, caller_session_id: str | None, pid: int, agent: str, worktree_path: str
+) -> FinalizationActor:
+    """Mint a unique lease owner for one command invocation."""
+
+    caller = (caller_session_id or "maintenance-complete").strip()
+    return FinalizationActor(
+        session_id=f"{caller}:{pid}:{uuid.uuid4().hex}",
+        caller_session_id=caller_session_id,
+        pid=pid,
+        agent=agent,
+        worktree_path=worktree_path,
+    )
 
 
 def finalization_task(key: FinalizationKey) -> TaskIdentity:
@@ -101,6 +150,7 @@ class FinalizationLeaseService:
             pid=actor.pid,
             agent=actor.agent,
             worktree_path=actor.worktree_path,
+            metadata={"caller_session_id": actor.caller_session_id},
         )
         try:
             claim = self._coordinator.claim_task(
@@ -111,14 +161,19 @@ class FinalizationLeaseService:
         except ClaimConflictError as exc:
             holder = exc.decision.claim
             return LeaseAcquisition(
-                acquired=False,
+                state=LeaseAcquisitionState.CONTENDED,
                 conflict_session_id=(
                     holder.owner.session_id if holder is not None else None
                 ),
                 reason="finalization authority held by another actor",
             )
+        except Exception as exc:  # noqa: BLE001 - fail closed at storage boundary
+            return LeaseAcquisition(
+                state=LeaseAcquisitionState.UNAVAILABLE,
+                reason=f"claim store unavailable: {type(exc).__name__}: {exc}",
+            )
         return LeaseAcquisition(
-            acquired=True,
+            state=LeaseAcquisitionState.ACQUIRED,
             lease=FinalizationLease(
                 key=key,
                 owner_session_id=actor.session_id,
@@ -127,6 +182,25 @@ class FinalizationLeaseService:
             ),
             reason="acquired",
         )
+
+    def heartbeat(self, lease: FinalizationLease) -> LeaseRelease:
+        try:
+            self._coordinator.heartbeat_claim(
+                lease.claim_id,
+                owner_session_id=lease.owner_session_id,
+                lease_epoch=lease.lease_epoch,
+                lease_seconds=self._lease_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - fail closed at storage boundary
+            return LeaseRelease(
+                state=LeaseReleaseState.STALE,
+                reason=f"{type(exc).__name__}: {exc}",
+            )
+        return LeaseRelease(state=LeaseReleaseState.RELEASED, reason="renewed")
+
+    @property
+    def heartbeat_seconds(self) -> float:
+        return max(0.1, self._lease_seconds / 3)
 
     def release(self, lease: FinalizationLease) -> LeaseRelease:
         try:
@@ -138,10 +212,10 @@ class FinalizationLeaseService:
             )
         except Exception as exc:  # noqa: BLE001 - boundary returns typed refusal
             return LeaseRelease(
-                released=False,
+                state=LeaseReleaseState.STALE,
                 reason=f"{type(exc).__name__}: {exc}",
             )
-        return LeaseRelease(released=True, reason="released")
+        return LeaseRelease(state=LeaseReleaseState.RELEASED, reason="released")
 
 
 def default_finalization_service() -> FinalizationLeaseService:
@@ -167,18 +241,42 @@ def run_with_finalization_lease(
     acquisition = lease_service.acquire(key, actor)
     if acquisition.lease is None:
         return FinalizationRun(
-            executed=False,
+            state=FinalizationRunState.DEFERRED,
             exit_code=10,
             reason=acquisition.reason,
         )
+    stop = threading.Event()
+    lease_lost: list[str] = []
+
+    def renew() -> None:
+        while not stop.wait(lease_service.heartbeat_seconds):
+            heartbeat = lease_service.heartbeat(acquisition.lease)
+            if not heartbeat.released:
+                lease_lost.append(heartbeat.reason)
+                stop.set()
+
+    renewer = threading.Thread(target=renew, name="finalization-lease", daemon=True)
+    renewer.start()
     try:
         exit_code = int(operation())
     finally:
+        stop.set()
+        renewer.join()
         release = lease_service.release(acquisition.lease)
+    if lease_lost:
+        return FinalizationRun(
+            state=FinalizationRunState.LEASE_LOST,
+            exit_code=2,
+            reason=f"finalization lease lost: {lease_lost[0]}",
+        )
     if not release.released:
         return FinalizationRun(
-            executed=True,
+            state=FinalizationRunState.LEASE_LOST,
             exit_code=2,
             reason=f"finalization lease release failed: {release.reason}",
         )
-    return FinalizationRun(executed=True, exit_code=exit_code, reason="completed")
+    return FinalizationRun(
+        state=FinalizationRunState.COMPLETED,
+        exit_code=exit_code,
+        reason="completed",
+    )
