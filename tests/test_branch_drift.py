@@ -91,6 +91,24 @@ def test_unattributed_branch_change_remains_sibling_drift(tmp_path, monkeypatch)
     assert branch_drift_message(["sess-A"], "fix/sibling", worktree) is not None
 
 
+def test_attributed_transition_in_other_worktree_does_not_rebind(tmp_path, monkeypatch):
+    registry = tmp_path / "events.jsonl"
+    worktree = tmp_path / "wt"
+    other = tmp_path / "other"
+    worktree.mkdir()
+    other.mkdir()
+    _write_events(registry, [
+        {"session_id": "sess-A", "event": "started", "branch": "fix/first",
+         "worktree_path": str(worktree)},
+        {"session_id": "sess-A", "event": "branch_transition",
+         "from_branch": "fix/first", "branch": "fix/sibling",
+         "attributed": True, "worktree_path": str(other)},
+    ])
+    monkeypatch.setenv("GAIA_SESSION_REGISTRY", str(registry))
+
+    assert branch_drift_message(["sess-A"], "fix/sibling", worktree) is not None
+
+
 def test_no_drift_when_session_started_on_primary_branch(tmp_path, monkeypatch):
     registry = tmp_path / "events.jsonl"
     worktree = tmp_path / "wt"

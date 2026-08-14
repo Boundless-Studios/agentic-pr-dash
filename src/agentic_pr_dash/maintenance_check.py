@@ -534,6 +534,9 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
                 return 10
             result, head = _monitor_observation(args)
+            if _foreground_deadline_reached(started, args.max_wait):
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                return 10
             if result == 0:
                 now = time.monotonic()
                 if clean_head != head:

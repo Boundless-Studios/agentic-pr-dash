@@ -197,7 +197,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     failing = [
         c.name
         for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
+        if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+        and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
     if github_api.rate_limit_events() != _rl_events_before:
@@ -261,7 +262,8 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
     failing = [
         c.name
         for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
+        if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+        and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
     if github_api.rate_limit_events() != _rl_events_before:
@@ -631,7 +633,8 @@ def _pr_open_state(pr_number: int, cwd: str):
     url = str(d.get("url", ""))
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [c.name for c in checks
-               if c.conclusion == "failure" and not github_api._is_infra_check(c.name)]
+               if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+               and not github_api._is_infra_check(c.name)]
     review_decision = str(d.get("reviewDecision") or "")
     merge_state = str(d.get("mergeStateStatus") or "")
     mergeable = str(d.get("mergeable") or "")

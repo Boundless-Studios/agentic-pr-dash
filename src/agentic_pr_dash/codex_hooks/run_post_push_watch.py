@@ -280,9 +280,11 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
         monitor_python = shlex.quote(sys.executable)
         policy_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_POLICY", "")
         if not policy_path:
-            candidate = Path(push_cwd) / "config" / "agent-review-policy.yaml"
-            if candidate.is_file():
-                policy_path = str(candidate)
+            for filename in ("review-policy.yaml", "agent-review-policy.yaml"):
+                candidate = Path(push_cwd) / "config" / filename
+                if candidate.is_file():
+                    policy_path = str(candidate)
+                    break
         policy_arg = f" --policy {shlex.quote(policy_path)}" if policy_path else ""
         return (
             f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "

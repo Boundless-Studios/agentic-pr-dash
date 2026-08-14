@@ -85,6 +85,13 @@ def branch_drift_message(
         session_id = str(started_event.get("session_id") or "")
         lineage_branch = started_branch
         for transition in reversed(transitions_by_id.get(session_id, [])):
+            transition_worktree = str(transition.get("worktree_path") or "").strip()
+            started_worktree = str(started_event.get("worktree_path") or "").strip()
+            try:
+                if Path(transition_worktree).expanduser().resolve() != Path(started_worktree).expanduser().resolve():
+                    continue
+            except OSError:
+                continue
             if str(transition.get("from_branch") or "").strip() != lineage_branch:
                 continue
             lineage_branch = str(transition.get("branch") or "").strip()
