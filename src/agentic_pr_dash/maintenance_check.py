@@ -80,6 +80,7 @@ from ._maintenance.markers import (  # noqa: F401, E402
     _marker_session_id,
     _read_session_marker,
     _prune_stale_marker,
+    release_ownership_claims,
     _session_is_live,
     _claim_pr,
 )
@@ -465,27 +466,63 @@ def _release_foreground_ownership(args: argparse.Namespace) -> None:
     """Relinquish an exited Codex foreground owner without waiting for its TTL."""
     cwd = os.path.abspath(args.cwd)
     session_id = getattr(args, "session_id", "") or _read_session_marker(cwd)
-    marker = _read_marker(cwd) or {}
-    pr = marker.get("pr")
-    if session_id and str(pr).isdigit():
+    pr = getattr(args, "pr", None)
+    if session_id and pr is not None:
         release_ownership_claims(cwd, {int(pr)}, session_id, reason="foreground_exited")
+
+
+def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
+    """Observe one explicit PR; resolution failure is never a clean result."""
+    from agentic_pr_dash import maintenance  # noqa: PLC0415
+
+    cwd = os.path.abspath(args.cwd)
+    pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+    if pr is _GH_UNAVAILABLE or pr is None:
+        print(f"PR #{args.pr} could not be observed", file=sys.stderr)
+        return 2, ""
+    if pr.is_draft:
+        print(f"PR #{args.pr} is draft; settlement is not complete")
+        return 10, pr.latest_commit_sha
+    blockers = maintenance.blockers_for_pr(pr)
+    if blockers:
+        print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
+        return 10, pr.latest_commit_sha
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    if github_api.required_checks_pending(args.pr, cwd):
+        print(f"PR #{args.pr} required CI is still pending")
+        return 11, pr.latest_commit_sha
+    return 0, pr.latest_commit_sha
 
 
 def _cmd_monitor(args: argparse.Namespace) -> int:
     """Bounded foreground settlement loop for runtimes with no wake channel."""
     started = time.monotonic()
     clean = 0
+    clean_head = ""
+    first_clean_at = 0.0
     try:
         while True:
-            result = _cmd_check(args)
+            if _foreground_deadline_reached(started, args.max_wait):
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                return 10
+            result, head = _monitor_observation(args)
             if result == 0:
+                now = time.monotonic()
+                if clean_head != head:
+                    clean = 0
+                    clean_head = head
                 clean += 1
-                if clean == 2:
+                if clean == 1:
+                    first_clean_at = now
+                if clean == 2 and now - first_clean_at >= args.poll_interval:
                     return 0
+            elif result == 10:
+                return 10
             else:
                 clean = 0
+                clean_head = ""
             if _foreground_deadline_reached(started, args.max_wait):
-                print("PR settlement timed out after exactly 1800 seconds", file=sys.stderr)
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
                 return 10
             time.sleep(min(args.poll_interval, max(0.0, args.max_wait - (time.monotonic() - started))))
     finally:
@@ -1968,6 +2005,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     monitor_p.add_argument("--cwd", default=".")
     monitor_p.add_argument("--session-id", default="")
+    monitor_p.add_argument("--pr", type=int, required=True)
     monitor_p.add_argument("--max-wait", type=float, default=1800.0)
     monitor_p.add_argument("--poll-interval", type=float, default=30.0)
 

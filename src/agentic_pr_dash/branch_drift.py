@@ -61,10 +61,10 @@ def branch_drift_message(
         session_id = str(event.get("session_id") or "")
         if session_id not in candidate_set:
             continue
+        if session_id in started_by_id:
+            continue
         if event.get("event") == "branch_transition" and event.get("attributed") is True:
             transitions_by_id.setdefault(session_id, []).append(event)
-            continue
-        if session_id in started_by_id:
             continue
         if str(event.get("event") or "") != "started":
             continue

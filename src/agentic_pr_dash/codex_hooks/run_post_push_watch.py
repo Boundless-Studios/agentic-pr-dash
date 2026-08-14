@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -281,7 +282,9 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
             "no asynchronous wake/resumption channel. Poll settlement in the "
             "FOREGROUND now until two clean observations 30 seconds apart or the "
             "exact 30-minute bound:\n  python3 -m agentic_pr_dash.maintenance_check "
-            f"monitor --cwd {push_cwd} --session-id {session_id} --max-wait 1800 "
+            f"monitor --cwd {shlex.quote(push_cwd)} --session-id {shlex.quote(session_id)} "
+            f"--pr {pr_number} "
+            "--max-wait 1800 "
             "--poll-interval 30"
         )
     await_cmd = load_config(push_cwd).await_command.format(

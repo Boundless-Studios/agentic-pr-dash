@@ -341,6 +341,7 @@ def test_codex_push_requires_bounded_foreground_settlement(monkeypatch, tmp_path
     assert "FOREGROUND" in ctx
     assert "monitor" in ctx
     assert "--max-wait 1800" in ctx
+    assert "--pr 2290" in ctx
     assert "BACKGROUND" not in ctx
     assert "await" not in ctx
 
