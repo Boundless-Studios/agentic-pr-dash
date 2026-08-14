@@ -30,6 +30,13 @@ class DispatchOutcome(str, Enum):
     UNAVAILABLE = "unavailable"
 
 
+class ClassificationAuthority(str, Enum):
+    """Whether task classification was declared or inferred for legacy metrics."""
+
+    DECLARED = "declared"
+    LEGACY_INFERRED = "legacy_inferred"
+
+
 _FIELDS: Final[frozenset[str]] = frozenset(
     {
         "provider",
@@ -42,6 +49,8 @@ _FIELDS: Final[frozenset[str]] = frozenset(
         "resolved_model",
         "outcome",
         "review_verdict",
+        "classification_authority",
+        "classification_framework",
     }
 )
 
@@ -60,6 +69,10 @@ class DispatchObservation:
     resolved_model: str | None
     outcome: DispatchOutcome
     review_verdict: dict[str, object] | None = None
+    classification_authority: ClassificationAuthority = (
+        ClassificationAuthority.LEGACY_INFERRED
+    )
+    classification_framework: str | None = None
 
     def __post_init__(self) -> None:
         if self.review_verdict is not None and not (
@@ -68,6 +81,11 @@ class DispatchObservation:
             raise ValueError(
                 "review_verdict is valid only for a completed successful review"
             )
+        if self.classification_authority is ClassificationAuthority.DECLARED:
+            if not self.classification_framework:
+                raise ValueError("declared classification requires a framework")
+        elif self.classification_framework is not None:
+            raise ValueError("inferred classification cannot name a framework")
 
     def to_dict(self) -> dict[str, object]:
         """Serialize using stable string enum values."""
@@ -85,6 +103,8 @@ class DispatchObservation:
             "review_verdict": (
                 dict(self.review_verdict) if self.review_verdict is not None else None
             ),
+            "classification_authority": self.classification_authority.value,
+            "classification_framework": self.classification_framework,
         }
 
     @classmethod
@@ -111,6 +131,17 @@ class DispatchObservation:
             resolved_model=_optional_string(payload.get("resolved_model")),
             outcome=DispatchOutcome(str(payload["outcome"])),
             review_verdict=dict(verdict) if verdict is not None else None,
+            classification_authority=ClassificationAuthority(
+                str(
+                    payload.get(
+                        "classification_authority",
+                        ClassificationAuthority.LEGACY_INFERRED.value,
+                    )
+                )
+            ),
+            classification_framework=_optional_string(
+                payload.get("classification_framework")
+            ),
         )
 
 

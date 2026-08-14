@@ -30,16 +30,20 @@ def _request(
     command: str,
     response: dict[str, object] | None = None,
     source: DispatchSource = DispatchSource.INTERACTIVE_HOOK,
+    classification: dict[str, str] | None = None,
 ) -> DispatchHookRequest:
+    payload: dict[str, object] = {
+        "session_id": "session-1",
+        "cwd": "/repo/wt",
+        "tool_input": {"command": command},
+        "tool_response": response or {"exit_code": 0},
+    }
+    if classification is not None:
+        payload["dispatch_classification"] = classification
     return DispatchHookRequest(
         provider=provider,
         source=source,
-        payload={
-            "session_id": "session-1",
-            "cwd": "/repo/wt",
-            "tool_input": {"command": command},
-            "tool_response": response or {"exit_code": 0},
-        },
+        payload=payload,
         ledger_path=tmp_path / "dispatch.jsonl",
         availability_path=tmp_path / "availability.json",
     )
@@ -145,6 +149,7 @@ def test_completed_review_persists_before_repository_callback(tmp_path: Path) ->
             "exit_code": 0,
             "review_verdict": {"status": "clean", "findings": []},
         },
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
     )
 
     def callback(observation) -> str | None:
@@ -158,11 +163,54 @@ def test_completed_review_persists_before_repository_callback(tmp_path: Path) ->
     assert result.additional_context == "Gaia review budget updated"
 
 
+def test_heuristic_review_label_cannot_invoke_repository_callback(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+    assert result.additional_context is None
+
+
+def test_coding_agent_command_declaration_is_policy_authoritative(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 "
+            "codex exec review"
+        ),
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.observation.classification_framework == "coding-agent/v1"
+    assert result.additional_context == "policy ran"
+
+
 def test_callback_failure_does_not_undo_persisted_observation(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
         provider=DispatchProvider.CODEX,
         command="codex exec review",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
     )
 
     def fail(_observation) -> str | None:
@@ -198,6 +246,10 @@ def test_codex_entrypoint_renders_repository_context(
                     "cwd": str(tmp_path),
                     "tool_input": {"command": "codex exec review"},
                     "tool_response": {"exit_code": 0},
+                    "dispatch_classification": {
+                        "task_type": "review",
+                        "framework": "coding-agent/v1",
+                    },
                 }
             )
         ),

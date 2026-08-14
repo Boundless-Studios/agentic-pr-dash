@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentic_pr_dash.dispatch_observation import (
+    ClassificationAuthority,
     DispatchObservation,
     DispatchOutcome,
     DispatchProvider,
@@ -155,6 +156,7 @@ def run_dispatch_hook(
         and observation.source is DispatchSource.INTERACTIVE_HOOK
         and observation.outcome is DispatchOutcome.SUCCESS
         and observation.task_type == "review"
+        and observation.classification_authority is ClassificationAuthority.DECLARED
     ):
         try:
             additional_context = callback(observation)
@@ -282,7 +284,12 @@ def _observation_from_request(
     response = request.payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
-    task_type = "review" if _REVIEW_PATTERN.search(command) else "exec"
+    declared = _declared_classification(request.payload, command)
+    task_type = (
+        declared[0]
+        if declared is not None
+        else ("review" if _REVIEW_PATTERN.search(command) else "exec")
+    )
     verdict = response.get("review_verdict")
     if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
         verdict = None
@@ -299,6 +306,49 @@ def _observation_from_request(
         resolved_model=requested_model,
         outcome=outcome,
         review_verdict=dict(verdict) if verdict is not None else None,
+        classification_authority=(
+            ClassificationAuthority.DECLARED
+            if declared is not None
+            else ClassificationAuthority.LEGACY_INFERRED
+        ),
+        classification_framework=declared[1] if declared is not None else None,
+    )
+
+
+def _declared_classification(
+    payload: dict[str, object], command: str
+) -> tuple[str, str] | None:
+    classification = payload.get("dispatch_classification")
+    if isinstance(classification, dict):
+        task_type = classification.get("task_type")
+        framework = classification.get("framework")
+    else:
+        task_type, framework = _classification_from_command(command)
+    if not isinstance(task_type, str) or not task_type.strip():
+        return None
+    if not isinstance(framework, str) or not framework.strip():
+        return None
+    return task_type.strip(), framework.strip()
+
+
+def _classification_from_command(command: str) -> tuple[str | None, str | None]:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return None, None
+    values: dict[str, str] = {}
+    for token in tokens:
+        if token in {"codex", "opencode"}:
+            break
+        name, separator, value = token.partition("=")
+        if separator and name in {
+            "AGENT_DISPATCH_TASK_TYPE",
+            "AGENT_DISPATCH_FRAMEWORK",
+        }:
+            values[name] = value
+    return (
+        values.get("AGENT_DISPATCH_TASK_TYPE"),
+        values.get("AGENT_DISPATCH_FRAMEWORK"),
     )
 
 
