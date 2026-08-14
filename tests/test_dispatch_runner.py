@@ -205,6 +205,31 @@ def test_coding_agent_command_declaration_is_policy_authoritative(
     assert result.additional_context == "policy ran"
 
 
+def test_declaration_on_earlier_shell_segment_is_not_authoritative(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 "
+            "true && codex exec implement feature"
+        ),
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+    assert result.additional_context is None
+
+
 def test_callback_failure_does_not_undo_persisted_observation(tmp_path: Path) -> None:
     request = _request(
         tmp_path,

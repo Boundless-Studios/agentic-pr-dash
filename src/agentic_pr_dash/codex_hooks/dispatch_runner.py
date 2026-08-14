@@ -284,7 +284,7 @@ def _observation_from_request(
     response = request.payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
-    declared = _declared_classification(request.payload, command)
+    declared = _declared_classification(request.payload, command, request.provider)
     task_type = (
         declared[0]
         if declared is not None
@@ -316,14 +316,14 @@ def _observation_from_request(
 
 
 def _declared_classification(
-    payload: dict[str, object], command: str
+    payload: dict[str, object], command: str, provider: DispatchProvider
 ) -> tuple[str, str] | None:
     classification = payload.get("dispatch_classification")
     if isinstance(classification, dict):
         task_type = classification.get("task_type")
         framework = classification.get("framework")
     else:
-        task_type, framework = _classification_from_command(command)
+        task_type, framework = _classification_from_command(command, provider)
     if not isinstance(task_type, str) or not task_type.strip():
         return None
     if not isinstance(framework, str) or not framework.strip():
@@ -331,20 +331,29 @@ def _declared_classification(
     return task_type.strip(), framework.strip()
 
 
-def _classification_from_command(command: str) -> tuple[str | None, str | None]:
+def _classification_from_command(
+    command: str, provider: DispatchProvider
+) -> tuple[str | None, str | None]:
     try:
         tokens = shlex.split(command)
     except ValueError:
         return None, None
-    values: dict[str, str] = {}
-    for token in tokens:
-        if token in {"codex", "opencode"}:
+    executable = provider.value
+    subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
+    provider_index = None
+    for index, token in enumerate(tokens[:-1]):
+        if token == executable and tokens[index + 1] == subcommand:
+            provider_index = index
             break
+    if provider_index is None:
+        return None, None
+
+    values: dict[str, str] = {}
+    for token in reversed(tokens[:provider_index]):
         name, separator, value = token.partition("=")
-        if separator and name in {
-            "AGENT_DISPATCH_TASK_TYPE",
-            "AGENT_DISPATCH_FRAMEWORK",
-        }:
+        if not separator:
+            break
+        if name in {"AGENT_DISPATCH_TASK_TYPE", "AGENT_DISPATCH_FRAMEWORK"}:
             values[name] = value
     return (
         values.get("AGENT_DISPATCH_TASK_TYPE"),
