@@ -507,6 +507,13 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
         if not snapshot.clean:
             work = [*snapshot.blockers, *snapshot.review.required_actions, *snapshot.review.missing_slots]
             print(_render_unsettled_message(work))
+            if (
+                not snapshot.blockers
+                and not snapshot.review.required_actions
+                and snapshot.review.missing_slots
+                and all(slot.startswith("backstop:") for slot in snapshot.review.missing_slots)
+            ):
+                return 11, pr.latest_commit_sha
             return 10, pr.latest_commit_sha
         return 0, snapshot.head_sha
     blockers = maintenance.blockers_for_pr(pr)

@@ -1,4 +1,5 @@
 from argparse import Namespace
+from types import SimpleNamespace
 
 from agentic_pr_dash import maintenance_check
 
@@ -47,3 +48,25 @@ def test_new_push_resets_clean_observation_count(monkeypatch, tmp_path):
     args = _args(tmp_path)
     args.poll_interval = 0
     assert maintenance_check._cmd_monitor(args) == 0
+
+
+def test_missing_backstop_is_watch_pending_not_actionable(monkeypatch, tmp_path):
+    snapshot = SimpleNamespace(
+        clean=False,
+        blockers=[],
+        head_sha="head",
+        review=SimpleNamespace(required_actions=[], missing_slots=["backstop:1"]),
+    )
+    monkeypatch.setattr(maintenance_check, "_resolve_pr_by_number", lambda *_args, **_kwargs:
+                        SimpleNamespace(is_draft=False, latest_commit_sha="head", repo="owner/repo"))
+    monkeypatch.setattr(maintenance_check, "_observe_finalization", lambda *_args: snapshot)
+    monkeypatch.setattr("agent_review_coordinator.ReviewPolicy.from_yaml", lambda _text: object())
+    monkeypatch.setattr("agent_review_coordinator.ReviewLedger.model_validate_json", lambda _text: object())
+    policy = tmp_path / "policy.yaml"
+    ledger = tmp_path / "ledger.json"
+    policy.write_text("version: 1")
+    ledger.write_text("{}")
+    args = _args(tmp_path)
+    args.policy = str(policy)
+    args.ledger = str(ledger)
+    assert maintenance_check._monitor_observation(args) == (11, "head")
