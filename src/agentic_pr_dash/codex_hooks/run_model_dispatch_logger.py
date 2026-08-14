@@ -38,54 +38,22 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
+from agentic_pr_dash.codex_hooks.dispatch_runner import (
+    AGENT_CLASSIFY_MAP,
+    AGENT_DEFAULT_MODEL_NAMES,
+    classify_agent_dispatch,
+    observation_from_agent_payload,
+    resolve_agent_model,
+)
 
 # Classification keyword map (description + prompt prefix). Order matters: the
 # first matching task type wins.
-CLASSIFY_MAP = [
-    ("code_review", [
-        r"\breview\b", r"\bcode review\b", r"\baudit (?:the )?code\b",
-        r"\bcheck (?:the )?implementation\b", r"\bverify (?:the )?changes\b",
-    ]),
-    ("debugging", [
-        r"\bdebug\b", r"\bdiagnose\b", r"\broot cause\b", r"\bfix (?:the )?bug\b",
-        r"\bstack trace\b", r"\bfailing test\b", r"\btest failure\b",
-    ]),
-    ("exploration", [
-        r"\bexplore\b", r"\bhow does .+ work\b", r"\barchitecture\b",
-        r"\btrace (?:the )?(?:data )?flow\b",
-        r"\bfind all (?:usages|references|callers)\b",
-    ]),
-    ("trivial", [
-        r"\blookup\b", r"\bsimple (?:fix|change|update)\b",
-        r"\bquick (?:fix|check|change)\b", r"\bone.line(?:r)?\b",
-    ]),
-    ("large_impl", [
-        r"\b(?:multiple|several|many) files?\b", r"\bcross[- ]module\b",
-        r"\bacross (?:multiple |several )?\w*(?:files?|modules?|services?|packages?)\b",
-        r"\b(?:3|4|5|6|7|8|9|\d{2,})\+?\s*files?\b",
-        r"\bmulti[- ]file\b", r"\blarge (?:impl|implementation|change|refactor)\b",
-        r"\bend[- ]to[- ]end\b", r"\bfull[- ]stack\b",
-        r"\btyped.*cross[- ]module\b",
-    ]),
-    ("small_impl", [
-        r"\bimplement\b", r"\badd feature\b",
-        r"\bcreate (?:the |a )?(?:new )?\w+ (?:file|class|function|component|module)\b",
-        r"\bbuild\b", r"\bwrite (?:the )?code\b",
-        r"\bmodify (?:the )?code\b", r"\bscaffold\b", r"\brefactor\b",
-    ]),
-]
-
-DEFAULT_MODEL_NAMES = {
-    "sonnet": "sonnet-4.6",
-    "opus": "opus-4.6",
-    "haiku": "haiku-4.5",
-    "": "opus-4.6",
-}
-_DEFAULT_MODEL = "opus-4.6"
+CLASSIFY_MAP = AGENT_CLASSIFY_MAP
+DEFAULT_MODEL_NAMES = AGENT_DEFAULT_MODEL_NAMES
 
 # Subagent-dispatch tool names across runtimes. Claude fires ``Agent``; Codex
 # fires ``spawn_agent`` (and the namespaced ``functions.spawn_agent`` shape seen
@@ -125,24 +93,20 @@ def extra_fields() -> dict:
 
 
 def classify(description: str, prompt: str, subagent_type: str) -> str:
-    if subagent_type == "Explore":
-        return "exploration"
-    text = f"{description} {prompt[:500]}".lower()
-    for task_type, keywords in CLASSIFY_MAP:
-        for kw in keywords:
-            if re.search(kw, text, re.IGNORECASE):
-                return task_type
-    return "general"
+    return classify_agent_dispatch(description, prompt, subagent_type)
 
 
 def resolve_model_name(model_raw: str) -> str:
-    return DEFAULT_MODEL_NAMES.get(model_raw, model_raw or _DEFAULT_MODEL)
+    return resolve_agent_model(model_raw)
 
 
 def is_fallback(task_type: str, model_raw: str) -> bool:
     """A Claude fallback: a task whose primary should be a cheaper model
     (codex/sonnet) but which was dispatched to sonnet/default instead."""
-    return task_type in ("small_impl", "code_review", "debugging") and model_raw in ("sonnet", "")
+    return task_type in ("small_impl", "code_review", "debugging") and model_raw in (
+        "sonnet",
+        "",
+    )
 
 
 def log_path(project_dir: str) -> str:
@@ -167,16 +131,24 @@ def _bd_audit(project_dir: str, model_name: str, prompt_str: str) -> None:
     try:
         subprocess.run(
             [
-                "bd", "audit", "record", "--no-daemon",
-                "--kind", "model_dispatch",
-                "--model", model_name,
-                "--prompt", prompt_str,
-                "--response", "dispatched",
+                "bd",
+                "audit",
+                "record",
+                "--no-daemon",
+                "--kind",
+                "model_dispatch",
+                "--model",
+                model_name,
+                "--prompt",
+                prompt_str,
+                "--response",
+                "dispatched",
             ],
             cwd=project_dir,
             capture_output=True,
             text=True,
             timeout=5,
+            check=False,
         )
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
         pass
@@ -198,14 +170,15 @@ def main() -> int:
 
     tool_input = input_data.get("tool_input", {}) or {}
     description = tool_input.get("description", "")
-    prompt = tool_input.get("prompt", "")
     model_raw = tool_input.get("model", "")
     subagent_type = tool_input.get("subagent_type", "")
 
-    task_type = classify(description, prompt, subagent_type)
-    model_name = resolve_model_name(model_raw)
-
     project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+    observation = observation_from_agent_payload(input_data, project_dir)
+    if observation is None:
+        return 0
+    task_type = observation.task_type
+    model_name = observation.resolved_model or resolve_model_name(model_raw)
     prompt_str = (
         f"task_type={task_type}, "
         f"fallback={str(is_fallback(task_type, model_raw)).lower()}, "
@@ -215,7 +188,7 @@ def main() -> int:
 
     entry = {
         "kind": "model_dispatch",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "model": model_name,
         "prompt": prompt_str,
         "response": "dispatched",
