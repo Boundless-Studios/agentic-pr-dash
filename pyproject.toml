@@ -75,6 +75,8 @@ Repository = "https://github.com/Boundless-Studios/agentic-pr-dash"
 
 [project.scripts]
 agentic-pr-dash = "agentic_pr_dash.cli:main"
+agentic-pr-dash-codex-dispatch = "agentic_pr_dash.codex_hooks.run_codex_dispatch_logger:main"
+agentic-pr-dash-opencode-dispatch = "agentic_pr_dash.codex_hooks.run_opencode_dispatch_logger:main"
 
 [tool.hatch.build.targets.wheel]
 # `packages` maps src/agentic_pr_dash -> agentic_pr_dash and includes ALL files
