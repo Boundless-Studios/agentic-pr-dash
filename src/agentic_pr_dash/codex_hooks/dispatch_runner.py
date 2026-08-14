@@ -360,37 +360,18 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
 
 
 def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
-    """Return whether a shell command segment executes the requested provider."""
+    """Return whether a simple command directly executes the requested provider."""
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        tokens = list(lexer)
-    except ValueError:
+    if any(character in command for character in "\n;&|<>"):
         return False
-
-    if any(token in {"&&", "||", "&"} for token in tokens):
-        return False
-
-    at_command_start = True
-    for index, token in enumerate(tokens):
-        if token and all(character in ";&|\n" for character in token):
-            at_command_start = True
-            continue
-        if not at_command_start:
-            continue
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
-            continue
-        at_command_start = False
-        if (
-            Path(token).name == executable
-            and index + 1 < len(tokens)
-            and tokens[index + 1] == subcommand
-        ):
-            return True
-    return False
+    assignment = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+\s+"
+    executable_path = rf"(?:[^\s;&|<>]*/)?{executable}"
+    return bool(
+        re.match(
+            rf"^(?:{assignment})*{executable_path}\s+{subcommand}(?:\s|$)", command
+        )
+    )
 
 
 def _requested_model(command: str) -> str | None:
