@@ -286,6 +286,26 @@ def test_path_qualified_provider_keeps_attached_classification(
     assert result.additional_context == "policy ran"
 
 
+def test_provider_words_used_as_arguments_are_not_a_dispatch(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "printf '%s' AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 codex exec review"
+        ),
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+
+
 def test_callback_failure_does_not_undo_persisted_observation(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
