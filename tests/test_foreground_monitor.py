@@ -2,6 +2,7 @@ from argparse import Namespace
 from types import SimpleNamespace
 
 from agentic_pr_dash import maintenance_check
+from agentic_pr_dash.github_api import ObservationReadResult
 
 
 def _clock(*values):
@@ -123,4 +124,29 @@ def test_policy_free_changes_requested_is_actionable(monkeypatch, tmp_path):
         failing_checks=[], review_comments=[],
     )
     monkeypatch.setattr(maintenance_check, "_resolve_pr_by_number", lambda *_args, **_kwargs: pr)
+    monkeypatch.setattr(
+        "agentic_pr_dash.github_api.scan_review_threads_observation",
+        lambda *_args: ObservationReadResult.observed(([], [])),
+    )
     assert maintenance_check._monitor_observation(_args(tmp_path)) == (10, "head")
+
+
+def test_policy_free_unobservable_review_is_watch_pending(monkeypatch, tmp_path):
+    pr = SimpleNamespace(is_draft=False, latest_commit_sha="head", latest_commit_date="")
+    monkeypatch.setattr(maintenance_check, "_resolve_pr_by_number", lambda *_args, **_kwargs: pr)
+    monkeypatch.setattr(
+        "agentic_pr_dash.github_api.scan_review_threads_observation",
+        lambda *_args: ObservationReadResult.unavailable("boom"),
+    )
+    assert maintenance_check._monitor_observation(_args(tmp_path)) == (11, "head")
+
+
+def test_monitor_poll_interval_must_be_positive():
+    assert maintenance_check._positive_float("1") == 1.0
+    for value in ("0", "-1"):
+        try:
+            maintenance_check._positive_float(value)
+        except Exception as exc:
+            assert "greater than zero" in str(exc)
+        else:
+            raise AssertionError(f"accepted invalid poll interval {value}")

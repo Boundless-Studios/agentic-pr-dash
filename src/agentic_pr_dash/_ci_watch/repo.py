@@ -84,7 +84,7 @@ def get_pr_number(branch: str, project_dir: Path) -> int | None:
     try:
         r = subprocess.run(
             ["gh", "pr", "list", "--head", branch, "--state", "open",
-             "--limit", "1", "--json", "number"],
+             "--limit", "100", "--json", "number,headRefName"],
             cwd=str(project_dir), capture_output=True, text=True, timeout=20,
             env=github_api.automation_subprocess_env(),
         )
@@ -96,7 +96,9 @@ def get_pr_number(branch: str, project_dir: Path) -> int | None:
         payload = json.loads(r.stdout or "[]")
     except json.JSONDecodeError:
         return None
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        n = payload[0].get("number")
-        return n if isinstance(n, int) else None
+    if isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, dict) and entry.get("headRefName") == branch:
+                n = entry.get("number")
+                return n if isinstance(n, int) else None
     return None

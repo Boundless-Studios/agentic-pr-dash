@@ -464,6 +464,13 @@ def _foreground_deadline_reached(started: float, max_wait: float) -> bool:
     return time.monotonic() - started >= max_wait
 
 
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than zero")
+    return parsed
+
+
 def _release_foreground_ownership(args: argparse.Namespace) -> None:
     """Relinquish an exited Codex foreground owner without waiting for its TTL."""
     cwd = os.path.abspath(args.cwd)
@@ -520,12 +527,24 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
                 return 11, pr.latest_commit_sha
             return 10, pr.latest_commit_sha
         return 0, snapshot.head_sha
+    review_observation = github_api.scan_review_threads_observation(
+        args.pr, getattr(pr, "latest_commit_date", ""), cwd
+    )
+    if not review_observation.observable:
+        print(f"PR #{args.pr} review feedback is unobservable")
+        return 11, pr.latest_commit_sha
+    strict_comments, _decisions = review_observation.value or ([], [])
     blockers = maintenance.blockers_for_pr(pr)
+    if strict_comments and "review_comments" not in blockers:
+        blockers.append("review_comments")
     if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
         blockers.append("changes_requested")
     if blockers:
         print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
         return 10, pr.latest_commit_sha
+    if str(pr.mergeable).upper() in {"", "UNKNOWN"}:
+        print(f"PR #{args.pr} mergeability is still being computed")
+        return 11, pr.latest_commit_sha
     if github_api.required_checks_pending(args.pr, cwd):
         print(f"PR #{args.pr} required CI is still pending")
         return 11, pr.latest_commit_sha
@@ -2071,7 +2090,7 @@ def main(argv: list[str] | None = None) -> int:
     monitor_p.add_argument("--session-id", default="")
     monitor_p.add_argument("--pr", type=int, required=True)
     monitor_p.add_argument("--max-wait", type=float, default=1800.0)
-    monitor_p.add_argument("--poll-interval", type=float, default=30.0)
+    monitor_p.add_argument("--poll-interval", type=_positive_float, default=30.0)
     monitor_p.add_argument("--policy", default=None)
     monitor_p.add_argument("--ledger", default=None)
 
