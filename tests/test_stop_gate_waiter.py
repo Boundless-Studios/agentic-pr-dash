@@ -391,8 +391,14 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     assert r2 == 2
     # Third call → loop-break releases the gate (exit 0)
     r3 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
-    err = capsys.readouterr().err
+    capsys.readouterr()
     assert r3 == 0
+
+    # The bounded release is durable for this exact observation. A later Stop
+    # attempt must not immediately re-arm and inject the same waiter request.
+    r4 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert r4 == 0
+    assert capsys.readouterr().err == ""
 
 
 def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):

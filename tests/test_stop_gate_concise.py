@@ -208,6 +208,26 @@ def test_fingerprint_loop_break_unchanged(
     assert results == [2, 2, 0]
 
 
+def test_released_fingerprint_does_not_rearm_until_state_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = _patch_pending_stop(monkeypatch, tmp_path)
+
+    assert [stop_gate._stop_gate_impl(args) for _ in range(3)] == [2, 2, 0]
+    capsys.readouterr()
+
+    assert stop_gate._stop_gate_impl(args) == 0
+    assert capsys.readouterr().err == ""
+
+    changed_args = _patch_pending_stop(
+        monkeypatch,
+        tmp_path,
+        prompt=VERBOSE_PROMPT.replace("Comment 12345", "Comment 67890"),
+    )
+    assert stop_gate._stop_gate_impl(changed_args) == 2
+    assert SUMMARY in capsys.readouterr().err
+
+
 class TestBuildMaintenanceSummary:
     @staticmethod
     def _summary_fn() -> Callable[[PRData], str]:

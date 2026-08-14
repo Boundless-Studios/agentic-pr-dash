@@ -726,13 +726,16 @@ def _stop_gate_impl(args) -> int:
             if escalated_open and not _await_alive(cwd, session_id):
                 escalation_text = _build_escalation_block(escalated_open)
                 fingerprint = "escalated:" + ",".join(str(n) for n in sorted(escalated_open))
+                if state.get("released_fingerprint") == fingerprint:
+                    _save_stop_state(cwd, {**state, "ts": now})
+                    return 0
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
                 threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
                 if count < threshold:
                     print(escalation_text, file=sys.stderr)
                     return 2
-                _save_stop_state(cwd, {"ts": now})
+                _save_stop_state(cwd, {"ts": now, "released_fingerprint": fingerprint})
                 return 0
             if open_prs and not _await_alive(cwd, session_id):
                 # BOU-1962 (codex PR #75 review): when this session's waiter
@@ -813,13 +816,16 @@ def _stop_gate_impl(args) -> int:
                         _save_stop_state(cwd, {"ts": now})
                         return 0
                 fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
+                if state.get("released_fingerprint") == fingerprint:
+                    _save_stop_state(cwd, {**state, "ts": now})
+                    return 0
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
                 threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
                 if count < threshold:
                     print(_build_waiter_block(open_prs, cwd, session_id), file=sys.stderr)
                     return 2
-                _save_stop_state(cwd, {"ts": now})
+                _save_stop_state(cwd, {"ts": now, "released_fingerprint": fingerprint})
                 return 0
         _save_stop_state(cwd, {"ts": now})
         return 0
@@ -833,6 +839,9 @@ def _stop_gate_impl(args) -> int:
     fingerprint = _stop_fingerprint(pending)
     if unknown_worktrees:
         fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
+    if state.get("released_fingerprint") == fingerprint:
+        _save_stop_state(cwd, {**state, "ts": now})
+        return 0
     count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
     _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
 
@@ -890,10 +899,11 @@ def _stop_gate_impl(args) -> int:
         print(
             f"[pr-watch] Same pending/unknown PR state seen {count}× with no "
             f"progress — releasing the stop gate so you can ask the user or "
-            f"take a safe action. A later stop will re-enforce it.",
+            f"take a safe action. This exact state stays suppressed until the "
+            f"PR head or actionable review/CI state changes.",
             file=sys.stderr,
         )
-        _save_stop_state(cwd, {"ts": now})
+        _save_stop_state(cwd, {"ts": now, "released_fingerprint": fingerprint})
         return 0
 
     if pending:
