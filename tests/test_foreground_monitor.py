@@ -4,6 +4,21 @@ from types import SimpleNamespace
 from agentic_pr_dash import maintenance_check
 
 
+def _clock(*values):
+    remaining = iter(values)
+    last = values[-1]
+
+    def now():
+        nonlocal last
+        try:
+            last = next(remaining)
+        except StopIteration:
+            pass
+        return last
+
+    return now
+
+
 def _args(tmp_path):
     return Namespace(cwd=str(tmp_path), pr=42, session_id="sess", max_wait=1800.0,
                      poll_interval=30.0, policy=None, ledger=None)
@@ -23,13 +38,37 @@ def test_pending_then_green_requires_two_clean_observations(monkeypatch, tmp_pat
     calls = []
     monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: (calls.append(1) or next(outcomes), "head"))
     monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
-    times = iter([0.0, 0.0, 0.0, 0.0, 30.0])
-    monkeypatch.setattr(maintenance_check.time, "monotonic", lambda: next(times))
+    times = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
+    monkeypatch.setattr(maintenance_check.time, "monotonic", _clock(*times))
     monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
     args = _args(tmp_path)
     args.poll_interval = 0
     assert maintenance_check._cmd_monitor(args) == 0
     assert len(calls) == 3
+
+
+def test_fast_poll_accepts_later_clean_observation(monkeypatch, tmp_path):
+    observations = iter([(0, "head"), (0, "head"), (0, "head")])
+    monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: next(observations))
+    monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
+    times = iter([0.0, 0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 30.0])
+    monkeypatch.setattr(maintenance_check.time, "monotonic", _clock(*times))
+    monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
+    args = _args(tmp_path)
+    args.poll_interval = 0
+    assert maintenance_check._cmd_monitor(args) == 0
+
+
+def test_actionable_after_early_clean_pair_releases_ownership(monkeypatch, tmp_path):
+    observations = iter([(0, "head"), (0, "head"), (10, "head")])
+    monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: next(observations))
+    monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(maintenance_check.time, "monotonic", _clock(0.0, 0.0, 0.0, 10.0, 10.0))
+    monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
+    released = []
+    monkeypatch.setattr(maintenance_check, "_release_foreground_ownership", lambda args: released.append(args.cwd))
+    assert maintenance_check._cmd_monitor(_args(tmp_path)) == 10
+    assert released == [str(tmp_path)]
 
 
 def test_exit_while_pending_releases_live_ownership(monkeypatch, tmp_path):
@@ -46,8 +85,8 @@ def test_new_push_resets_clean_observation_count(monkeypatch, tmp_path):
     observations = iter([(0, "old-head"), (0, "new-head"), (0, "new-head")])
     monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: next(observations))
     monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
-    times = iter([0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
-    monkeypatch.setattr(maintenance_check.time, "monotonic", lambda: next(times))
+    times = iter([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
+    monkeypatch.setattr(maintenance_check.time, "monotonic", _clock(*times))
     monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
     args = _args(tmp_path)
     args.poll_interval = 0
@@ -75,3 +114,13 @@ def test_missing_backstop_is_watch_pending_not_actionable(monkeypatch, tmp_path)
     args.policy = str(policy)
     args.ledger = str(ledger)
     assert maintenance_check._monitor_observation(args) == (11, "head")
+
+
+def test_policy_free_changes_requested_is_actionable(monkeypatch, tmp_path):
+    pr = SimpleNamespace(
+        is_draft=False, latest_commit_sha="head", review_decision="CHANGES_REQUESTED",
+        merge_state="CLEAN", mergeable="MERGEABLE", status=SimpleNamespace(value="clean"),
+        failing_checks=[], review_comments=[],
+    )
+    monkeypatch.setattr(maintenance_check, "_resolve_pr_by_number", lambda *_args, **_kwargs: pr)
+    assert maintenance_check._monitor_observation(_args(tmp_path)) == (10, "head")

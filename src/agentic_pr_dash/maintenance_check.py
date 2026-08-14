@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
 import sys
 import time
@@ -520,6 +521,8 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
             return 10, pr.latest_commit_sha
         return 0, snapshot.head_sha
     blockers = maintenance.blockers_for_pr(pr)
+    if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
+        blockers.append("changes_requested")
     if blockers:
         print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
         return 10, pr.latest_commit_sha
@@ -538,12 +541,31 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     clean = 0
     clean_head = ""
     first_clean_at = 0.0
+    settled = False
     try:
         while True:
             if _foreground_deadline_reached(started, args.max_wait):
                 print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
                 return 10
-            result, head = _monitor_observation(args)
+            remaining = args.max_wait - (time.monotonic() - started)
+            previous_handler = signal.getsignal(signal.SIGALRM)
+
+            def _deadline_expired(_signum, _frame):
+                raise TimeoutError("foreground settlement deadline reached")
+
+            signal.signal(signal.SIGALRM, _deadline_expired)
+            signal.setitimer(signal.ITIMER_REAL, max(0.001, remaining))
+            try:
+                result, head = _monitor_observation(args)
+            except TimeoutError:
+                print(
+                    f"PR settlement timed out after exactly {args.max_wait:g} seconds",
+                    file=sys.stderr,
+                )
+                return 10
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
             if _foreground_deadline_reached(started, args.max_wait):
                 print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
                 return 10
@@ -555,7 +577,8 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 clean += 1
                 if clean == 1:
                     first_clean_at = now
-                if clean == 2 and now - first_clean_at >= 30.0:
+                if clean >= 2 and now - first_clean_at >= 30.0:
+                    settled = True
                     return 0
             elif result == 10:
                 return 10
@@ -567,7 +590,7 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 return 10
             time.sleep(min(args.poll_interval, max(0.0, args.max_wait - (time.monotonic() - started))))
     finally:
-        if clean < 2:
+        if not settled:
             _release_foreground_ownership(args)
 
 

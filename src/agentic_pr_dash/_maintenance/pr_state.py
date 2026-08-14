@@ -249,6 +249,11 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
             if entry.get("number") == pr_number:
                 raw = entry
                 break
+    if prs is not None and raw is None:
+        # The authoritative open-PR snapshot answered successfully and the
+        # requested PR is absent.  Do not synthesize a clean PR from detail
+        # probes: it may have been closed while a foreground monitor waited.
+        return None
 
     # See _resolve_pr_for_branch: keep a live gh-availability signal across the
     # detail fetch so a warm snapshot (or REST-fallback resolution) + a
