@@ -503,6 +503,7 @@ def test_rest_pr_payload_normalizes_to_graphql_shape(monkeypatch):
     payload = github_api._rest_pr_payload(123, cwd=".")
     assert payload == {
         "number": 123,
+        "state": "",
         "author": {"login": "octo"},
         "title": "Quota-safe fallback",
         "body": "body",
