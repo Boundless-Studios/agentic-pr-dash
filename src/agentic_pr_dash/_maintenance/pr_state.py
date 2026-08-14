@@ -243,6 +243,7 @@ def _resolve_pr_by_number(
     # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
     prs = github_api.list_open_prs_cached(cwd, force=force)
     raw: dict | None = None
+    needs_review_decision_probe = False
     if prs is None:
         # Quota-safe REST fallback (BOU-1966): see _resolve_pr_for_branch. A
         # rate-limited author list still verifies an explicit --pr N via the
@@ -250,6 +251,7 @@ def _resolve_pr_by_number(
         raw = _rest_fallback_entry_by_number(pr_number, cwd)
         if raw is None:
             return _GH_UNAVAILABLE
+        needs_review_decision_probe = True
     elif prs:
         for entry in prs:
             if entry.get("number") == pr_number:
@@ -264,6 +266,9 @@ def _resolve_pr_by_number(
             return _GH_UNAVAILABLE
         if str(raw.get("state") or "").lower() != "open":
             return None
+        needs_review_decision_probe = True
+
+    if needs_review_decision_probe:
         review_decision, diagnostic = _gh_pr_view_field(
             cwd, pr_number, "reviewDecision"
         )
