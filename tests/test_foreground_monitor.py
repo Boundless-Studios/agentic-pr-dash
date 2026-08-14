@@ -23,6 +23,8 @@ def test_pending_then_green_requires_two_clean_observations(monkeypatch, tmp_pat
     calls = []
     monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: (calls.append(1) or next(outcomes), "head"))
     monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
+    times = iter([0.0, 0.0, 0.0, 0.0, 30.0])
+    monkeypatch.setattr(maintenance_check.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
     args = _args(tmp_path)
     args.poll_interval = 0
@@ -44,6 +46,8 @@ def test_new_push_resets_clean_observation_count(monkeypatch, tmp_path):
     observations = iter([(0, "old-head"), (0, "new-head"), (0, "new-head")])
     monkeypatch.setattr(maintenance_check, "_monitor_observation", lambda _args: next(observations))
     monkeypatch.setattr(maintenance_check.time, "sleep", lambda _seconds: None)
+    times = iter([0.0, 0.0, 0.0, 0.0, 0.0, 30.0])
+    monkeypatch.setattr(maintenance_check.time, "monotonic", lambda: next(times))
     monkeypatch.setattr(maintenance_check, "_foreground_deadline_reached", lambda *_: False)
     args = _args(tmp_path)
     args.poll_interval = 0
@@ -59,7 +63,8 @@ def test_missing_backstop_is_watch_pending_not_actionable(monkeypatch, tmp_path)
     )
     monkeypatch.setattr(maintenance_check, "_resolve_pr_by_number", lambda *_args, **_kwargs:
                         SimpleNamespace(is_draft=False, latest_commit_sha="head", repo="owner/repo"))
-    monkeypatch.setattr(maintenance_check, "_observe_finalization", lambda *_args: snapshot)
+    monkeypatch.setattr(maintenance_check, "_observe_finalization",
+                        lambda *_args, **_kwargs: snapshot)
     monkeypatch.setattr("agent_review_coordinator.ReviewPolicy.from_yaml", lambda _text: object())
     monkeypatch.setattr("agent_review_coordinator.ReviewLedger.model_validate_json", lambda _text: object())
     policy = tmp_path / "policy.yaml"

@@ -199,7 +199,7 @@ class _NoOpenPR(RuntimeError):
     """The requested branch or PR has no open pull request to finalize."""
 
 
-def _observe_finalization(args, policy, ledger):
+def _observe_finalization(args, policy, ledger, pr=None):
     """Read one fail-closed PR/CI/review snapshot for ``finalize``."""
 
     from agentic_pr_dash import github_api  # noqa: PLC0415
@@ -208,11 +208,12 @@ def _observe_finalization(args, policy, ledger):
     )
 
     cwd = os.path.abspath(args.cwd)
-    github_api.reset_checks_probe_failure_seen()
-    if args.pr is not None:
-        pr = _resolve_pr_by_number(args.pr, cwd, force=True)
-    else:
-        pr = _resolve_pr_for_branch(cwd, force=True)
+    if pr is None:
+        github_api.reset_checks_probe_failure_seen()
+        if args.pr is not None:
+            pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+        else:
+            pr = _resolve_pr_for_branch(cwd, force=True)
     if pr is _GH_UNAVAILABLE:
         raise RuntimeError(_gh_unavailable_message(cwd))
     if pr is None:
@@ -500,18 +501,20 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
         try:
             policy = ReviewPolicy.from_yaml(Path(policy_path).read_text(encoding="utf-8"))
             ledger = ReviewLedger.model_validate_json(ledger_path.read_text(encoding="utf-8"))
-            snapshot = _observe_finalization(args, policy, ledger)
+            snapshot = _observe_finalization(args, policy, ledger, pr=pr)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"PR #{args.pr} settlement is unobservable: {exc}")
             return 11, pr.latest_commit_sha
         if not snapshot.clean:
             work = [*snapshot.blockers, *snapshot.review.required_actions, *snapshot.review.missing_slots]
             print(_render_unsettled_message(work))
+            missing_only_backstop = all(
+                slot.startswith("backstop:") for slot in snapshot.review.missing_slots
+            )
             if (
-                not snapshot.blockers
+                set(snapshot.blockers) <= {"ci_pending"}
                 and not snapshot.review.required_actions
-                and snapshot.review.missing_slots
-                and all(slot.startswith("backstop:") for slot in snapshot.review.missing_slots)
+                and missing_only_backstop
             ):
                 return 11, pr.latest_commit_sha
             return 10, pr.latest_commit_sha
@@ -552,7 +555,7 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 clean += 1
                 if clean == 1:
                     first_clean_at = now
-                if clean == 2 and now - first_clean_at >= args.poll_interval:
+                if clean == 2 and now - first_clean_at >= 30.0:
                     return 0
             elif result == 10:
                 return 10
