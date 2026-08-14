@@ -56,9 +56,15 @@ def branch_drift_message(
     # newest, so a benign newer candidate cannot mask a drifting older candidate.
     candidate_set = set(candidate_ids)
     started_by_id: dict[str, dict] = {}
+    transitions_by_id: dict[str, list[dict]] = {}
     for event in reversed(events):
         session_id = str(event.get("session_id") or "")
-        if session_id not in candidate_set or session_id in started_by_id:
+        if session_id not in candidate_set:
+            continue
+        if event.get("event") == "branch_transition" and event.get("attributed") is True:
+            transitions_by_id.setdefault(session_id, []).append(event)
+            continue
+        if session_id in started_by_id:
             continue
         if str(event.get("event") or "") != "started":
             continue
@@ -76,6 +82,13 @@ def branch_drift_message(
 
     for started_event in started_by_id.values():
         started_branch = str(started_event.get("branch") or "").strip()
+        session_id = str(started_event.get("session_id") or "")
+        lineage_branch = started_branch
+        for transition in reversed(transitions_by_id.get(session_id, [])):
+            if str(transition.get("from_branch") or "").strip() != lineage_branch:
+                continue
+            lineage_branch = str(transition.get("branch") or "").strip()
+        started_branch = lineage_branch
         if (
             not started_branch
             or started_branch == current_branch

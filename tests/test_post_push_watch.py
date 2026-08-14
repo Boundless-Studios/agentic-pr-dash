@@ -331,12 +331,18 @@ def test_nudge_emitted_for_claude_push_with_owned_nondraft_pr(monkeypatch, tmp_p
     assert "sess-1" in ctx
 
 
-def test_no_nudge_for_codex_exec_push(monkeypatch, tmp_path, capsys):
+def test_codex_push_requires_bounded_foreground_settlement(monkeypatch, tmp_path, capsys):
     _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
     payload = {"tool_name": "exec_command", "tool_input": {"cmd": "git push"},
                "cwd": str(tmp_path)}
     rc, out = _run_hook_capture(monkeypatch, capsys, payload)
-    assert rc == 0 and out is None
+    assert rc == 0
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "FOREGROUND" in ctx
+    assert "monitor" in ctx
+    assert "--max-wait 1800" in ctx
+    assert "BACKGROUND" not in ctx
+    assert "await" not in ctx
 
 
 def test_no_nudge_for_draft_pr(monkeypatch, tmp_path, capsys):
@@ -390,15 +396,17 @@ def test_no_nudge_when_worktree_not_owned_by_session(monkeypatch, tmp_path, caps
     assert rc == 0 and out is None
 
 
-def test_no_nudge_when_no_waiter_env_set(monkeypatch, tmp_path, capsys):
-    # Codex review #49: a host wiring this hook via run_shared_hook normalizes
-    # exec_command→Bash; PR_WATCH_NO_WAITER=1 suppresses the nudge for runtimes
-    # with no background-task wake channel, regardless of payload normalization.
+def test_no_waiter_env_selects_foreground_nudge(monkeypatch, tmp_path, capsys):
+    # A host may normalize exec_command→Bash. PR_WATCH_NO_WAITER identifies the
+    # wakeless Codex path and must select foreground monitoring, not silence it.
     _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
     monkeypatch.setenv("PR_WATCH_NO_WAITER", "1")
     payload = {"tool_name": "Bash", "tool_input": {"command": "git push"}, "cwd": str(tmp_path)}
     rc, out = _run_hook_capture(monkeypatch, capsys, payload)
-    assert rc == 0 and out is None
+    assert rc == 0
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "FOREGROUND" in ctx
+    assert "BACKGROUND" not in ctx
 
 
 def test_nudge_construction_error_is_advisory(monkeypatch, tmp_path, capsys):

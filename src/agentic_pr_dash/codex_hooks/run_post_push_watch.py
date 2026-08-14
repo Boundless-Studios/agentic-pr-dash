@@ -249,7 +249,8 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     * **Live PR.** An owned, non-draft open PR exists for the pushed branch.
     * **No duplicate.** No waiter is already alive for this session.
     """
-    if raw_tool_name != "Bash" or os.environ.get("PR_WATCH_NO_WAITER") == "1":
+    is_codex = raw_tool_name == "exec_command" or os.environ.get("PR_WATCH_NO_WAITER") == "1"
+    if raw_tool_name not in ("Bash", "exec_command"):
         return None
     branch = current_branch(Path(push_cwd))
     if branch in ("", "main", "master"):
@@ -274,6 +275,15 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     if _await_alive(push_cwd, session_id):
         return None
     sha = head_sha(Path(push_cwd))
+    if is_codex:
+        return (
+            f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "
+            "no asynchronous wake/resumption channel. Poll settlement in the "
+            "FOREGROUND now until two clean observations 30 seconds apart or the "
+            "exact 30-minute bound:\n  python3 -m agentic_pr_dash.maintenance_check "
+            f"monitor --cwd {push_cwd} --session-id {session_id} --max-wait 1800 "
+            "--poll-interval 30"
+        )
     await_cmd = load_config(push_cwd).await_command.format(
         cwd=push_cwd, session_id=session_id
     )
@@ -304,8 +314,8 @@ def main() -> int:
     cfg = ci_watch.CIWatchConfig.from_env(env)
     ci_watch.arm_post_push_watch(cfg)
 
-    # Proactively nudge the agent to launch the exit-10 await waiter in the
-    # background so a red check wakes the session this turn (BOU-1786). Advisory:
+    # Proactively nudge Claude to launch its waiter, or Codex to run the bounded
+    # foreground monitor (Codex has no wake channel). Advisory:
     # never block the push — any failure → no stdout, return 0.
     try:
         nudge = build_post_push_waiter_nudge(watch_cwd, payload.get("tool_name", ""))

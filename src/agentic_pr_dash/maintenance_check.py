@@ -457,6 +457,42 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
     return 0 if report.settled else 10
 
 
+def _foreground_deadline_reached(started: float, max_wait: float) -> bool:
+    return time.monotonic() - started >= max_wait
+
+
+def _release_foreground_ownership(args: argparse.Namespace) -> None:
+    """Relinquish an exited Codex foreground owner without waiting for its TTL."""
+    cwd = os.path.abspath(args.cwd)
+    session_id = getattr(args, "session_id", "") or _read_session_marker(cwd)
+    marker = _read_marker(cwd) or {}
+    pr = marker.get("pr")
+    if session_id and str(pr).isdigit():
+        release_ownership_claims(cwd, {int(pr)}, session_id, reason="foreground_exited")
+
+
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    """Bounded foreground settlement loop for runtimes with no wake channel."""
+    started = time.monotonic()
+    clean = 0
+    try:
+        while True:
+            result = _cmd_check(args)
+            if result == 0:
+                clean += 1
+                if clean == 2:
+                    return 0
+            else:
+                clean = 0
+            if _foreground_deadline_reached(started, args.max_wait):
+                print("PR settlement timed out after exactly 1800 seconds", file=sys.stderr)
+                return 10
+            time.sleep(min(args.poll_interval, max(0.0, args.max_wait - (time.monotonic() - started))))
+    finally:
+        if clean < 2:
+            _release_foreground_ownership(args)
+
+
 def _await_watch_pending_this_tick(
     owned: list[str],
     detached_records: list[dict],
@@ -1927,6 +1963,14 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the machine-readable finalization report.",
     )
 
+    monitor_p = subparsers.add_parser(
+        "monitor", help="Foreground Codex settlement polling (bounded; no wake channel)."
+    )
+    monitor_p.add_argument("--cwd", default=".")
+    monitor_p.add_argument("--session-id", default="")
+    monitor_p.add_argument("--max-wait", type=float, default=1800.0)
+    monitor_p.add_argument("--poll-interval", type=float, default=30.0)
+
     # --- complete ---
     complete_p = subparsers.add_parser(
         "complete",
@@ -2215,6 +2259,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_check(args)
     if args.command == "finalize":
         return _cmd_finalize(args)
+    if args.command == "monitor":
+        return _cmd_monitor(args)
     if args.command == "complete":
         return _cmd_complete(args)
     if args.command == "hold-worktree":
