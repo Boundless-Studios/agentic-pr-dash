@@ -264,6 +264,12 @@ def _resolve_pr_by_number(
             return _GH_UNAVAILABLE
         if str(raw.get("state") or "").lower() != "open":
             return None
+        review_decision, diagnostic = _gh_pr_view_field(
+            cwd, pr_number, "reviewDecision"
+        )
+        if diagnostic is not None:
+            return _GH_UNAVAILABLE
+        raw["reviewDecision"] = review_decision or "none"
 
     # See _resolve_pr_for_branch: keep a live gh-availability signal across the
     # detail fetch so a warm snapshot (or REST-fallback resolution) + a

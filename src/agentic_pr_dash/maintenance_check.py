@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import signal
 import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
@@ -466,9 +467,13 @@ def _foreground_deadline_reached(started: float, max_wait: float) -> bool:
 
 def _positive_float(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be greater than zero")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
     return parsed
+
+
+class _ForegroundDeadline(BaseException):
+    """Hard alarm that ordinary API exception adapters must not swallow."""
 
 
 def _release_foreground_ownership(args: argparse.Namespace) -> None:
@@ -488,7 +493,14 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     cwd = os.path.abspath(args.cwd)
     github_api.reset_checks_probe_failure_seen()
     pr = _resolve_pr_by_number(args.pr, cwd, force=True, include_reviews=False)
-    if pr is _GH_UNAVAILABLE or pr is None:
+    if pr is None:
+        merged = github_api._rest_pr_payload(args.pr, cwd=cwd)
+        if merged is not None and merged.get("mergedAt"):
+            print(f"PR #{args.pr} merged; settlement is complete")
+            return 0, str(merged.get("headRefOid") or "merged")
+        print(f"PR #{args.pr} is no longer open", file=sys.stderr)
+        return 10, ""
+    if pr is _GH_UNAVAILABLE:
         print(f"PR #{args.pr} could not be observed", file=sys.stderr)
         return 2, ""
     if pr.is_draft:
@@ -559,15 +571,18 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
         from agentic_pr_dash._ci_watch.config import NO_CHECKS_GRACE_S  # noqa: PLC0415
 
         now = time.monotonic()
+        grace_head = getattr(args, "_no_checks_head", None)
         first_empty = getattr(args, "_no_checks_first_seen_at", None)
-        if first_empty is None:
+        if first_empty is None or grace_head != pr.latest_commit_sha:
             args._no_checks_first_seen_at = now
+            args._no_checks_head = pr.latest_commit_sha
             first_empty = now
         if now - first_empty < NO_CHECKS_GRACE_S:
             print(f"PR #{args.pr} is waiting for CI checks to register")
             return 11, pr.latest_commit_sha
     else:
         args._no_checks_first_seen_at = None
+        args._no_checks_head = None
     if github_api.required_checks_pending(args.pr, cwd):
         print(f"PR #{args.pr} required CI is still pending")
         return 11, pr.latest_commit_sha
@@ -593,13 +608,13 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
             previous_handler = signal.getsignal(signal.SIGALRM)
 
             def _deadline_expired(_signum, _frame):
-                raise TimeoutError("foreground settlement deadline reached")
+                raise _ForegroundDeadline("foreground settlement deadline reached")
 
             signal.signal(signal.SIGALRM, _deadline_expired)
             signal.setitimer(signal.ITIMER_REAL, max(0.001, remaining))
             try:
                 result, head = _monitor_observation(args)
-            except TimeoutError:
+            except _ForegroundDeadline:
                 print(
                     f"PR settlement timed out after exactly {args.max_wait:g} seconds",
                     file=sys.stderr,
@@ -2112,7 +2127,7 @@ def main(argv: list[str] | None = None) -> int:
     monitor_p.add_argument("--cwd", default=".")
     monitor_p.add_argument("--session-id", default="")
     monitor_p.add_argument("--pr", type=int, required=True)
-    monitor_p.add_argument("--max-wait", type=float, default=1800.0)
+    monitor_p.add_argument("--max-wait", type=_positive_float, default=1800.0)
     monitor_p.add_argument("--poll-interval", type=_positive_float, default=30.0)
     monitor_p.add_argument("--policy", default=None)
     monitor_p.add_argument("--ledger", default=None)
