@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentic_pr_dash.dispatch_observation import (
+    ClassificationAuthority,
     DispatchObservation,
     DispatchOutcome,
     DispatchProvider,
@@ -155,6 +156,7 @@ def run_dispatch_hook(
         and observation.source is DispatchSource.INTERACTIVE_HOOK
         and observation.outcome is DispatchOutcome.SUCCESS
         and observation.task_type == "review"
+        and observation.classification_authority is ClassificationAuthority.DECLARED
     ):
         try:
             additional_context = callback(observation)
@@ -282,7 +284,14 @@ def _observation_from_request(
     response = request.payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
-    task_type = "review" if _REVIEW_PATTERN.search(command) else "exec"
+    declared = _declared_classification(request.payload)
+    if declared is not None and not _has_provider_invocation(command, request.provider):
+        declared = None
+    task_type = (
+        declared[0]
+        if declared is not None
+        else ("review" if _REVIEW_PATTERN.search(command) else "exec")
+    )
     verdict = response.get("review_verdict")
     if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
         verdict = None
@@ -299,7 +308,26 @@ def _observation_from_request(
         resolved_model=requested_model,
         outcome=outcome,
         review_verdict=dict(verdict) if verdict is not None else None,
+        classification_authority=(
+            ClassificationAuthority.DECLARED
+            if declared is not None
+            else ClassificationAuthority.LEGACY_INFERRED
+        ),
+        classification_framework=declared[1] if declared is not None else None,
     )
+
+
+def _declared_classification(payload: dict[str, object]) -> tuple[str, str] | None:
+    classification = payload.get("dispatch_classification")
+    if not isinstance(classification, dict):
+        return None
+    task_type = classification.get("task_type")
+    framework = classification.get("framework")
+    if not isinstance(task_type, str) or not task_type.strip():
+        return None
+    if framework != "coding-agent/v1":
+        return None
+    return task_type.strip(), framework.strip()
 
 
 def _normalize_hook_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -329,6 +357,21 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
     return bool(re.search(rf"\b{executable}\s+{subcommand}\b", command))
+
+
+def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
+    """Return whether a simple command directly executes the requested provider."""
+    executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
+    subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
+    if any(character in command for character in "\n;&|<>"):
+        return False
+    assignment = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+\s+"
+    executable_path = rf"(?:[^\s;&|<>]*/)?{executable}"
+    return bool(
+        re.match(
+            rf"^(?:{assignment})*{executable_path}\s+{subcommand}(?:\s|$)", command
+        )
+    )
 
 
 def _requested_model(command: str) -> str | None:
