@@ -184,7 +184,7 @@ def test_heuristic_review_label_cannot_invoke_repository_callback(
     assert result.additional_context is None
 
 
-def test_coding_agent_command_declaration_is_policy_authoritative(
+def test_command_environment_declaration_is_telemetry_only(
     tmp_path: Path,
 ) -> None:
     request = _request(
@@ -197,12 +197,17 @@ def test_coding_agent_command_declaration_is_policy_authoritative(
         ),
     )
 
-    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+    callbacks: list[str] = []
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
 
     assert result.observation is not None
-    assert result.observation.classification_authority.value == "declared"
-    assert result.observation.classification_framework == "coding-agent/v1"
-    assert result.additional_context == "policy ran"
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert result.observation.classification_framework is None
+    assert callbacks == []
+    assert result.additional_context is None
 
 
 def test_declaration_on_earlier_shell_segment_is_not_authoritative(
@@ -230,7 +235,7 @@ def test_declaration_on_earlier_shell_segment_is_not_authoritative(
     assert result.additional_context is None
 
 
-def test_last_duplicate_classification_assignment_matches_shell_environment(
+def test_duplicate_command_environment_assignments_are_not_authoritative(
     tmp_path: Path,
 ) -> None:
     request = _request(
@@ -251,8 +256,7 @@ def test_last_duplicate_classification_assignment_matches_shell_environment(
     )
 
     assert result.observation is not None
-    assert result.observation.task_type == "exec"
-    assert result.observation.classification_authority.value == "declared"
+    assert result.observation.classification_authority.value == "legacy_inferred"
     assert callbacks == []
 
 
@@ -277,6 +281,7 @@ def test_path_qualified_provider_keeps_attached_classification(
             "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 "
             f"{executable} {subcommand} review"
         ),
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
     )
 
     result = run_dispatch_hook(request, lambda _observation: "policy ran")
@@ -286,7 +291,7 @@ def test_path_qualified_provider_keeps_attached_classification(
     assert result.additional_context == "policy ran"
 
 
-def test_provider_words_used_as_arguments_are_not_a_dispatch(tmp_path: Path) -> None:
+def test_provider_words_used_as_arguments_cannot_reach_policy(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
         provider=DispatchProvider.CODEX,
@@ -302,7 +307,68 @@ def test_provider_words_used_as_arguments_are_not_a_dispatch(tmp_path: Path) -> 
         lambda observation: callbacks.append(observation.task_type) or "policy ran",
     )
 
-    assert result.observation is None
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+
+
+def test_typed_classification_survives_newline_separated_setup(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="cd /repo\ncodex exec review",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.additional_context == "policy ran"
+
+
+def test_quoted_shell_separator_cannot_create_authoritative_classification(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "printf '%s' '&&' AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 codex exec review"
+        ),
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+
+
+@pytest.mark.parametrize("framework", ["other/v1", "coding-agent/v2", ""])
+def test_unsupported_typed_framework_is_not_authoritative(
+    tmp_path: Path, framework: str
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+        classification={"task_type": "review", "framework": framework},
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
     assert callbacks == []
 
 

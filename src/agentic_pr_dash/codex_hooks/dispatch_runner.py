@@ -284,7 +284,7 @@ def _observation_from_request(
     response = request.payload.get("tool_response")
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
-    declared = _declared_classification(request.payload, command, request.provider)
+    declared = _declared_classification(request.payload)
     task_type = (
         declared[0]
         if declared is not None
@@ -293,7 +293,7 @@ def _observation_from_request(
     verdict = response.get("review_verdict")
     if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
         verdict = None
-    requested_model = _requested_model(command, request.provider)
+    requested_model = _requested_model(command)
 
     return DispatchObservation(
         provider=request.provider,
@@ -315,75 +315,17 @@ def _observation_from_request(
     )
 
 
-def _declared_classification(
-    payload: dict[str, object], command: str, provider: DispatchProvider
-) -> tuple[str, str] | None:
+def _declared_classification(payload: dict[str, object]) -> tuple[str, str] | None:
     classification = payload.get("dispatch_classification")
-    if isinstance(classification, dict):
-        task_type = classification.get("task_type")
-        framework = classification.get("framework")
-    else:
-        task_type, framework = _classification_from_command(command, provider)
+    if not isinstance(classification, dict):
+        return None
+    task_type = classification.get("task_type")
+    framework = classification.get("framework")
     if not isinstance(task_type, str) or not task_type.strip():
         return None
-    if not isinstance(framework, str) or not framework.strip():
+    if framework != "coding-agent/v1":
         return None
     return task_type.strip(), framework.strip()
-
-
-def _classification_from_command(
-    command: str, provider: DispatchProvider
-) -> tuple[str | None, str | None]:
-    invocation = _provider_invocation(command, provider)
-    if invocation is None:
-        return None, None
-    _, values = invocation
-    return (
-        values.get("AGENT_DISPATCH_TASK_TYPE"),
-        values.get("AGENT_DISPATCH_FRAMEWORK"),
-    )
-
-
-def _provider_invocation(
-    command: str, provider: DispatchProvider
-) -> tuple[list[str], dict[str, str]] | None:
-    """Return tokens and leading assignments for a real provider command segment."""
-
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
-        lexer.whitespace_split = True
-        lexer.commenters = ""
-        tokens = list(lexer)
-    except ValueError:
-        return None
-    executable = provider.value
-    subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
-    segment: list[str] = []
-    for token in [*tokens, ";"]:
-        if token and set(token) <= {";", "&", "|"}:
-            values: dict[str, str] = {}
-            index = 0
-            while index < len(segment):
-                name, separator, value = segment[index].partition("=")
-                if not separator or not re.fullmatch(r"[A-Za-z_]\w*", name):
-                    break
-                if name in {
-                    "AGENT_DISPATCH_TASK_TYPE",
-                    "AGENT_DISPATCH_FRAMEWORK",
-                }:
-                    values[name] = value
-                index += 1
-            invocation = segment[index:]
-            if (
-                len(invocation) >= 2
-                and Path(invocation[0]).name == executable
-                and invocation[1] == subcommand
-            ):
-                return invocation, values
-            segment = []
-        else:
-            segment.append(token)
-    return None
 
 
 def _normalize_hook_payload(payload: dict[str, object]) -> dict[str, object]:
@@ -410,14 +352,16 @@ def _option_value(argv: list[str], option: str) -> str | None:
 
 
 def _matches_provider(command: str, provider: DispatchProvider) -> bool:
-    return _provider_invocation(command, provider) is not None
+    executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
+    subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
+    return bool(re.search(rf"\b{executable}\s+{subcommand}\b", command))
 
 
-def _requested_model(command: str, provider: DispatchProvider) -> str | None:
-    invocation = _provider_invocation(command, provider)
-    if invocation is None:
+def _requested_model(command: str) -> str | None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
         return None
-    tokens, _ = invocation
     for index, token in enumerate(tokens):
         if token in {"--model", "-m"} and index + 1 < len(tokens):
             return tokens[index + 1]
