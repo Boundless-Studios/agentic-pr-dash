@@ -72,8 +72,30 @@ _SECRET_LONG_OPTION_VALUE_RE = re.compile(
 _OPTION_BOUNDARY_RE = re.compile(r"^--?[A-Za-z0-9]")
 
 
-def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
-    """Return active Claude/Codex sessions grouped by worktree path."""
+class ProcessScanUnavailable(RuntimeError):
+    """The local process scan could not be trusted to answer "who is home?".
+
+    Raised only by :func:`worktree_occupants`. The display queries return an
+    empty mapping on a failed scan, which is right for rendering and fatal for
+    a destructive gate — see that function's docstring (BOU-2933).
+    """
+
+
+def discover_active_agents(
+    worktree_paths: list[str], *, min_cpu: float = _ACTIVE_CPU_THRESHOLD
+) -> dict[str, list[AgentProcess]]:
+    """Return active Claude/Codex sessions grouped by worktree path.
+
+    This is the dashboard's "who is busy right now" query. ``min_cpu`` is the
+    CPU% floor for counting a process as actively working; the default keeps
+    those display semantics, and ``min_cpu=0.0`` turns it into a liveness read
+    (the BOU-1540 precedent already applied to
+    :func:`discover_primary_feature_pipeline_agents`).
+
+    **Do not use this to gate a destructive action.** It fails open twice over:
+    idle occupants fall under the CPU floor, and a failed scan is reported as
+    "nobody is home". Use :func:`worktree_occupants` (BOU-2933).
+    """
     sorted_paths = sorted({path for path in worktree_paths if path}, key=len, reverse=True)
     if not sorted_paths:
         return {}
@@ -114,7 +136,7 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
         # wrapper case the wrapper itself is always near 0%, so roll in the
         # same-cli descendants' CPU too.
         effective_cpu = _effective_cpu(row, cli_name, children_by_pid)
-        if effective_cpu < _ACTIVE_CPU_THRESHOLD:
+        if effective_cpu < min_cpu:
             continue
 
         worktree_path = _resolve_worktree(row, by_pid, sorted_paths)
@@ -139,6 +161,73 @@ def discover_active_agents(worktree_paths: list[str]) -> dict[str, list[AgentPro
         agents.sort(key=lambda agent: (agent.label, agent.pid))
 
     return result
+
+
+def worktree_occupants(worktree_paths: list[str]) -> dict[str, list[AgentProcess]]:
+    """Return EVERY live process whose cwd is inside each worktree.
+
+    This is the safety gate for destructive actions (``git worktree remove
+    --force``). It deliberately differs from :func:`discover_active_agents` on
+    all three axes that made that function unsafe to reuse here (BOU-2933):
+
+    * **No CPU floor.** An idle REPL sitting at a prompt, or a SIGSTOP'd agent
+      on a detached tty, samples ~0% CPU and is exactly the occupant we most
+      need to see — the incident that motivated this destroyed a checkout out
+      from under a stopped codex, which then held codex's machine-wide log DB
+      and took the CLI down in every worktree on the box.
+    * **No CLI allow-list.** A stray pytest running from a ``.venv`` in the
+      tree, or a user's shell sitting in it, is also a reason not to delete.
+      Being over-conservative here costs disk; being wrong the other way
+      destroys work.
+    * **Fails closed.** If ``ps`` or ``lsof`` cannot be read we raise
+      :class:`ProcessScanUnavailable` instead of reporting an empty mapping.
+      Failing to *look* is not evidence that nobody is there.
+
+    Attribution is by the process's own cwd only, never the parent chain — see
+    :func:`_resolve_worktree` for why that matters for orphans specifically.
+    """
+    sorted_paths = sorted({path for path in worktree_paths if path}, key=len, reverse=True)
+    if not sorted_paths:
+        return {}
+
+    rows = _parse_process_rows(_run_process_table())
+    if not rows:
+        raise ProcessScanUnavailable("process table unavailable (ps returned nothing)")
+
+    cwds = _collect_cwds()
+    if not cwds:
+        raise ProcessScanUnavailable("cwd scan unavailable (lsof returned nothing)")
+
+    result: dict[str, list[AgentProcess]] = {}
+    for row in rows:
+        cwd = cwds.get(row.pid)
+        if not cwd:
+            continue
+        worktree_path = _match_path(cwd, sorted_paths)
+        if not worktree_path:
+            continue
+        cli_name = _agent_cli_name(row.command) or ""
+        result.setdefault(worktree_path, []).append(
+            AgentProcess(
+                pid=row.pid,
+                cli_name=cli_name,
+                label=(cli_name or _process_label(row.command)).capitalize(),
+                command=_redact_command_for_display(row.command),
+            )
+        )
+
+    for occupants in result.values():
+        occupants.sort(key=lambda occupant: occupant.pid)
+    return result
+
+
+def _process_label(command: str) -> str:
+    """Short human label for a non-agent occupant (``python``, ``zsh``, ...)."""
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = command.split()
+    return Path(argv[0]).name if argv else "process"
 
 
 def discover_primary_feature_pipeline_agents(

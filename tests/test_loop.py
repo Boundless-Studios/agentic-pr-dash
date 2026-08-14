@@ -291,7 +291,7 @@ def test_cleanup_skips_live_idle_feature_pipeline_owner(monkeypatch, tmp_path):
     removed = []
 
     monkeypatch.setattr(loop, "find_worktree_for_path", lambda cwd: {"path": cwd, "branch": "feature/idle-owned"})
-    monkeypatch.setattr(loop, "discover_active_agents", lambda paths: {})
+    monkeypatch.setattr(loop, "worktree_occupants", lambda paths: {})
     monkeypatch.setattr(loop, "selected_worktree_cleanup_reason", lambda worktree, active_agents: (True, "stale orphan"))
     monkeypatch.setattr(loop, "_live_independent_owner_paths", lambda paths, session_id: {str(worktree)}, raising=False)
     monkeypatch.setattr(loop, "remove_worktree", lambda cwd: removed.append(cwd) or (True, ""))

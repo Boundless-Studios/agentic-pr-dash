@@ -306,8 +306,32 @@ def selected_worktree_cleanup_reason(
     return False, "selected worktree is not stale enough"
 
 
+def _worktree_is_registered(path: str) -> bool:
+    """True when git still lists ``path`` as a worktree of its main repo."""
+    listed = _run(["git", "-C", get_main_repo_root(path), "worktree", "list", "--porcelain"])
+    if listed.returncode != 0:
+        # Can't tell. Treat as still-registered so the caller reports failure
+        # rather than claiming a removal it did not verify.
+        return True
+    target = os.path.abspath(path)
+    return any(
+        os.path.abspath(line[len("worktree ") :].strip()) == target
+        for line in (listed.stdout or "").splitlines()
+        if line.startswith("worktree ")
+    )
+
+
 def remove_worktree(path: str) -> tuple[bool, str]:
-    """Remove a git worktree and report a short failure detail."""
+    """Remove a git worktree and report a short failure detail.
+
+    The success post-check asks git whether the worktree is still REGISTERED
+    rather than whether the directory exists. A bare ``Path(path).exists()``
+    was wrong: the agent-session guardian recreates ``.agent-session-harness/``
+    and ``.gaia/`` under the dead path within seconds, so a fully successful
+    removal reported ``selected worktree still exists`` — after the checkout was
+    already destroyed. That log read as "nothing happened" and the caller
+    retried the entry forever (BOU-2933).
+    """
     try:
         result = subprocess.run(
             ["git", "-C", get_main_repo_root(path), "worktree", "remove", "--force", path],
@@ -322,6 +346,6 @@ def remove_worktree(path: str) -> tuple[bool, str]:
     output = (result.stdout or result.stderr or "").strip()
     if result.returncode != 0:
         return False, output.splitlines()[-1] if output else f"exit {result.returncode}"
-    if Path(path).exists():
-        return False, "selected worktree still exists"
+    if _worktree_is_registered(path):
+        return False, "selected worktree still registered with git"
     return True, ""

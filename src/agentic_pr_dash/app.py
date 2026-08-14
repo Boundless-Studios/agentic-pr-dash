@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from html import escape
 import json
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .agents import discover_active_agents
+from .agents import ProcessScanUnavailable, discover_active_agents, worktree_occupants
 from .config import load as load_config
 from .iterm import focus_or_open_worktree
 from .models import (
@@ -43,6 +44,7 @@ from .worktrees import (
     _now_epoch as _worktree_now_epoch,
     discover_worktrees,
     get_main_repo_root,
+    remove_worktree,
     selected_worktree_cleanup_reason,
 )
 
@@ -2010,35 +2012,40 @@ async def cleanup_worktree(request: Request, path: str = Form(...)):
             409,
         )
 
-    active_agents = discover_active_agents([path]).get(path, [])
-    if active_agents:
-        return _cleanup_response(request, '<span class="card-warning">Cannot cleanup: active agent detected</span>', 409)
+    # Liveness, not activity — an idle or stopped occupant still owns this
+    # checkout, and a scan we could not run is not proof that nobody is home
+    # (BOU-2933). Same gate the loop's autonomous reaper uses.
+    try:
+        occupants = worktree_occupants([path]).get(path, [])
+    except ProcessScanUnavailable as exc:
+        orchestrator.log(f"Cleanup blocked for {Path(path).name}: {exc}", level="error")
+        return _cleanup_response(
+            request, '<span class="card-warning">Cannot cleanup: process scan unavailable</span>', 409
+        )
+    if occupants:
+        # Name them: the gate now counts any live process in the tree, so a bare
+        # "active agent detected" would read as a false positive to someone
+        # looking at a worktree whose only occupant is a tunnel or a test run.
+        summary = ", ".join(f"{o.label} ({o.pid})" for o in occupants[:3])
+        if len(occupants) > 3:
+            summary += f" +{len(occupants) - 3} more"
+        return _cleanup_response(
+            request,
+            f'<span class="card-warning">Cannot cleanup: worktree in use by {escape(summary)}</span>',
+            409,
+        )
 
-    eligible, reason = _selected_worktree_cleanup_reason(worktree, active_agents)
+    eligible, reason = _selected_worktree_cleanup_reason(worktree, occupants)
     if not eligible:
         return _cleanup_response(request, f'<span class="card-warning">Cannot cleanup: {reason}</span>', 409)
 
-    try:
-        result = subprocess.run(
-            ["git", "-C", get_main_repo_root(), "worktree", "remove", "--force", path],
-            cwd=None,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    except Exception as exc:
-        orchestrator.log(f"Cleanup failed for {Path(path).name}: {exc}", level="error")
-        return _cleanup_response(request, '<span class="card-warning">Cleanup failed</span>', 500)
-
-    output = (result.stdout or result.stderr or "").strip()
-    if result.returncode != 0:
-        detail = output.splitlines()[-1] if output else f"exit {result.returncode}"
+    # Shared with the loop's reaper so both paths get the same registration-based
+    # post-check — `Path(path).exists()` reported a successful removal as a
+    # failure once the guardian recreated its scaffolding dirs (BOU-2933).
+    removed, detail = remove_worktree(path)
+    if not removed:
         orchestrator.log(f"Cleanup failed for {Path(path).name}: {detail}", level="error")
         return _cleanup_response(request, '<span class="card-warning">Cleanup failed</span>', 500)
-
-    if Path(path).exists():
-        orchestrator.log(f"Cleanup failed for {Path(path).name}: selected worktree still exists", level="error")
-        return _cleanup_response(request, '<span class="card-warning">Cleanup did not remove selected worktree</span>', 500)
 
     orchestrator.log(f"Cleanup requested for {Path(path).name}: {reason}")
     return _cleanup_response(request, '<span class="card-clean-status">Cleanup requested</span>', 200)

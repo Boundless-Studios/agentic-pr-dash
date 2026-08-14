@@ -58,7 +58,7 @@ from . import coordinator
 from ._maintenance import mutation_lock, worktree_check
 from ._maintenance._common import _pid_alive
 from ._maintenance.worktrees import _live_independent_owner_paths
-from .agents import discover_active_agents
+from .agents import ProcessScanUnavailable, worktree_occupants
 from .config import load as load_config
 from .models import MaintenanceActor
 from .worktrees import find_worktree_for_path, remove_worktree, selected_worktree_cleanup_reason
@@ -1359,18 +1359,32 @@ def _dispatch_was_inconclusive(exec_errors: dict[str, str], pr: int | None) -> b
 
 
 def _cleanup_stale_no_pr_worktree(cwd: str, session_id: str = "") -> bool:
-    """Remove a stale worktree with no open PR; return True when removed."""
+    """Remove a stale worktree with no open PR; return True when removed.
+
+    Occupancy is checked with ``worktree_occupants``, NOT the dashboard's
+    ``discover_active_agents``: the latter skips anything under a 1% CPU floor,
+    so an idle or SIGSTOP'd agent read as "worktree is empty" and its checkout
+    got force-removed underneath it (BOU-2933).
+    """
+    name = Path(cwd).name
     worktree = find_worktree_for_path(cwd)
     if not worktree:
         return False
     if os.path.abspath(cwd) in _live_independent_owner_paths([cwd], session_id):
         return False
-    active_agents = discover_active_agents([cwd]).get(cwd, [])
-    eligible, reason = selected_worktree_cleanup_reason(worktree, active_agents)
+    try:
+        occupants = worktree_occupants([cwd]).get(cwd, [])
+    except ProcessScanUnavailable as exc:
+        # Fail closed: we could not look, which is not the same as nobody home.
+        print(
+            f"[apd:loop] skipped stale no-PR worktree cleanup for {name}: {exc}",
+            file=sys.stderr,
+        )
+        return False
+    eligible, reason = selected_worktree_cleanup_reason(worktree, occupants)
     if not eligible:
         return False
     removed, detail = remove_worktree(cwd)
-    name = Path(cwd).name
     if removed:
         print(f"[apd:loop] cleaned stale no-PR worktree {name}: {reason}", file=sys.stderr)
         return True
