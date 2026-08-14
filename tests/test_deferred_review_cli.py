@@ -35,7 +35,7 @@ def _thread(node_id: str = "T1", *, is_resolved: bool = False, body: str = "plea
 
 def _pr() -> PRData:
     return PRData(
-        number=PR_NUMBER, title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
+        number=PR_NUMBER, repo="boundless/test", title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
         worktree_path="/wt", status=PRStatus.CLEAN,
         latest_commit_sha="a" * 40, author="pr-author",
     )

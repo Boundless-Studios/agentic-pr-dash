@@ -40,7 +40,7 @@ def _thread(body: str = "Guard against a None campaign here.", node_id: str = "t
 
 def _pr() -> PRData:
     return PRData(
-        number=PR_NUMBER, title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
+        number=PR_NUMBER, repo="boundless/test", title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
         failing_checks=[], review_comments=[], merge_state="CLEAN",
         latest_commit_sha="headsha", latest_commit_date="2026-02-01T00:00:00Z",
         worktree_path="/wt", status=PRStatus.CLEAN,
