@@ -47,6 +47,85 @@ _UNAVAILABLE_PATTERN = re.compile(
 )
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
+AGENT_CLASSIFY_MAP = [
+    (
+        "code_review",
+        [
+            r"\breview\b",
+            r"\bcode review\b",
+            r"\baudit (?:the )?code\b",
+            r"\bcheck (?:the )?implementation\b",
+            r"\bverify (?:the )?changes\b",
+        ],
+    ),
+    (
+        "debugging",
+        [
+            r"\bdebug\b",
+            r"\bdiagnose\b",
+            r"\broot cause\b",
+            r"\bfix (?:the )?bug\b",
+            r"\bstack trace\b",
+            r"\bfailing test\b",
+            r"\btest failure\b",
+        ],
+    ),
+    (
+        "exploration",
+        [
+            r"\bexplore\b",
+            r"\bhow does .+ work\b",
+            r"\barchitecture\b",
+            r"\btrace (?:the )?(?:data )?flow\b",
+            r"\bfind all (?:usages|references|callers)\b",
+        ],
+    ),
+    (
+        "trivial",
+        [
+            r"\blookup\b",
+            r"\bsimple (?:fix|change|update)\b",
+            r"\bquick (?:fix|check|change)\b",
+            r"\bone.line(?:r)?\b",
+        ],
+    ),
+    (
+        "large_impl",
+        [
+            r"\b(?:multiple|several|many) files?\b",
+            r"\bcross[- ]module\b",
+            r"\bacross (?:multiple |several )?\w*(?:files?|modules?|services?|packages?)\b",
+            r"\b(?:3|4|5|6|7|8|9|\d{2,})\+?\s*files?\b",
+            r"\bmulti[- ]file\b",
+            r"\blarge (?:impl|implementation|change|refactor)\b",
+            r"\bend[- ]to[- ]end\b",
+            r"\bfull[- ]stack\b",
+            r"\btyped.*cross[- ]module\b",
+        ],
+    ),
+    (
+        "small_impl",
+        [
+            r"\bimplement\b",
+            r"\badd feature\b",
+            r"\bcreate (?:the |a )?(?:new )?\w+ (?:file|class|function|component|module)\b",
+            r"\bbuild\b",
+            r"\bwrite (?:the )?code\b",
+            r"\bmodify (?:the )?code\b",
+            r"\bscaffold\b",
+            r"\brefactor\b",
+        ],
+    ),
+]
+
+AGENT_DEFAULT_MODEL_NAMES = {
+    "sonnet": "sonnet-4.6",
+    "opus": "opus-4.6",
+    "haiku": "haiku-4.5",
+    "": "opus-4.6",
+}
+_AGENT_DEFAULT_MODEL = "opus-4.6"
+
 
 def run_dispatch_hook(
     request: DispatchHookRequest,
@@ -82,6 +161,55 @@ def run_dispatch_hook(
         except Exception:  # noqa: BLE001 - repository callbacks are advisory
             additional_context = None
     return DispatchHookResult(observation, additional_context)
+
+
+def classify_agent_dispatch(description: str, prompt: str, subagent_type: str) -> str:
+    """Classify an Agent/spawn_agent dispatch using the shared task taxonomy."""
+
+    if subagent_type == "Explore":
+        return "exploration"
+    text = f"{description} {prompt[:500]}".lower()
+    for task_type, patterns in AGENT_CLASSIFY_MAP:
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in patterns):
+            return task_type
+    return "general"
+
+
+def resolve_agent_model(model_raw: str) -> str:
+    """Resolve a runtime model alias to the stable ledger display name."""
+
+    return AGENT_DEFAULT_MODEL_NAMES.get(model_raw, model_raw or _AGENT_DEFAULT_MODEL)
+
+
+def observation_from_agent_payload(
+    payload: dict[str, object], worktree_root: str
+) -> DispatchObservation | None:
+    """Normalize an Agent/spawn_agent PostToolUse payload."""
+
+    if payload.get("tool_name") not in {
+        "Agent",
+        "spawn_agent",
+        "functions.spawn_agent",
+    }:
+        return None
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        tool_input = {}
+    description = str(tool_input.get("description") or "")
+    prompt = str(tool_input.get("prompt") or "")
+    subagent_type = str(tool_input.get("subagent_type") or "")
+    model_raw = str(tool_input.get("model") or "")
+    return DispatchObservation(
+        provider=DispatchProvider.CLAUDE,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id=str(payload.get("session_id") or ""),
+        worktree_root=worktree_root,
+        command=f"{description} {prompt}".strip(),
+        task_type=classify_agent_dispatch(description, prompt, subagent_type),
+        requested_model=model_raw or None,
+        resolved_model=resolve_agent_model(model_raw),
+        outcome=DispatchOutcome.SUCCESS,
+    )
 
 
 def run_provider_entrypoint(

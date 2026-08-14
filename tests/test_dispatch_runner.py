@@ -13,6 +13,7 @@ from agentic_pr_dash.codex_hooks import (
 )
 from agentic_pr_dash.codex_hooks.dispatch_runner import (
     DispatchHookRequest,
+    observation_from_agent_payload,
     run_dispatch_hook,
 )
 from agentic_pr_dash.dispatch_observation import (
@@ -230,3 +231,26 @@ def test_detached_opencode_entrypoint_persists_without_context(
         "detached_runner"
     )
     assert capsys.readouterr().out == ""
+
+
+def test_agent_dispatch_produces_normalized_observation() -> None:
+    observation = observation_from_agent_payload(
+        {
+            "tool_name": "Agent",
+            "session_id": "s",
+            "tool_input": {
+                "description": "Implement the parser",
+                "prompt": "Modify the code",
+                "model": "sonnet",
+                "subagent_type": "general-purpose",
+            },
+        },
+        "/repo/wt",
+    )
+
+    assert observation is not None
+    assert observation.provider is DispatchProvider.CLAUDE
+    assert observation.task_type == "small_impl"
+    assert observation.requested_model == "sonnet"
+    assert observation.resolved_model == "sonnet-4.6"
+    assert observation.outcome is DispatchOutcome.SUCCESS

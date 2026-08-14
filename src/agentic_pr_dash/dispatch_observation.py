@@ -12,6 +12,7 @@ class DispatchProvider(str, Enum):
 
     CODEX = "codex"
     OPENCODE = "opencode"
+    CLAUDE = "claude"
 
 
 class DispatchSource(str, Enum):
