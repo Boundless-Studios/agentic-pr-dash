@@ -924,6 +924,72 @@ def _cmd_complete_sweep_p2(args: argparse.Namespace) -> int:
 
 
 def _cmd_complete(args: argparse.Namespace) -> int:
+    """Fence every completion mutation to one actor for the exact PR head."""
+
+    if getattr(args, "sweep_p2", False):
+        return _cmd_complete_sweep_p2(args)
+
+    from .finalization_lease import (
+        FinalizationKey,
+        invocation_actor,
+        run_with_finalization_lease,
+    )
+
+    cwd = os.path.abspath(args.cwd)
+    pr = _complete_resolve_target_pr(args, cwd)
+    if pr is _GH_UNAVAILABLE:
+        print(_gh_unavailable_message(cwd))
+        return 2
+    if pr is None:
+        print("no open PR for this branch")
+        return 0
+    head_sha = str(pr.latest_commit_sha or "").strip()
+    if not head_sha:
+        print(
+            f"cannot acquire finalization authority for PR #{pr.number}: "
+            "head SHA is unavailable",
+            file=sys.stderr,
+        )
+        return 2
+    repository = str(pr.repo or _repo_slug(cwd)).strip()
+    if not repository:
+        print(
+            f"cannot acquire finalization authority for PR #{pr.number}: "
+            "repository is unavailable",
+            file=sys.stderr,
+        )
+        return 2
+    caller_session_id = str(getattr(args, "session_id", "") or "").strip() or None
+    result = run_with_finalization_lease(
+        key=FinalizationKey(
+            repository=repository,
+            pr_number=pr.number,
+            head_sha=head_sha,
+        ),
+        actor=invocation_actor(
+            caller_session_id=caller_session_id,
+            pid=os.getpid(),
+            agent="maintenance-complete",
+            worktree_path=cwd,
+        ),
+        operation=lambda: _cmd_complete_unleased(args, resolved_pr=pr),
+    )
+    if not result.executed:
+        print(
+            f"finalization deferred for PR #{pr.number} at {head_sha}: "
+            f"{result.reason}",
+            file=sys.stderr,
+        )
+    elif result.exit_code == 2 and result.reason != "completed":
+        print(result.reason, file=sys.stderr)
+    return result.exit_code
+
+
+def _cmd_complete_unleased(
+    args: argparse.Namespace,
+    *,
+    resolved_pr=None,
+) -> int:
     if getattr(args, "defer", None):
         return _cmd_complete_defer(args)
     if getattr(args, "sweep_p2", False):
@@ -942,7 +1008,9 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     # mutation. The freshness cost here is one extra `gh` call per completion
     # run, not per Stop-hook/poll-tick, so it does not reintroduce the
     # fan-out the cache exists to collapse.
-    if pr_number_arg is not None:
+    if resolved_pr is not None:
+        pr = resolved_pr
+    elif pr_number_arg is not None:
         pr = _resolve_pr_by_number(int(pr_number_arg), cwd, force=True)
     else:
         pr = _resolve_pr_for_branch(cwd, force=True)
