@@ -197,7 +197,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     failing = [
         c.name
         for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
+        if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+        and not github_api._is_infra_check(c.name)
     ]
     review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
     if github_api.rate_limit_events() != _rl_events_before:
@@ -226,7 +227,13 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     )
 
 
-def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
+def _resolve_pr_by_number(
+    pr_number: int,
+    cwd: str,
+    *,
+    force: bool = False,
+    include_reviews: bool = True,
+):
     """Resolve a PR by explicit number (for --pr override).
 
     See :func:`_resolve_pr_for_branch` for the ``force`` semantics."""
@@ -248,6 +255,21 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
             if entry.get("number") == pr_number:
                 raw = entry
                 break
+    if prs is not None and raw is None:
+        # The configured author snapshot is not authoritative for an explicit
+        # PR number: shared/fork PRs may belong to another author. Verify the
+        # named PR directly, and require positive evidence that it remains open.
+        raw = github_api._rest_pr_payload(pr_number, cwd=cwd)
+        if raw is None:
+            return _GH_UNAVAILABLE
+        if str(raw.get("state") or "").lower() != "open":
+            return None
+        review_decision, diagnostic = _gh_pr_view_field(
+            cwd, pr_number, "reviewDecision"
+        )
+        if diagnostic is not None:
+            return _GH_UNAVAILABLE
+        raw["reviewDecision"] = review_decision or "none"
 
     # See _resolve_pr_for_branch: keep a live gh-availability signal across the
     # detail fetch so a warm snapshot (or REST-fallback resolution) + a
@@ -261,9 +283,14 @@ def _resolve_pr_by_number(pr_number: int, cwd: str, *, force: bool = False):
     failing = [
         c.name
         for c in checks
-        if c.conclusion == "failure" and not github_api._is_infra_check(c.name)
+        if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+        and not github_api._is_infra_check(c.name)
     ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    review_comments = (
+        github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        if include_reviews
+        else []
+    )
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
@@ -631,7 +658,8 @@ def _pr_open_state(pr_number: int, cwd: str):
     url = str(d.get("url", ""))
     checks = github_api.get_ci_checks(pr_number, cwd)
     failing = [c.name for c in checks
-               if c.conclusion == "failure" and not github_api._is_infra_check(c.name)]
+               if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
+               and not github_api._is_infra_check(c.name)]
     review_decision = str(d.get("reviewDecision") or "")
     merge_state = str(d.get("mergeStateStatus") or "")
     mergeable = str(d.get("mergeable") or "")

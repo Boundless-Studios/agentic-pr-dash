@@ -348,6 +348,8 @@ def record_event(
     ppid: int | None = None,
     worktree_path: str | None = None,
     branch: str | None = None,
+    from_branch: str | None = None,
+    attributed: bool | None = None,
     pr_number: int | None = None,
     bead_id: str | None = None,
     docker_mode: str | None = None,
@@ -383,6 +385,8 @@ def record_event(
             "ppid": ppid,
             "worktree_path": resolved_worktree,
             "branch": resolved_branch,
+            "from_branch": from_branch,
+            "attributed": attributed,
             "pr_number": pr_number,
             "bead_id": bead_id,
             "docker_mode": docker_mode or _env("DOCKER_MODE") or "unknown",
@@ -1013,6 +1017,8 @@ def _record_from_args(args: argparse.Namespace) -> int:
         ppid=args.ppid,
         worktree_path=args.worktree_path,
         branch=args.branch,
+        from_branch=args.from_branch,
+        attributed=args.attributed or None,
         pr_number=args.pr_number,
         bead_id=args.bead_id,
         docker_mode=args.docker_mode,
@@ -1073,6 +1079,8 @@ def main(argv: list[str] | None = None) -> int:
     record.add_argument("--ppid", type=int)
     record.add_argument("--worktree-path")
     record.add_argument("--branch")
+    record.add_argument("--from-branch")
+    record.add_argument("--attributed", action="store_true")
     record.add_argument("--pr-number", type=int)
     record.add_argument("--bead-id")
     record.add_argument("--docker-mode")

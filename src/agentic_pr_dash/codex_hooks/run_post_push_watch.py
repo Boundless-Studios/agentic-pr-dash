@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -249,7 +250,9 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     * **Live PR.** An owned, non-draft open PR exists for the pushed branch.
     * **No duplicate.** No waiter is already alive for this session.
     """
-    if raw_tool_name != "Bash" or os.environ.get("PR_WATCH_NO_WAITER") == "1":
+    codex_tool_names = {"exec_command", "functions.exec_command"}
+    is_codex = raw_tool_name in codex_tool_names or os.environ.get("PR_WATCH_NO_WAITER") == "1"
+    if raw_tool_name not in ("Bash", *codex_tool_names):
         return None
     branch = current_branch(Path(push_cwd))
     if branch in ("", "main", "master"):
@@ -271,9 +274,39 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
         return None
     if _pr_is_draft(pr_number, push_cwd):
         return None
-    if _await_alive(push_cwd, session_id):
+    if not is_codex and _await_alive(push_cwd, session_id):
         return None
     sha = head_sha(Path(push_cwd))
+    if is_codex:
+        monitor_python = shlex.quote(sys.executable)
+        policy_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_POLICY", "")
+        if policy_path and not os.path.isabs(policy_path):
+            policy_path = str(Path(push_cwd) / policy_path)
+        if not policy_path:
+            for filename in ("review-policy.yaml", "agent-review-policy.yaml"):
+                candidate = Path(push_cwd) / "config" / filename
+                if candidate.is_file():
+                    policy_path = str(candidate)
+                    break
+        policy_arg = f" --policy {shlex.quote(policy_path)}" if policy_path else ""
+        ledger_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_LEDGER", "")
+        if ledger_path and not os.path.isabs(ledger_path):
+            ledger_path = str(Path(push_cwd) / ledger_path)
+        if not ledger_path:
+            candidate = Path(push_cwd) / ".agentic-review" / "ledger.json"
+            if candidate.is_file():
+                ledger_path = str(candidate)
+        ledger_arg = f" --ledger {shlex.quote(ledger_path)}" if policy_path and ledger_path else ""
+        return (
+            f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "
+            "no asynchronous wake/resumption channel. Poll settlement in the "
+            "FOREGROUND now until two clean observations 30 seconds apart or the "
+            f"exact 30-minute bound:\n  {monitor_python} -m agentic_pr_dash.maintenance_check "
+            f"monitor --cwd {shlex.quote(push_cwd)} --session-id {shlex.quote(session_id)} "
+            f"--pr {pr_number} "
+            "--max-wait 1800 "
+            f"--poll-interval 30{policy_arg}{ledger_arg}"
+        )
     await_cmd = load_config(push_cwd).await_command.format(
         cwd=push_cwd, session_id=session_id
     )
@@ -304,8 +337,8 @@ def main() -> int:
     cfg = ci_watch.CIWatchConfig.from_env(env)
     ci_watch.arm_post_push_watch(cfg)
 
-    # Proactively nudge the agent to launch the exit-10 await waiter in the
-    # background so a red check wakes the session this turn (BOU-1786). Advisory:
+    # Proactively nudge Claude to launch its waiter, or Codex to run the bounded
+    # foreground monitor (Codex has no wake channel). Advisory:
     # never block the push — any failure → no stdout, return 0.
     try:
         nudge = build_post_push_waiter_nudge(watch_cwd, payload.get("tool_name", ""))

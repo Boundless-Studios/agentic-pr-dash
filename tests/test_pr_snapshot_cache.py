@@ -412,6 +412,24 @@ def test_resolve_by_number_warm_cache_plus_outage_is_unavailable(tmp_path, monke
     assert result is pr_state._GH_UNAVAILABLE
 
 
+def test_resolve_by_number_rejects_pr_absent_from_open_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda *_args, **_kwargs: {"state": "closed"},
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_latest_commit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("closed PR must not reach detail probes")
+        ),
+    )
+
+    assert pr_state._resolve_pr_by_number(42, str(tmp_path), force=True) is None
+
+
 # --------------------------------------------------------------------------- #
 # snapshot is partitioned by pr_author (PR #69 review)
 # --------------------------------------------------------------------------- #

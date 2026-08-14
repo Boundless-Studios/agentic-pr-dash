@@ -1667,6 +1667,7 @@ def _normalize_rest_pr_payload(pr: dict) -> dict | None:
     user = pr.get("user") if isinstance(pr.get("user"), dict) else {}
     return {
         "number": number,
+        "state": str(pr.get("state") or ""),
         # REST `user` is the PR author; GraphQL serializes it as `author`.
         # Carried so the quota fallback can preserve the author-scoped
         # resolution contract (PR #77 review).

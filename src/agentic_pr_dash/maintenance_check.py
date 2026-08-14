@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import signal
 import subprocess  # noqa: F401  — kept for mc.subprocess patch seam used by tests
 import sys
 import time
@@ -80,6 +82,7 @@ from ._maintenance.markers import (  # noqa: F401, E402
     _marker_session_id,
     _read_session_marker,
     _prune_stale_marker,
+    release_ownership_claims,
     _session_is_live,
     _claim_pr,
 )
@@ -198,7 +201,7 @@ class _NoOpenPR(RuntimeError):
     """The requested branch or PR has no open pull request to finalize."""
 
 
-def _observe_finalization(args, policy, ledger):
+def _observe_finalization(args, policy, ledger, pr=None):
     """Read one fail-closed PR/CI/review snapshot for ``finalize``."""
 
     from agentic_pr_dash import github_api  # noqa: PLC0415
@@ -207,10 +210,12 @@ def _observe_finalization(args, policy, ledger):
     )
 
     cwd = os.path.abspath(args.cwd)
-    if args.pr is not None:
-        pr = _resolve_pr_by_number(args.pr, cwd, force=True)
-    else:
-        pr = _resolve_pr_for_branch(cwd, force=True)
+    if pr is None:
+        github_api.reset_checks_probe_failure_seen()
+        if args.pr is not None:
+            pr = _resolve_pr_by_number(args.pr, cwd, force=True)
+        else:
+            pr = _resolve_pr_for_branch(cwd, force=True)
     if pr is _GH_UNAVAILABLE:
         raise RuntimeError(_gh_unavailable_message(cwd))
     if pr is None:
@@ -218,7 +223,6 @@ def _observe_finalization(args, policy, ledger):
 
     repository = pr.repo or _repo_slug(cwd)
     pr = pr.model_copy(update={"repo": repository}, deep=True)
-    github_api.reset_checks_probe_failure_seen()
     pr.ci_watch_pending = github_api.required_checks_pending(pr.number, cwd)
     if github_api.checks_probe_failure_seen():
         raise RuntimeError(
@@ -455,6 +459,196 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
         ]
         print(_render_unsettled_message(work))
     return 0 if report.settled else 10
+
+
+def _foreground_deadline_reached(started: float, max_wait: float) -> bool:
+    return time.monotonic() - started >= max_wait
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be finite and greater than zero")
+    return parsed
+
+
+class _ForegroundDeadline(BaseException):
+    """Hard alarm that ordinary API exception adapters must not swallow."""
+
+
+def _release_foreground_ownership(args: argparse.Namespace) -> None:
+    """Relinquish an exited Codex foreground owner without waiting for its TTL."""
+    cwd = os.path.abspath(args.cwd)
+    session_id = getattr(args, "session_id", "") or _read_session_marker(cwd)
+    pr = getattr(args, "pr", None)
+    if session_id and pr is not None:
+        release_ownership_claims(cwd, {int(pr)}, session_id, reason="foreground_exited")
+
+
+def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
+    """Observe one explicit PR; resolution failure is never a clean result."""
+    from agentic_pr_dash import maintenance  # noqa: PLC0415
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    cwd = os.path.abspath(args.cwd)
+    github_api.reset_checks_probe_failure_seen()
+    pr = _resolve_pr_by_number(args.pr, cwd, force=True, include_reviews=False)
+    if pr is None:
+        merged = github_api._rest_pr_payload(args.pr, cwd=cwd)
+        if merged is not None and merged.get("mergedAt"):
+            print(f"PR #{args.pr} merged; settlement is complete")
+            return 0, str(merged.get("headRefOid") or "merged")
+        print(f"PR #{args.pr} is no longer open", file=sys.stderr)
+        return 10, ""
+    if pr is _GH_UNAVAILABLE:
+        print(f"PR #{args.pr} could not be observed", file=sys.stderr)
+        return 2, ""
+    if pr.is_draft:
+        print(f"PR #{args.pr} is draft; settlement is not complete")
+        return 10, pr.latest_commit_sha
+    policy_path = getattr(args, "policy", None)
+    if policy_path:
+        from pathlib import Path  # noqa: PLC0415
+        from agent_review_coordinator import ReviewLedger, ReviewPolicy  # noqa: PLC0415
+
+        ledger_path = Path(
+            getattr(args, "ledger", None)
+            or os.path.join(cwd, ".agentic-pr-dash", "review-ledger.json")
+        )
+        if not ledger_path.is_file():
+            print(f"PR #{args.pr} not settled: review_ledger_missing")
+            return 10, pr.latest_commit_sha
+        try:
+            policy = ReviewPolicy.from_yaml(Path(policy_path).read_text(encoding="utf-8"))
+            ledger = ReviewLedger.model_validate_json(ledger_path.read_text(encoding="utf-8"))
+            snapshot = _observe_finalization(args, policy, ledger, pr=pr)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"PR #{args.pr} settlement is unobservable: {exc}")
+            return 11, pr.latest_commit_sha
+        if not snapshot.clean:
+            work = [*snapshot.blockers, *snapshot.review.required_actions, *snapshot.review.missing_slots]
+            print(_render_unsettled_message(work))
+            missing_only_backstop = all(
+                slot.startswith("backstop:") for slot in snapshot.review.missing_slots
+            )
+            if (
+                set(snapshot.blockers) <= {"ci_pending", "ci_unavailable", "not_mergeable"}
+                and not snapshot.review.required_actions
+                and missing_only_backstop
+            ):
+                return 11, pr.latest_commit_sha
+            return 10, pr.latest_commit_sha
+        return 0, snapshot.head_sha
+    review_observation = github_api.scan_review_threads_observation(
+        args.pr, getattr(pr, "latest_commit_date", ""), cwd
+    )
+    if not review_observation.observable:
+        print(f"PR #{args.pr} review feedback is unobservable")
+        return 11, pr.latest_commit_sha
+    strict_comments, decisions = review_observation.value or ([], [])
+    blockers = maintenance.blockers_for_pr(pr)
+    if strict_comments and "review_comments" not in blockers:
+        blockers.append("review_comments")
+    unresolved = [
+        decision
+        for decision in decisions
+        if decision.decision not in {"SKIP_RESOLVED", "SKIP_DEFERRED"}
+    ]
+    if unresolved and "review_comments" not in blockers:
+        blockers.append("review_comments")
+    if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
+        blockers.append("changes_requested")
+    if blockers:
+        print(f"PR #{args.pr} not settled: {', '.join(blockers)}")
+        return 10, pr.latest_commit_sha
+    if str(pr.mergeable).upper() in {"", "UNKNOWN"}:
+        print(f"PR #{args.pr} mergeability is still being computed")
+        return 11, pr.latest_commit_sha
+    if str(pr.review_decision).upper() == "REVIEW_REQUIRED":
+        print(f"PR #{args.pr} is waiting for a required approval")
+        return 11, pr.latest_commit_sha
+    if not pr.ci_checks:
+        from agentic_pr_dash._ci_watch.config import NO_CHECKS_GRACE_S  # noqa: PLC0415
+
+        now = time.monotonic()
+        grace_head = getattr(args, "_no_checks_head", None)
+        first_empty = getattr(args, "_no_checks_first_seen_at", None)
+        if first_empty is None or grace_head != pr.latest_commit_sha:
+            args._no_checks_first_seen_at = now
+            args._no_checks_head = pr.latest_commit_sha
+            first_empty = now
+        if now - first_empty < NO_CHECKS_GRACE_S:
+            print(f"PR #{args.pr} is waiting for CI checks to register")
+            return 11, pr.latest_commit_sha
+    else:
+        args._no_checks_first_seen_at = None
+        args._no_checks_head = None
+    if github_api.required_checks_pending(args.pr, cwd):
+        print(f"PR #{args.pr} required CI is still pending")
+        return 11, pr.latest_commit_sha
+    if github_api.checks_probe_failure_seen():
+        print(f"PR #{args.pr} required CI status is unobservable")
+        return 11, pr.latest_commit_sha
+    return 0, pr.latest_commit_sha
+
+
+def _cmd_monitor(args: argparse.Namespace) -> int:
+    """Bounded foreground settlement loop for runtimes with no wake channel."""
+    started = time.monotonic()
+    clean = 0
+    clean_head = ""
+    first_clean_at = 0.0
+    settled = False
+    try:
+        while True:
+            if _foreground_deadline_reached(started, args.max_wait):
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                return 10
+            remaining = args.max_wait - (time.monotonic() - started)
+            previous_handler = signal.getsignal(signal.SIGALRM)
+
+            def _deadline_expired(_signum, _frame):
+                raise _ForegroundDeadline("foreground settlement deadline reached")
+
+            signal.signal(signal.SIGALRM, _deadline_expired)
+            signal.setitimer(signal.ITIMER_REAL, max(0.001, remaining))
+            try:
+                result, head = _monitor_observation(args)
+            except _ForegroundDeadline:
+                print(
+                    f"PR settlement timed out after exactly {args.max_wait:g} seconds",
+                    file=sys.stderr,
+                )
+                return 10
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, previous_handler)
+            if _foreground_deadline_reached(started, args.max_wait):
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                return 10
+            if result == 0:
+                now = time.monotonic()
+                if clean_head != head:
+                    clean = 0
+                    clean_head = head
+                clean += 1
+                if clean == 1:
+                    first_clean_at = now
+                if clean >= 2 and now - first_clean_at >= 30.0:
+                    settled = True
+                    return 0
+            elif result == 10:
+                return 10
+            else:
+                clean = 0
+                clean_head = ""
+            if _foreground_deadline_reached(started, args.max_wait):
+                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                return 10
+            time.sleep(min(args.poll_interval, max(0.0, args.max_wait - (time.monotonic() - started))))
+    finally:
+        if not settled:
+            _release_foreground_ownership(args)
 
 
 def _await_watch_pending_this_tick(
@@ -1927,6 +2121,17 @@ def main(argv: list[str] | None = None) -> int:
         help="Print the machine-readable finalization report.",
     )
 
+    monitor_p = subparsers.add_parser(
+        "monitor", help="Foreground Codex settlement polling (bounded; no wake channel)."
+    )
+    monitor_p.add_argument("--cwd", default=".")
+    monitor_p.add_argument("--session-id", default="")
+    monitor_p.add_argument("--pr", type=int, required=True)
+    monitor_p.add_argument("--max-wait", type=_positive_float, default=1800.0)
+    monitor_p.add_argument("--poll-interval", type=_positive_float, default=30.0)
+    monitor_p.add_argument("--policy", default=None)
+    monitor_p.add_argument("--ledger", default=None)
+
     # --- complete ---
     complete_p = subparsers.add_parser(
         "complete",
@@ -2215,6 +2420,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_check(args)
     if args.command == "finalize":
         return _cmd_finalize(args)
+    if args.command == "monitor":
+        return _cmd_monitor(args)
     if args.command == "complete":
         return _cmd_complete(args)
     if args.command == "hold-worktree":
