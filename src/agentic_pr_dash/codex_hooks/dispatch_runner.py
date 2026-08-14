@@ -342,7 +342,7 @@ def _classification_from_command(
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
     provider_index = None
     for index, token in enumerate(tokens[:-1]):
-        if token == executable and tokens[index + 1] == subcommand:
+        if Path(token).name == executable and tokens[index + 1] == subcommand:
             provider_index = index
             break
     if provider_index is None:
@@ -354,7 +354,7 @@ def _classification_from_command(
         if not separator:
             break
         if name in {"AGENT_DISPATCH_TASK_TYPE", "AGENT_DISPATCH_FRAMEWORK"}:
-            values[name] = value
+            values.setdefault(name, value)
     return (
         values.get("AGENT_DISPATCH_TASK_TYPE"),
         values.get("AGENT_DISPATCH_FRAMEWORK"),

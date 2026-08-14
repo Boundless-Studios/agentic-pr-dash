@@ -230,6 +230,62 @@ def test_declaration_on_earlier_shell_segment_is_not_authoritative(
     assert result.additional_context is None
 
 
+def test_last_duplicate_classification_assignment_matches_shell_environment(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_TASK_TYPE=exec "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 "
+            "codex exec implement feature"
+        ),
+    )
+    callbacks: list[str] = []
+
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.task_type == "exec"
+    assert result.observation.classification_authority.value == "declared"
+    assert callbacks == []
+
+
+@pytest.mark.parametrize(
+    ("provider", "executable", "subcommand"),
+    [
+        (DispatchProvider.CODEX, "/usr/local/bin/codex", "exec"),
+        (DispatchProvider.OPENCODE, "./bin/opencode", "run"),
+    ],
+)
+def test_path_qualified_provider_keeps_attached_classification(
+    tmp_path: Path,
+    provider: DispatchProvider,
+    executable: str,
+    subcommand: str,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=provider,
+        command=(
+            "AGENT_DISPATCH_TASK_TYPE=review "
+            "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 "
+            f"{executable} {subcommand} review"
+        ),
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.additional_context == "policy ran"
+
+
 def test_callback_failure_does_not_undo_persisted_observation(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
