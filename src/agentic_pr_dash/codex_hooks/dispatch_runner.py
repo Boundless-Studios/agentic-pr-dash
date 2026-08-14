@@ -285,6 +285,8 @@ def _observation_from_request(
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
     declared = _declared_classification(request.payload)
+    if declared is not None and not _has_provider_invocation(command, request.provider):
+        declared = None
     task_type = (
         declared[0]
         if declared is not None
@@ -355,6 +357,33 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
     return bool(re.search(rf"\b{executable}\s+{subcommand}\b", command))
+
+
+def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
+    """Return whether a shell command segment executes the requested provider."""
+    executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
+    subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+
+    at_command_start = True
+    for index, token in enumerate(tokens):
+        if token and all(character in ";&|\n" for character in token):
+            at_command_start = True
+            continue
+        if not at_command_start:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token):
+            continue
+        at_command_start = False
+        if Path(token).name == executable:
+            return index + 1 < len(tokens) and tokens[index + 1] == subcommand
+    return False
 
 
 def _requested_model(command: str) -> str | None:

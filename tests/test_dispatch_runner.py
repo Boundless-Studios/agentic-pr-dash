@@ -299,6 +299,7 @@ def test_provider_words_used_as_arguments_cannot_reach_policy(tmp_path: Path) ->
             "printf '%s' AGENT_DISPATCH_TASK_TYPE=review "
             "AGENT_DISPATCH_FRAMEWORK=coding-agent/v1 codex exec review"
         ),
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
     )
     callbacks: list[str] = []
 
