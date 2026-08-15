@@ -117,6 +117,42 @@ def test_missing_backstop_is_watch_pending_not_actionable(monkeypatch, tmp_path)
     assert maintenance_check._monitor_observation(args) == (11, "head")
 
 
+def test_policy_clean_observation_key_includes_full_snapshot(monkeypatch, tmp_path):
+    class Snapshot(SimpleNamespace):
+        def model_dump_json(self, **_kwargs):
+            return self.payload
+
+    snapshots = iter([
+        Snapshot(clean=True, head_sha="head", payload='{"checks":["one"]}'),
+        Snapshot(clean=True, head_sha="head", payload='{"checks":["one","two"]}'),
+    ])
+    monkeypatch.setattr(
+        maintenance_check,
+        "_resolve_pr_by_number",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            is_draft=False, latest_commit_sha="head", repo="owner/repo"
+        ),
+    )
+    monkeypatch.setattr(
+        maintenance_check, "_observe_finalization", lambda *_args, **_kwargs: next(snapshots)
+    )
+    monkeypatch.setattr("agent_review_coordinator.ReviewPolicy.from_yaml", lambda _text: object())
+    monkeypatch.setattr("agent_review_coordinator.ReviewLedger.model_validate_json", lambda _text: object())
+    policy = tmp_path / "policy.yaml"
+    ledger = tmp_path / "ledger.json"
+    policy.write_text("version: 1")
+    ledger.write_text("{}")
+    args = _args(tmp_path)
+    args.policy = str(policy)
+    args.ledger = str(ledger)
+
+    first = maintenance_check._monitor_observation(args)
+    second = maintenance_check._monitor_observation(args)
+
+    assert first[0] == second[0] == 0
+    assert first[1] != second[1]
+
+
 def test_policy_free_changes_requested_is_actionable(monkeypatch, tmp_path):
     pr = SimpleNamespace(
         is_draft=False, latest_commit_sha="head", review_decision="CHANGES_REQUESTED",

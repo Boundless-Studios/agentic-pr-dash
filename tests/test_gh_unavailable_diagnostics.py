@@ -333,6 +333,11 @@ def test_quota_blocked_list_falls_back_to_rest_by_number(monkeypatch):
     calls = []
     monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls))
     _patch_detail_getters(monkeypatch)
+    monkeypatch.setattr(
+        _pr_state_mod,
+        "_gh_pr_view_field",
+        lambda cwd, number, field: ("APPROVED", ""),
+    )
 
     pr = _pr_state_mod._resolve_pr_by_number(123, ".", force=True)
     assert pr is not _pr_state_mod._GH_UNAVAILABLE and pr is not None
@@ -493,6 +498,22 @@ def test_quota_fallback_detail_rate_limit_stays_fail_closed(monkeypatch):
 
     assert _pr_state_mod._resolve_pr_by_number(
         123, ".", force=True) is _pr_state_mod._GH_UNAVAILABLE
+
+
+def test_quota_fallback_preserves_formal_review_decision(monkeypatch):
+    calls = []
+    monkeypatch.setattr(github_api, "_run", _quota_dispatch_run(calls))
+    _patch_detail_getters(monkeypatch)
+    monkeypatch.setattr(
+        _pr_state_mod,
+        "_gh_pr_view_field",
+        lambda cwd, number, field: ("CHANGES_REQUESTED", ""),
+    )
+
+    pr = _pr_state_mod._resolve_pr_by_number(123, ".", force=True)
+
+    assert pr is not _pr_state_mod._GH_UNAVAILABLE and pr is not None
+    assert pr.review_decision == "CHANGES_REQUESTED"
 
 
 def test_rest_pr_payload_normalizes_to_graphql_shape(monkeypatch):

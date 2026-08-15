@@ -510,6 +510,9 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
     if policy_path:
         from pathlib import Path  # noqa: PLC0415
         from agent_review_coordinator import ReviewLedger, ReviewPolicy  # noqa: PLC0415
+        from agentic_pr_dash._maintenance.review_settlement import (  # noqa: PLC0415
+            _observation_key,
+        )
 
         ledger_path = Path(
             getattr(args, "ledger", None)
@@ -538,7 +541,7 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
             ):
                 return 11, pr.latest_commit_sha
             return 10, pr.latest_commit_sha
-        return 0, snapshot.head_sha
+        return 0, _observation_key(snapshot)
     review_observation = github_api.scan_review_threads_observation(
         args.pr, getattr(pr, "latest_commit_date", ""), cwd
     )
