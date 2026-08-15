@@ -367,6 +367,7 @@ def _stop_gate_impl(args) -> int:
     # cheap on the common "everything already armed" stop: no candidate is
     # unmarked, so it never makes the gh call.
     newly_adopted: list[str] = []
+    detached: list[dict] = []
     if session_id:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
@@ -798,6 +799,17 @@ def _stop_gate_impl(args) -> int:
                     for r in open_detached_records
                     if r["pr"] in open_prs
                 }
+                ci_running = any(
+                    r.get("ci_watch_pending") for r in open_detached_records
+                )
+                if not ci_running:
+                    for n in sorted(open_prs):
+                        if any(
+                            github_api.required_checks_pending(n, wt)
+                            for wt in pr_to_wts.get(n, ())
+                        ):
+                            ci_running = True
+                            break
                 if (
                     verified_clean
                     and open_keys
@@ -812,18 +824,6 @@ def _stop_gate_impl(args) -> int:
                     and not check_warn_only
                     and not check_probe_failed
                 ):
-                    # ANY open detached record with required CI running keeps
-                    # the demand alive — never collapse same-numbered records
-                    # across repos to a last-wins value (round 3).
-                    ci_running = any(
-                        r.get("ci_watch_pending") for r in open_detached_records
-                    )
-                    if not ci_running:
-                        for n in sorted(open_prs):
-                            if any(github_api.required_checks_pending(n, wt)
-                                   for wt in pr_to_wts.get(n, ())):
-                                ci_running = True
-                                break
                     if (
                         not ci_running
                         and not github_api.checks_probe_failure_seen()
@@ -873,6 +873,17 @@ def _stop_gate_impl(args) -> int:
     # pending work. Sorted so the fingerprint is stable regardless of dict/set
     # iteration order.
     fingerprint = _stop_fingerprint(pending)
+    from ._common import _repo_slug as _slug  # noqa: PLC0415
+    pending_heads = {
+        f"{_slug(path)}#{_extract_pr_number(text)}@{_local_head_sha(path) or 'unknown'}"
+        for path, text in pending
+        if not path.startswith("(no worktree)")
+    } | {
+        f"{record.get('repo', '')}#{record['pr']}@{record.get('head_sha') or 'unknown'}"
+        for record in detached
+    }
+    if pending_heads:
+        fingerprint += "|heads:" + ",".join(sorted(pending_heads))
     if escalated_owned:
         escalation_state = json.dumps(escalated_owned, sort_keys=True, separators=(",", ":"))
         fingerprint += "|escalated:" + hashlib.sha256(
