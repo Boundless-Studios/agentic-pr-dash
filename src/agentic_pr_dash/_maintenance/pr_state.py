@@ -272,7 +272,7 @@ def _resolve_pr_by_number(
         review_decision, diagnostic = _gh_pr_view_field(
             cwd, pr_number, "reviewDecision"
         )
-        if diagnostic is not None:
+        if diagnostic:
             return _GH_UNAVAILABLE
         raw["reviewDecision"] = review_decision or "none"
 

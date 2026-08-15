@@ -336,7 +336,7 @@ def test_quota_blocked_list_falls_back_to_rest_by_number(monkeypatch):
     monkeypatch.setattr(
         _pr_state_mod,
         "_gh_pr_view_field",
-        lambda cwd, number, field: ("APPROVED", None),
+        lambda cwd, number, field: ("APPROVED", ""),
     )
 
     pr = _pr_state_mod._resolve_pr_by_number(123, ".", force=True)
@@ -507,7 +507,7 @@ def test_quota_fallback_preserves_formal_review_decision(monkeypatch):
     monkeypatch.setattr(
         _pr_state_mod,
         "_gh_pr_view_field",
-        lambda cwd, number, field: ("CHANGES_REQUESTED", None),
+        lambda cwd, number, field: ("CHANGES_REQUESTED", ""),
     )
 
     pr = _pr_state_mod._resolve_pr_by_number(123, ".", force=True)
