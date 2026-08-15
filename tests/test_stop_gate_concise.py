@@ -212,12 +212,18 @@ def test_released_fingerprint_does_not_rearm_until_state_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     args = _patch_pending_stop(monkeypatch, tmp_path)
+    head = {"sha": "head-1"}
+    monkeypatch.setattr(stop_gate, "_local_head_sha", lambda cwd: head["sha"])
 
     assert [stop_gate._stop_gate_impl(args) for _ in range(3)] == [2, 2, 0]
     capsys.readouterr()
 
     assert stop_gate._stop_gate_impl(args) == 0
     assert capsys.readouterr().err == ""
+
+    head["sha"] = "head-2"
+    assert stop_gate._stop_gate_impl(args) == 2
+    assert SUMMARY in capsys.readouterr().err
 
     new_session_args = SimpleNamespace(
         cwd=str(tmp_path), session_id="sess-new", pid=None, no_waiter=True

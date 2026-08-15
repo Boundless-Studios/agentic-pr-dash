@@ -444,7 +444,6 @@ def test_stop_gate_ci_rerun_invalidates_waiter_release(tmp_path, monkeypatch, ca
     capsys.readouterr()
     assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 0
 
-    observation["verified"] = True
     observation["ci_pending"] = True
     assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
     assert "42" in capsys.readouterr().err
