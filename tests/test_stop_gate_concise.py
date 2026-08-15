@@ -8,7 +8,7 @@ from typing import Callable
 
 import pytest
 
-from agentic_pr_dash import config, maintenance
+from agentic_pr_dash import config, github_api, maintenance
 from agentic_pr_dash._maintenance import stop_gate
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
@@ -212,12 +212,22 @@ def test_released_fingerprint_does_not_rearm_until_state_changes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     args = _patch_pending_stop(monkeypatch, tmp_path)
+    head = {"sha": "head-1"}
+    monkeypatch.setattr(
+        github_api,
+        "published_pr_head_sha",
+        lambda number, cwd: head["sha"],
+    )
 
     assert [stop_gate._stop_gate_impl(args) for _ in range(3)] == [2, 2, 0]
     capsys.readouterr()
 
     assert stop_gate._stop_gate_impl(args) == 0
     assert capsys.readouterr().err == ""
+
+    head["sha"] = "head-2"
+    assert stop_gate._stop_gate_impl(args) == 2
+    assert SUMMARY in capsys.readouterr().err
 
     new_session_args = SimpleNamespace(
         cwd=str(tmp_path), session_id="sess-new", pid=None, no_waiter=True
@@ -231,6 +241,26 @@ def test_released_fingerprint_does_not_rearm_until_state_changes(
         prompt=VERBOSE_PROMPT.replace("Comment 12345", "Comment 67890"),
     )
     assert stop_gate._stop_gate_impl(changed_args) == 2
+    assert SUMMARY in capsys.readouterr().err
+
+
+def test_released_fingerprint_bypasses_clean_stop_throttle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "180")
+    args = _patch_pending_stop(monkeypatch, tmp_path)
+    head = {"sha": "head-1"}
+    monkeypatch.setattr(
+        github_api,
+        "published_pr_head_sha",
+        lambda number, cwd: head["sha"],
+    )
+
+    assert [stop_gate._stop_gate_impl(args) for _ in range(3)] == [2, 2, 0]
+    capsys.readouterr()
+
+    head["sha"] = "head-2"
+    assert stop_gate._stop_gate_impl(args) == 2
     assert SUMMARY in capsys.readouterr().err
 
 

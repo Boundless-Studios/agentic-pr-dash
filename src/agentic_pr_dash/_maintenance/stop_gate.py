@@ -353,6 +353,7 @@ def _stop_gate_impl(args) -> int:
     # fails fast instead — the long-lived `await` waiter (a different process)
     # is unaffected and keeps backing off.
     github_api.set_rate_limit_backoff(False)
+    github_api.reset_required_check_observations()
 
     cwd = os.path.abspath(args.cwd)
 
@@ -367,6 +368,7 @@ def _stop_gate_impl(args) -> int:
     # cheap on the common "everything already armed" stop: no candidate is
     # unmarked, so it never makes the gh call.
     newly_adopted: list[str] = []
+    detached: list[dict] = []
     if session_id:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
@@ -377,7 +379,13 @@ def _stop_gate_impl(args) -> int:
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
     now = time.time()
-    last_pending = bool(state.get("fingerprint"))
+    # A released fingerprint is still a pending observation whose durable
+    # identity must be rechecked on every stop.  Treating it as clean here
+    # would hide a newly published head (or restarted CI) until STOP_INTERVAL
+    # expires.
+    last_pending = bool(
+        state.get("fingerprint") or state.get("released_fingerprint")
+    )
     rate_limited = (
         interval > 0
         and not last_pending
@@ -798,6 +806,23 @@ def _stop_gate_impl(args) -> int:
                     for r in open_detached_records
                     if r["pr"] in open_prs
                 }
+                ci_pending_identities = {
+                    f"{r.get('repo', '')}#{r['pr']}"
+                    for r in open_detached_records
+                    if r.get("ci_watch_pending")
+                }
+                for n in sorted(open_prs):
+                    for wt in pr_to_wts.get(n, ()):
+                        pending_observation = (
+                            github_api.observed_required_checks_pending(n, wt)
+                        )
+                        if pending_observation is None:
+                            pending_observation = github_api.required_checks_pending(
+                                n, wt
+                            )
+                        if pending_observation:
+                            ci_pending_identities.add(f"{_slug(wt)}#{n}")
+                ci_running = bool(ci_pending_identities)
                 if (
                     verified_clean
                     and open_keys
@@ -812,18 +837,6 @@ def _stop_gate_impl(args) -> int:
                     and not check_warn_only
                     and not check_probe_failed
                 ):
-                    # ANY open detached record with required CI running keeps
-                    # the demand alive — never collapse same-numbered records
-                    # across repos to a last-wins value (round 3).
-                    ci_running = any(
-                        r.get("ci_watch_pending") for r in open_detached_records
-                    )
-                    if not ci_running:
-                        for n in sorted(open_prs):
-                            if any(github_api.required_checks_pending(n, wt)
-                                   for wt in pr_to_wts.get(n, ())):
-                                ci_running = True
-                                break
                     if (
                         not ci_running
                         and not github_api.checks_probe_failure_seen()
@@ -841,7 +854,9 @@ def _stop_gate_impl(args) -> int:
                     if r["pr"] in open_prs
                 }
                 fingerprint = "need-waiter:" + ",".join(sorted(waiter_identities))
-                fingerprint += f"|ci-pending:{int(ci_running)}"
+                fingerprint += "|ci-pending:" + ",".join(
+                    sorted(ci_pending_identities)
+                )
                 if (
                     state.get("released_fingerprint") == fingerprint
                     and state.get("released_session_id") == session_id
@@ -873,6 +888,19 @@ def _stop_gate_impl(args) -> int:
     # pending work. Sorted so the fingerprint is stable regardless of dict/set
     # iteration order.
     fingerprint = _stop_fingerprint(pending)
+    from ._common import _repo_slug as _slug  # noqa: PLC0415
+    pending_heads = {
+        f"{_slug(path)}#{_extract_pr_number(text)}@"
+        f"{github_api.published_pr_head_sha(int(_extract_pr_number(text)), path) or 'unknown'}"
+        for path, text in pending
+        if not path.startswith("(no worktree)")
+        and _extract_pr_number(text).isdigit()
+    } | {
+        f"{record.get('repo', '')}#{record['pr']}@{record.get('head_sha') or 'unknown'}"
+        for record in detached
+    }
+    if pending_heads:
+        fingerprint += "|heads:" + ",".join(sorted(pending_heads))
     if escalated_owned:
         escalation_state = json.dumps(escalated_owned, sort_keys=True, separators=(",", ":"))
         fingerprint += "|escalated:" + hashlib.sha256(

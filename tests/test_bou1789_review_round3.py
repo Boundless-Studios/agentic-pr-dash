@@ -82,7 +82,7 @@ def test_detached_record_carries_ci_watch_pending(monkeypatch, tmp_path):
     monkeypatch.setattr(session_ledger, "read", lambda *a, **k: [entry])
     # Open PR, no failing CI, no threads, no conflict — but required CI running.
     monkeypatch.setattr(_rec, "_pr_open_state",
-                        lambda pr, cwd: ("open", "http://x/77", False, [], "REVIEW_REQUIRED", "BLOCKED", "MERGEABLE"))
+                        lambda pr, cwd: ("open", "http://x/77", False, [], "REVIEW_REQUIRED", "BLOCKED", "MERGEABLE", "head-77"))
     monkeypatch.setattr(_rec, "_unpack_pr_open_state", lambda s: s)
     monkeypatch.setattr(_gh, "get_review_threads", lambda pr, cwd: [])
     monkeypatch.setattr(_gh, "required_checks_pending", lambda pr, cwd: True)
@@ -91,4 +91,5 @@ def test_detached_record_carries_ci_watch_pending(monkeypatch, tmp_path):
     records = _rec._detached_pr_records("sess", str(tmp_path))
     rec = next(r for r in records if r["pr"] == 77)
     assert rec["ci_watch_pending"] is True
+    assert rec["head_sha"] == "head-77"
     config.load.cache_clear()

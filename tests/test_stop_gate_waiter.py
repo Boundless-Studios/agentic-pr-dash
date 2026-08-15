@@ -444,10 +444,97 @@ def test_stop_gate_ci_rerun_invalidates_waiter_release(tmp_path, monkeypatch, ca
     capsys.readouterr()
     assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 0
 
-    observation["verified"] = True
     observation["ci_pending"] = True
     assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
     assert "42" in capsys.readouterr().err
+
+
+def test_stop_gate_ci_identity_swap_invalidates_waiter_release(
+    tmp_path, monkeypatch, capsys
+):
+    """CI moving between owned PRs is new state even while some CI stays pending."""
+    wt_a = tmp_path / "worktree-a"
+    wt_b = tmp_path / "worktree-b"
+    wt_a.mkdir()
+    wt_b.mkdir()
+    mc._write_arm_marker(str(wt_a), SID, os.getpid(), 41)
+    mc._write_arm_marker(str(wt_b), SID, os.getpid(), 42)
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt_a), str(wt_b)],
+    )
+    monkeypatch.setattr(
+        _worktree_check_mod,
+        "_check_worktree",
+        lambda path, sid, *, claim=True: (0, "nothing pending"),
+    )
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(
+        _stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {41, 42}
+    )
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: "head")
+    pending = {41}
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda number, cwd: number in pending,
+    )
+
+    assert [
+        mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+        for _ in range(3)
+    ] == [2, 2, 0]
+    capsys.readouterr()
+
+    pending.clear()
+    pending.add(42)
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert "41" in capsys.readouterr().err
+
+
+def test_stop_gate_reuses_worktree_check_ci_observation(tmp_path, monkeypatch):
+    """The waiter fingerprint must not repeat CI I/O paid for by the check."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+    calls = {"count": 0}
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt)],
+    )
+
+    def check(path, sid, *, claim=True):
+        calls["count"] += 1
+        github_api.required_checks_pending(42, path)
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", check)
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: "head")
+    live_calls = {"count": 0}
+
+    def live_probe(number, cwd):
+        live_calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(github_api, "_required_checks_pending_live", live_probe)
+
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert calls["count"] == 1
+    assert live_calls["count"] == 1
 
 
 def test_stop_gate_escalation_detail_invalidates_release(tmp_path, monkeypatch, capsys):

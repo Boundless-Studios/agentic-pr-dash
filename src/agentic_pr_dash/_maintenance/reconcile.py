@@ -4,7 +4,12 @@ from __future__ import annotations
 import os
 
 from ._common import _resolve_owner_pid, _repo_slug, _current_branch
-from .pr_state import _pr_open_state, _unpack_pr_open_state, _thread_is_p1
+from .pr_state import (
+    _pr_open_state,
+    _thread_is_p1,
+    _unpack_pr_open_state,
+    _unpack_pr_open_state_with_head,
+)
 from . import deferred_review
 from agentic_pr_dash import ownership
 from .markers import (
@@ -203,8 +208,8 @@ def _detached_pr_records(session_id: str, cwd: str,
             continue
         if abs_wt and abs_wt in present_worktrees and _worktree_is_for_entry(abs_wt, e, snap=snap):
             continue
-        state, url, has_fail, failing, review_decision, merge_state, mergeable = (
-            _unpack_pr_open_state(_pr_open_state(e.pr, cwd))
+        state, url, has_fail, failing, review_decision, merge_state, mergeable, head_sha = (
+            _unpack_pr_open_state_with_head(_pr_open_state(e.pr, cwd))
         )
         if state in ("merged", "closed"):
             prune.add(e.pr)
@@ -244,6 +249,7 @@ def _detached_pr_records(session_id: str, cwd: str,
             # the second repo's blockers (PR #61 review, P2). Legacy repo-less rows
             # fall back to the anchor's repo.
             "repo": e.repo or target_repo,
+            "head_sha": head_sha,
             "worktree_present": False, "unresolved_threads": len(unresolved),
             "deferred_threads": len(deferred),
             "ci_failing": has_fail, "failing_checks": failing,
