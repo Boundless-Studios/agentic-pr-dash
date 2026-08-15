@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from agentic_pr_dash import config, maintenance_check as mc
+from agentic_pr_dash import config, github_api, maintenance_check as mc
 from agentic_pr_dash._maintenance import (
     ownership_resolution as _ownership_resolution_mod,
 )
@@ -383,6 +383,8 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
     monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
     monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    head = {"sha": "head-1"}
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: head["sha"])
 
     # First two calls → exit 2
     r1 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
@@ -391,8 +393,90 @@ def test_stop_gate_need_waiter_loop_break(tmp_path, monkeypatch, capsys):
     assert r2 == 2
     # Third call → loop-break releases the gate (exit 0)
     r3 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
-    err = capsys.readouterr().err
+    capsys.readouterr()
     assert r3 == 0
+
+    # The bounded release is durable for this exact observation. A later Stop
+    # attempt must not immediately re-arm and inject the same waiter request.
+    r4 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert r4 == 0
+    assert capsys.readouterr().err == ""
+
+    # A new immutable PR head is new observation state even though the open PR
+    # number and waiter requirement are otherwise identical.
+    head["sha"] = "head-2"
+    r5 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert r5 == 2
+    assert "42" in capsys.readouterr().err
+
+
+def test_stop_gate_ci_rerun_invalidates_waiter_release(tmp_path, monkeypatch, capsys):
+    """Required CI restarting on the same head is a new waiter observation."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: "head-1")
+
+    observation = {"verified": False, "ci_pending": False}
+    monkeypatch.setattr(
+        _waiter_mod,
+        "_read_clean_exit_keys",
+        lambda sid: (
+            {_waiter_mod._clean_exit_key("", 42)}
+            if observation["verified"]
+            else set()
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda number, cwd: observation["ci_pending"],
+    )
+
+    assert [
+        mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+        for _ in range(3)
+    ] == [2, 2, 0]
+    capsys.readouterr()
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 0
+
+    observation["verified"] = True
+    observation["ci_pending"] = True
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert "42" in capsys.readouterr().err
+
+
+def test_stop_gate_escalation_detail_invalidates_release(tmp_path, monkeypatch, capsys):
+    """A changed escalation streak/error must re-arm the same open PR."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+
+    monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending"))
+    monkeypatch.setattr(_reconcile_mod, "_detached_pr_records", lambda sid, cwd, include_legacy=True, prune_legacy=True: [])
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    escalation = {"count": 3, "last_error": "executor failed"}
+    monkeypatch.setattr(
+        _stop_gate_mod,
+        "_read_escalation_marker",
+        lambda cwd: {"42": escalation.copy()},
+    )
+
+    assert [
+        mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+        for _ in range(3)
+    ] == [2, 2, 0]
+    capsys.readouterr()
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 0
+
+    escalation["count"] = 4
+    escalation["last_error"] = "executor failed again"
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert "executor failed again" in capsys.readouterr().err
 
 
 def test_stop_gate_pending_work_still_wins(tmp_path, monkeypatch, capsys):

@@ -725,14 +725,32 @@ def _stop_gate_impl(args) -> int:
             escalated_open = {pr: info for pr, info in escalated_owned.items() if pr in open_prs}
             if escalated_open and not _await_alive(cwd, session_id):
                 escalation_text = _build_escalation_block(escalated_open)
-                fingerprint = "escalated:" + ",".join(str(n) for n in sorted(escalated_open))
+                escalation_state = json.dumps(
+                    escalated_open, sort_keys=True, separators=(",", ":")
+                )
+                fingerprint = "escalated:" + hashlib.sha256(
+                    escalation_state.encode("utf-8")
+                ).hexdigest()
+                if (
+                    state.get("released_fingerprint") == fingerprint
+                    and state.get("released_session_id") == session_id
+                ):
+                    _save_stop_state(cwd, {**state, "ts": now})
+                    return 0
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
                 threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
                 if count < threshold:
                     print(escalation_text, file=sys.stderr)
                     return 2
-                _save_stop_state(cwd, {"ts": now})
+                _save_stop_state(
+                    cwd,
+                    {
+                        "ts": now,
+                        "released_fingerprint": fingerprint,
+                        "released_session_id": session_id,
+                    },
+                )
                 return 0
             if open_prs and not _await_alive(cwd, session_id):
                 # BOU-1962 (codex PR #75 review): when this session's waiter
@@ -744,6 +762,7 @@ def _stop_gate_impl(args) -> int:
                 # alive: required CI running again (BOU-1789 watch-pending) or
                 # CI state unobservable this tick (fail toward coverage).
                 verified_clean = _read_clean_exit_keys(session_id)
+                ci_running = False
                 # A blocker-status read that failed DURING the _check_worktree
                 # pass above (get_ci_checks / its REST fallback unobservable)
                 # means this stop's "nothing pending" was computed blind —
@@ -812,14 +831,37 @@ def _stop_gate_impl(args) -> int:
                     ):
                         _save_stop_state(cwd, {"ts": now})
                         return 0
-                fingerprint = "need-waiter:" + ",".join(str(n) for n in sorted(open_prs))
+                waiter_identities = {
+                    f"{_slug(wt)}#{n}@{_local_head_sha(wt) or 'unknown'}"
+                    for n in open_prs
+                    for wt in _live_wts_for(n)
+                } | {
+                    f"{r.get('repo', '')}#{r['pr']}@{r.get('head_sha') or 'unknown'}"
+                    for r in open_detached_records
+                    if r["pr"] in open_prs
+                }
+                fingerprint = "need-waiter:" + ",".join(sorted(waiter_identities))
+                fingerprint += f"|ci-pending:{int(ci_running)}"
+                if (
+                    state.get("released_fingerprint") == fingerprint
+                    and state.get("released_session_id") == session_id
+                ):
+                    _save_stop_state(cwd, {**state, "ts": now})
+                    return 0
                 count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
                 _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
                 threshold = _env_int("STOP_LOOP_THRESHOLD", 3)
                 if count < threshold:
                     print(_build_waiter_block(open_prs, cwd, session_id), file=sys.stderr)
                     return 2
-                _save_stop_state(cwd, {"ts": now})
+                _save_stop_state(
+                    cwd,
+                    {
+                        "ts": now,
+                        "released_fingerprint": fingerprint,
+                        "released_session_id": session_id,
+                    },
+                )
                 return 0
         _save_stop_state(cwd, {"ts": now})
         return 0
@@ -831,8 +873,21 @@ def _stop_gate_impl(args) -> int:
     # pending work. Sorted so the fingerprint is stable regardless of dict/set
     # iteration order.
     fingerprint = _stop_fingerprint(pending)
+    if escalated_owned:
+        escalation_state = json.dumps(escalated_owned, sort_keys=True, separators=(",", ":"))
+        fingerprint += "|escalated:" + hashlib.sha256(
+            escalation_state.encode("utf-8")
+        ).hexdigest()
     if unknown_worktrees:
         fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
+    released_until = float(state.get("released_until", 0) or 0)
+    if (
+        state.get("released_fingerprint") == fingerprint
+        and state.get("released_session_id") == session_id
+        and (not unknown_worktrees or now < released_until)
+    ):
+        _save_stop_state(cwd, {**state, "ts": now})
+        return 0
     count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
     _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
 
@@ -890,10 +945,21 @@ def _stop_gate_impl(args) -> int:
         print(
             f"[pr-watch] Same pending/unknown PR state seen {count}× with no "
             f"progress — releasing the stop gate so you can ask the user or "
-            f"take a safe action. A later stop will re-enforce it.",
+            f"take a safe action. This exact state stays suppressed until the "
+            f"PR head or actionable review/CI state changes.",
             file=sys.stderr,
         )
-        _save_stop_state(cwd, {"ts": now})
+        released_state: dict[str, object] = {
+            "ts": now,
+            "released_fingerprint": fingerprint,
+            "released_session_id": session_id,
+        }
+        if unknown_worktrees:
+            # Unknown is not an exact actionable observation. Suppress only for
+            # one bounded cache window, then force another attempt so changed
+            # review/CI state on an unchecked PR cannot remain hidden forever.
+            released_state["released_until"] = now + max(interval, 1)
+        _save_stop_state(cwd, released_state)
         return 0
 
     if pending:
