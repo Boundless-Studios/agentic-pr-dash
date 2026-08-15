@@ -637,7 +637,7 @@ def _pr_open_state(pr_number: int, cwd: str):
     from agentic_pr_dash import github_api  # noqa: PLC0415
     import json as _json  # noqa: PLC0415
 
-    unavailable = ("unknown", "", False, [], "", "", "")
+    unavailable = ("unknown", "", False, [], "", "", "", "")
     # Route through github_api._run (not raw subprocess) so a rate-limit on this
     # detached PR-state probe is detected and recorded in the per-tick
     # rate_limit_seen() flag — otherwise a detached-only waiter whose only gh call
@@ -647,7 +647,7 @@ def _pr_open_state(pr_number: int, cwd: str):
     res = github_api._run(
         [
             "gh", "pr", "view", str(pr_number),
-            "--json", "state,url,isDraft,reviewDecision,mergeStateStatus,mergeable",
+            "--json", "state,url,isDraft,reviewDecision,mergeStateStatus,mergeable,headRefOid",
         ],
         timeout_s=15, cwd=cwd,
     )
@@ -668,7 +668,11 @@ def _pr_open_state(pr_number: int, cwd: str):
     review_decision = str(d.get("reviewDecision") or "")
     merge_state = str(d.get("mergeStateStatus") or "")
     mergeable = str(d.get("mergeable") or "")
-    return (state, url, bool(failing), failing, review_decision, merge_state, mergeable)
+    head_sha = str(d.get("headRefOid") or "")
+    return (
+        state, url, bool(failing), failing, review_decision, merge_state,
+        mergeable, head_sha,
+    )
 
 
 def _unpack_pr_open_state(raw):
@@ -679,8 +683,15 @@ def _unpack_pr_open_state(raw):
     if len(raw) == 6:
         state, url, has_fail, failing, review_decision, merge_state = raw
         return state, url, has_fail, failing, review_decision, merge_state, ""
-    state, url, has_fail, failing, review_decision, merge_state, mergeable = raw
+    state, url, has_fail, failing, review_decision, merge_state, mergeable = raw[:7]
     return state, url, has_fail, failing, review_decision, merge_state, mergeable
+
+
+def _unpack_pr_open_state_with_head(raw):
+    """Normalize PR state while preserving head SHA when the probe supplied it."""
+    state = _unpack_pr_open_state(raw)
+    head_sha = str(raw[7] or "") if len(raw) >= 8 else ""
+    return (*state, head_sha)
 
 
 def _thread_is_p1(thread) -> bool:

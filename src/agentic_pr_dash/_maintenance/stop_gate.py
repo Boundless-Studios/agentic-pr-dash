@@ -799,17 +799,16 @@ def _stop_gate_impl(args) -> int:
                     for r in open_detached_records
                     if r["pr"] in open_prs
                 }
-                ci_running = any(
-                    r.get("ci_watch_pending") for r in open_detached_records
-                )
-                if not ci_running:
-                    for n in sorted(open_prs):
-                        if any(
-                            github_api.required_checks_pending(n, wt)
-                            for wt in pr_to_wts.get(n, ())
-                        ):
-                            ci_running = True
-                            break
+                ci_pending_identities = {
+                    f"{r.get('repo', '')}#{r['pr']}"
+                    for r in open_detached_records
+                    if r.get("ci_watch_pending")
+                }
+                for n in sorted(open_prs):
+                    for wt in pr_to_wts.get(n, ()):
+                        if github_api.required_checks_pending(n, wt):
+                            ci_pending_identities.add(f"{_slug(wt)}#{n}")
+                ci_running = bool(ci_pending_identities)
                 if (
                     verified_clean
                     and open_keys
@@ -841,7 +840,9 @@ def _stop_gate_impl(args) -> int:
                     if r["pr"] in open_prs
                 }
                 fingerprint = "need-waiter:" + ",".join(sorted(waiter_identities))
-                fingerprint += f"|ci-pending:{int(ci_running)}"
+                fingerprint += "|ci-pending:" + ",".join(
+                    sorted(ci_pending_identities)
+                )
                 if (
                     state.get("released_fingerprint") == fingerprint
                     and state.get("released_session_id") == session_id
