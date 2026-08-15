@@ -219,6 +219,12 @@ def test_released_fingerprint_does_not_rearm_until_state_changes(
     assert stop_gate._stop_gate_impl(args) == 0
     assert capsys.readouterr().err == ""
 
+    new_session_args = SimpleNamespace(
+        cwd=str(tmp_path), session_id="sess-new", pid=None, no_waiter=True
+    )
+    assert stop_gate._stop_gate_impl(new_session_args) == 2
+    assert SUMMARY in capsys.readouterr().err
+
     changed_args = _patch_pending_stop(
         monkeypatch,
         tmp_path,
