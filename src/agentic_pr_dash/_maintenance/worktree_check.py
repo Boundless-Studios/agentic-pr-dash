@@ -423,6 +423,8 @@ def _resolve_and_blockers(cwd: str):
     pr = pr_state._resolve_pr_for_branch(cwd)
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    github_api.record_published_pr_head(pr.number, pr.latest_commit_sha, cwd)
     blockers = maintenance.blockers_for_pr(pr)
     if not blockers:
         unresolved_threads = pr_state._unresolved_review_threads(pr.number, cwd)

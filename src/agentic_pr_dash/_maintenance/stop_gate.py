@@ -353,6 +353,7 @@ def _stop_gate_impl(args) -> int:
     # fails fast instead — the long-lived `await` waiter (a different process)
     # is unaffected and keeps backing off.
     github_api.set_rate_limit_backoff(False)
+    github_api.reset_required_check_observations()
 
     cwd = os.path.abspath(args.cwd)
 
@@ -378,7 +379,13 @@ def _stop_gate_impl(args) -> int:
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
     now = time.time()
-    last_pending = bool(state.get("fingerprint"))
+    # A released fingerprint is still a pending observation whose durable
+    # identity must be rechecked on every stop.  Treating it as clean here
+    # would hide a newly published head (or restarted CI) until STOP_INTERVAL
+    # expires.
+    last_pending = bool(
+        state.get("fingerprint") or state.get("released_fingerprint")
+    )
     rate_limited = (
         interval > 0
         and not last_pending
@@ -806,7 +813,14 @@ def _stop_gate_impl(args) -> int:
                 }
                 for n in sorted(open_prs):
                     for wt in pr_to_wts.get(n, ()):
-                        if github_api.required_checks_pending(n, wt):
+                        pending_observation = (
+                            github_api.observed_required_checks_pending(n, wt)
+                        )
+                        if pending_observation is None:
+                            pending_observation = github_api.required_checks_pending(
+                                n, wt
+                            )
+                        if pending_observation:
                             ci_pending_identities.add(f"{_slug(wt)}#{n}")
                 ci_running = bool(ci_pending_identities)
                 if (
@@ -876,9 +890,11 @@ def _stop_gate_impl(args) -> int:
     fingerprint = _stop_fingerprint(pending)
     from ._common import _repo_slug as _slug  # noqa: PLC0415
     pending_heads = {
-        f"{_slug(path)}#{_extract_pr_number(text)}@{_local_head_sha(path) or 'unknown'}"
+        f"{_slug(path)}#{_extract_pr_number(text)}@"
+        f"{github_api.published_pr_head_sha(int(_extract_pr_number(text)), path) or 'unknown'}"
         for path, text in pending
         if not path.startswith("(no worktree)")
+        and _extract_pr_number(text).isdigit()
     } | {
         f"{record.get('repo', '')}#{record['pr']}@{record.get('head_sha') or 'unknown'}"
         for record in detached

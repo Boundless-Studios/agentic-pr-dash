@@ -2145,6 +2145,30 @@ def get_primed_mergeability(
     return merge_state, mergeable
 
 
+def published_pr_head_sha(pr_number: int, cwd: str | None = None) -> str:
+    """Return the authoritative published PR head, preferring the batch cache."""
+    repo = _repo_for_cwd(cwd) or ""
+    observed = _PUBLISHED_HEAD_OBSERVATIONS.get((repo, pr_number))
+    if observed:
+        return observed
+    primed_repo = _batch_repo_for_cwd(cwd)
+    cached = (
+        _PR_BATCH_CACHE.get((primed_repo, pr_number)) if primed_repo else None
+    )
+    if cached is not None and cached.get("head_sha"):
+        return str(cached["head_sha"])
+    return ""
+
+
+def record_published_pr_head(
+    pr_number: int, head_sha: str, cwd: str | None = None
+) -> None:
+    """Retain the published head already resolved by the worktree check."""
+    repo = _repo_for_cwd(cwd) or ""
+    if head_sha:
+        _PUBLISHED_HEAD_OBSERVATIONS[(repo, pr_number)] = head_sha
+
+
 def get_review_threads(
     pr_number: int,
     cwd: str | None = None,
@@ -3027,7 +3051,7 @@ def _repo_for_cwd(cwd: str | None) -> str | None:
     return load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
 
 
-def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
+def _required_checks_pending_live(pr_number: int, cwd: str | None = None) -> bool:
     """True iff a required/merge-gating check is still non-terminal.
 
     Reads the GraphQL ``statusCheckRollup`` and inspects per-context
@@ -3122,6 +3146,32 @@ def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
     # (codex PR #75 review, round 2).
     _note_checks_probe_failure()
     return False
+
+
+_REQUIRED_CHECK_OBSERVATIONS: dict[tuple[str, int], bool] = {}
+_PUBLISHED_HEAD_OBSERVATIONS: dict[tuple[str, int], str] = {}
+
+
+def reset_required_check_observations() -> None:
+    """Clear per-tick required-check observations retained for gate reuse."""
+    _REQUIRED_CHECK_OBSERVATIONS.clear()
+    _PUBLISHED_HEAD_OBSERVATIONS.clear()
+
+
+def required_checks_pending(pr_number: int, cwd: str | None = None) -> bool:
+    """Observe required CI and retain the result for other readers this tick."""
+    pending = _required_checks_pending_live(pr_number, cwd)
+    repo = _repo_for_cwd(cwd) or ""
+    _REQUIRED_CHECK_OBSERVATIONS[(repo, pr_number)] = pending
+    return pending
+
+
+def observed_required_checks_pending(
+    pr_number: int, cwd: str | None = None
+) -> bool | None:
+    """Return an already-paid-for CI observation, or ``None`` if absent."""
+    repo = _repo_for_cwd(cwd) or ""
+    return _REQUIRED_CHECK_OBSERVATIONS.get((repo, pr_number))
 
 
 # A batch call covering too many PRs at once risks a pathologically expensive

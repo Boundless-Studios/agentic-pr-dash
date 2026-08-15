@@ -499,6 +499,44 @@ def test_stop_gate_ci_identity_swap_invalidates_waiter_release(
     assert "41" in capsys.readouterr().err
 
 
+def test_stop_gate_reuses_worktree_check_ci_observation(tmp_path, monkeypatch):
+    """The waiter fingerprint must not repeat CI I/O paid for by the check."""
+    wt = _make_armed_worktree(tmp_path, SID, 42)
+    calls = {"count": 0}
+
+    monkeypatch.setattr(
+        _worktrees_mod,
+        "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(wt)],
+    )
+
+    def check(path, sid, *, claim=True):
+        calls["count"] += 1
+        github_api.required_checks_pending(42, path)
+        return 0, "nothing pending"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", check)
+    monkeypatch.setattr(
+        _reconcile_mod,
+        "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    monkeypatch.setattr(_stop_gate_mod, "_owned_open_pr_numbers", lambda owned: {42})
+    monkeypatch.setattr(_waiter_mod, "_await_alive", lambda cwd, sid: False)
+    monkeypatch.setattr(_stop_gate_mod, "_local_head_sha", lambda cwd: "head")
+    live_calls = {"count": 0}
+
+    def live_probe(number, cwd):
+        live_calls["count"] += 1
+        return True
+
+    monkeypatch.setattr(github_api, "_required_checks_pending_live", live_probe)
+
+    assert mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID]) == 2
+    assert calls["count"] == 1
+    assert live_calls["count"] == 1
+
+
 def test_stop_gate_escalation_detail_invalidates_release(tmp_path, monkeypatch, capsys):
     """A changed escalation streak/error must re-arm the same open PR."""
     wt = _make_armed_worktree(tmp_path, SID, 42)
