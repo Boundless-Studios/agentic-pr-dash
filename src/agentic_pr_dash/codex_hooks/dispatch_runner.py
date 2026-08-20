@@ -226,11 +226,20 @@ def run_provider_entrypoint(
         source = DispatchSource.DETACHED_RUNNER
         command = _option_value(argv, "--command") or ""
         exit_code = _option_value(argv, "--exit-code")
+        error_file = _option_value(argv, "--error-file")
+        stderr = ""
+        if error_file:
+            try:
+                stderr = Path(error_file).read_text(
+                    encoding="utf-8", errors="replace"
+                )
+            except OSError:
+                pass
         payload: dict[str, object] = {
             "session_id": os.environ.get("CLAUDE_SESSION_ID", ""),
             "cwd": os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()),
             "tool_input": {"command": command},
-            "tool_response": {"exit_code": exit_code},
+            "tool_response": {"exit_code": exit_code, "stderr": stderr},
         }
     else:
         try:

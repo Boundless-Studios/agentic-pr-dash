@@ -521,6 +521,33 @@ def test_detached_opencode_entrypoint_persists_without_context(
     assert capsys.readouterr().out == ""
 
 
+def test_detached_failure_reads_error_file_for_unavailability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    availability = tmp_path / "codex-availability.json"
+    error_file = tmp_path / "codex-error.txt"
+    error_file.write_text("usage quota exhausted", encoding="utf-8")
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("DISPATCH_AVAILABILITY_PATH", str(availability))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--command",
+            "codex exec review",
+            "--exit-code",
+            "1",
+            "--error-file",
+            str(error_file),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(ledger.read_text(encoding="utf-8"))["outcome"] == "unavailable"
+    assert json.loads(availability.read_text(encoding="utf-8"))["available"] is False
+
+
 def test_agent_dispatch_produces_normalized_observation() -> None:
     observation = observation_from_agent_payload(
         {
