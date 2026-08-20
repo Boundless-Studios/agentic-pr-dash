@@ -370,18 +370,27 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
 
 
 def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
-    """Return whether a simple command directly executes the requested provider."""
+    """Return whether a shell command directly executes the requested provider."""
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
-    if any(character in command for character in "\n;&|<>"):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
         return False
-    assignment = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+\s+"
-    executable_path = rf"(?:[^\s;&|<>]*/)?{executable}"
-    return bool(
-        re.match(
-            rf"^(?:{assignment})*{executable_path}\s+{subcommand}(?:\s|$)", command
-        )
-    )
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens.pop(0)
+    if len(tokens) < 2 or Path(tokens[0]).name != executable or tokens[1] != subcommand:
+        return False
+    remainder = tokens[2:]
+    for index, token in enumerate(remainder):
+        if token == "<" and index + 1 < len(remainder) and remainder[index + 1] == "/dev/null":
+            continue
+        if token in {";", "&", "&&", "|", "||", ">", ">>", "<", "<<"}:
+            return False
+    return True
 
 
 def _requested_model(command: str) -> str | None:

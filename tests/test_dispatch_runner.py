@@ -291,6 +291,26 @@ def test_path_qualified_provider_keeps_attached_classification(
     assert result.additional_context == "policy ran"
 
 
+def test_canonical_multiline_review_with_stdin_redirect_keeps_classification(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "codex exec --sandbox workspace-write \"Review this diff:\n"
+            "+print('safe; quoted')\" </dev/null"
+        ),
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.additional_context == "policy ran"
+
+
 def test_provider_words_used_as_arguments_cannot_reach_policy(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
