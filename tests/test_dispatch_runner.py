@@ -528,6 +528,14 @@ def test_detached_failure_reads_error_file_for_unavailability(
     availability = tmp_path / "codex-availability.json"
     error_file = tmp_path / "codex-error.txt"
     error_file.write_text("usage quota exhausted", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def reject_unbounded_error_read(path: Path, *args, **kwargs) -> str:
+        if path == error_file:
+            raise AssertionError("error files must be scanned incrementally")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_unbounded_error_read)
     monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
     monkeypatch.setenv("DISPATCH_AVAILABILITY_PATH", str(availability))
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))

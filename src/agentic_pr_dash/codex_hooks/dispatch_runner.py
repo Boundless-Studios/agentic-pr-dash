@@ -46,6 +46,8 @@ _UNAVAILABLE_PATTERN = re.compile(
     r"\b(?:quota|rate[ -]?limit|authorization|unauthorized|forbidden|credits?)\b",
     re.IGNORECASE,
 )
+_ERROR_SCAN_CHUNK_SIZE = 64 * 1024
+_ERROR_SCAN_OVERLAP = 64
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
 AGENT_CLASSIFY_MAP = [
@@ -230,9 +232,8 @@ def run_provider_entrypoint(
         stderr = ""
         if error_file:
             try:
-                stderr = Path(error_file).read_text(
-                    encoding="utf-8", errors="replace"
-                )
+                if _error_file_reports_unavailable(Path(error_file)):
+                    stderr = "quota"
             except OSError:
                 pass
         payload: dict[str, object] = {
@@ -412,6 +413,17 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
     if isinstance(stderr, str) and _UNAVAILABLE_PATTERN.search(stderr):
         return DispatchOutcome.UNAVAILABLE
     return DispatchOutcome.FAILURE
+
+
+def _error_file_reports_unavailable(path: Path) -> bool:
+    carry = ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        while chunk := handle.read(_ERROR_SCAN_CHUNK_SIZE):
+            window = carry + chunk
+            if _UNAVAILABLE_PATTERN.search(window):
+                return True
+            carry = window[-_ERROR_SCAN_OVERLAP:]
+    return False
 
 
 def _append_jsonl(path: Path, payload: dict[str, object]) -> None:
