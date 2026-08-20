@@ -55,6 +55,7 @@ _FIELDS: Final[frozenset[str]] = frozenset(
         "classification_framework",
     }
 )
+_LEGACY_OBSERVED_AT: Final[str] = datetime.fromtimestamp(0, UTC).isoformat()
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,14 +71,15 @@ class DispatchObservation:
     requested_model: str | None
     resolved_model: str | None
     outcome: DispatchOutcome
-    observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     review_verdict: dict[str, object] | None = None
     classification_authority: ClassificationAuthority = (
         ClassificationAuthority.LEGACY_INFERRED
     )
     classification_framework: str | None = None
+    observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "observed_at", _normalize_observed_at(self.observed_at))
         if self.review_verdict is not None and not (
             self.outcome is DispatchOutcome.SUCCESS and self.task_type == "review"
         ):
@@ -126,7 +128,6 @@ class DispatchObservation:
 
         return cls(
             provider=DispatchProvider(str(payload["provider"])),
-            observed_at=str(payload["observed_at"]),
             source=DispatchSource(str(payload["source"])),
             session_id=str(payload["session_id"]),
             worktree_root=str(payload["worktree_root"]),
@@ -147,6 +148,9 @@ class DispatchObservation:
             classification_framework=_optional_string(
                 payload.get("classification_framework")
             ),
+            observed_at=_normalize_observed_at(
+                payload.get("observed_at", _LEGACY_OBSERVED_AT)
+            ),
         )
 
 
@@ -156,3 +160,15 @@ def _optional_string(value: object) -> str | None:
     if not isinstance(value, str):
         raise TypeError("model fields must be strings or null")
     return value
+
+
+def _normalize_observed_at(value: object) -> str:
+    if not isinstance(value, str):
+        raise TypeError("observed_at must be an ISO timestamp string")
+    try:
+        observed_at = datetime.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("observed_at must be a valid ISO timestamp") from error
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must include a UTC offset")
+    return observed_at.astimezone(UTC).isoformat()
