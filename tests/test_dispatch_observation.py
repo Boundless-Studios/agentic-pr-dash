@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 import pytest
 
 from agentic_pr_dash.dispatch_observation import (
@@ -25,6 +27,24 @@ def test_dispatch_observation_round_trips() -> None:
     )
 
     assert DispatchObservation.from_dict(observation.to_dict()) == observation
+
+
+def test_dispatch_observation_records_a_portable_timestamp() -> None:
+    observation = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/wt",
+        command="codex exec review",
+        task_type="review",
+        requested_model=None,
+        resolved_model="gpt-5.6-sol",
+        outcome=DispatchOutcome.SUCCESS,
+    )
+
+    observed_at = observation.to_dict()["observed_at"]
+    assert isinstance(observed_at, str)
+    assert datetime.fromisoformat(observed_at).tzinfo is not None
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))

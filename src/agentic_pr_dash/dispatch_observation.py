@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Final
 
@@ -40,6 +41,7 @@ class ClassificationAuthority(str, Enum):
 _FIELDS: Final[frozenset[str]] = frozenset(
     {
         "provider",
+        "observed_at",
         "source",
         "session_id",
         "worktree_root",
@@ -68,6 +70,7 @@ class DispatchObservation:
     requested_model: str | None
     resolved_model: str | None
     outcome: DispatchOutcome
+    observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
     review_verdict: dict[str, object] | None = None
     classification_authority: ClassificationAuthority = (
         ClassificationAuthority.LEGACY_INFERRED
@@ -92,6 +95,7 @@ class DispatchObservation:
 
         return {
             "provider": self.provider.value,
+            "observed_at": self.observed_at,
             "source": self.source.value,
             "session_id": self.session_id,
             "worktree_root": self.worktree_root,
@@ -122,6 +126,7 @@ class DispatchObservation:
 
         return cls(
             provider=DispatchProvider(str(payload["provider"])),
+            observed_at=str(payload["observed_at"]),
             source=DispatchSource(str(payload["source"])),
             session_id=str(payload["session_id"]),
             worktree_root=str(payload["worktree_root"]),
