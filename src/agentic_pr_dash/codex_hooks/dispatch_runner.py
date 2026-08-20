@@ -374,7 +374,8 @@ def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>")
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
+        lexer.whitespace = " \t\r"
         lexer.whitespace_split = True
         lexer.commenters = ""
         tokens = list(lexer)
@@ -388,7 +389,7 @@ def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
     for index, token in enumerate(remainder):
         if token == "<" and index + 1 < len(remainder) and remainder[index + 1] == "/dev/null":
             continue
-        if token in {";", "&", "&&", "|", "||", ">", ">>", "<", "<<"}:
+        if re.fullmatch(r"[;&|<>\n]+", token):
             return False
     return True
 

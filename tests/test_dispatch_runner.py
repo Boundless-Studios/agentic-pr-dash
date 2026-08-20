@@ -391,6 +391,34 @@ def test_newline_separated_dispatch_cannot_reach_policy(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "separator",
+    [
+        " |& ",
+        "\n",
+    ],
+)
+def test_dispatch_followed_by_shell_separator_cannot_reach_policy(
+    tmp_path: Path, separator: str
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=f"codex exec review{separator}true",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    callbacks: list[str] = []
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+
+
+@pytest.mark.parametrize(
     "command",
     [
         "cat <<'EOF'\ncodex exec review\nEOF",
