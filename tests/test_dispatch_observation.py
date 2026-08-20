@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from agentic_pr_dash.dispatch_observation import (
@@ -25,6 +27,103 @@ def test_dispatch_observation_round_trips() -> None:
     )
 
     assert DispatchObservation.from_dict(observation.to_dict()) == observation
+
+
+def test_dispatch_observation_records_a_portable_timestamp() -> None:
+    observation = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/wt",
+        command="codex exec review",
+        task_type="review",
+        requested_model=None,
+        resolved_model="gpt-5.6-sol",
+        outcome=DispatchOutcome.SUCCESS,
+    )
+
+    observed_at = observation.to_dict()["observed_at"]
+    assert isinstance(observed_at, str)
+    assert datetime.fromisoformat(observed_at).tzinfo is not None
+
+
+def test_dispatch_observation_preserves_legacy_positional_arguments() -> None:
+    verdict = {"status": "clean", "findings": []}
+
+    observation = DispatchObservation(
+        DispatchProvider.CODEX,
+        DispatchSource.INTERACTIVE_HOOK,
+        "session-1",
+        "/repo/wt",
+        "codex exec review",
+        "review",
+        "gpt-5.6-sol",
+        "gpt-5.6-sol",
+        DispatchOutcome.SUCCESS,
+        verdict,
+    )
+
+    assert observation.review_verdict == verdict
+    assert datetime.fromisoformat(observation.observed_at).tzinfo is UTC
+
+
+def test_legacy_dispatch_observation_uses_epoch_timestamp() -> None:
+    payload = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/wt",
+        command="codex exec implement",
+        task_type="implementation",
+        requested_model=None,
+        resolved_model="gpt-5.6-sol",
+        outcome=DispatchOutcome.SUCCESS,
+    ).to_dict()
+    del payload["observed_at"]
+
+    observation = DispatchObservation.from_dict(payload)
+
+    assert observation.observed_at == "1970-01-01T00:00:00+00:00"
+
+
+def test_deserialized_timestamp_is_normalized_to_utc() -> None:
+    payload = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/wt",
+        command="codex exec implement",
+        task_type="implementation",
+        requested_model=None,
+        resolved_model="gpt-5.6-sol",
+        outcome=DispatchOutcome.SUCCESS,
+    ).to_dict()
+    payload["observed_at"] = "2026-08-20T08:00:00-07:00"
+
+    observation = DispatchObservation.from_dict(payload)
+
+    assert observation.observed_at == "2026-08-20T15:00:00+00:00"
+
+
+@pytest.mark.parametrize(
+    "observed_at", [None, 123, "not-a-timestamp", "2026-08-20T08:00:00"]
+)
+def test_deserialized_timestamp_rejects_invalid_values(observed_at: object) -> None:
+    payload = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/wt",
+        command="codex exec implement",
+        task_type="implementation",
+        requested_model=None,
+        resolved_model="gpt-5.6-sol",
+        outcome=DispatchOutcome.SUCCESS,
+    ).to_dict()
+    payload["observed_at"] = observed_at
+
+    with pytest.raises((TypeError, ValueError), match="observed_at"):
+        DispatchObservation.from_dict(payload)
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))

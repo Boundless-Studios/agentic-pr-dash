@@ -291,6 +291,26 @@ def test_path_qualified_provider_keeps_attached_classification(
     assert result.additional_context == "policy ran"
 
 
+def test_canonical_multiline_review_with_stdin_redirect_keeps_classification(
+    tmp_path: Path,
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=(
+            "codex exec --sandbox workspace-write \"Review this diff:\n"
+            "+print('safe; quoted')\" </dev/null"
+        ),
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    result = run_dispatch_hook(request, lambda _observation: "policy ran")
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "declared"
+    assert result.additional_context == "policy ran"
+
+
 def test_provider_words_used_as_arguments_cannot_reach_policy(tmp_path: Path) -> None:
     request = _request(
         tmp_path,
@@ -356,6 +376,34 @@ def test_newline_separated_dispatch_cannot_reach_policy(tmp_path: Path) -> None:
         tmp_path,
         provider=DispatchProvider.CODEX,
         command="cd /repo\ncodex exec review",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    callbacks: list[str] = []
+    result = run_dispatch_hook(
+        request,
+        lambda observation: callbacks.append(observation.task_type) or "policy ran",
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert callbacks == []
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        " |& ",
+        "\n",
+    ],
+)
+def test_dispatch_followed_by_shell_separator_cannot_reach_policy(
+    tmp_path: Path, separator: str
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=f"codex exec review{separator}true",
         classification={"task_type": "review", "framework": "coding-agent/v1"},
     )
 
@@ -519,6 +567,41 @@ def test_detached_opencode_entrypoint_persists_without_context(
         "detached_runner"
     )
     assert capsys.readouterr().out == ""
+
+
+def test_detached_failure_reads_error_file_for_unavailability(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    availability = tmp_path / "codex-availability.json"
+    error_file = tmp_path / "codex-error.txt"
+    error_file.write_text("usage quota exhausted", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def reject_unbounded_error_read(path: Path, *args, **kwargs) -> str:
+        if path == error_file:
+            raise AssertionError("error files must be scanned incrementally")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", reject_unbounded_error_read)
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("DISPATCH_AVAILABILITY_PATH", str(availability))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--command",
+            "codex exec review",
+            "--exit-code",
+            "1",
+            "--error-file",
+            str(error_file),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(ledger.read_text(encoding="utf-8"))["outcome"] == "unavailable"
+    assert json.loads(availability.read_text(encoding="utf-8"))["available"] is False
 
 
 def test_agent_dispatch_produces_normalized_observation() -> None:

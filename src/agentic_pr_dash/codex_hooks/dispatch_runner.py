@@ -46,6 +46,8 @@ _UNAVAILABLE_PATTERN = re.compile(
     r"\b(?:quota|rate[ -]?limit|authorization|unauthorized|forbidden|credits?)\b",
     re.IGNORECASE,
 )
+_ERROR_SCAN_CHUNK_SIZE = 64 * 1024
+_ERROR_SCAN_OVERLAP = 64
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
 AGENT_CLASSIFY_MAP = [
@@ -226,11 +228,19 @@ def run_provider_entrypoint(
         source = DispatchSource.DETACHED_RUNNER
         command = _option_value(argv, "--command") or ""
         exit_code = _option_value(argv, "--exit-code")
+        error_file = _option_value(argv, "--error-file")
+        stderr = ""
+        if error_file:
+            try:
+                if _error_file_reports_unavailable(Path(error_file)):
+                    stderr = "quota"
+            except OSError:
+                pass
         payload: dict[str, object] = {
             "session_id": os.environ.get("CLAUDE_SESSION_ID", ""),
             "cwd": os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()),
             "tool_input": {"command": command},
-            "tool_response": {"exit_code": exit_code},
+            "tool_response": {"exit_code": exit_code, "stderr": stderr},
         }
     else:
         try:
@@ -360,18 +370,28 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
 
 
 def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
-    """Return whether a simple command directly executes the requested provider."""
+    """Return whether a shell command directly executes the requested provider."""
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
-    if any(character in command for character in "\n;&|<>"):
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>\n")
+        lexer.whitespace = " \t\r"
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
         return False
-    assignment = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|<>]+\s+"
-    executable_path = rf"(?:[^\s;&|<>]*/)?{executable}"
-    return bool(
-        re.match(
-            rf"^(?:{assignment})*{executable_path}\s+{subcommand}(?:\s|$)", command
-        )
-    )
+    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
+        tokens.pop(0)
+    if len(tokens) < 2 or Path(tokens[0]).name != executable or tokens[1] != subcommand:
+        return False
+    remainder = tokens[2:]
+    for index, token in enumerate(remainder):
+        if token == "<" and index + 1 < len(remainder) and remainder[index + 1] == "/dev/null":
+            continue
+        if re.fullmatch(r"[;&|<>\n]+", token):
+            return False
+    return True
 
 
 def _requested_model(command: str) -> str | None:
@@ -403,6 +423,17 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
     if isinstance(stderr, str) and _UNAVAILABLE_PATTERN.search(stderr):
         return DispatchOutcome.UNAVAILABLE
     return DispatchOutcome.FAILURE
+
+
+def _error_file_reports_unavailable(path: Path) -> bool:
+    carry = ""
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        while chunk := handle.read(_ERROR_SCAN_CHUNK_SIZE):
+            window = carry + chunk
+            if _UNAVAILABLE_PATTERN.search(window):
+                return True
+            carry = window[-_ERROR_SCAN_OVERLAP:]
+    return False
 
 
 def _append_jsonl(path: Path, payload: dict[str, object]) -> None:
