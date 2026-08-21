@@ -2656,7 +2656,13 @@ def _resolve_fallback_env() -> dict[str, str] | None:
     env = dict(os.environ)
     # Never let GITHUB_TOKEN shadow the identity we're switching to (see above).
     env.pop("GITHUB_TOKEN", None)
-    resolve_token = os.environ.get("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN")
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    token_file = config_home / "agentic-pr-dash" / "gh-resolve-token"
+    try:
+        file_token = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        file_token = ""
+    resolve_token = file_token or os.environ.get("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN")
     if resolve_token:
         env["GH_TOKEN"] = resolve_token
     else:
