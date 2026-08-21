@@ -794,6 +794,13 @@ PR_SNAPSHOT_FIELDS = (
 #: be handed a field the snapshot did not actually fetch.
 _SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
 
+# ``gh pr list`` defaults to 30 items and has no explicit ``--paginate`` flag.
+# Its implementation keeps fetching pages until ``--limit`` is reached or
+# GitHub reports no next page.  Use the CLI's maximum signed-int count as the
+# conventional "drain every page" sentinel so client-side author filtering is
+# not applied to an arbitrarily capped repository population.
+_GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
+
 
 def last_list_open_prs_failure() -> GhFailure | None:
     """Return diagnostics for the most recent failed :func:`list_open_prs` call.
@@ -826,8 +833,8 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
 
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
-        "gh", "pr", "list", "--state", "open", "--limit", "1000",
-        "--json", PR_SNAPSHOT_FIELDS + ",author", "--limit", "10000",
+        "gh", "pr", "list", "--state", "open",
+        "--limit", _GH_COMPLETE_LIST_LIMIT, "--json", PR_SNAPSHOT_FIELDS,
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -840,15 +847,6 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
         return None
     try:
         prs = json.loads(r.stdout or "[]")
-        if not isinstance(prs, list):
-            raise ValueError("not-a-list")
-        author = _load_config(cwd).pr_author
-        if author == "@me":
-            viewer = _run(["gh", "api", "user", "--jq", ".login"], cwd=cwd, timeout_s=15)
-            if viewer.returncode != 0:
-                return None
-            author = viewer.stdout.strip()
-        prs = [pr for pr in prs if isinstance(pr, dict) and (pr.get("author") or {}).get("login") == author]
     except json.JSONDecodeError:
         _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
             command=cmd, returncode=r.returncode,
@@ -865,6 +863,24 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
             reason="not-a-list",
         )
         return None
+    author = _load_config(cwd).pr_author
+    if author == "@me":
+        viewer = _run(["gh", "api", "user", "--jq", ".login"], cwd=cwd, timeout_s=15)
+        author = viewer.stdout.strip() if viewer.returncode == 0 else ""
+        if not author:
+            _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+                command=viewer.args if isinstance(viewer.args, list) else ["gh", "api", "user"],
+                returncode=viewer.returncode,
+                stderr=(viewer.stderr or "authenticated GitHub login is unavailable"),
+                reason="viewer-unavailable",
+            )
+            return None
+    prs = [
+        pr for pr in prs
+        if isinstance(pr, dict)
+        and isinstance(pr.get("author"), dict)
+        and pr["author"].get("login") == author
+    ]
     _LAST_LIST_OPEN_PRS_FAILURE = None
     return prs
 
