@@ -70,7 +70,7 @@ _CWD_DEPENDENT_WRAPPER_RE = re.compile(
 )
 
 
-def _primary_checkout_root() -> Path:
+def _primary_checkout_root(repository_root: Path | None = None) -> Path:
     """Return the primary checkout root (main-repo-root) that survives worktree cleanup.
 
     When this script runs from a feature worktree,
@@ -91,6 +91,7 @@ def _primary_checkout_root() -> Path:
     # directory), ``git rev-parse`` without -C would resolve THAT repo's root
     # and bake its path into the global hook — exactly the bug we're fixing.
     script_dir = Path(__file__).resolve().parent
+    git_anchor = repository_root.resolve() if repository_root is not None else script_dir
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--git-common-dir"],
@@ -98,7 +99,7 @@ def _primary_checkout_root() -> Path:
             text=True,
             check=False,
             timeout=5,
-            cwd=str(script_dir),
+            cwd=str(git_anchor),
         )
         if result.returncode == 0:
             common_dir = result.stdout.strip()
@@ -107,7 +108,7 @@ def _primary_checkout_root() -> Path:
                 # against THIS SCRIPT'S directory (not process cwd).
                 common_dir_path = Path(common_dir)
                 if not common_dir_path.is_absolute():
-                    common_dir_path = script_dir / common_dir_path
+                    common_dir_path = git_anchor / common_dir_path
                 common_dir_path = common_dir_path.resolve()
                 # The primary checkout root is the parent of the .git dir.
                 primary_root = common_dir_path.parent
@@ -115,10 +116,10 @@ def _primary_checkout_root() -> Path:
     except (OSError, subprocess.TimeoutExpired):
         pass
     # Fall back: use the directory containing this script (the current checkout).
-    return script_dir.parent.parent
+    return repository_root.resolve() if repository_root is not None else script_dir.parent.parent
 
 
-def _wrapper_command() -> str:
+def _wrapper_command(repository_root: Path | None = None) -> str:
     """Return the canonical fail-open wrapper command as a STABLE absolute path.
 
     The path is anchored to the PRIMARY checkout root (main-repo-root) so that
@@ -130,7 +131,7 @@ def _wrapper_command() -> str:
       feature worktree where the repair originally ran.
     - No ``$(git rev-parse --show-toplevel)`` expansion that depends on cwd.
     """
-    primary_root = _primary_checkout_root()
+    primary_root = _primary_checkout_root(repository_root)
     wrapper = primary_root / "scripts" / "codex-hooks" / "run_peon_ping.py"
     return f'python3 "{wrapper}"'
 
@@ -203,7 +204,11 @@ def _needs_repair(command: str, primary_wrapper: str | None = None) -> bool:
     return _is_stale_absolute_wrapper(command, primary_wrapper)
 
 
-def _repair_config(config: dict) -> tuple[dict, int]:
+def _repair_config(
+    config: dict,
+    *,
+    repository_root: Path | None = None,
+) -> tuple[dict, int]:
     """Walk *config* and replace stale peon-ping adapter invocations.
 
     Replaces both:
@@ -217,7 +222,7 @@ def _repair_config(config: dict) -> tuple[dict, int]:
 
     repaired = copy.deepcopy(config)
     count = 0
-    replacement = _wrapper_command()
+    replacement = _wrapper_command(repository_root)
 
     hooks_by_event: dict = repaired.get("hooks", {})
     for _event_name, groups in hooks_by_event.items():
@@ -263,6 +268,15 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Report stale entries but do not write changes",
     )
+    parser.add_argument(
+        "--repository-root",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Repository checkout containing scripts/codex-hooks/run_peon_ping.py; "
+            "used to resolve the durable primary-checkout path"
+        ),
+    )
     args = parser.parse_args(argv)
 
     target = Path(args.target) if args.target else default_target_path()
@@ -281,7 +295,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0  # best-effort: never fail the SessionStart chain
 
-    repaired, count = _repair_config(config)
+    repository_root = Path(args.repository_root) if args.repository_root else None
+    repaired, count = _repair_config(config, repository_root=repository_root)
 
     if count == 0:
         return 0  # already clean
