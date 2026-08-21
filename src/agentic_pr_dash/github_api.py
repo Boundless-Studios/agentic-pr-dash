@@ -805,6 +805,9 @@ _GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
 def _repo_hostname(cwd: str | None = None) -> str:
     """Return the current repository's GitHub host without an API call."""
 
+    gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
+    if len(gh_repo_parts) >= 3:
+        return gh_repo_parts[0]
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],

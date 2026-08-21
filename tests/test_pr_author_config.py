@@ -94,6 +94,17 @@ def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"
 
 
+def test_repo_hostname_prefers_host_qualified_gh_repo(monkeypatch):
+    monkeypatch.setenv("GH_REPO", "enterprise.example/owner/repo")
+    monkeypatch.setattr(
+        github_api.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("GH_REPO must avoid consulting origin"),
+    )
+
+    assert github_api._repo_hostname("/repo") == "enterprise.example"
+
+
 def test_list_open_prs_rejects_non_list_before_author_filtering(tmp_path, monkeypatch):
     monkeypatch.setattr(github_api, "_run", lambda *args, **kwargs: _cp(stdout='{"number": 1}'))
 
