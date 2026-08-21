@@ -802,6 +802,37 @@ _SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
 _GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
 
 
+def _repo_hostname(cwd: str | None = None) -> str:
+    """Return the current repository's GitHub host without an API call."""
+
+    try:
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        remote = None
+    url = (remote.stdout or "").strip() if remote and remote.returncode == 0 else ""
+    if url.startswith("git@") and ":" in url:
+        return url[4:].split(":", 1)[0]
+    if "://" in url:
+        hostname = urllib.parse.urlparse(url).hostname
+        if hostname:
+            return hostname
+    return os.environ.get("GH_HOST", "").strip() or "github.com"
+
+
+def _viewer_login_result(
+    cwd: str | None = None, *, timeout_s: float = 15,
+) -> subprocess.CompletedProcess:
+    """Resolve ``@me`` on the same GitHub host as the working repository."""
+
+    return _run(
+        ["gh", "api", "user", "--hostname", _repo_hostname(cwd), "--jq", ".login"],
+        cwd=cwd, timeout_s=timeout_s,
+    )
+
+
 def last_list_open_prs_failure() -> GhFailure | None:
     """Return diagnostics for the most recent failed :func:`list_open_prs` call.
 
@@ -865,7 +896,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
-        viewer = _run(["gh", "api", "user", "--jq", ".login"], cwd=cwd, timeout_s=15)
+        viewer = _viewer_login_result(cwd)
         author = viewer.stdout.strip() if viewer.returncode == 0 else ""
         if not author:
             _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(

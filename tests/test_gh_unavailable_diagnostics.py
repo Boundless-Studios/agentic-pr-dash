@@ -231,6 +231,7 @@ def test_list_open_prs_recovers_via_retry(monkeypatch):
     """BOU-1694 AC: the completion path retries successfully when gh works
     moments later from the same cwd."""
     monkeypatch.setattr(github_api.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "github.com")
     stub, calls = _sequence_run([
         _cp(returncode=1, stderr="error connecting to api.github.com"),
         _cp(stdout='[{"number": 7, "author": {"login": "viewer"}}]', returncode=0),

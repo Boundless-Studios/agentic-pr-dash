@@ -76,6 +76,7 @@ def test_list_open_prs_uses_configured_author(tmp_path, monkeypatch):
 
 def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     seen: list[list[str]] = []
+    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
@@ -90,6 +91,7 @@ def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     ]
     assert "--author" not in seen[0]
     assert seen[1][:3] == ["gh", "api", "user"]
+    assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"
 
 
 def test_list_open_prs_rejects_non_list_before_author_filtering(tmp_path, monkeypatch):
@@ -136,6 +138,7 @@ def test_gh_pr_list_json_uses_configured_author(tmp_path, monkeypatch):
 
 def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatch):
     seen: list[list[str]] = []
+    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)
@@ -150,3 +153,4 @@ def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatc
     ]
     assert seen[0][seen[0].index("--json") + 1] == "number,author"
     assert seen[1][:3] == ["gh", "api", "user"]
+    assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"

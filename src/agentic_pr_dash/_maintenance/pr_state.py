@@ -510,7 +510,7 @@ def _gh_pr_list_json(
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
-        viewer = github_api._run(["gh", "api", "user", "--jq", ".login"], cwd=cwd, timeout_s=timeout)
+        viewer = github_api._viewer_login_result(cwd, timeout_s=timeout)
         if viewer.returncode != 0:
             return None
         author = viewer.stdout.strip()
