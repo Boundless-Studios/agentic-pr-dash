@@ -401,6 +401,100 @@ def test_dispatch_default_log_path(tmp_path, monkeypatch, capsys):
     assert (tmp_path / ".beads" / "interactions.jsonl").exists()
 
 
+def test_dispatch_shared_git_common_log_path(tmp_path, monkeypatch, capsys):
+    common_root = tmp_path / "main"
+    project = tmp_path / "worktree"
+    common_root.mkdir()
+    project.mkdir()
+    log = common_root / ".beads" / "interactions.jsonl"
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.setenv("MODEL_DISPATCH_SHARED_GIT_COMMON", "1")
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project))
+
+    class Result:
+        stdout = str(common_root / ".git") + "\n"
+
+    monkeypatch.setattr(run_model_dispatch_logger.subprocess, "run", lambda *args, **kwargs: Result())
+    _run(run_model_dispatch_logger, {"tool_name": "Agent", "tool_input": {"description": "build"}}, capsys=capsys)
+
+    assert log.exists()
+
+
+def test_dispatch_shared_bare_git_common_log_is_repository_scoped(tmp_path, monkeypatch):
+    common_dir = tmp_path / "project.git"
+    common_dir.mkdir()
+    monkeypatch.setenv("MODEL_DISPATCH_SHARED_GIT_COMMON", "1")
+
+    class Result:
+        stdout = str(common_dir) + "\n"
+
+    monkeypatch.setattr(run_model_dispatch_logger.subprocess, "run", lambda *args, **kwargs: Result())
+    assert run_model_dispatch_logger.log_path(str(tmp_path)) == str(
+        common_dir / ".beads" / "interactions.jsonl"
+    )
+
+
+def test_dispatch_payload_observer_can_extend_row(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    observed = []
+
+    def observer(payload):
+        observed.append(payload)
+        monkeypatch.setenv("MODEL_DISPATCH_EXTRA", json.dumps({"review_round": 2}))
+
+    payload = {"tool_name": "Agent", "tool_input": {"description": "Review the changes"}}
+    sys.stdin = io.StringIO(json.dumps(payload))
+    assert run_model_dispatch_logger.main(payload_observer=observer) == 0
+
+    assert observed == [payload]
+    assert json.loads(log.read_text())["review_round"] == 2
+
+
+def test_dispatch_payload_observer_failure_never_blocks_logging(tmp_path, monkeypatch, capsys):
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+
+    def observer(_payload):
+        raise RuntimeError("advisory failure")
+
+    sys.stdin = io.StringIO(json.dumps({"tool_name": "Agent", "tool_input": {"description": "build"}}))
+    assert run_model_dispatch_logger.main(payload_observer=observer) == 0
+    assert log.exists()
+
+
+def test_dispatch_payload_observer_cannot_mutate_logging_payload(tmp_path, monkeypatch):
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+
+    def observer(payload):
+        payload.pop("tool_name")
+        raise RuntimeError("advisory failure")
+
+    sys.stdin = io.StringIO(json.dumps({"tool_name": "Agent", "tool_input": {"description": "build"}}))
+    assert run_model_dispatch_logger.main(payload_observer=observer) == 0
+    assert log.exists()
+
+
+def test_dispatch_payload_observer_extra_is_scoped_to_one_call(tmp_path, monkeypatch):
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(log))
+    monkeypatch.delenv("MODEL_DISPATCH_EXTRA", raising=False)
+
+    def observer(payload):
+        if payload["tool_input"]["description"] == "review":
+            monkeypatch.setenv("MODEL_DISPATCH_EXTRA", json.dumps({"review_round": 2}))
+
+    for description in ("review", "build"):
+        sys.stdin = io.StringIO(json.dumps({"tool_name": "Agent", "tool_input": {"description": description}}))
+        assert run_model_dispatch_logger.main(payload_observer=observer) == 0
+
+    first, second = [json.loads(line) for line in log.read_text().splitlines()]
+    assert first["review_round"] == 2
+    assert "review_round" not in second
+    assert "MODEL_DISPATCH_EXTRA" not in os.environ
+
+
 def test_dispatch_codex_spawn_agent_logged(tmp_path, monkeypatch, capsys):
     """Codex subagent launches (spawn_agent / functions.spawn_agent) are logged,
     not just Claude's Agent tool."""
