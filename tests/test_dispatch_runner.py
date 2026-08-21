@@ -13,6 +13,7 @@ from agentic_pr_dash.codex_hooks import (
 )
 from agentic_pr_dash.codex_hooks.dispatch_runner import (
     DispatchHookRequest,
+    has_provider_invocation,
     observation_from_agent_payload,
     run_dispatch_hook,
 )
@@ -32,6 +33,7 @@ def _request(
     response: dict[str, object] | None = None,
     source: DispatchSource = DispatchSource.INTERACTIVE_HOOK,
     classification: dict[str, str] | None = None,
+    model_resolution: dict[str, str] | None = None,
 ) -> DispatchHookRequest:
     payload: dict[str, object] = {
         "session_id": "session-1",
@@ -41,6 +43,8 @@ def _request(
     }
     if classification is not None:
         payload["dispatch_classification"] = classification
+    if model_resolution is not None:
+        payload["dispatch_model_resolution"] = model_resolution
     return DispatchHookRequest(
         provider=provider,
         source=source,
@@ -48,6 +52,101 @@ def _request(
         ledger_path=tmp_path / "dispatch.jsonl",
         availability_path=tmp_path / "availability.json",
     )
+
+
+@pytest.mark.parametrize(
+    ("provider", "command"),
+    [
+        (DispatchProvider.CODEX, "codex exec review"),
+        (DispatchProvider.CODEX, "OPENAI_API_KEY=secret codex exec review"),
+        (DispatchProvider.CODEX, "cd /repo && codex exec review"),
+        (DispatchProvider.OPENCODE, "timeout 900 opencode run review"),
+    ],
+)
+def test_provider_invocation_accepts_supported_shell_prefixes(
+    provider: DispatchProvider, command: str
+) -> None:
+    assert has_provider_invocation(command, provider)
+
+
+@pytest.mark.parametrize(
+    ("provider", "command"),
+    [
+        (DispatchProvider.CODEX, "echo codex exec"),
+        (DispatchProvider.CODEX, "env FOO=1 grep codex exec"),
+        (DispatchProvider.OPENCODE, "printf 'opencode run'"),
+    ],
+)
+def test_provider_invocation_rejects_provider_words_as_arguments(
+    provider: DispatchProvider, command: str
+) -> None:
+    assert not has_provider_invocation(command, provider)
+
+
+def test_false_positive_command_cannot_supply_declared_policy_or_verdict(
+    tmp_path: Path,
+) -> None:
+    result = run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="echo codex exec",
+            classification={"task_type": "review", "framework": "coding-agent/v1"},
+            response={"exit_code": 0, "review_verdict": {"findings": []}},
+        )
+    )
+
+    assert result.observation is not None
+    assert result.observation.classification_authority.value == "legacy_inferred"
+    assert result.observation.review_verdict is None
+
+
+@pytest.mark.parametrize(
+    ("resolution", "expected"),
+    [
+        (
+            {
+                "configured_model": "gpt-5.6-sol",
+                "default_model": "codex-default",
+            },
+            "gpt-5.6-sol",
+        ),
+        ({"configured_model": "", "default_model": "codex-default"}, "codex-default"),
+    ],
+)
+def test_flagless_dispatch_resolves_adapter_model_candidates(
+    tmp_path: Path, resolution: dict[str, str], expected: str
+) -> None:
+    result = run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="codex exec review",
+            model_resolution=resolution,
+        )
+    )
+
+    assert result.observation is not None
+    assert result.observation.requested_model is None
+    assert result.observation.resolved_model == expected
+
+
+def test_explicit_model_wins_over_adapter_resolution(tmp_path: Path) -> None:
+    result = run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.OPENCODE,
+            command="opencode run --model explicit review",
+            model_resolution={
+                "configured_model": "configured",
+                "default_model": "provider-default",
+            },
+        )
+    )
+
+    assert result.observation is not None
+    assert result.observation.requested_model == "explicit"
+    assert result.observation.resolved_model == "explicit"
 
 
 @pytest.mark.parametrize(
@@ -590,6 +689,32 @@ def test_detached_opencode_entrypoint_persists_without_context(
         "detached_runner"
     )
     assert capsys.readouterr().out == ""
+
+
+def test_detached_entrypoint_accepts_adapter_model_resolution(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+
+    result = run_opencode_dispatch_logger.main(
+        [
+            "--command",
+            "opencode run review",
+            "--exit-code",
+            "0",
+            "--configured-model",
+            "kimi-for-coding/k3-256k",
+            "--default-model",
+            "opencode-default",
+        ]
+    )
+
+    assert result == 0
+    persisted = json.loads(ledger.read_text(encoding="utf-8"))
+    assert persisted["requested_model"] is None
+    assert persisted["resolved_model"] == "kimi-for-coding/k3-256k"
 
 
 def test_detached_failure_reads_error_file_for_unavailability(
