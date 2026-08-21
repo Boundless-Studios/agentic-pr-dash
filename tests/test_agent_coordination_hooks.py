@@ -12,9 +12,11 @@ import io
 import json
 import os
 import sys
+import tomllib
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -26,6 +28,15 @@ from agentic_pr_dash.codex_hooks import (
     run_model_dispatch_logger,
     run_permission_agentflow,
 )
+
+
+def test_agent_activity_is_published_as_a_console_entrypoint() -> None:
+    pyproject = Path(__file__).parents[1] / "pyproject.toml"
+    scripts = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["scripts"]
+
+    assert scripts["agentic-pr-dash-agent-activity"] == (
+        "agentic_pr_dash.codex_hooks.run_agent_activity:main"
+    )
 
 
 def _run(module, payload, *, argv=None, capsys=None):

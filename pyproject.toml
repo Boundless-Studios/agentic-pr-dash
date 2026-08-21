@@ -75,6 +75,7 @@ Repository = "https://github.com/Boundless-Studios/agentic-pr-dash"
 
 [project.scripts]
 agentic-pr-dash = "agentic_pr_dash.cli:main"
+agentic-pr-dash-agent-activity = "agentic_pr_dash.codex_hooks.run_agent_activity:main"
 agentic-pr-dash-codex-dispatch = "agentic_pr_dash.codex_hooks.run_codex_dispatch_logger:main"
 agentic-pr-dash-opencode-dispatch = "agentic_pr_dash.codex_hooks.run_opencode_dispatch_logger:main"
 
