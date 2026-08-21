@@ -242,6 +242,13 @@ def run_provider_entrypoint(
             "tool_input": {"command": command},
             "tool_response": {"exit_code": exit_code, "stderr": stderr},
         }
+        configured_model = _option_value(argv, "--configured-model")
+        default_model = _option_value(argv, "--default-model")
+        if configured_model is not None or default_model is not None:
+            payload["dispatch_model_resolution"] = {
+                "configured_model": configured_model,
+                "default_model": default_model,
+            }
     else:
         try:
             raw = json.load(sys.stdin)
@@ -295,7 +302,8 @@ def _observation_from_request(
     response = response if isinstance(response, dict) else {}
     outcome = _outcome(response)
     declared = _declared_classification(request.payload)
-    if declared is not None and not _has_provider_invocation(command, request.provider):
+    direct_invocation = has_provider_invocation(command, request.provider)
+    if declared is not None and not direct_invocation:
         declared = None
     task_type = (
         declared[0]
@@ -303,9 +311,17 @@ def _observation_from_request(
         else ("review" if _REVIEW_PATTERN.search(command) else "exec")
     )
     verdict = response.get("review_verdict")
-    if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
+    if (
+        not isinstance(verdict, dict)
+        or outcome is not DispatchOutcome.SUCCESS
+        or not direct_invocation
+    ):
         verdict = None
     requested_model = _requested_model(command)
+    resolved_model = resolve_provider_model(
+        requested_model,
+        request.payload.get("dispatch_model_resolution"),
+    )
 
     return DispatchObservation(
         provider=request.provider,
@@ -315,7 +331,7 @@ def _observation_from_request(
         command=command,
         task_type=task_type,
         requested_model=requested_model,
-        resolved_model=requested_model,
+        resolved_model=resolved_model,
         outcome=outcome,
         review_verdict=dict(verdict) if verdict is not None else None,
         classification_authority=(
@@ -369,8 +385,13 @@ def _matches_provider(command: str, provider: DispatchProvider) -> bool:
     return bool(re.search(rf"\b{executable}\s+{subcommand}\b", command))
 
 
-def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
-    """Return whether a shell command directly executes the requested provider."""
+def has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
+    """Return whether a shell command executes the requested provider.
+
+    Provider words passed to another executable are not invocations. Leading
+    environment assignments, ``env`` and ``timeout`` prefixes, and the canonical
+    ``cd <directory> && <provider>`` boundary are recognized.
+    """
     executable = "codex" if provider is DispatchProvider.CODEX else "opencode"
     subcommand = "exec" if provider is DispatchProvider.CODEX else "run"
     try:
@@ -381,17 +402,89 @@ def _has_provider_invocation(command: str, provider: DispatchProvider) -> bool:
         tokens = list(lexer)
     except ValueError:
         return False
-    while tokens and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", tokens[0]):
-        tokens.pop(0)
-    if len(tokens) < 2 or Path(tokens[0]).name != executable or tokens[1] != subcommand:
-        return False
-    remainder = tokens[2:]
-    for index, token in enumerate(remainder):
-        if token == "<" and index + 1 < len(remainder) and remainder[index + 1] == "/dev/null":
-            continue
-        if re.fullmatch(r"[;&|<>\n]+", token):
+    if "&&" in tokens:
+        boundary = tokens.index("&&")
+        prefix, tokens = tokens[:boundary], tokens[boundary + 1 :]
+        if (
+            not prefix
+            or Path(prefix[0]).name != "cd"
+            or any(re.fullmatch(r"[;&|<>\n]+", token) for token in prefix)
+        ):
             return False
-    return True
+    tokens = _without_dev_null_stdin_redirect(tokens)
+    if any(re.fullmatch(r"[;&|<>\n]+", token) for token in tokens):
+        return False
+    return _segment_invokes_provider(tokens, executable, subcommand)
+
+
+def _without_dev_null_stdin_redirect(tokens: list[str]) -> list[str]:
+    if len(tokens) >= 2 and tokens[-2:] == ["<", "/dev/null"]:
+        return tokens[:-2]
+    return tokens
+
+
+def _segment_invokes_provider(
+    tokens: list[str], executable: str, subcommand: str
+) -> bool:
+    index = 0
+    while index < len(tokens) and _is_environment_assignment(tokens[index]):
+        index += 1
+    if index < len(tokens) and Path(tokens[index]).name == "env":
+        index = _skip_env_prefix(tokens, index + 1)
+    if index < len(tokens) and Path(tokens[index]).name == "timeout":
+        index = _skip_timeout_prefix(tokens, index + 1)
+    return (
+        index + 1 < len(tokens)
+        and Path(tokens[index]).name == executable
+        and tokens[index + 1] == subcommand
+    )
+
+
+def _is_environment_assignment(token: str) -> bool:
+    return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", token) is not None
+
+
+def _skip_env_prefix(tokens: list[str], index: int) -> int:
+    options_with_value = {"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}
+    while index < len(tokens):
+        token = tokens[index]
+        if _is_environment_assignment(token):
+            index += 1
+        elif token in options_with_value:
+            index += 2
+        elif token.startswith("-"):
+            index += 1
+        else:
+            break
+    return index
+
+
+def _skip_timeout_prefix(tokens: list[str], index: int) -> int:
+    options_with_value = {"-k", "--kill-after", "-s", "--signal"}
+    while index < len(tokens) and tokens[index].startswith("-"):
+        token = tokens[index]
+        index += 2 if token in options_with_value else 1
+    return min(index + 1, len(tokens))
+
+
+def resolve_provider_model(
+    requested_model: str | None, resolution: object
+) -> str | None:
+    """Resolve model attribution supplied by a repository adapter.
+
+    ``dispatch_model_resolution`` is an optional payload mapping with
+    ``configured_model`` and ``default_model`` string candidates. An explicit
+    provider CLI model always wins.
+    """
+    if requested_model:
+        return requested_model
+    if not isinstance(resolution, dict):
+        return None
+    for key in ("configured_model", "default_model"):
+        candidate = resolution.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
 
 
 def _requested_model(command: str) -> str | None:
