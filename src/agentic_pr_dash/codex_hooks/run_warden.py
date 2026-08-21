@@ -408,7 +408,21 @@ def _translate_warden_stdout(
     return MALFORMED_WARDEN_OUTPUT
 
 
-def run_payload(normalized: dict) -> int:
+def _is_ask_output(stdout: str) -> bool:
+    try:
+        payload = json.loads(stdout.strip())
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    hook_specific = payload.get("hookSpecificOutput")
+    return isinstance(hook_specific, dict) and (
+        hook_specific.get("hookEventName") in (None, "PreToolUse")
+        and hook_specific.get("permissionDecision") == "ask"
+    )
+
+
+def run_payload(normalized: dict, *, preserve_ask: bool = False) -> int:
     """Evaluate one normalized Bash payload with the Warden engine."""
     # apply_shared_env omitted upstream: gaia-specific env (CLAUDE_PROJECT_DIR /
     # GAIA_PROJECT_DIR) is not set here; the gaia shim handles that if needed.
@@ -448,6 +462,12 @@ def run_payload(normalized: dict) -> int:
             )
         )
 
+    if preserve_ask and _is_ask_output(result.stdout):
+        sys.stdout.write(result.stdout)
+        if not result.stdout.endswith("\n"):
+            sys.stdout.write("\n")
+        return 0
+
     command = normalized.get("tool_input", {}).get("command", "")
     translated_block_reason = _translate_warden_stdout(
         result.stdout, command, cwd=normalized.get("cwd")
@@ -468,6 +488,7 @@ def run_policy_pipeline(
     behavior_check=None,
     apply_env=None,
     warden_enabled: bool = True,
+    preserve_warden_ask: bool = False,
 ) -> int:
     """Run Warden and repository-supplied validators as one policy pipeline.
 
@@ -494,7 +515,10 @@ def run_policy_pipeline(
     if warden_enabled:
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
-            result = run_payload(normalized)
+            if preserve_warden_ask:
+                result = run_payload(normalized, preserve_ask=True)
+            else:
+                result = run_payload(normalized)
         output = captured.getvalue()
         if output:
             sys.stdout.write(output)
