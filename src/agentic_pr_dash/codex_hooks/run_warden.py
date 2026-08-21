@@ -15,6 +15,8 @@ supplies policy via warden's own allow-list configuration.
 from __future__ import annotations
 
 import json
+import contextlib
+import io
 import os
 import re
 import shutil
@@ -406,12 +408,8 @@ def _translate_warden_stdout(
     return MALFORMED_WARDEN_OUTPUT
 
 
-def main() -> int:
-    if not behavior_enabled("warden"):
-        return 0
-
-    payload = load_payload()
-    normalized = normalized_payload(payload)
+def run_payload(normalized: dict) -> int:
+    """Evaluate one normalized Bash payload with the Warden engine."""
     # apply_shared_env omitted upstream: gaia-specific env (CLAUDE_PROJECT_DIR /
     # GAIA_PROJECT_DIR) is not set here; the gaia shim handles that if needed.
 
@@ -457,6 +455,71 @@ def main() -> int:
     if translated_block_reason is None:
         return 0
     return _emit_codex_block(translated_block_reason)
+
+
+def run_policy_pipeline(
+    payload_text: str,
+    *,
+    validator: object,
+    shared_hooks: list[tuple[str, str]],
+    commit_only_hooks: list[tuple[str, str]],
+    base_dir: str | Path,
+    trust_check=None,
+    behavior_check=None,
+    apply_env=None,
+    warden_enabled: bool = True,
+) -> int:
+    """Run Warden and repository-supplied validators as one policy pipeline.
+
+    Repositories keep their validator roster and trusted-path policy as data;
+    ordering, payload normalization, and fail-closed dispatch live here.
+    """
+    try:
+        raw = json.loads(payload_text)
+    except json.JSONDecodeError:
+        raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    normalized = normalized_payload(raw)
+    if normalized.get("tool_name") != "Bash":
+        return 0
+    if apply_env is not None:
+        apply_env(raw)
+    tool_input = normalized.get("tool_input") or {}
+    command = str(tool_input.get("command", "")) if isinstance(tool_input, dict) else ""
+    if trust_check is not None:
+        reason = trust_check(command, normalized.get("cwd"))
+        if reason is not None:
+            return _emit_codex_block(str(reason))
+    if warden_enabled:
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            result = run_payload(normalized)
+        output = captured.getvalue()
+        if output:
+            sys.stdout.write(output)
+            return result
+        if result != 0:
+            return result
+    block_reason = validator._block_reason_for_command(command)
+    if block_reason is not None:
+        return _emit_codex_block(str(block_reason))
+    return int(
+        validator.run(
+            shared_hooks,
+            commit_only_hooks,
+            base_dir=Path(base_dir),
+            behavior_enabled=behavior_check,
+            payload_text=json.dumps(normalized),
+            command=command,
+        )
+    )
+
+
+def main() -> int:
+    if not behavior_enabled("warden"):
+        return 0
+    return run_payload(normalized_payload(load_payload()))
 
 
 if __name__ == "__main__":
