@@ -67,12 +67,11 @@ def test_list_open_prs_uses_configured_author(tmp_path, monkeypatch):
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
-        return _cp()
+        return _cp(stdout='[{"number": 1, "author": {"login": "ilganeli"}}]')
 
     monkeypatch.setattr(github_api, "_run", fake_run)
-    assert github_api.list_open_prs(str(tmp_path)) == []
-    assert seen and "--author" in seen[0]
-    assert seen[0][seen[0].index("--author") + 1] == "ilganeli"
+    assert github_api.list_open_prs(str(tmp_path)) == [{"number": 1, "author": {"login": "ilganeli"}}]
+    assert seen and "--author" not in seen[0]
 
 
 def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
@@ -84,7 +83,7 @@ def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
 
     monkeypatch.setattr(github_api, "_run", fake_run)
     assert github_api.list_open_prs(str(tmp_path)) == []
-    assert seen[0][seen[0].index("--author") + 1] == "@me"
+    assert "--author" not in seen[0]
 
 
 # --------------------------------------------------------------------------- #
@@ -99,8 +98,8 @@ def test_gh_pr_list_json_uses_configured_author(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)
-        return _cp()
+        return _cp(stdout='[{"number": 1, "author": {"login": "ilganeli"}}]')
 
     monkeypatch.setattr(pr_state.subprocess, "run", fake_run)
-    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == []
-    assert seen and seen[0][seen[0].index("--author") + 1] == "ilganeli"
+    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == [{"number": 1, "author": {"login": "ilganeli"}}]
+    assert seen and "--author" not in seen[0]
