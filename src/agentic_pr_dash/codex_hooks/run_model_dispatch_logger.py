@@ -45,6 +45,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
+from copy import deepcopy
 from datetime import UTC, datetime
 
 from agentic_pr_dash.codex_hooks.dispatch_runner import (
@@ -131,8 +132,13 @@ def log_path(project_dir: str) -> str:
         except (OSError, subprocess.SubprocessError):
             common_dir = ""
         if common_dir:
+            ledger_root = (
+                os.path.dirname(common_dir)
+                if os.path.basename(common_dir) == ".git"
+                else common_dir
+            )
             return os.path.join(
-                os.path.dirname(common_dir), ".beads", "interactions.jsonl"
+                ledger_root, ".beads", "interactions.jsonl"
             )
     return os.path.join(project_dir, ".beads", "interactions.jsonl")
 
@@ -186,11 +192,19 @@ def main(*, payload_observer: Callable[[dict], None] | None = None) -> int:
     if not isinstance(input_data, dict):
         return 0
 
+    invocation_extra = extra_fields()
     if payload_observer is not None:
+        previous_extra = os.environ.get("MODEL_DISPATCH_EXTRA")
         try:
-            payload_observer(input_data)
+            payload_observer(deepcopy(input_data))
+            invocation_extra = extra_fields()
         except Exception:  # noqa: BLE001 - observers are advisory by contract
             pass
+        finally:
+            if previous_extra is None:
+                os.environ.pop("MODEL_DISPATCH_EXTRA", None)
+            else:
+                os.environ["MODEL_DISPATCH_EXTRA"] = previous_extra
 
     if input_data.get("tool_name") not in _DISPATCH_TOOLS:
         return 0
@@ -225,7 +239,7 @@ def main(*, payload_observer: Callable[[dict], None] | None = None) -> int:
         # ledger replays can attribute Agent rows.
         "source": "session",
         "cwd": project_dir,
-        **extra_fields(),
+        **invocation_extra,
     }
     _write_jsonl(log_path(project_dir), entry)
     _bd_audit(project_dir, model_name, prompt_str)
