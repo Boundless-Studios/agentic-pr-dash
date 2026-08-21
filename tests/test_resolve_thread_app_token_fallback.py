@@ -240,6 +240,21 @@ def test_resolve_fallback_env_uses_configured_token(monkeypatch):
     assert env["GH_TOKEN"] == "machine-user-pat"
 
 
+def test_resolve_fallback_env_refreshes_rotated_token_file(monkeypatch, tmp_path):
+    config = tmp_path / "agentic-pr-dash"
+    config.mkdir()
+    token_file = config / "gh-resolve-token"
+    token_file.write_text("fresh-machine-user-pat\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GH_TOKEN", "app-installation-token")
+    monkeypatch.setenv("AGENTIC_PR_DASH_GH_RESOLVE_TOKEN", "stale-pat")
+
+    env = github_api._resolve_fallback_env()
+
+    assert env is not None
+    assert env["GH_TOKEN"] == "fresh-machine-user-pat"
+
+
 def test_resolve_fallback_env_drops_github_token_too_ambient(monkeypatch):
     """gh falls back GH_TOKEN -> GITHUB_TOKEN; GITHUB_TOKEN is commonly the SAME
     App token (GitHub Actions / wrapper shells). Dropping only GH_TOKEN would let
