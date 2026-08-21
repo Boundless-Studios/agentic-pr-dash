@@ -512,6 +512,27 @@ def run_policy_pipeline(
         reason = trust_check(command, normalized.get("cwd"))
         if reason is not None:
             return _emit_codex_block(str(reason))
+    block_reason = validator._block_reason_for_command(command)
+    if block_reason is not None:
+        return _emit_codex_block(str(block_reason))
+    validator_output = io.StringIO()
+    with contextlib.redirect_stdout(validator_output):
+        validator_result = int(
+            validator.run(
+                shared_hooks,
+                commit_only_hooks,
+                base_dir=Path(base_dir),
+                behavior_enabled=behavior_check,
+                payload_text=json.dumps(normalized),
+                command=command,
+            )
+        )
+    output = validator_output.getvalue()
+    if output:
+        sys.stdout.write(output)
+        return validator_result
+    if validator_result != 0:
+        return validator_result
     if warden_enabled:
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
@@ -525,19 +546,7 @@ def run_policy_pipeline(
             return result
         if result != 0:
             return result
-    block_reason = validator._block_reason_for_command(command)
-    if block_reason is not None:
-        return _emit_codex_block(str(block_reason))
-    return int(
-        validator.run(
-            shared_hooks,
-            commit_only_hooks,
-            base_dir=Path(base_dir),
-            behavior_enabled=behavior_check,
-            payload_text=json.dumps(normalized),
-            command=command,
-        )
-    )
+    return 0
 
 
 def main() -> int:

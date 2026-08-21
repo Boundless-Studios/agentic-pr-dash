@@ -18,7 +18,7 @@ class _Validator:
         return 0
 
 
-def test_run_policy_pipeline_dispatches_validators_after_warden_allow(monkeypatch) -> None:
+def test_run_policy_pipeline_dispatches_validators_before_warden(monkeypatch) -> None:
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
@@ -101,4 +101,32 @@ def test_policy_pipeline_forwards_preserve_warden_ask(monkeypatch, capsys) -> No
 
     assert result == 0
     assert "permissionDecision" in capsys.readouterr().out
-    assert validator.calls == []
+    assert len(validator.calls) == 1
+
+
+def test_policy_pipeline_stops_before_warden_when_validator_blocks(
+    monkeypatch, capsys
+) -> None:
+    class BlockingValidator(_Validator):
+        def run(self, shared, commit_only, **kwargs) -> int:
+            super().run(shared, commit_only, **kwargs)
+            print('{"decision":"block","reason":"production command"}')
+            return 0
+
+    validator = BlockingValidator()
+    warden_calls = []
+    monkeypatch.setattr(
+        run_warden, "run_payload", lambda _payload: warden_calls.append(_payload) or 0
+    )
+
+    result = run_warden.run_policy_pipeline(
+        json.dumps({"tool_name": "Bash", "tool_input": {"command": "gcloud run deploy"}}),
+        validator=validator,
+        shared_hooks=[],
+        commit_only_hooks=[],
+        base_dir="/repo",
+    )
+
+    assert result == 0
+    assert "production command" in capsys.readouterr().out
+    assert warden_calls == []
