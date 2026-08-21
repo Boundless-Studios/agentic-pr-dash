@@ -826,7 +826,7 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
 
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
-        "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
+        "gh", "pr", "list", "--state", "open", "--limit", "1000",
         "--json", PR_SNAPSHOT_FIELDS,
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
@@ -840,6 +840,9 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
         return None
     try:
         prs = json.loads(r.stdout or "[]")
+        author = _load_config(cwd).pr_author
+        if author != "@me":
+            prs = [pr for pr in prs if (pr.get("author") or {}).get("login") == author]
     except json.JSONDecodeError:
         _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
             command=cmd, returncode=r.returncode,

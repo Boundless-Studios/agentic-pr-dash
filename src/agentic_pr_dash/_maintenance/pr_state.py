@@ -494,7 +494,7 @@ def _gh_pr_list_json(
         return None
     deadline = time.monotonic() + timeout
     result = github_api._run(
-        ["gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open", *extra_args, "--json", fields],
+        ["gh", "pr", "list", "--state", "open", "--limit", "1000", *extra_args, "--json", fields],
         timeout_s=timeout, deadline=deadline,
         cwd=cwd,
     )
@@ -504,7 +504,10 @@ def _gh_pr_list_json(
         data = json.loads(result.stdout or "[]")
     except ValueError:
         return None
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    author = _load_config(cwd).pr_author
+    return [pr for pr in data if (pr.get("author") or {}).get("login") == author]
 
 
 def _resolve_open_pr_for_branch(cwd: str, branch: str):
