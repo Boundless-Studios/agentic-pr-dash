@@ -12,6 +12,8 @@ Generic behavior (here):
 Repo config:
   * the interactions-log path — defaults to ``<project>/.beads/interactions.jsonl``,
     overridable via ``MODEL_DISPATCH_LOG``;
+  * ``MODEL_DISPATCH_SHARED_GIT_COMMON=1`` routes the default log to the main
+    checkout beside Git's common directory, so linked worktrees share one ledger;
   * an optional secondary ``bd audit record`` write, enabled via
     ``MODEL_DISPATCH_BD_AUDIT=1`` (beads is a repo-specific tool, off by default
     so the upstream surface has no beads dependency).
@@ -31,7 +33,9 @@ Row provenance (BOU-2159):
     rows (without ``source``/``cwd``) keep parsing unchanged.
 
 Runs after the Agent call completes, so it never blocks. ``SKIP_MODEL_DISPATCH=1``
-disables it entirely.
+disables it entirely. Embedders may pass a fail-open ``payload_observer`` to
+``main`` for repository policy that must inspect the parsed payload before the
+row is assembled.
 """
 
 from __future__ import annotations
@@ -40,6 +44,7 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 from agentic_pr_dash.codex_hooks.dispatch_runner import (
@@ -113,6 +118,22 @@ def log_path(project_dir: str) -> str:
     override = os.environ.get("MODEL_DISPATCH_LOG")
     if override:
         return override
+    if os.environ.get("MODEL_DISPATCH_SHARED_GIT_COMMON") == "1":
+        try:
+            common_dir = subprocess.run(
+                ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                cwd=project_dir,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            common_dir = ""
+        if common_dir:
+            return os.path.join(
+                os.path.dirname(common_dir), ".beads", "interactions.jsonl"
+            )
     return os.path.join(project_dir, ".beads", "interactions.jsonl")
 
 
@@ -154,7 +175,7 @@ def _bd_audit(project_dir: str, model_name: str, prompt_str: str) -> None:
         pass
 
 
-def main() -> int:
+def main(*, payload_observer: Callable[[dict], None] | None = None) -> int:
     if os.environ.get("SKIP_MODEL_DISPATCH") == "1":
         return 0
 
@@ -164,6 +185,12 @@ def main() -> int:
         return 0
     if not isinstance(input_data, dict):
         return 0
+
+    if payload_observer is not None:
+        try:
+            payload_observer(input_data)
+        except Exception:  # noqa: BLE001 - observers are advisory by contract
+            pass
 
     if input_data.get("tool_name") not in _DISPATCH_TOOLS:
         return 0
