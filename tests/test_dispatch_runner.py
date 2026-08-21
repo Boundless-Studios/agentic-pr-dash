@@ -17,6 +17,7 @@ from agentic_pr_dash.codex_hooks.dispatch_runner import (
     run_dispatch_hook,
 )
 from agentic_pr_dash.dispatch_observation import (
+    DispatchObservation,
     DispatchOutcome,
     DispatchProvider,
     DispatchSource,
@@ -79,7 +80,29 @@ def test_interactive_provider_dispatch_is_normalized_and_persisted(
     assert result.observation.resolved_model == model
     assert result.observation.outcome is DispatchOutcome.SUCCESS
     persisted = json.loads((tmp_path / "dispatch.jsonl").read_text(encoding="utf-8"))
-    assert persisted == result.observation.to_dict()
+    assert persisted == result.observation.to_persisted_dict()
+
+
+def test_persisted_dispatch_omits_raw_command_content(tmp_path: Path) -> None:
+    secret = "sk-sensitive-inline-token"
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command=f"OPENAI_API_KEY={secret} codex exec review embedded-diff",
+        classification={"task_type": "review", "framework": "coding-agent/v1"},
+    )
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert secret in result.observation.command
+    persisted_text = request.ledger_path.read_text(encoding="utf-8")
+    persisted = json.loads(persisted_text)
+    assert secret not in persisted_text
+    assert persisted["command"] == "<redacted>"
+    assert persisted["provider"] == "codex"
+    assert persisted["task_type"] == "review"
+    assert DispatchObservation.from_dict(persisted).command == "<redacted>"
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))

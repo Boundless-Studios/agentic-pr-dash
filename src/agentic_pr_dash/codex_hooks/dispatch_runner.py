@@ -150,7 +150,7 @@ def run_dispatch_hook(
                 "worktree_root": observation.worktree_root,
             },
         )
-    _append_jsonl(request.ledger_path, observation.to_dict())
+    _append_jsonl(request.ledger_path, observation.to_persisted_dict())
 
     additional_context = None
     if (
