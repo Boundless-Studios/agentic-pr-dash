@@ -73,6 +73,42 @@ def test_activity_user_prompt_starts_busy_turn(tmp_path, monkeypatch):
     assert rec["busy_since"]
 
 
+def test_activity_payload_cwd_wins_over_stale_project_environment(tmp_path, monkeypatch):
+    stale_root = tmp_path / "stale"
+    actual_root = tmp_path / "actual"
+    stale_root.mkdir()
+    actual_root.mkdir()
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(stale_root))
+
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s1",
+        "cwd": str(actual_root),
+        "owner_pid": os.getpid(),
+    }
+    rc, _ = _run(run_agent_activity, payload, argv=["UserPromptSubmit"])
+
+    assert rc == 0
+    assert (actual_root / ".agentic-pr-dash" / "agent-activity.json").is_file()
+    assert not (stale_root / ".agentic-pr-dash" / "agent-activity.json").exists()
+
+
+def test_activity_accepts_explicit_owner_pid_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
+    monkeypatch.setenv("AGENT_ACTIVITY_OWNER_PID", str(os.getpid()))
+    payload = {
+        "hook_event_name": "UserPromptSubmit",
+        "session_id": "s1",
+        "cwd": str(tmp_path),
+    }
+
+    rc, _ = _run(run_agent_activity, payload, argv=["UserPromptSubmit"])
+
+    assert rc == 0
+    record = json.loads(_activity_file(tmp_path).read_text())["sessions"]["s1"]
+    assert record["pid"] == os.getpid()
+
+
 def test_activity_stop_marks_idle(tmp_path, monkeypatch):
     monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     base = {"session_id": "s1", "cwd": str(tmp_path), "owner_pid": os.getpid()}

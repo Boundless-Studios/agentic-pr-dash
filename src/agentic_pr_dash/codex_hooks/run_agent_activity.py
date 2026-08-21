@@ -95,7 +95,7 @@ def _parse_iso(value) -> datetime | None:
 
 
 def _worktree_root(payload: dict) -> str:
-    return os.environ.get("CLAUDE_PROJECT_DIR") or str(payload.get("cwd") or os.getcwd())
+    return str(payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd())
 
 
 def _pid_is_live(pid) -> bool:
@@ -269,7 +269,11 @@ def main() -> int:
     # the agent process for Claude; the Codex adapter passes its own ppid as
     # owner_pid (its parent is the codex process, not this short-lived child).
     try:
-        owner_pid = int(payload.get("owner_pid") or os.getppid())
+        owner_pid = int(
+            payload.get("owner_pid")
+            or os.environ.get("AGENT_ACTIVITY_OWNER_PID")
+            or os.getppid()
+        )
     except (TypeError, ValueError):
         owner_pid = os.getppid()
 
