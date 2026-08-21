@@ -113,6 +113,13 @@ class DispatchObservation:
             "classification_framework": self.classification_framework,
         }
 
+    def to_persisted_dict(self) -> dict[str, object]:
+        """Serialize durable telemetry without retaining raw command content."""
+
+        payload = self.to_dict()
+        payload.pop("command")
+        return payload
+
     @classmethod
     def from_dict(cls, payload: dict[str, object]) -> DispatchObservation:
         """Deserialize a portable record, rejecting provider-specific fields."""
