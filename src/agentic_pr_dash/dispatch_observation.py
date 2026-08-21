@@ -117,7 +117,7 @@ class DispatchObservation:
         """Serialize durable telemetry without retaining raw command content."""
 
         payload = self.to_dict()
-        payload.pop("command")
+        payload["command"] = "<redacted>"
         return payload
 
     @classmethod

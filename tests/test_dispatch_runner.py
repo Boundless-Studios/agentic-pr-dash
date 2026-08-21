@@ -17,6 +17,7 @@ from agentic_pr_dash.codex_hooks.dispatch_runner import (
     run_dispatch_hook,
 )
 from agentic_pr_dash.dispatch_observation import (
+    DispatchObservation,
     DispatchOutcome,
     DispatchProvider,
     DispatchSource,
@@ -98,9 +99,10 @@ def test_persisted_dispatch_omits_raw_command_content(tmp_path: Path) -> None:
     persisted_text = request.ledger_path.read_text(encoding="utf-8")
     persisted = json.loads(persisted_text)
     assert secret not in persisted_text
-    assert "command" not in persisted
+    assert persisted["command"] == "<redacted>"
     assert persisted["provider"] == "codex"
     assert persisted["task_type"] == "review"
+    assert DispatchObservation.from_dict(persisted).command == "<redacted>"
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))
