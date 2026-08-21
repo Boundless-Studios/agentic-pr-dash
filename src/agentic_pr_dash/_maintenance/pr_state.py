@@ -494,7 +494,7 @@ def _gh_pr_list_json(
         return None
     deadline = time.monotonic() + timeout
     result = github_api._run(
-        ["gh", "pr", "list", "--state", "open", "--limit", "1000", *extra_args, "--json", fields],
+        ["gh", "pr", "list", "--state", "open", "--limit", "10000", *extra_args, "--json", fields + ",author"],
         timeout_s=timeout, deadline=deadline,
         cwd=cwd,
     )
@@ -507,6 +507,11 @@ def _gh_pr_list_json(
     if not isinstance(data, list):
         return None
     author = _load_config(cwd).pr_author
+    if author == "@me":
+        viewer = github_api._run(["gh", "api", "user", "--jq", ".login"], cwd=cwd, timeout_s=timeout)
+        if viewer.returncode != 0:
+            return None
+        author = viewer.stdout.strip()
     return [pr for pr in data if (pr.get("author") or {}).get("login") == author]
 
 
