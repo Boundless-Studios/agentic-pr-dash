@@ -19,17 +19,19 @@ cwd-dependent (e.g. uses ``$(git rev-parse --show-toplevel)``), or points
 into a non-primary (worktree) path.  These break when Codex's cwd is a
 different repo or when a worktree is deleted.
 
-The repaired command delegates through the wrapper using the ABSOLUTE path
-resolved to the PRIMARY checkout (the main-repo-root that survives worktree
-cleanup) so the command works correctly when Codex runs in a different working
-directory or a non-git repo:
+The repaired command delegates through the ABSOLUTE wrapper path supplied by
+the host checkout, whose adapter knows which main-repo-root survives worktree
+cleanup. This package deliberately does not infer that host path from its own
+installation location:
 
     python3 /absolute/primary-checkout/scripts/codex-hooks/run_peon_ping.py
 
 Usage (idempotent — safe to call on every SessionStart):
 
-    python3 scripts/codex-hooks/repair_global_codex_hooks.py [--target PATH] [--dry-run]
+    python3 -m agentic_pr_dash.codex_hook_repair --wrapper PATH [--target PATH] [--dry-run]
 
+    --wrapper PATH  Canonical host-checkout run_peon_ping.py path. May also be
+                    supplied via $CODEX_PEON_PING_WRAPPER.
     --target PATH   Path to the hooks.json to inspect/repair.  Defaults to
                     $CODEX_HOME/hooks.json or ~/.codex/hooks.json.
     --dry-run       Print what would change but do not write.
@@ -46,8 +48,9 @@ import argparse
 import json
 import os
 import re
-import subprocess
+import shlex
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -56,11 +59,6 @@ from pathlib import Path
 # paths, with or without a leading shell verb ("bash", "sh", or bare path).
 # Handles optional single or double quoting of the path argument (e.g.
 # ``bash "$HOME/.../codex.sh"`` or ``bash '/abs/path/codex.sh'``).
-_STALE_ADAPTER_RE = re.compile(
-    r"""(?:bash\s+|sh\s+)?(?:["']?)(?:/|~|\$HOME/)(?:[^\s"']*?)peon-ping/adapters/codex\.sh(?:["']?)""",
-    re.IGNORECASE,
-)
-
 # Pattern that matches a peon-ping wrapper entry whose path relies on
 # $(git rev-parse --show-toplevel) expansion — cwd-dependent and broken
 # outside a git repo or in a different repo.
@@ -70,69 +68,9 @@ _CWD_DEPENDENT_WRAPPER_RE = re.compile(
 )
 
 
-def _primary_checkout_root() -> Path:
-    """Return the primary checkout root (main-repo-root) that survives worktree cleanup.
-
-    When this script runs from a feature worktree,
-    ``git rev-parse --git-common-dir`` returns the path to the PRIMARY repo's
-    ``.git`` directory (e.g. ``/path/to/primary-repo/.git``).  The primary
-    checkout root is the parent of that directory.
-
-    When running from the primary checkout itself, ``--git-common-dir`` returns
-    a relative ``.git``, so we resolve it against THIS SCRIPT'S directory
-    (not the process cwd, which may be a completely different repo when this
-    runs as a Codex SessionStart hook).
-
-    Falls back to the directory containing this script if git is unavailable or
-    returns an unexpected value.
-    """
-    # Anchor git resolution to THIS script's directory, never the process cwd.
-    # If process cwd is a different git repo (e.g. another Codex session working
-    # directory), ``git rev-parse`` without -C would resolve THAT repo's root
-    # and bake its path into the global hook — exactly the bug we're fixing.
-    script_dir = Path(__file__).resolve().parent
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-common-dir"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-            cwd=str(script_dir),
-        )
-        if result.returncode == 0:
-            common_dir = result.stdout.strip()
-            if common_dir:
-                # Resolve relative paths (e.g. ".git" from the primary checkout)
-                # against THIS SCRIPT'S directory (not process cwd).
-                common_dir_path = Path(common_dir)
-                if not common_dir_path.is_absolute():
-                    common_dir_path = script_dir / common_dir_path
-                common_dir_path = common_dir_path.resolve()
-                # The primary checkout root is the parent of the .git dir.
-                primary_root = common_dir_path.parent
-                return primary_root
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    # Fall back: use the directory containing this script (the current checkout).
-    return script_dir.parent.parent
-
-
-def _wrapper_command() -> str:
-    """Return the canonical fail-open wrapper command as a STABLE absolute path.
-
-    The path is anchored to the PRIMARY checkout root (main-repo-root) so that
-    it survives worktree cleanup.  Writing this absolute path into the GLOBAL
-    ~/.codex/hooks.json means:
-
-    - The command works when Codex's cwd is a different repo (or no git repo).
-    - The path remains valid after ``cleanup-merged-worktrees.sh`` deletes the
-      feature worktree where the repair originally ran.
-    - No ``$(git rev-parse --show-toplevel)`` expansion that depends on cwd.
-    """
-    primary_root = _primary_checkout_root()
-    wrapper = primary_root / "scripts" / "codex-hooks" / "run_peon_ping.py"
-    return f'python3 "{wrapper}"'
+def _wrapper_command(wrapper: str | Path) -> str:
+    """Build the replacement from the host-supplied canonical wrapper path."""
+    return f'python3 "{Path(wrapper).expanduser().resolve()}"'
 
 
 def _is_stale(command: str) -> bool:
@@ -142,7 +80,11 @@ def _is_stale(command: str) -> bool:
     tilde, $HOME, quoted).  It does NOT flag wrapper entries whose path is merely
     cwd-dependent; use ``_is_cwd_dependent_wrapper`` for that.
     """
-    return bool(_STALE_ADAPTER_RE.search(command))
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return any(token.lower().endswith("peon-ping/adapters/codex.sh") for token in tokens)
 
 
 def _is_cwd_dependent_wrapper(command: str) -> bool:
@@ -177,8 +119,17 @@ def _is_stale_absolute_wrapper(command: str, primary_wrapper: str) -> bool:
     """
     if "run_peon_ping.py" not in command:
         return False
-    # Already the correct absolute wrapper — leave it alone.
-    if command == primary_wrapper:
+    try:
+        command_tokens = shlex.split(command)
+        primary_tokens = shlex.split(primary_wrapper)
+    except ValueError:
+        return True
+    canonical_paths = [token for token in primary_tokens if token.endswith("run_peon_ping.py")]
+    invocation_paths = [token for token in command_tokens if token.endswith("run_peon_ping.py")]
+    if canonical_paths and invocation_paths and any(
+        Path(path).expanduser().resolve() == Path(canonical_paths[0]).expanduser().resolve()
+        for path in invocation_paths
+    ):
         return False
     # Cwd-dependent form — already handled by _is_cwd_dependent_wrapper.
     if _CWD_DEPENDENT_WRAPPER_RE.search(command):
@@ -199,11 +150,11 @@ def _needs_repair(command: str, primary_wrapper: str | None = None) -> bool:
     if _is_stale(command) or _is_cwd_dependent_wrapper(command):
         return True
     if primary_wrapper is None:
-        primary_wrapper = _wrapper_command()
+        return False  # host path is required; never infer it from this package
     return _is_stale_absolute_wrapper(command, primary_wrapper)
 
 
-def _repair_config(config: dict) -> tuple[dict, int]:
+def _repair_config(config: dict, replacement: str) -> tuple[dict, int]:
     """Walk *config* and replace stale peon-ping adapter invocations.
 
     Replaces both:
@@ -217,8 +168,6 @@ def _repair_config(config: dict) -> tuple[dict, int]:
 
     repaired = copy.deepcopy(config)
     count = 0
-    replacement = _wrapper_command()
-
     hooks_by_event: dict = repaired.get("hooks", {})
     for _event_name, groups in hooks_by_event.items():
         if not isinstance(groups, list):
@@ -259,6 +208,12 @@ def main(argv: list[str] | None = None) -> int:
         "or ~/.codex/hooks.json)",
     )
     parser.add_argument(
+        "--wrapper",
+        metavar="PATH",
+        default=os.environ.get("CODEX_PEON_PING_WRAPPER"),
+        help="Absolute host-checkout path to scripts/codex-hooks/run_peon_ping.py",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Report stale entries but do not write changes",
@@ -281,7 +236,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 0  # best-effort: never fail the SessionStart chain
 
-    repaired, count = _repair_config(config)
+    if not isinstance(config, dict) or not isinstance(config.get("hooks", {}), dict):
+        print(
+            f"repair_global_codex_hooks: invalid hooks configuration in {target}; skipping",
+            file=sys.stderr,
+        )
+        return 0
+    if not args.wrapper:
+        print(
+            "repair_global_codex_hooks: --wrapper (or CODEX_PEON_PING_WRAPPER) "
+            "must be supplied by the host checkout; skipping",
+            file=sys.stderr,
+        )
+        return 0
+
+    replacement = _wrapper_command(args.wrapper)
+    repaired, count = _repair_config(config, replacement)
 
     if count == 0:
         return 0  # already clean
@@ -298,7 +268,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         new_text = json.dumps(repaired, indent=2) + "\n"
-        target.write_text(new_text, encoding="utf-8")
+        target_mode = target.stat().st_mode
+        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+        temp_path = Path(temp_name)
+        try:
+            os.fchmod(fd, target_mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(new_text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, target)
+        finally:
+            temp_path.unlink(missing_ok=True)
     except OSError as exc:
         print(
             f"repair_global_codex_hooks: failed to write {target}: {exc}",

@@ -51,12 +51,18 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shlex
 import subprocess
 import sys
 import time
 from pathlib import Path
+
+from .codex_hooks.command_parser import (
+    cd_target,
+    effective_git_cwd,
+    is_git_push,
+    split_command_segments,
+)
 
 # Total wall-clock budget for ALL of a push's remote `ls-remote` checks
 # combined, not a per-call timeout: `check_command()` sets a single deadline
@@ -70,23 +76,6 @@ from pathlib import Path
 # hang risk the shared deadline exists for.
 GIT_TIMEOUT_SECONDS = 8
 
-# Flags git-push accepts that never take a following value token. Anything not
-# in this set is still treated conservatively (assumed to take no separate
-# value) rather than mis-consuming the next positional as a flag argument --
-# this hook is scoped to recognise ordinary agent-issued invocations, not to
-# exhaustively validate git's full flag grammar.
-_NO_VALUE_FLAGS = {
-    "-u", "--set-upstream",
-    "-f", "--force",
-    "-n", "--dry-run",
-    "-v", "--verbose",
-    "-q", "--quiet",
-    "--tags", "--follow-tags",
-    "--atomic", "--thin", "--no-thin",
-    "--porcelain", "--progress", "--no-progress",
-    "--prune", "--all", "--mirror",
-    "--signed", "--no-signed", "--no-verify",
-}
 _DELETE_FLAGS = {"-d", "--delete"}
 
 # Flags that DO take a separate value token (`-o ci.skip`, not `-o=ci.skip`).
@@ -107,9 +96,6 @@ _REFS_HEADS_PREFIX = "refs/heads/"
 # resurrection, so it must never block one (BOU-2576 finding 3).
 _DRY_RUN_FLAGS = {"-n", "--dry-run"}
 
-_SEGMENT_SPLIT = re.compile(r"&&|\|\||;|\|")
-
-
 def _segments(command: str) -> list[str]:
     """Split a shell command into top-level segments on &&, ||, ;, |.
 
@@ -117,23 +103,52 @@ def _segments(command: str) -> list[str]:
     among ordinary agent-issued command chains (`cd x && git push`, `git add
     -A && git commit -m ... && git push`), which is all this guard needs.
     """
-    return [s.strip() for s in _SEGMENT_SPLIT.split(command) if s.strip()]
+    return [segment for _op, segment in split_command_segments(command)]
 
 
 def _push_segment(command: str) -> str | None:
     """Return the first shell segment that is a `git push` invocation, else None."""
     for segment in _segments(command):
-        try:
-            tokens = shlex.split(segment)
-        except ValueError:
-            continue  # unbalanced quoting -- not parseable, not our concern
-        i = 0
-        # Skip leading env-var assignments (FOO=bar git push ...).
-        while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("-"):
-            i += 1
-        if tokens[i : i + 2] == ["git", "push"]:
+        if is_git_push(segment):
             return segment
     return None
+
+
+def _push_context(command: str, cwd: Path) -> tuple[str, Path] | None:
+    """Return the push segment and its effective cwd after shell/git relocation."""
+    current = cwd
+    segments = split_command_segments(command)
+    saw_unmodeled_command = False
+    for index, (leading_op, segment) in enumerate(segments):
+        destination = cd_target(segment)
+        if destination is not None:
+            next_op = segments[index + 1][0] if index + 1 < len(segments) else ""
+            target = Path(destination).expanduser()
+            target = target.resolve() if target.is_absolute() else (current / target).resolve()
+            cd_succeeds = target.is_dir()
+            if next_op == "||" and cd_succeeds:
+                return None  # the push segment cannot execute
+            if not cd_succeeds:
+                if next_op == "&&":
+                    return None  # a command chained to the failed cd cannot execute
+                continue
+            if saw_unmodeled_command and leading_op in {"&&", "||"}:
+                return None  # execution of this cd is conditional and unknowable pre-run
+            current = target
+            continue
+        if is_git_push(segment):
+            return segment, Path(effective_git_cwd(segment, str(current)))
+        saw_unmodeled_command = True
+    return None
+
+
+def _push_tokens(segment: str) -> list[str]:
+    """Return arguments after the git ``push`` subcommand."""
+    tokens = shlex.split(segment)
+    for index, token in enumerate(tokens):
+        if token == "push":
+            return tokens[index + 1 :]
+    return []
 
 
 def _is_dry_run(segment: str) -> bool:
@@ -145,10 +160,19 @@ def _is_dry_run(segment: str) -> bool:
     nothing (BOU-2576 finding 3).
     """
     try:
-        tokens = shlex.split(segment)
+        tokens = _push_tokens(segment)
     except ValueError:
         return False
-    return any(tok in _DRY_RUN_FLAGS for tok in tokens)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _DRY_RUN_FLAGS:
+            return True
+        if token in _VALUE_FLAGS:
+            index += 2
+            continue
+        index += 1
+    return False
 
 
 def _parse_push_args(segment: str) -> tuple[str | None, list[str], bool, bool]:
@@ -171,11 +195,7 @@ def _parse_push_args(segment: str) -> tuple[str | None, list[str], bool, bool]:
     `--tags`, it still pushes the current branch (plus any newly-reachable
     annotated tags), so the current-branch check must still run for it.
     """
-    tokens = shlex.split(segment)
-    i = 0
-    while i < len(tokens) and "=" in tokens[i] and not tokens[i].startswith("-"):
-        i += 1
-    tokens = tokens[i + 2 :]  # drop the leading env assignments + "git push"
+    tokens = _push_tokens(segment)
 
     is_delete = False
     saw_bare_tags_flag = False
@@ -229,6 +249,26 @@ def _parse_push_args(segment: str) -> tuple[str | None, list[str], bool, bool]:
     return remote, branch_refspecs, is_delete, had_refspecs
 
 
+def _bulk_push_mode(segment: str) -> str | None:
+    """Return ``all``/``mirror`` when either bulk branch mode was requested."""
+    try:
+        tokens = _push_tokens(segment)
+    except ValueError:
+        return None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _VALUE_FLAGS:
+            index += 2
+            continue
+        if token == "--all":
+            return "all"
+        if token == "--mirror":
+            return "mirror"
+        index += 1
+    return None
+
+
 def _resolve_target(
     remote: str | None, refspec: str | None
 ) -> tuple[str, str, str] | None:
@@ -251,6 +291,8 @@ def _resolve_target(
         local_branch = "HEAD"
         remote_branch = "HEAD"  # resolved to the current branch name below
 
+    if local_branch == "@":
+        local_branch = "HEAD"
     if local_branch != "HEAD" and local_branch.startswith(_REFS_HEADS_PREFIX):
         # `git push origin refs/heads/feature/x` (or the local half of a
         # `local:remote` refspec) is fully qualified.
@@ -294,6 +336,31 @@ def _current_branch_name(cwd: Path) -> str | None:
     return name if name and name != "HEAD" else None
 
 
+def _config_value(key: str, cwd: Path) -> str | None:
+    return _run(["git", "-C", str(cwd), "config", "--get", key], cwd)
+
+
+def _push_remote(local_branch: str, cwd: Path) -> str:
+    """Resolve Git's remote selection for a push with no repository argument."""
+    for key in (
+        f"branch.{local_branch}.pushRemote",
+        "remote.pushDefault",
+        f"branch.{local_branch}.remote",
+    ):
+        value = _config_value(key, cwd)
+        if value and value.strip() and value.strip() != ".":
+            return value.strip()
+    return "origin"
+
+
+def _local_branches(cwd: Path) -> list[str]:
+    out = _run(
+        ["git", "-C", str(cwd), "for-each-ref", "--format=%(refname:short)", "refs/heads"],
+        cwd,
+    )
+    return [line for line in (out or "").splitlines() if line]
+
+
 def _configured_upstream(
     local_branch: str, cwd: Path
 ) -> tuple[str, str] | None:
@@ -321,6 +388,16 @@ def _push_url(remote: str, cwd: Path) -> str | None:
         return None
     url = out.strip()
     return url or None
+
+
+def _push_urls(remote: str, cwd: Path) -> list[str]:
+    """Return every configured push destination, or the raw repository value."""
+    out = _run(
+        ["git", "-C", str(cwd), "remote", "get-url", "--push", "--all", remote],
+        cwd,
+    )
+    urls = [line.strip() for line in (out or "").splitlines() if line.strip()]
+    return urls or [remote]
 
 
 def _same_remote(upstream_remote: str, remote: str, cwd: Path) -> bool:
@@ -387,29 +464,35 @@ def _remote_ref_exists(
     substring/tail-match failure mode.
     """
     exact_ref = f"refs/heads/{branch}"
-    timeout = deadline - time.monotonic()
-    if timeout <= 0:
-        return None
-    try:
-        result = subprocess.run(
-            ["git", "-C", str(cwd), "ls-remote", "--exit-code", "--heads", remote, exact_ref],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode == 0:
-        return any(
-            line.split("\t", 1)[-1].strip() == exact_ref
-            for line in result.stdout.splitlines()
-            if "\t" in line
-        )
-    if result.returncode == 2:
-        # git ls-remote --exit-code: 2 means the query succeeded but found no
-        # matching ref -- a definitive "does not exist", not an error.
-        return False
-    return None  # any other exit code (auth, network, bad remote) is inconclusive
+    inconclusive = False
+    for push_destination in _push_urls(remote, cwd):
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            inconclusive = True
+            break
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(cwd), "ls-remote", "--exit-code", "--heads", push_destination, exact_ref],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            inconclusive = True
+            continue
+        if result.returncode == 0:
+            exists = any(
+                line.split("\t", 1)[-1].strip() == exact_ref
+                for line in result.stdout.splitlines()
+                if "\t" in line
+            )
+            if not exists:
+                return False
+            continue
+        if result.returncode == 2:
+            return False
+        inconclusive = True
+    return None if inconclusive else True
 
 
 def _check_one_target(
@@ -427,19 +510,24 @@ def _check_one_target(
             return None  # detached HEAD or unreadable repo -- not our concern
         local_branch = current
         if remote_branch == "HEAD" and refspec is None:
-            push_default = _run(
-                ["git", "-C", str(cwd), "config", "--get", "push.default"],
-                cwd,
-            )
-            if push_default and push_default.strip() == "upstream":
+            push_default = _config_value("push.default", cwd)
+            mode = push_default.strip() if push_default else "simple"
+            if mode in {"matching", "nothing"}:
+                return None  # these modes cannot recreate an absent current ref
+            if mode == "upstream":
                 upstream = _configured_upstream(local_branch, cwd)
                 if upstream is None:
                     return None
                 configured_remote, remote_branch = upstream
                 if remote is None:
+                    selected_remote = _push_remote(local_branch, cwd)
+                    if not _same_remote(configured_remote, selected_remote, cwd):
+                        return None  # Git rejects upstream pushes to another remote
                     remote_name = configured_remote
             else:
                 remote_branch = current
+                if remote is None:
+                    remote_name = _push_remote(local_branch, cwd)
         elif remote_branch == "HEAD":
             remote_branch = current
 
@@ -482,9 +570,10 @@ def check_command(command: str, cwd: Path) -> str | None:
     live feature/x` must still block on a deleted `feature/x` even though
     `live` (checked first) is fine (BOU-2571 P2 review).
     """
-    segment = _push_segment(command)
-    if segment is None:
+    context = _push_context(command, Path(cwd))
+    if context is None:
         return None
+    segment, effective_cwd = context
 
     if _is_dry_run(segment):
         return None  # pushes nothing -- cannot resurrect anything (finding 3)
@@ -498,10 +587,19 @@ def check_command(command: str, cwd: Path) -> str | None:
     # No refspec at all (`git push` / `git push origin`) resolves to the
     # current branch -- represented as a single `None` target, same as before
     # this refspec list existed.
-    targets: list[str | None] = list(refspecs) if refspecs else [None]
+    bulk_mode = _bulk_push_mode(segment)
+    if bulk_mode:
+        current_branch = _current_branch_name(effective_cwd) or ""
+        bulk_remote = remote or _push_remote(current_branch, effective_cwd)
+        targets = [
+            (bulk_remote, f"{branch}:{branch}")
+            for branch in _local_branches(effective_cwd)
+        ]
+    else:
+        targets = [(remote, refspec) for refspec in (list(refspecs) if refspecs else [None])]
     deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
-    for refspec in targets:
-        message = _check_one_target(remote, refspec, cwd, deadline)
+    for target_remote, refspec in targets:
+        message = _check_one_target(target_remote, refspec, effective_cwd, deadline)
         if message is not None:
             return message
     return None
