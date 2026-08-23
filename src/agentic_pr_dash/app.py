@@ -109,11 +109,24 @@ def _observation_context() -> dict[str, object]:
     freshness = orchestrator.open_set_freshness()
     age = freshness.age_seconds(orchestrator.observation_controller.now())
     if age is None:
+        # Never observed. That is "still starting up" only until an attempt has
+        # actually failed — a daemon that starts while discovery is quota-denied
+        # would otherwise show a calm, non-stale "loading" forever, which is
+        # precisely the outage this indicator exists to expose (BOU-3095
+        # PR #169 review).
+        reason = freshness.degraded_reason
+        if reason:
+            return {
+                "known": False,
+                "stale": True,
+                "label": "PR data unavailable",
+                "detail": reason,
+            }
         return {
             "known": False,
             "stale": False,
             "label": "PR data loading",
-            "detail": freshness.degraded_reason or "no GitHub observation yet",
+            "detail": "no GitHub observation yet",
         }
     stale = age > OBSERVATION_STALE_AFTER_SECONDS or not freshness.complete
     label = f"PR data {_format_observation_age(age)} old"
@@ -1396,6 +1409,13 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
         "board_partial_url": "/partials/board?show_agents=1" if show_agent_worktrees else "/partials/board",
         "runner_issues_partial_url": "/partials/runner-issues?show_agents=1" if show_agent_worktrees else "/partials/runner-issues",
         "asset_version": _asset_version(),
+        # This tab builds its own context rather than going through
+        # _dashboard_context_from_cards, so the shared header include would
+        # otherwise fall back to "PR data loading" forever on it (BOU-3095
+        # PR #169 review). The board's out-of-band swap does not reach this tab,
+        # so the value is correct at render and refreshes on the tab's own poll.
+        "observation": _observation_context(),
+        "board_loaded": True,
     }
 
 
@@ -1456,7 +1476,12 @@ async def _dashboard_context_async(
                 orchestrator.log(
                     f"Dashboard context rebuild failed: {exc}", level="error"
                 )
-                _dashboard_context_tasks.pop(key, None)
+                # Only clear the entry if it is still OURS. A refresh may have
+                # cleared the map and a later poll installed a replacement;
+                # popping that would start duplicate scans and strand the
+                # replacement's result (BOU-3095 PR #169 review).
+                if _dashboard_context_tasks.get(key) is asyncio.current_task():
+                    _dashboard_context_tasks.pop(key, None)
                 raise
             current_task = asyncio.current_task()
             if _dashboard_context_tasks.get(key) is current_task:

@@ -981,7 +981,13 @@ def probe_open_prs_rest(
     configured_author = (configured_author or "").strip()
     if configured_author.casefold() in {"@me", "me"}:
         configured_author = _rest_viewer_login(cwd)
-    expected_author = configured_author.casefold()
+    # Canonicalize BOTH sides. A GitHub App identity is spelled ``app/<name>``
+    # in configuration and ``<name>[bot]`` in REST payloads, so a raw casefold
+    # comparison silently matches nothing and the probe reports an empty
+    # open-PR list. That used to cost only a wasted relist; now that the probe
+    # body is authoritative for pruning, it would take every open PR off the
+    # board (BOU-3095 PR #169 review).
+    expected_author = _login_key(configured_author)
     normalized: list[dict] = []
     for item in payload:
         if not isinstance(item, dict):
@@ -989,7 +995,7 @@ def probe_open_prs_rest(
         if expected_author:
             user = item.get("user")
             login = user.get("login") if isinstance(user, dict) else ""
-            if str(login or "").casefold() != expected_author:
+            if _login_key(str(login or "")) != expected_author:
                 continue
         converted = _normalize_rest_pr_payload(item)
         if converted is not None:

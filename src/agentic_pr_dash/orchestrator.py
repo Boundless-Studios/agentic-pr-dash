@@ -693,6 +693,17 @@ class Orchestrator:
             complete=True,
         )
 
+    def _note_open_set_unobserved(self, root: str | None, reason: str) -> None:
+        """Record why this root's open set could not be observed.
+
+        A successful observation clears it (see :meth:`_refresh_repo`). Without
+        this, a daemon that starts while discovery is quota-denied never records
+        a reason and the header renders a calm "PR data loading" forever —
+        exactly the outage the indicator exists to expose.
+        """
+
+        self._open_set_degraded_reason[root] = reason
+
     def _merge_probe_activity(
         self, root: str | None, probe_prs: list[dict]
     ) -> None:
@@ -728,6 +739,8 @@ class Orchestrator:
         observation_key: ObservationKey,
         raw: dict,
         now: datetime,
+        *,
+        newly_discovered: bool,
     ) -> None:
         """Re-plan the review slice when GitHub says the PR changed.
 
@@ -761,14 +774,39 @@ class Orchestrator:
             return
         previous = self._pr_last_updated_at.get(key)
         self._pr_last_updated_at[key] = updated_at
-        if previous is None or updated_at <= previous:
+        if previous is not None and updated_at <= previous:
             return
+        if previous is None and newly_discovered:
+            # First sight of a brand-new PR: its INITIAL plan already requests
+            # every slice, so there is nothing to invalidate. Just seed.
+            return
+        if previous is None:
+            # A PR we already track, seeing its first timestamp. Because
+            # PR_SNAPSHOT_FIELDS omits updatedAt, this is the normal state after
+            # startup — and if the REST 200 that produced it was itself caused by
+            # a comment, swallowing it loses the only signal that PR changed
+            # (BOU-3095 PR #169 review). Later probes would see the same value
+            # and do nothing. Be conservative and treat it as a change.
+            self.log(
+                f"Seeding review baseline for PR #{key[1]} from its first REST "
+                "timestamp; re-planning review to avoid missing a change that "
+                "predates it",
+                pr_number=key[1],
+                level="info",
+            )
         self.observation_controller.handle_event(
             "pull_request_review",
             observation_key.repo,
             observation_key.number,
             observation_key.head_sha,
             now=now,
+        )
+        # Match the webhook path. Invalidating the slice without revoking its
+        # authority leaves the previous REVIEW observation reportable, so a
+        # quota-deferred re-read can keep a resolved thread showing as
+        # actionable, or leave a newly-commented PR CLEAN (PR #169 review).
+        self._revoke_event_blocker_authority(
+            observation_key, "pull_request_review", None
         )
 
     def _list_validation_due(self, root: str | None, now: datetime) -> bool:
@@ -1281,6 +1319,9 @@ class Orchestrator:
                 level="warn",
             )
             self._metadata_last_attempt[root] = now
+            self._note_open_set_unobserved(
+                root, f"rich metadata deferred: quota {decision.reason.value}"
+            )
             return self._metadata_cache.get(root), False
 
         reservation = self.quota_ledger.reserve(
@@ -1294,6 +1335,9 @@ class Orchestrator:
                 level="warn",
             )
             self._metadata_last_attempt[root] = now
+            self._note_open_set_unobserved(
+                root, "rich metadata deferred: quota admission changed"
+            )
             return self._metadata_cache.get(root), False
 
         list_error: Exception | None = None
@@ -1338,6 +1382,9 @@ class Orchestrator:
                 f"Skipping metadata refresh for {root}: could not list open PRs"
                 f" (GitHub API unavailable{detail})",
                 level="error",
+            )
+            self._note_open_set_unobserved(
+                root, f"could not list open PRs{detail}"
             )
             return self._metadata_cache.get(root), False
 
@@ -1521,11 +1568,33 @@ class Orchestrator:
             # sit on the board for hours (BOU-3095).
             probe_open = _open_numbers(probe.prs)
             if not rich_due:
+                cached = self._metadata_cache[root]
+                cached_open = _open_numbers(cached)
+                # "Every PR I own closed at once" is rare; "my author filter
+                # stopped matching" is not, and its blast radius is the whole
+                # board. Make the cheap path prove an all-gone result with a
+                # real relist before it may prune everything. A partial shrink
+                # is still pruned immediately (BOU-3095 PR #169 review).
+                if cached_open and not probe_open:
+                    self.log(
+                        f"Cheap open-PR probe for {root} reported an empty set "
+                        "while PRs are tracked; deferring to a rich relist "
+                        "before pruning",
+                        level="warn",
+                    )
+                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                    return _MetadataRead(cached, False, None)
+                # A PR the probe knows about but the cached rich list does not
+                # cannot be projected from this cheap body — it carries none of
+                # the GraphQL-only fields a card needs. Schedule the rich relist
+                # now instead of leaving it invisible until the 15-minute clock.
+                if probe_open - cached_open:
+                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
                 # Cheap pass: prune from the probe, spend no GraphQL, and leave
                 # the validator untouched so the next rich-due window still
                 # sees this change and refreshes the GraphQL-only fields.
                 self._merge_probe_activity(root, probe.prs)
-                return _MetadataRead(self._metadata_cache[root], False, probe_open)
+                return _MetadataRead(cached, False, probe_open)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
             )
@@ -1660,6 +1729,7 @@ class Orchestrator:
 
             # Get or create PR data
             pr = self.prs.get(key)
+            newly_discovered = pr is None
             if pr is None:
                 pr = PRData(
                     number=num,
@@ -1700,7 +1770,9 @@ class Orchestrator:
                 observation_repo, observation_number, head_sha
             )
             self._observation_keys[key] = observation_key
-            self._note_pr_activity(key, observation_key, raw, now)
+            self._note_pr_activity(
+                key, observation_key, raw, now, newly_discovered=newly_discovered
+            )
             plan = self.observation_controller.plan_for(
                 observation_key.repo,
                 observation_key.number,
