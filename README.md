@@ -148,6 +148,12 @@ back to GitHub's repository runner endpoint, which requires **Repository
 Administration: Read**; a missing permission is reported as an unauthorized
 probe rather than runner downtime.
 
+If the fleet registers at the **organisation** level — a runner group rather than
+per-repository registration — the token additionally needs organisation
+**Self-hosted runners: Read**. The repository endpoint lists only repo-registered
+runners, so without that permission an org-registered fleet reads as zero runners
+and the panel reports it offline while every runner is online and taking jobs.
+
 ### GitHub observation and quota
 
 For near-real-time review and CI updates, configure a GitHub repository webhook

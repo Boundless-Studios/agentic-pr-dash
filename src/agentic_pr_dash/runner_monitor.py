@@ -268,11 +268,131 @@ def get_runner_fleet_load(
     org = repo_name.split("/", 1)[0]
     if not org:
         return load
-    org_payload, org_failure = _fetch_runner_scope(f"orgs/{org}", cwd, run)
-    if org_failure is not None or org_payload is None:
+
+    accessible = _accessible_group_ids(org, repo_name, cwd, run)
+    if accessible is None:
+        # Could not enumerate groups. Counting the org-wide endpoint would
+        # include runners in groups this repo has no access to and overstate
+        # capacity, so keep the repo answer instead of guessing.
         return load
-    org_load = parse_runner_inventory(org_payload, label=label)
-    return org_load if org_load.online else load
+    if not accessible:
+        return load
+
+    # Fetch per GROUP rather than filtering the org-wide list: that listing
+    # returns `runner_group_id: null`, so there is no way to tell from it which
+    # group a runner belongs to. The per-group endpoint answers the question we
+    # actually have -- "runners this repo may use".
+    merged: list[Any] = []
+    for group_id in sorted(accessible):
+        payload_g, failure_g = _fetch_runner_scope_raw(
+            f"orgs/{org}/actions/runner-groups/{group_id}/runners", cwd, run
+        )
+        if failure_g is not None:
+            # A PERMISSION error means "cannot see org runners" -- benign on a
+            # repo-mode deployment, so keep the repo answer. Anything else
+            # (timeout, invalid JSON, transient 5xx) leaves the fleet's state
+            # unknown and must surface: returning the repo-only load would
+            # present that as a healthy empty fleet.
+            if failure_g.error and "unauthorized" in failure_g.error.casefold():
+                return load
+            return failure_g
+        if isinstance(payload_g, dict):
+            merged.extend(payload_g.get("runners", []))
+
+    org_load = parse_runner_inventory({"runners": merged}, label=label)
+    # Prefer the org answer whenever it knows about ANY runners, online or not.
+    # Keying on `online` would hide a genuine org-fleet outage: every runner
+    # offline would fall back to the repo's empty or stale view and report zero
+    # registered runners instead of N offline.
+    return org_load if org_load.total else load
+
+
+def _accessible_group_ids(
+    org: str,
+    repo_name: str,
+    cwd: str | None,
+    run: RunCommand,
+) -> set[int] | None:
+    """Runner-group ids that grant `repo_name`, or None if they can't be listed.
+
+    The org-wide runner endpoint returns every runner in the organisation
+    regardless of which groups grant which repositories, so counting it directly
+    reports capacity this repo cannot actually use.
+    """
+    payload, failure = _fetch_runner_scope_raw(f"orgs/{org}/actions/runner-groups", cwd, run)
+    if failure or not isinstance(payload, dict):
+        return None
+    groups = payload.get("runner_groups")
+    if not isinstance(groups, list):
+        return None
+
+    accessible: set[int] = set()
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        gid = group.get("id")
+        if not isinstance(gid, int):
+            continue
+        if group.get("visibility") == "all":
+            accessible.add(gid)
+            continue
+        repos, repos_failure = _fetch_runner_scope_raw(
+            f"orgs/{org}/actions/runner-groups/{gid}/repositories", cwd, run
+        )
+        if repos_failure or not isinstance(repos, dict):
+            continue
+        names = {
+            item.get("full_name")
+            for item in repos.get("repositories", [])
+            if isinstance(item, dict)
+        }
+        if repo_name in names:
+            accessible.add(gid)
+    return accessible
+
+
+
+
+def _fetch_runner_scope_raw(
+    path: str,
+    cwd: str | None,
+    run: RunCommand,
+) -> tuple[Any, RunnerFleetLoad | None]:
+    """Paginated `gh api` returning the merged payload, or (None, failure)."""
+    cmd = ["gh", "api", path, "--paginate", "--slurp"]
+    try:
+        result = run(cmd, cwd, 20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, _degraded_load(f"Runner probe failed: {exc}")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "unknown error").strip()
+        return None, _runner_probe_failure(detail)
+    try:
+        parsed = json.loads(result.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        return None, _degraded_load(f"Runner probe returned invalid JSON: {exc}")
+    try:
+        return _merge_pages(parsed), None
+    except TypeError:
+        return None, _degraded_load("Runner probe returned an unexpected response shape.")
+
+
+def _merge_pages(payload: Any) -> dict[str, Any]:
+    """Merge --slurp pages, concatenating whichever list key they carry."""
+    if isinstance(payload, dict):
+        return payload
+    if not isinstance(payload, list):
+        raise TypeError("payload must be a dict or list of dict pages")
+    merged: dict[str, Any] = {}
+    for page in payload:
+        if not isinstance(page, dict):
+            raise TypeError("page must be a dict")
+        for key, value in page.items():
+            if isinstance(value, list):
+                merged.setdefault(key, []).extend(value)
+            else:
+                merged.setdefault(key, value)
+    return merged
 
 
 def _fetch_runner_scope(
