@@ -371,9 +371,18 @@ async def test_advanced_updated_at_replans_the_review_slice_before_the_hour(
     clock.advance(timedelta(seconds=90))
     await orch.refresh_prs()
 
+    # The re-plan goes through the controller's normal event debounce, so the
+    # scan lands on the following poll tick — 15 seconds in production, not the
+    # hour the reconciliation interval would otherwise impose.
+    clock.advance(timedelta(seconds=orchestrator.POLL_INTERVAL_SECONDS))
+    await orch.refresh_prs()
+
     assert len(review_scans) > scans_after_seed, (
         "the review slice was not re-planned despite an advanced updatedAt — "
         "the card comment count stays stale for up to an hour"
+    )
+    assert clock.current - ManualClock().current < timedelta(hours=1), (
+        "the re-scan must beat the hourly review reconciliation interval"
     )
 
 

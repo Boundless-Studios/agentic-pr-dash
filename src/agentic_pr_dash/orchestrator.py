@@ -628,6 +628,72 @@ class Orchestrator:
         )
         return "", ""
 
+    def _merge_probe_activity(
+        self, root: str | None, probe_prs: list[dict]
+    ) -> None:
+        """Carry the probe's ``updatedAt`` into the cached rich list.
+
+        A cheap validation pass deliberately does not replace the cached list —
+        the REST body has no ``reviewDecision`` and would erase GraphQL-only
+        fields. But ``updatedAt`` is the change signal
+        :meth:`_note_pr_activity` reads, and it is only meaningful if it is the
+        current one, so merge exactly that field and nothing else.
+        """
+
+        cached = self._metadata_cache.get(root)
+        if not cached:
+            return
+        fresh = {
+            raw["number"]: raw["updatedAt"]
+            for raw in probe_prs
+            if isinstance(raw.get("number"), int)
+            and isinstance(raw.get("updatedAt"), str)
+            and raw["updatedAt"]
+        }
+        if not fresh:
+            return
+        for raw in cached:
+            updated_at = fresh.get(raw.get("number"))
+            if updated_at:
+                raw["updatedAt"] = updated_at
+
+    def _note_pr_activity(
+        self,
+        key: PRKey,
+        observation_key: ObservationKey,
+        raw: dict,
+        now: datetime,
+    ) -> None:
+        """Re-plan the review slice when GitHub says the PR changed.
+
+        ``review_reconciliation_interval`` is one hour per immutable head, so a
+        comment posted or resolved without a push could not move the card's
+        comment count for up to an hour (BOU-3095). ``updatedAt`` is the cheap
+        change signal the open-PR list already carries: when it advances on an
+        unchanged head, something happened that a review scan should see.
+
+        This routes through the same ``handle_event`` path a review webhook
+        would use, so the slice mapping and the debounce window stay in one
+        place — the re-scan therefore lands on the next poll tick rather than
+        this one. A PR whose ``updatedAt`` has not moved is left alone, so the
+        hourly floor still bounds background spend on quiet PRs.
+        """
+
+        updated_at = raw.get("updatedAt")
+        if not isinstance(updated_at, str) or not updated_at:
+            return
+        previous = self._pr_last_updated_at.get(key)
+        self._pr_last_updated_at[key] = updated_at
+        if previous is None or updated_at <= previous:
+            return
+        self.observation_controller.handle_event(
+            "pull_request_review",
+            observation_key.repo,
+            observation_key.number,
+            observation_key.head_sha,
+            now=now,
+        )
+
     def _list_validation_due(self, root: str | None, now: datetime) -> bool:
         """Whether the cheap conditional open-PR validator should run.
 
@@ -1381,6 +1447,7 @@ class Orchestrator:
                 # Cheap pass: prune from the probe, spend no GraphQL, and leave
                 # the validator untouched so the next rich-due window still
                 # sees this change and refreshes the GraphQL-only fields.
+                self._merge_probe_activity(root, probe.prs)
                 return _MetadataRead(self._metadata_cache[root], False, probe_open)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
@@ -1467,6 +1534,7 @@ class Orchestrator:
                     self._observation_keys.pop(key, None)
                     self._event_head_overrides.pop(key, None)
                     self._event_head_override_observed_at.pop(key, None)
+                    self._pr_last_updated_at.pop(key, None)
                     self.log(
                         f"PR #{key[1]} closed/merged: {old.title}",
                         pr_number=key[1],
@@ -1552,6 +1620,7 @@ class Orchestrator:
                 observation_repo, observation_number, head_sha
             )
             self._observation_keys[key] = observation_key
+            self._note_pr_activity(key, observation_key, raw, now)
             plan = self.observation_controller.plan_for(
                 observation_key.repo,
                 observation_key.number,

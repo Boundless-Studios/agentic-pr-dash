@@ -538,6 +538,11 @@ def test_rest_pr_payload_normalizes_to_graphql_shape(monkeypatch):
         "baseRefName": "main",
         "mergedAt": None,
         "mergeable": "MERGEABLE",
+        # BOU-3095: the dashboard re-plans a PR's review slice when its
+        # ``updatedAt`` advances, so both timestamps have to survive the
+        # REST -> GraphQL mapping. Absent from this fixture, hence None.
+        "createdAt": None,
+        "updatedAt": None,
     }
 
 

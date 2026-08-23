@@ -1687,6 +1687,12 @@ def _normalize_rest_pr_payload(pr: dict) -> dict | None:
         "baseRefName": str(base.get("ref") or ""),
         "mergedAt": pr.get("merged_at"),
         "mergeable": _REST_MERGEABLE_ENUM.get(pr.get("mergeable"), "UNKNOWN"),
+        # GitHub advances ``updated_at`` when a comment is posted or resolved
+        # without a push. That is the only cheap signal the dashboard has that
+        # a review re-scan is worth spending on an otherwise unchanged head
+        # (BOU-3095), so it must survive this REST -> GraphQL field mapping.
+        "createdAt": pr.get("created_at"),
+        "updatedAt": pr.get("updated_at"),
     }
 
 
