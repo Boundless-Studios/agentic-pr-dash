@@ -3,7 +3,22 @@ from __future__ import annotations
 import json
 import subprocess
 
+import pytest
+
+from agentic_pr_dash import runner_monitor
 from agentic_pr_dash.runner_monitor import get_runner_fleet_load
+
+
+@pytest.fixture(autouse=True)
+def _clear_group_cache():
+    """Group discovery is cached for 60s to spare the 15s dashboard poll.
+
+    Each test drives a different org topology through the same (org, repo) key,
+    so without this they would read each other's cached answer.
+    """
+    runner_monitor._group_cache.clear()
+    yield
+    runner_monitor._group_cache.clear()
 
 LABEL = "gaia-ci-desktop"
 REPO = "Boundless-Studios/gaia-free"
@@ -63,7 +78,7 @@ def test_org_registered_fleet_is_not_reported_offline() -> None:
 
     def run(cmd, cwd, timeout_s):
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners())
         if path.endswith("/repositories"):
             return _ok(_group_repos(REPO))
@@ -86,7 +101,7 @@ def test_stale_offline_repo_registrations_do_not_mask_the_org_fleet() -> None:
 
     def run(cmd, cwd, timeout_s):
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners(*[f"stale-{i}" for i in range(27)], status="offline"))
         if path.endswith("/repositories"):
             return _ok(_group_repos(REPO))
@@ -108,7 +123,7 @@ def test_runners_in_groups_this_repo_cannot_use_are_excluded() -> None:
 
     def run(cmd, cwd, timeout_s):
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners())
         if path.endswith("/repositories"):
             return _ok(_group_repos("Boundless-Studios/some-other-repo"))
@@ -130,7 +145,7 @@ def test_offline_org_fleet_is_reported_as_offline_not_absent() -> None:
 
     def run(cmd, cwd, timeout_s):
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners())
         if path.endswith("/repositories"):
             return _ok(_group_repos(REPO))
@@ -153,7 +168,7 @@ def test_transient_org_failure_surfaces_instead_of_looking_healthy() -> None:
 
     def run(cmd, cwd, timeout_s):
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners())
         if path.endswith("/repositories"):
             return _ok(_group_repos(REPO))
@@ -190,7 +205,7 @@ def test_both_scopes_paginate() -> None:
     def run(cmd, cwd, timeout_s):
         commands.append(cmd)
         path = cmd[2]
-        if path.startswith("repos/"):
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
             return _ok(_runners())
         if path.endswith("/repositories"):
             return _ok(_group_repos(REPO))
@@ -202,3 +217,93 @@ def test_both_scopes_paginate() -> None:
     assert len(commands) >= 2
     for cmd in commands:
         assert "--paginate" in cmd
+
+
+def _repo_meta(private: bool = True) -> str:
+    return json.dumps({"full_name": REPO, "private": private})
+
+
+def _dispatch(*, group_runners, groups=None, group_repos=None, repo_private=True):
+    """Stub covering every endpoint the monitor touches, routed unambiguously."""
+
+    def run(cmd, cwd, timeout_s):
+        path = cmd[2]
+        if path.endswith("/actions/runners") and path.startswith("repos/"):
+            return _ok(_runners())
+        if path.startswith("repos/"):
+            return _ok(_repo_meta(repo_private))
+        if path.endswith("/repositories"):
+            return group_repos() if callable(group_repos) else _ok(_group_repos(REPO))
+        if path.endswith("/runner-groups"):
+            return groups() if callable(groups) else _ok(_groups())
+        return group_runners() if callable(group_runners) else group_runners
+
+    return run
+
+
+def test_group_enumeration_failure_surfaces_as_degraded() -> None:
+    """A transient failure listing groups must not read as an empty fleet."""
+    run = _dispatch(
+        group_runners=_ok(_runners("gha-ubuntu-1")),
+        groups=lambda: _err("gh: Internal Server Error (HTTP 500)"),
+    )
+    assert _load(run).is_degraded is True
+
+
+def test_selected_group_membership_failure_surfaces_as_degraded() -> None:
+    """Skipping a group whose membership check failed hides a partial fleet."""
+    run = _dispatch(
+        group_runners=_ok(_runners("gha-ubuntu-1")),
+        group_repos=lambda: _err("gh: Bad Gateway (HTTP 502)"),
+    )
+    assert _load(run).is_degraded is True
+
+
+def test_repository_names_match_case_insensitively() -> None:
+    """GitHub names are case-insensitive; the remote's spelling may differ."""
+    run = _dispatch(
+        group_runners=_ok(_runners("gha-ubuntu-1", "gha-ubuntu-2")),
+        group_repos=lambda: _ok(_group_repos("boundless-studios/GAIA-FREE")),
+    )
+    assert _load(run).online == 2
+
+
+def test_public_repo_excluded_from_group_disallowing_public() -> None:
+    """`visibility: all` still refuses public repos unless the flag is set."""
+    groups_json = json.dumps(
+        {
+            "runner_groups": [
+                {
+                    "id": GROUP_ID,
+                    "name": "gaia-ci",
+                    "visibility": "all",
+                    "allows_public_repositories": False,
+                }
+            ]
+        }
+    )
+    run = _dispatch(
+        group_runners=_ok(_runners("gha-ubuntu-1")),
+        groups=lambda: _ok(groups_json),
+        repo_private=False,
+    )
+    load = _load(run)
+    assert load.online == 0
+    assert load.is_degraded is False
+
+
+def test_group_discovery_is_cached_between_polls() -> None:
+    """The dashboard polls every 15s; group membership need not be re-walked."""
+    calls: list[str] = []
+    inner = _dispatch(group_runners=_ok(_runners("gha-ubuntu-1")))
+
+    def run(cmd, cwd, timeout_s):
+        calls.append(cmd[2])
+        return inner(cmd, cwd, timeout_s)
+
+    _load(run)
+    first = sum(1 for path in calls if "runner-groups" in path)
+    _load(run)
+    second = sum(1 for path in calls if "runner-groups" in path) - first
+    assert first > 0
+    assert second < first, f"group discovery not cached: {first} then {second}"
