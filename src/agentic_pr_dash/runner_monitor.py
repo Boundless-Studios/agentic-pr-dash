@@ -269,12 +269,15 @@ def get_runner_fleet_load(
     if not org:
         return load
 
-    accessible = _accessible_group_ids(org, repo_name, cwd, run)
-    if accessible is None:
-        # Could not enumerate groups. Counting the org-wide endpoint would
-        # include runners in groups this repo has no access to and overstate
-        # capacity, so keep the repo answer instead of guessing.
-        return load
+    accessible, groups_failure = _accessible_group_ids(org, repo_name, cwd, run)
+    if groups_failure is not None:
+        # Same rule as the runner fetch below: only a PERMISSION error may be
+        # swallowed. A timeout, malformed response, or transient 5xx while
+        # enumerating groups leaves the fleet's state unknown, and returning the
+        # repo-only load would present that as a healthy empty fleet.
+        if groups_failure.error and "unauthorized" in groups_failure.error.casefold():
+            return load
+        return groups_failure
     if not accessible:
         return load
 
@@ -307,48 +310,105 @@ def get_runner_fleet_load(
     return org_load if org_load.total else load
 
 
+_GROUP_CACHE_TTL_SECONDS = 60.0
+_group_cache: dict[tuple[str, str], tuple[float, set[int]]] = {}
+
+
 def _accessible_group_ids(
     org: str,
     repo_name: str,
     cwd: str | None,
     run: RunCommand,
-) -> set[int] | None:
-    """Runner-group ids that grant `repo_name`, or None if they can't be listed.
+) -> tuple[set[int], RunnerFleetLoad | None]:
+    """Runner-group ids that grant `repo_name`, or (empty, failure).
 
     The org-wide runner endpoint returns every runner in the organisation
     regardless of which groups grant which repositories, so counting it directly
     reports capacity this repo cannot actually use.
-    """
-    payload, failure = _fetch_runner_scope_raw(f"orgs/{org}/actions/runner-groups", cwd, run)
-    if failure or not isinstance(payload, dict):
-        return None
-    groups = payload.get("runner_groups")
-    if not isinstance(groups, list):
-        return None
 
+    Cached briefly: the dashboard polls runner load every 15s, and this walk
+    costs one request per group plus one per selected group. Group membership
+    changes on human timescales, so a short TTL removes almost all of that
+    traffic without going stale in a way anyone would notice.
+    """
+    cache_key = (org, repo_name.casefold())
+    cached = _group_cache.get(cache_key)
+    now = datetime.now(timezone.utc).timestamp()
+    if cached is not None and now - cached[0] < _GROUP_CACHE_TTL_SECONDS:
+        return set(cached[1]), None
+
+    payload, failure = _fetch_runner_scope_raw(f"orgs/{org}/actions/runner-groups", cwd, run)
+    if failure is not None:
+        return set(), failure
+    if not isinstance(payload, dict) or not isinstance(payload.get("runner_groups"), list):
+        return set(), _degraded_load("Runner group probe returned an unexpected response shape.")
+
+    is_private = _repo_is_private(repo_name, cwd, run)
     accessible: set[int] = set()
-    for group in groups:
+    for group in payload["runner_groups"]:
         if not isinstance(group, dict):
             continue
         gid = group.get("id")
         if not isinstance(gid, int):
             continue
-        if group.get("visibility") == "all":
+
+        # A PUBLIC repo additionally needs allows_public_repositories, which is
+        # independent of visibility and defaults to false. A `visibility: all`
+        # group still refuses public repos when it is unset, so counting those
+        # runners would report capacity this repo cannot claim.
+        if is_private is False and group.get("allows_public_repositories") is not True:
+            continue
+
+        visibility = group.get("visibility")
+        if visibility == "all":
             accessible.add(gid)
             continue
+        if visibility == "private":
+            # Grants every PRIVATE repo in the org, and those are NOT listed by
+            # the selected-repositories endpoint.
+            if is_private is not False:
+                accessible.add(gid)
+            continue
+
         repos, repos_failure = _fetch_runner_scope_raw(
             f"orgs/{org}/actions/runner-groups/{gid}/repositories", cwd, run
         )
-        if repos_failure or not isinstance(repos, dict):
-            continue
+        if repos_failure is not None:
+            # Silently skipping would drop a group this repo may well be in and
+            # report a partial fleet as healthy. Surface it instead.
+            return set(), repos_failure
+        if not isinstance(repos, dict):
+            return set(), _degraded_load(
+                "Runner group repository probe returned an unexpected response shape."
+            )
+        # Repository names are case-insensitive on GitHub, and `repo_name` keeps
+        # whatever spelling the remote or caller used while `full_name` is
+        # canonical -- so `boundless-studios/gaia-free` must match
+        # `Boundless-Studios/gaia-free`.
         names = {
-            item.get("full_name")
+            str(item.get("full_name", "")).casefold()
             for item in repos.get("repositories", [])
             if isinstance(item, dict)
         }
-        if repo_name in names:
+        if repo_name.casefold() in names:
             accessible.add(gid)
-    return accessible
+
+    _group_cache[cache_key] = (now, set(accessible))
+    return accessible, None
+
+
+def _repo_is_private(repo_name: str, cwd: str | None, run: RunCommand) -> bool | None:
+    """True/False when known, None when the visibility cannot be determined.
+
+    None is deliberately distinct from False: an unknown visibility must not be
+    treated as "public" and silently drop every group that disallows public
+    repositories.
+    """
+    payload, failure = _fetch_runner_scope_raw(f"repos/{repo_name}", cwd, run)
+    if failure is not None or not isinstance(payload, dict):
+        return None
+    private = payload.get("private")
+    return private if isinstance(private, bool) else None
 
 
 
