@@ -467,6 +467,13 @@ header h1 {
 
 .column-empty-search[hidden] { display: none; }
 
+/* The board has not observed anything yet — distinct from an observed-empty
+   column, which reads "No worktrees" (BOU-3095). */
+.column-loading {
+    font-style: italic;
+    opacity: 0.75;
+}
+
 /* ─── Cards ──────────────────────────────────────────────────────────────── */
 .card {
     background: var(--card);

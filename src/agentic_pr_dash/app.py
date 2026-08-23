@@ -1186,6 +1186,7 @@ def _dashboard_context_from_cards(
     *,
     show_agent_worktrees: bool,
     active_tab: str,
+    loaded: bool = True,
 ) -> dict[str, object]:
     runner_summary = orchestrator.weekly_runner_execution_summary
     runner_issues = _runner_issues(cards)
@@ -1217,6 +1218,11 @@ def _dashboard_context_from_cards(
         "no_pr_cards": no_pr_cards(cards),
         "quota": _quota_context(orchestrator.quota_telemetry),
         "asset_version": _asset_version(),
+        # False only for the skeleton served while the first card scan runs.
+        # An empty board asserts "you have no PRs", which is the most wrong
+        # thing this dashboard can say; the template renders a loading state
+        # instead (BOU-3095).
+        "board_loaded": loaded,
     }
 
 
@@ -1362,10 +1368,16 @@ async def _dashboard_context_async(
     cached = _dashboard_context_cache.get(key)
     if cached is None:
         # A cold process has no materialized worktree/session snapshot yet.
-        # Serve a valid empty board immediately and let the normal stale-cache
-        # path populate it in the background. Browser polling replaces this
-        # skeleton as soon as discovery completes, while a slow local scan can
-        # no longer make the dashboard look dead after an upgrade/restart.
+        # Serve a valid board skeleton immediately and let the normal
+        # stale-cache path populate it in the background. Browser polling
+        # replaces this skeleton as soon as discovery completes, while a slow
+        # local scan can no longer make the dashboard look dead after an
+        # upgrade/restart.
+        #
+        # The skeleton is marked NOT loaded (BOU-3095): rendered as a normal
+        # empty board it claimed "no worktrees" in every column, so a forced
+        # refresh — which clears this cache — made the dashboard assert zero
+        # PRs for as long as the rebuild took.
         cached = (
             0.0,
             _dashboard_context_from_cards(
@@ -1374,6 +1386,7 @@ async def _dashboard_context_async(
                 0,
                 show_agent_worktrees=show_agent_worktrees,
                 active_tab=active_tab,
+                loaded=False,
             ),
         )
         _dashboard_context_cache[key] = cached
@@ -1385,11 +1398,21 @@ async def _dashboard_context_async(
         context_func = runner_dashboard_context if active_tab == "runner_issues" else dashboard_context
 
         async def rebuild() -> dict[str, object]:
-            context = await asyncio.to_thread(
-                context_func,
-                show_agent_worktrees=show_agent_worktrees,
-                active_tab=active_tab,
-            )
+            try:
+                context = await asyncio.to_thread(
+                    context_func,
+                    show_agent_worktrees=show_agent_worktrees,
+                    active_tab=active_tab,
+                )
+            except Exception as exc:  # noqa: BLE001 — a failed rebuild must be visible
+                # Nothing awaits this task once a cached context exists, so an
+                # exception here was silently swallowed and the cold skeleton
+                # could persist across polls with no explanation (BOU-3095).
+                orchestrator.log(
+                    f"Dashboard context rebuild failed: {exc}", level="error"
+                )
+                _dashboard_context_tasks.pop(key, None)
+                raise
             current_task = asyncio.current_task()
             if _dashboard_context_tasks.get(key) is current_task:
                 _dashboard_context_tasks.pop(key, None)
