@@ -742,6 +742,18 @@ class Orchestrator:
         place — the re-scan therefore lands on the next poll tick rather than
         this one. A PR whose ``updatedAt`` has not moved is left alone, so the
         hourly floor still bounds background spend on quiet PRs.
+
+        Note where the value comes from: ``PR_SNAPSHOT_FIELDS`` does NOT request
+        ``updatedAt``, so the rich ``gh pr list`` payload has none and
+        :meth:`_cache_metadata` drops the merged value every time it replaces
+        the cache. That is fine and deliberate — the REST probe is the source of
+        this signal, and it supplies it exactly when it matters: the conditional
+        response body contains every open PR's ``updated_at``, so a comment
+        changes the body, changes the ETag, and the probe returns 200 rather
+        than 304. ``_pr_last_updated_at`` survives the cache replacement, so the
+        re-supplied value does not read as a spurious change. Do not "fix" the
+        wipe by adding ``updatedAt`` to ``PR_SNAPSHOT_FIELDS`` without checking
+        ``_SNAPSHOT_SERVABLE_FIELDS`` and the snapshot-shape tests.
         """
 
         updated_at = raw.get("updatedAt")
