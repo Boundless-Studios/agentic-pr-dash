@@ -1487,11 +1487,13 @@ class Orchestrator:
         self._record_estimated_success(context, reservation)
         await self._cache_metadata(root, raw_prs, now)
         if bootstrap:
-            await self._bootstrap_metadata_validator(root)
+            await self._bootstrap_metadata_validator(root, now)
         self.observed_roots.add(root)
         return raw_prs, True
 
-    async def _bootstrap_metadata_validator(self, root: str | None) -> None:
+    async def _bootstrap_metadata_validator(
+        self, root: str | None, now: datetime
+    ) -> None:
         """Capture a REST validator after the first rich discovery.
 
         ``gh pr list`` does not expose response headers, so the first rich
@@ -1525,6 +1527,38 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - validator is an optimization
             return
         if probe.observable and (probe.etag or probe.last_modified):
+            # This is a SECOND request, issued after the rich snapshot was
+            # already cached. If the open set moved in the gap, the validator
+            # describes a newer world than the cache it is stored against — and
+            # every later 304 would confirm (and re-observe) that already-stale
+            # cache (BOU-3095 PR #169 review round 5).
+            #
+            # Scheduling a relist is not enough on its own: the 304 branch only
+            # spends a rich relist once the HOURLY interval is up, so an
+            # event-forced refresh would be answered by another 304. Discard the
+            # validator instead, so the next probe is a body-bearing 200 that
+            # actually reconciles the cache.
+            #
+            # A truncated body cannot be compared, so it is not evidence of a
+            # mismatch; its 304s are already barred from counting as
+            # observations by the truncation guard.
+            cached = self._metadata_cache.get(root)
+            mismatched = (
+                probe.changed
+                and not probe.truncated
+                and cached is not None
+                and _open_numbers(probe.prs) != _open_numbers(cached)
+            )
+            if mismatched:
+                self.log(
+                    f"Bootstrap validator for {root} disagrees with the rich "
+                    "snapshot it was captured against; forcing a relist",
+                    level="warn",
+                )
+                self._metadata_validators.pop(root, None)
+                self._metadata_validator_truncated.pop(root, None)
+                self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                return
             self._metadata_validators[root] = (probe.etag, probe.last_modified)
             self._metadata_validator_truncated[root] = probe.truncated
 
