@@ -1,0 +1,16 @@
+{# Out-of-band refresh of the header freshness indicator.
+
+   EVERY partial the dashboard polls must include this. The header lives outside
+   each tab's swap target, so a tab that omits it renders the indicator once and
+   then freezes it — which is worse than not showing it at all, because a label
+   that is fresh at render and never moves reads as "current" right through an
+   outage (BOU-3095). Board, Runner Issues and Worktrees all include it; a new
+   polling tab should too.
+
+   Guarded so the full-page render, which includes the same partial inline, does
+   not emit a second element with this id — htmx swaps the first match. #}
+{% if observation_oob %}
+<span id="observation-age-slot" hx-swap-oob="true">
+    {% include 'partials/observation_age.html' %}
+</span>
+{% endif %}

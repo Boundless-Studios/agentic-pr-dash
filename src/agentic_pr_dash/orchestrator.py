@@ -667,30 +667,43 @@ class Orchestrator:
         state — that is the failure BOU-3095 reported.
         """
 
-        roots = [root for root in self._repo_roots()]
+        current = set(self._repo_roots())
+        # ``_resolve_maintenance_roots`` silently omits a configured sibling
+        # whose ``git worktree list`` fails, but that repo's cards are still on
+        # the board and have stopped being refreshed. Computing completeness
+        # from the reduced list would report the board fully fresh while a whole
+        # repo went dark (BOU-3095 PR #169 review), so keep every root we have
+        # ever observed or that still owns a tracked PR.
+        known = (
+            current
+            | set(self._open_set_last_observed)
+            | set(self._open_set_degraded_reason)
+            | set(self._pr_root.values())
+        )
+        dropped = known - current
         observed = [
             self._open_set_last_observed[root]
-            for root in roots
+            for root in known
             if root in self._open_set_last_observed
         ]
+        unobserved = [root for root in known if root not in self._open_set_last_observed]
         reasons = [
             self._open_set_degraded_reason[root]
-            for root in roots
+            for root in known
             if root in self._open_set_degraded_reason
         ]
-        if len(observed) < len(roots):
-            # A root that has never been observed is not "fresh"; report it as
-            # unknown rather than borrowing a sibling root's timestamp.
-            oldest = min(observed) if observed else None
-            return ObservationFreshness(
-                observed_at=oldest,
-                degraded_reason=reasons[0] if reasons else None,
-                complete=False,
+        if dropped:
+            reasons.insert(
+                0,
+                f"{len(dropped)} watched repo root(s) could not be resolved on "
+                "this poll and are no longer being refreshed",
             )
         return ObservationFreshness(
+            # The oldest root bounds the whole board: the age shown has to be
+            # true for everything on it.
             observed_at=min(observed) if observed else None,
             degraded_reason=reasons[0] if reasons else None,
-            complete=True,
+            complete=not unobserved and not dropped,
         )
 
     def _note_open_set_unobserved(self, root: str | None, reason: str) -> None:
@@ -1566,32 +1579,39 @@ class Orchestrator:
             # leaves the board even when the rich relist below is deferred or
             # quota-denied — that deferral is exactly how a merged PR used to
             # sit on the board for hours (BOU-3095).
-            probe_open = _open_numbers(probe.prs)
+            cached = self._metadata_cache[root]
+            cached_open = _open_numbers(cached)
+            probe_open: set[int] | None = _open_numbers(probe.prs)
+            # Decide ONCE whether this body may be treated as the authoritative
+            # open set, so the answer is the same on the cheap pass and on the
+            # rich-due pass. Deciding it per-branch is how the first version of
+            # this safeguard ended up not covering the follow-up tick — where a
+            # failing relist would expose the empty set and wipe the board,
+            # i.e. it failed exactly when it was needed (BOU-3095 PR #169).
+            unconfirmed: str | None = None
             if probe.truncated:
-                # The REST page was full, and the author filter runs after the
-                # fetch — so this body may simply not have reached one of the
-                # author's older open PRs. It remains a valid cache validator,
-                # but it cannot prove anything was closed (BOU-3095 PR #169
-                # review). Fall through to the rich list for an authoritative
-                # answer, and schedule one if it is not due yet.
-                if not rich_due:
-                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
-                    self._merge_probe_activity(root, probe.prs)
-                    return _MetadataRead(self._metadata_cache[root], False, None)
-                probe_open = None
-            if not rich_due:
-                cached = self._metadata_cache[root]
-                cached_open = _open_numbers(cached)
+                # The REST page was full and the author filter runs after the
+                # fetch, so this body may never have reached one of the author's
+                # older open PRs. Fine as a cache validator; cannot prove a
+                # close-out.
+                unconfirmed = (
+                    "the REST page was full, so it may not have reached every "
+                    "open PR of this author"
+                )
+            elif cached_open and not probe_open:
                 # "Every PR I own closed at once" is rare; "my author filter
                 # stopped matching" is not, and its blast radius is the whole
-                # board. Make the cheap path prove an all-gone result with a
-                # real relist before it may prune everything. A partial shrink
-                # is still pruned immediately (BOU-3095 PR #169 review).
-                if cached_open and not probe_open:
+                # board. A partial shrink still prunes immediately.
+                unconfirmed = (
+                    "the probe reported an empty open set while PRs are tracked"
+                )
+            if unconfirmed is not None:
+                probe_open = None
+            self._merge_probe_activity(root, probe.prs)
+            if not rich_due:
+                if probe_open is None:
                     self.log(
-                        f"Cheap open-PR probe for {root} reported an empty set "
-                        "while PRs are tracked; deferring to a rich relist "
-                        "before pruning",
+                        f"Deferring prune for {root} to a rich relist: {unconfirmed}",
                         level="warn",
                     )
                     self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
@@ -1605,7 +1625,6 @@ class Orchestrator:
                 # Cheap pass: prune from the probe, spend no GraphQL, and leave
                 # the validator untouched so the next rich-due window still
                 # sees this change and refreshes the GraphQL-only fields.
-                self._merge_probe_activity(root, probe.prs)
                 return _MetadataRead(cached, False, probe_open)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
@@ -1628,6 +1647,15 @@ class Orchestrator:
                 if merged is not None:
                     return _MetadataRead(merged, True, _open_numbers(merged))
                 return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []))
+            # The relist that would have confirmed an unconfirmed probe failed.
+            # ``probe_open`` is already None in exactly those cases, so this
+            # cannot prune on an unproven body.
+            if probe_open is None and unconfirmed is not None:
+                self.log(
+                    f"Rich relist for {root} failed while the probe was "
+                    f"unconfirmed ({unconfirmed}); leaving tracked PRs in place",
+                    level="warn",
+                )
             return _MetadataRead(raw_prs, False, probe_open)
 
         # Keep the old validator when the probe failed.  Reusing a new ETag

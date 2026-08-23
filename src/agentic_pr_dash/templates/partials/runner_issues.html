@@ -1,13 +1,4 @@
-{% if runner_oob %}
-{# This tab polls every five seconds but is not the board, so the board's
-   out-of-band header swap never reaches it. Without this, an initially fresh
-   freshness label stays fresh for as long as the tab is left open — including
-   right through an outage, which is the one time it must not (BOU-3095). Only
-   for the HTMX partial; the full-page include must not duplicate the slot id. #}
-<span id="observation-age-slot" hx-swap-oob="true">
-    {% include 'partials/observation_age.html' %}
-</span>
-{% endif %}
+{% include 'partials/observation_age_oob.html' %}
 
 <div class="runner-issues-header">
     <div>

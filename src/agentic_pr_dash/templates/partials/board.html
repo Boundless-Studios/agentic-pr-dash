@@ -5,10 +5,8 @@
 <div id="escalation-banner-slot" hx-swap-oob="true">
     {% include 'partials/escalation_banner.html' %}
 </div>
-<span id="observation-age-slot" hx-swap-oob="true">
-    {% include 'partials/observation_age.html' %}
-</span>
 {% endif %}
+{% include 'partials/observation_age_oob.html' %}
 
 {# ── Ownership summary bar ── #}
 {% set ns = namespace(owned_live=0, unowned=0, stale=0) %}

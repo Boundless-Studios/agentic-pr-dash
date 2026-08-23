@@ -140,6 +140,32 @@ def _observation_context() -> dict[str, object]:
     return {"known": True, "stale": stale, "label": label, "detail": detail}
 
 
+def _with_header_oob(
+    ctx: dict[str, object], *, board_oob: bool = False
+) -> dict[str, object]:
+    """Context for an HTMX partial that must refresh the shared header.
+
+    Every polled partial needs this: the header lives outside each tab's swap
+    target, so a tab that omits it renders the freshness indicator once and then
+    freezes it — which reads as "current" right through an outage (BOU-3095).
+
+    Always COPIES. ``_dashboard_context_async`` hands back the cached dict, and
+    setting these flags on it in place leaks them into later full-page renders,
+    which then emit a duplicate slot id — and htmx swaps the first match.
+
+    ``observation`` is recomputed so the swapped-in value reflects this request
+    rather than whenever the context was last built.
+    """
+
+    extra: dict[str, object] = {
+        "observation_oob": True,
+        "observation": _observation_context(),
+    }
+    if board_oob:
+        extra["board_oob"] = True
+    return {**ctx, **extra}
+
+
 def _quota_context(telemetry: QuotaTelemetry) -> dict[str, object]:
     latest = telemetry.latest
     degraded_reason = telemetry.degraded_reason
@@ -1940,7 +1966,7 @@ async def board_partial(request: Request):
     # htmx swap the wrong one (BOU-3095). Observed in the browser as the
     # observation-age indicator rendering both in the header and inside the
     # board.
-    ctx = {**ctx, "board_oob": True}
+    ctx = _with_header_oob(ctx, board_oob=True)
     return templates.TemplateResponse(
         request=request,
         name="partials/board.html",
@@ -1955,11 +1981,7 @@ async def runner_issues_partial(request: Request):
         show_agent_worktrees=show_agent_worktrees,
         active_tab="runner_issues",
     )
-    # Refresh the header freshness indicator out-of-band with this tab's own
-    # poll — the board's swap never reaches it (BOU-3095). Copy rather than
-    # mutate: ctx is the cached dict, and setting the flag on it would leak
-    # into full-page renders and duplicate the slot id.
-    ctx = {**ctx, "runner_oob": True, "observation": _observation_context()}
+    ctx = _with_header_oob(ctx)
     return templates.TemplateResponse(
         request=request,
         name="partials/runner_issues.html",
@@ -1970,13 +1992,14 @@ async def runner_issues_partial(request: Request):
 @app.get("/partials/worktrees", response_class=HTMLResponse)
 async def worktrees_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(
+        show_agent_worktrees=show_agent_worktrees,
+        active_tab="worktrees",
+    )
     return templates.TemplateResponse(
         request=request,
         name="partials/worktrees.html",
-        context=await _dashboard_context_async(
-            show_agent_worktrees=show_agent_worktrees,
-            active_tab="worktrees",
-        ),
+        context=_with_header_oob(ctx),
     )
 
 
