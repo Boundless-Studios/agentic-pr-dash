@@ -149,7 +149,7 @@ class HarnessStatusReport(BaseModel):
 
     schema_version: Literal[1]
     event_id: str | None = Field(default=None, min_length=1, max_length=240)
-    runtime: Literal["claude", "codex"]
+    runtime: Literal["claude", "codex", "pi"]
     state: str = Field(min_length=1, max_length=64)
     chain_id: str = Field(min_length=1, max_length=240)
     conversation_id: str | None

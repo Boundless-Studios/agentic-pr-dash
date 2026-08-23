@@ -43,6 +43,18 @@ def test_claude_bash_git_push_arms(monkeypatch, tmp_path):
     assert cfg.project_dir == tmp_path
 
 
+def test_pi_lowercase_bash_git_push_arms(monkeypatch, tmp_path):
+    payload = {
+        "tool_name": "bash",
+        "tool_input": {"command": "git push origin HEAD"},
+        "cwd": str(tmp_path),
+        "runtime": "pi",
+    }
+    cfg = _arm_via_hook(monkeypatch, payload)
+    assert cfg is not None
+    assert cfg.project_dir == tmp_path
+
+
 def test_non_push_command_is_noop(monkeypatch, tmp_path):
     payload = {"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": str(tmp_path)}
     assert _arm_via_hook(monkeypatch, payload) is None
@@ -345,6 +357,23 @@ def test_codex_push_requires_bounded_foreground_settlement(monkeypatch, tmp_path
     assert "BACKGROUND" not in ctx
     assert "await" not in ctx
     assert sys.executable in ctx
+
+
+def test_pi_push_requires_bounded_foreground_settlement(monkeypatch, tmp_path, capsys):
+    _stub_owned_open_nondraft_pr(monkeypatch, tmp_path)
+    payload = {
+        "tool_name": "bash",
+        "tool_input": {"command": "git push"},
+        "cwd": str(tmp_path),
+        "runtime": "pi",
+    }
+    rc, out = _run_hook_capture(monkeypatch, capsys, payload)
+    assert rc == 0
+    ctx = out["hookSpecificOutput"]["additionalContext"]
+    assert "FOREGROUND" in ctx
+    assert "monitor" in ctx
+    assert "--max-wait 1800" in ctx
+    assert "--pr 2290" in ctx
 
 
 def test_live_waiter_does_not_suppress_codex_foreground_monitor(monkeypatch, tmp_path, capsys):
