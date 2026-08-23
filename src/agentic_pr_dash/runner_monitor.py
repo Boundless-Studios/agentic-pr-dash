@@ -240,27 +240,74 @@ def get_runner_fleet_load(
     if not repo_name:
         return _degraded_load("Runner probe failed: could not determine active GitHub repository.")
 
-    cmd = ["gh", "api", f"repos/{repo_name}/actions/runners", "--paginate", "--slurp"]
+    payload, failure = _fetch_runner_scope(f"repos/{repo_name}", cwd, run)
+    if failure is not None:
+        return failure
+    load = parse_runner_inventory(payload or {}, label=label)
+    if load.online:
+        return load
+
+    # Nothing ONLINE at repo scope: try the ORG scope before declaring the fleet
+    # down. The test is `online`, not `total`, and that distinction is the whole
+    # bug: a repo that used to host the fleet keeps its stale `offline`
+    # registrations, so `total` stays non-zero long after the runners moved.
+    # Measured on gaia-free right after the org flip -- total=27, online=0, while
+    # nine runners were live at org scope. Gating on `total` would have returned
+    # that empty answer and kept reporting the fleet offline.
+    #
+    # `repos/<owner>/<repo>/actions/runners` lists ONLY runners registered to
+    # that repo. It does NOT include org runners the repo can reach through a
+    # runner group -- so once a fleet registers at org level this endpoint
+    # returns zero and the dashboard reports "offline" while every runner is up
+    # and taking jobs. Observed exactly that: repo scope 0, org scope 6, nine
+    # healthy containers.
+    #
+    # Best-effort: a token without org `Self-hosted runners: read` gets a 403
+    # here, which means "cannot see org runners", not "the fleet is down". In
+    # that case keep the repo-scope answer rather than surfacing a probe error.
+    org = repo_name.split("/", 1)[0]
+    if not org:
+        return load
+    org_payload, org_failure = _fetch_runner_scope(f"orgs/{org}", cwd, run)
+    if org_failure is not None or org_payload is None:
+        return load
+    org_load = parse_runner_inventory(org_payload, label=label)
+    return org_load if org_load.online else load
+
+
+def _fetch_runner_scope(
+    scope: str,
+    cwd: str | None,
+    run: RunCommand,
+) -> tuple[dict[str, Any] | None, RunnerFleetLoad | None]:
+    """Fetch one runner scope. Returns (payload, failure) with exactly one set.
+
+    `scope` is an API path prefix: `repos/<owner>/<repo>` or `orgs/<owner>`.
+
+    --paginate is required, not an optimisation: the fleet's runners are
+    ephemeral and JIT-register a fresh name per job, so stale `offline` rows
+    accumulate and GitHub returns them oldest-first, pushing the live runners
+    past the first page (BOU-2834).
+    """
+    cmd = ["gh", "api", f"{scope}/actions/runners", "--paginate", "--slurp"]
     try:
         result = run(cmd, cwd, 20)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return _degraded_load(f"Runner probe failed: {exc}")
+        return None, _degraded_load(f"Runner probe failed: {exc}")
 
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "unknown error").strip()
-        return _runner_probe_failure(detail)
+        return None, _runner_probe_failure(detail)
 
     try:
         payload = json.loads(result.stdout or "{}")
     except json.JSONDecodeError as exc:
-        return _degraded_load(f"Runner probe returned invalid JSON: {exc}")
+        return None, _degraded_load(f"Runner probe returned invalid JSON: {exc}")
 
     try:
-        payload = _merge_runner_pages(payload)
+        return _merge_runner_pages(payload), None
     except TypeError:
-        return _degraded_load("Runner probe returned an unexpected response shape.")
-
-    return parse_runner_inventory(payload, label=label)
+        return None, _degraded_load("Runner probe returned an unexpected response shape.")
 
 
 def _get_repo_full_name(*, cwd: str | None, run: RunCommand) -> str | None:
