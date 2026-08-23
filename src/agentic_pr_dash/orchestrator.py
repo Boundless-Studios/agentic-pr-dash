@@ -1567,6 +1567,18 @@ class Orchestrator:
             # quota-denied — that deferral is exactly how a merged PR used to
             # sit on the board for hours (BOU-3095).
             probe_open = _open_numbers(probe.prs)
+            if probe.truncated:
+                # The REST page was full, and the author filter runs after the
+                # fetch — so this body may simply not have reached one of the
+                # author's older open PRs. It remains a valid cache validator,
+                # but it cannot prove anything was closed (BOU-3095 PR #169
+                # review). Fall through to the rich list for an authoritative
+                # answer, and schedule one if it is not due yet.
+                if not rich_due:
+                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                    self._merge_probe_activity(root, probe.prs)
+                    return _MetadataRead(self._metadata_cache[root], False, None)
+                probe_open = None
             if not rich_due:
                 cached = self._metadata_cache[root]
                 cached_open = _open_numbers(cached)
@@ -1603,6 +1615,18 @@ class Orchestrator:
                     probe.etag or etag,
                     probe.last_modified or last_modified,
                 )
+                # This is the tick on which the probe actually saw a change, and
+                # the rich list carries no ``updatedAt`` at all. Dropping the
+                # probe's timestamps here loses the activity signal precisely
+                # when it exists — and the validator has just been advanced, so
+                # the following probes come back 304 and the review slice is
+                # never invalidated (BOU-3095 PR #169 review). Merge them into
+                # the freshly cached list and return that, so ``_note_pr_activity``
+                # sees them.
+                self._merge_probe_activity(root, probe.prs)
+                merged = self._metadata_cache.get(root)
+                if merged is not None:
+                    return _MetadataRead(merged, True, _open_numbers(merged))
                 return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []))
             return _MetadataRead(raw_prs, False, probe_open)
 

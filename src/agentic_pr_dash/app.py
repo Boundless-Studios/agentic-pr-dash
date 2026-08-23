@@ -1951,13 +1951,19 @@ async def board_partial(request: Request):
 @app.get("/partials/runner-issues", response_class=HTMLResponse)
 async def runner_issues_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(
+        show_agent_worktrees=show_agent_worktrees,
+        active_tab="runner_issues",
+    )
+    # Refresh the header freshness indicator out-of-band with this tab's own
+    # poll — the board's swap never reaches it (BOU-3095). Copy rather than
+    # mutate: ctx is the cached dict, and setting the flag on it would leak
+    # into full-page renders and duplicate the slot id.
+    ctx = {**ctx, "runner_oob": True, "observation": _observation_context()}
     return templates.TemplateResponse(
         request=request,
         name="partials/runner_issues.html",
-        context=await _dashboard_context_async(
-            show_agent_worktrees=show_agent_worktrees,
-            active_tab="runner_issues",
-        ),
+        context=ctx,
     )
 
 

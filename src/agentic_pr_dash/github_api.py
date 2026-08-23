@@ -113,6 +113,13 @@ class ConditionalPRListProbe:
     etag: str | None = None
     last_modified: str | None = None
     error: str | None = None
+    #: Whether the underlying REST page was full, i.e. there may be open PRs
+    #: this response never saw. The endpoint is repo-wide and paged, and the
+    #: author filter runs *after* the fetch, so on a repo with more than one
+    #: page of open PRs the configured author's older PR can fall outside it.
+    #: A truncated body is still a fine cache validator, but it is NOT an
+    #: authoritative open set and must never drive pruning (BOU-3095 PR #169).
+    truncated: bool = False
 
     @property
     def observable(self) -> bool:
@@ -920,9 +927,10 @@ def probe_open_prs_rest(
     if not owner or not repo:
         return ConditionalPRListProbe(None, [], error="repository identity unavailable")
 
+    per_page = 100
     endpoint = (
         f"repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc"
-        "&per_page=100&page=1"
+        f"&per_page={per_page}&page=1"
     )
     cmd = ["gh", "api", "--include", endpoint]
     if etag:
@@ -1005,6 +1013,10 @@ def probe_open_prs_rest(
         normalized,
         etag=headers.get("etag") or etag,
         last_modified=headers.get("last-modified") or last_modified,
+        # Measured on the RAW payload, before author filtering: a full page
+        # means the repo has more open PRs than this response saw, so the
+        # author-filtered result may be missing some of theirs.
+        truncated=len(payload) >= per_page,
     )
 
 
