@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -133,6 +135,92 @@ METADATA_RECONCILIATION_INTERVAL = timedelta(minutes=15)
 # cheap 15-minute probe while forcing one rich snapshot per hour so those
 # fields cannot remain stale forever behind an unchanged REST validator.
 RICH_METADATA_RECONCILIATION_INTERVAL = timedelta(hours=1)
+# The conditional REST validator is cheap in a way the rich relist is not: it
+# spends REST budget rather than GraphQL points, and a 304 costs no rate limit
+# at all. Gating it behind the rich relist's 15-minute clock (BOU-3095) meant a
+# merged PR kept rendering as open for the whole interval — and far longer in
+# practice, because a quota-denied or failed rich relist stamped that same clock
+# and bought another full interval without pruning anything. Validate the
+# open-PR list on its own fast cadence; keep the slow clocks for the slow read.
+LIST_VALIDATION_INTERVAL = timedelta(
+    seconds=float(os.environ.get("APD_LIST_VALIDATION_INTERVAL_S", "60"))
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _MetadataRead:
+    """One metadata read's result.
+
+    ``open_numbers`` is the authoritative set of open PR numbers this read
+    proved, or ``None`` when it proved nothing. A stale projection is still
+    worth rendering, but only a positive observation may remove a PR.
+
+    Only a successful rich relist populates it. The cheap REST probe is a change
+    detector: it decides *when* to spend that relist, not *what* is open. Three
+    review rounds on BOU-3095 PR #169 found three separate ways for a
+    page-limited, author-filtered REST body to be wrong about the open set, each
+    of which pruned real PRs off the board, so the capability was removed rather
+    than guarded case by case. The latency win survives — the probe still gets a
+    merged PR reconciled in about a minute instead of fifteen — but under GraphQL
+    exhaustion the board now holds stale entries rather than risking wrong ones.
+    """
+
+    raw_prs: list[dict] | None
+    rich_read: bool
+    open_numbers: set[int] | None
+    #: Whether GitHub positively confirmed this root's open set — which a
+    #: conditional 304 does (it proves the list is unchanged) even though it
+    #: supplies no set to prune against. Kept separate from ``open_numbers`` so
+    #: withdrawing the probe's authority over *removal* did not also make the
+    #: freshness indicator claim staleness that isn't there.
+    observed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ObservationFreshness:
+    """How current the board's open-PR set is, and why when it is not.
+
+    ``complete`` is False while some watched repo root has never been observed,
+    so the UI can say "partial" instead of quoting an age that only covers the
+    roots that happen to have answered.
+    """
+
+    observed_at: datetime | None
+    degraded_reason: str | None
+    complete: bool
+
+    def age_seconds(self, now: datetime) -> float | None:
+        if self.observed_at is None:
+            return None
+        return max(0.0, (now - self.observed_at).total_seconds())
+
+
+def _tracked_projection(raw_prs: list[dict]) -> set[tuple[int, str]]:
+    """The part of a PR list this dashboard actually tracks.
+
+    A conditional 200 says the repo-wide ``/pulls`` page changed, which is a far
+    coarser signal than "something we care about changed": the ETag covers every
+    author's PRs, and the author filter runs client-side afterwards. Comparing
+    THIS projection instead lets an unchanged result be recognised as unchanged
+    even when the raw response was a 200 — whether that is because another
+    author is busy, or because no validator could be installed at all and every
+    probe is unconditional (BOU-3095 PR #169 review round 6).
+
+    ``updatedAt`` is part of the identity because a comment moving it is exactly
+    the change the review-slice re-plan depends on.
+    """
+
+    return {
+        (raw["number"], str(raw.get("updatedAt") or ""))
+        for raw in raw_prs
+        if isinstance(raw.get("number"), int)
+    }
+
+
+def _open_numbers(raw_prs: list[dict]) -> set[int]:
+    return {
+        raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
+    }
 # Cold start has no cached projection to fall back on, so the board is simply
 # empty until the first list succeeds. One transient at daemon startup must not
 # hold it empty for a whole reconciliation interval; retry on the next poll tick
@@ -296,6 +384,36 @@ class Orchestrator:
         self._metadata_validators: dict[
             str | None, tuple[str | None, str | None]
         ] = {}
+        # The cheap open-PR validator runs on ``LIST_VALIDATION_INTERVAL``,
+        # independent of the rich relist's clocks above (BOU-3095).
+        self._list_validation_last_attempt: dict[str | None, datetime] = {}
+        # When each root's open-PR set was last positively observed, and why the
+        # last attempt failed when it was not. This is what the board reports as
+        # its observation age — the PR's own ``updatedAt`` cannot serve, because
+        # a stale payload carries a stale timestamp and reads as plausibly
+        # recent (BOU-3095).
+        self._open_set_last_observed: dict[str | None, datetime] = {}
+        self._open_set_degraded_reason: dict[str | None, str] = {}
+        # Roots the dashboard considers itself responsible for, refreshed once
+        # per poll tick. Rendering reads THIS and never resolves, because
+        # ``_resolve_maintenance_roots`` shells out ``git worktree list`` with a
+        # 10-second timeout per root — doing that on the request path put it on
+        # the event loop on every five-second poll, from three tabs (BOU-3095
+        # PR #169 review round 4).
+        self._watched_roots: set[str | None] = set()
+        self._resolved_roots: set[str | None] = set()
+        # Truncation state of each root's stored REST validator. A 304 against a
+        # validator that was established from a full page only revalidates that
+        # page, so it cannot count as observing the whole open set.
+        self._metadata_validator_truncated: dict[str | None, bool] = {}
+        # Last tracked-author projection each root's probe reported, so an
+        # unchanged result is recognised as unchanged even when the raw
+        # conditional response was a 200 (round-6 review).
+        self._probe_projection: dict[str | None, set[tuple[int, str]]] = {}
+        # Last ``updatedAt`` observed per PR key. GitHub advances it when a
+        # comment is posted or resolved without a push, which is the only cheap
+        # signal that a review re-scan is worth spending (BOU-3095).
+        self._pr_last_updated_at: dict[PRKey, str] = {}
         self._root_repo_identity: dict[str | None, str] = {}
         self._root_repo_slugs: dict[str | None, set[str]] = {}
         self._repo_roots_by_slug: dict[str, str | None] = {}
@@ -586,6 +704,264 @@ class Orchestrator:
             reason="mergeability_fallback_unavailable"
         )
         return "", ""
+
+    def _configured_roots(self) -> set[str]:
+        """Watched roots taken from configuration, with no subprocess at all.
+
+        ``_resolve_maintenance_roots`` proves each root is a git repo by running
+        ``git worktree list``, and drops any root whose call fails. That makes it
+        useless for answering "what are we responsible for?": a sibling whose
+        very first resolution fails has never been observed, degraded, or
+        assigned a PR, so retention logic keyed on past success cannot see it
+        either, and the board reports complete while that repo is absent
+        (BOU-3095 PR #169 review round 4).
+
+        Existence is checked with a stat rather than a git call: it keeps an
+        uncloned/removed root from being reported as permanently missing, which
+        would be a standing false alarm, while costing nothing on the hot path.
+        """
+
+        if not self.repo_cwd:
+            return set()
+        try:
+            cfg = load_config(self.repo_cwd)
+        except Exception:  # noqa: BLE001 — freshness must never raise
+            return {os.path.abspath(os.path.expanduser(self.repo_cwd))}
+        roots: set[str] = set()
+        for candidate in (
+            self.repo_cwd,
+            *(getattr(cfg, "maintenance_repo_roots", ()) or ()),
+        ):
+            path = os.path.abspath(os.path.expanduser(str(candidate)))
+            if os.path.isdir(path):
+                roots.add(path)
+        return roots
+
+    def _refresh_watched_roots(self, resolved: Iterable[str | None]) -> None:
+        """Recompute the watched set from one poll tick's resolution."""
+
+        resolved_set = set(resolved)
+        # A root stays watched while configuration still names it, while it is
+        # still resolving, or while it still owns tracked state. Historical
+        # observation/degradation keys are NOT enough on their own: unioning
+        # them back every tick meant a root deliberately removed from
+        # ``maintenance_repo_roots`` was remembered forever and reported as
+        # dropped, so the header stayed partial after an intentional config
+        # change (BOU-3095 PR #169 round 7).
+        live: set[str | None] = set(self._configured_roots())
+        live |= resolved_set
+        live |= set(self._pr_root.values())
+        for root in (
+            set(self._open_set_last_observed)
+            | set(self._open_set_degraded_reason)
+        ) - live:
+            self._open_set_last_observed.pop(root, None)
+            self._open_set_degraded_reason.pop(root, None)
+            self._probe_projection.pop(root, None)
+            self._metadata_validators.pop(root, None)
+            self._metadata_validator_truncated.pop(root, None)
+            self.log(
+                f"Repo root {root} is no longer configured or tracked; "
+                "dropping its observation history",
+                level="info",
+            )
+        self._watched_roots = live
+        # Kept separately so freshness can tell "watched but not resolved this
+        # tick" from "watched and resolving fine". A root that resolved before
+        # and has since vanished keeps a stale observation timestamp, so
+        # observation alone cannot detect it (round-3 review).
+        self._resolved_roots = resolved_set
+
+    def open_set_freshness(self) -> ObservationFreshness:
+        """How current the board's open-PR set actually is.
+
+        Reports the OLDEST root's observation, because the board mixes repos and
+        the age shown has to be true for everything on it. ``observed_at`` is
+        ``None`` until some root has been observed at least once.
+
+        This is deliberately distinct from the header's "Live" chip, which
+        tracks whether the browser's poll of *localhost* is succeeding
+        (BOU-2193). A board can poll perfectly while showing hours-old GitHub
+        state — that is the failure BOU-3095 reported.
+        """
+
+        # Read the cached watched set — never resolve here. This runs on the
+        # request path for every partial poll (BOU-3095 PR #169 review round 4).
+        known = set(self._watched_roots)
+        if not known:
+            # Before the first poll tick has populated the cache, fall back to
+            # configuration, which is a stat rather than a git call.
+            known = set(self._configured_roots()) or {self.repo_cwd}
+        observed = [
+            self._open_set_last_observed[root]
+            for root in known
+            if root in self._open_set_last_observed
+        ]
+        # "Watched but never observed" is the single completeness test, and it
+        # covers both shapes the reviews found: a root that resolved before and
+        # has since disappeared, and a configured root whose very first
+        # resolution failed so it was never seen at all.
+        unobserved = [root for root in known if root not in self._open_set_last_observed]
+        # A root that resolved before and has since disappeared keeps a stale
+        # observation timestamp, so "never observed" cannot catch it — compare
+        # against what actually resolved on the last tick.
+        dropped = (
+            [root for root in known if root not in self._resolved_roots]
+            if self._resolved_roots
+            else []
+        )
+        reasons = [
+            self._open_set_degraded_reason[root]
+            for root in known
+            if root in self._open_set_degraded_reason
+        ]
+        if not reasons and (unobserved or dropped):
+            missing = len({*unobserved, *dropped})
+            reasons.append(
+                f"{missing} watched repo root(s) are not being refreshed and "
+                "may be absent from the board"
+            )
+        return ObservationFreshness(
+            # The oldest root bounds the whole board: the age shown has to be
+            # true for everything on it.
+            observed_at=min(observed) if observed else None,
+            degraded_reason=reasons[0] if reasons else None,
+            complete=not unobserved and not dropped,
+        )
+
+    def _note_open_set_unobserved(self, root: str | None, reason: str) -> None:
+        """Record why this root's open set could not be observed.
+
+        A successful observation clears it (see :meth:`_refresh_repo`). Without
+        this, a daemon that starts while discovery is quota-denied never records
+        a reason and the header renders a calm "PR data loading" forever —
+        exactly the outage the indicator exists to expose.
+        """
+
+        self._open_set_degraded_reason[root] = reason
+
+    def _merge_probe_activity(
+        self, root: str | None, probe_prs: list[dict]
+    ) -> None:
+        """Carry the probe's ``updatedAt`` into the cached rich list.
+
+        A cheap validation pass deliberately does not replace the cached list —
+        the REST body has no ``reviewDecision`` and would erase GraphQL-only
+        fields. But ``updatedAt`` is the change signal
+        :meth:`_note_pr_activity` reads, and it is only meaningful if it is the
+        current one, so merge exactly that field and nothing else.
+        """
+
+        cached = self._metadata_cache.get(root)
+        if not cached:
+            return
+        fresh = {
+            raw["number"]: raw["updatedAt"]
+            for raw in probe_prs
+            if isinstance(raw.get("number"), int)
+            and isinstance(raw.get("updatedAt"), str)
+            and raw["updatedAt"]
+        }
+        if not fresh:
+            return
+        for raw in cached:
+            updated_at = fresh.get(raw.get("number"))
+            if updated_at:
+                raw["updatedAt"] = updated_at
+
+    def _note_pr_activity(
+        self,
+        key: PRKey,
+        observation_key: ObservationKey,
+        raw: dict,
+        now: datetime,
+        *,
+        newly_discovered: bool,
+    ) -> None:
+        """Re-plan the review slice when GitHub says the PR changed.
+
+        ``review_reconciliation_interval`` is one hour per immutable head, so a
+        comment posted or resolved without a push could not move the card's
+        comment count for up to an hour (BOU-3095). ``updatedAt`` is the cheap
+        change signal the open-PR list already carries: when it advances on an
+        unchanged head, something happened that a review scan should see.
+
+        This routes through the same ``handle_event`` path a review webhook
+        would use, so the slice mapping and the debounce window stay in one
+        place — the re-scan therefore lands on the next poll tick rather than
+        this one. A PR whose ``updatedAt`` has not moved is left alone, so the
+        hourly floor still bounds background spend on quiet PRs.
+
+        Note where the value comes from: ``PR_SNAPSHOT_FIELDS`` does NOT request
+        ``updatedAt``, so the rich ``gh pr list`` payload has none and
+        :meth:`_cache_metadata` drops the merged value every time it replaces
+        the cache. That is fine and deliberate — the REST probe is the source of
+        this signal, and it supplies it exactly when it matters: the conditional
+        response body contains every open PR's ``updated_at``, so a comment
+        changes the body, changes the ETag, and the probe returns 200 rather
+        than 304. ``_pr_last_updated_at`` survives the cache replacement, so the
+        re-supplied value does not read as a spurious change. Do not "fix" the
+        wipe by adding ``updatedAt`` to ``PR_SNAPSHOT_FIELDS`` without checking
+        ``_SNAPSHOT_SERVABLE_FIELDS`` and the snapshot-shape tests.
+        """
+
+        updated_at = raw.get("updatedAt")
+        if not isinstance(updated_at, str) or not updated_at:
+            return
+        previous = self._pr_last_updated_at.get(key)
+        self._pr_last_updated_at[key] = updated_at
+        if previous is not None and updated_at <= previous:
+            return
+        if previous is None and newly_discovered:
+            # First sight of a brand-new PR: its INITIAL plan already requests
+            # every slice, so there is nothing to invalidate. Just seed.
+            return
+        if previous is None:
+            # A PR we already track, seeing its first timestamp. Because
+            # PR_SNAPSHOT_FIELDS omits updatedAt, this is the normal state after
+            # startup — and if the REST 200 that produced it was itself caused by
+            # a comment, swallowing it loses the only signal that PR changed
+            # (BOU-3095 PR #169 review). Later probes would see the same value
+            # and do nothing. Be conservative and treat it as a change.
+            self.log(
+                f"Seeding review baseline for PR #{key[1]} from its first REST "
+                "timestamp; re-planning review to avoid missing a change that "
+                "predates it",
+                pr_number=key[1],
+                level="info",
+            )
+        self.observation_controller.handle_event(
+            "pull_request_review",
+            observation_key.repo,
+            observation_key.number,
+            observation_key.head_sha,
+            now=now,
+        )
+        # Match the webhook path. Invalidating the slice without revoking its
+        # authority leaves the previous REVIEW observation reportable, so a
+        # quota-deferred re-read can keep a resolved thread showing as
+        # actionable, or leave a newly-commented PR CLEAN (PR #169 review).
+        self._revoke_event_blocker_authority(
+            observation_key, "pull_request_review", None
+        )
+
+    def _list_validation_due(self, root: str | None, now: datetime) -> bool:
+        """Whether the cheap conditional open-PR validator should run.
+
+        This clock is deliberately separate from the rich relist's (BOU-3095).
+        It is stamped on every attempt, successful or not — but the interval is
+        short, so a failed probe costs one validation window rather than a full
+        15-minute reconciliation interval in which nothing can be pruned.
+
+        A root with no cached metadata is not validated here: there is nothing
+        to validate, and ``_metadata_refresh_due`` already owns the cold-start
+        fast retry.
+        """
+
+        if root not in self._metadata_cache:
+            return False
+        last_attempt = self._list_validation_last_attempt.get(root)
+        return last_attempt is None or now >= last_attempt + LIST_VALIDATION_INTERVAL
 
     def _metadata_refresh_due(self, root: str | None, now: datetime, *, force: bool) -> bool:
         """Whether ``root`` needs a real, successful-capable metadata read."""
@@ -1031,7 +1407,11 @@ class Orchestrator:
                 self._weekly_runner_summary_polled_at = now
                 github_api.save_runner_execution_summary_cache(runner_summary, now.isoformat())
 
-        for root in self._repo_roots():
+        resolved_roots = self._repo_roots()
+        # Recompute what we consider ourselves responsible for once per tick, so
+        # rendering can read it without resolving anything (round-4 review).
+        self._refresh_watched_roots(resolved_roots)
+        for root in resolved_roots:
             try:
                 await self._refresh_repo(root, now, force=force)
             except Exception as exc:
@@ -1079,6 +1459,9 @@ class Orchestrator:
                 level="warn",
             )
             self._metadata_last_attempt[root] = now
+            self._note_open_set_unobserved(
+                root, f"rich metadata deferred: quota {decision.reason.value}"
+            )
             return self._metadata_cache.get(root), False
 
         reservation = self.quota_ledger.reserve(
@@ -1092,6 +1475,9 @@ class Orchestrator:
                 level="warn",
             )
             self._metadata_last_attempt[root] = now
+            self._note_open_set_unobserved(
+                root, "rich metadata deferred: quota admission changed"
+            )
             return self._metadata_cache.get(root), False
 
         list_error: Exception | None = None
@@ -1137,17 +1523,22 @@ class Orchestrator:
                 f" (GitHub API unavailable{detail})",
                 level="error",
             )
+            self._note_open_set_unobserved(
+                root, f"could not list open PRs{detail}"
+            )
             return self._metadata_cache.get(root), False
 
         raw_prs = [raw for raw in listed_prs if isinstance(raw, dict)]
         self._record_estimated_success(context, reservation)
         await self._cache_metadata(root, raw_prs, now)
         if bootstrap:
-            await self._bootstrap_metadata_validator(root)
+            await self._bootstrap_metadata_validator(root, now)
         self.observed_roots.add(root)
         return raw_prs, True
 
-    async def _bootstrap_metadata_validator(self, root: str | None) -> None:
+    async def _bootstrap_metadata_validator(
+        self, root: str | None, now: datetime
+    ) -> None:
         """Capture a REST validator after the first rich discovery.
 
         ``gh pr list`` does not expose response headers, so the first rich
@@ -1181,7 +1572,63 @@ class Orchestrator:
         except Exception:  # noqa: BLE001 - validator is an optimization
             return
         if probe.observable and (probe.etag or probe.last_modified):
+            # This is a SECOND request, issued after the rich snapshot was
+            # already cached. If the open set moved in the gap, the validator
+            # describes a newer world than the cache it is stored against — and
+            # every later 304 would confirm (and re-observe) that already-stale
+            # cache (BOU-3095 PR #169 review round 5).
+            #
+            # Scheduling a relist is not enough on its own: the 304 branch only
+            # spends a rich relist once the HOURLY interval is up, so an
+            # event-forced refresh would be answered by another 304. Discard the
+            # validator instead, so the next probe is a body-bearing 200 that
+            # actually reconciles the cache.
+            #
+            # A truncated body cannot be compared, so it is not evidence of a
+            # mismatch; its 304s are already barred from counting as
+            # observations by the truncation guard.
+            # Carry the bootstrap body's activity timestamps into the cache
+            # before anything else. A comment landing between the rich list and
+            # this second request leaves the open NUMBERS identical, so the
+            # mismatch check below passes and this ETag is stored — and since
+            # production rich snapshots carry no ``updatedAt``, every later probe
+            # is then a 304 that never delivers it, so ``_note_pr_activity``
+            # never sees the change and the review slice is never re-planned
+            # (round-11 review). Merging costs nothing and closes that window.
+            if probe.changed:
+                self._merge_probe_activity(root, probe.prs)
+            cached = self._metadata_cache.get(root)
+            mismatched = (
+                probe.changed
+                and not probe.truncated
+                and cached is not None
+                and _open_numbers(probe.prs) != _open_numbers(cached)
+            )
+            if mismatched:
+                self.log(
+                    f"Bootstrap validator for {root} disagrees with the rich "
+                    "snapshot it was captured against; forcing a relist",
+                    level="warn",
+                )
+                self._metadata_validators.pop(root, None)
+                self._metadata_validator_truncated.pop(root, None)
+                self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                return
             self._metadata_validators[root] = (probe.etag, probe.last_modified)
+            self._metadata_validator_truncated[root] = probe.truncated
+
+    def _rich_read(
+        self, raw_prs: list[dict] | None, rich_read: bool
+    ) -> _MetadataRead:
+        """Wrap a rich-relist result, deriving its authoritative open set.
+
+        A successful rich list is authoritative about which PRs are open; a
+        failed or quota-denied one proves nothing and must not prune.
+        """
+
+        if rich_read and raw_prs is not None:
+            return _MetadataRead(raw_prs, True, _open_numbers(raw_prs), observed=True)
+        return _MetadataRead(raw_prs, rich_read, None)
 
     async def _read_metadata(
         self,
@@ -1189,11 +1636,21 @@ class Orchestrator:
         now: datetime,
         *,
         force: bool,
-    ) -> tuple[list[dict] | None, bool]:
-        """Read metadata using rich discovery or a conditional REST validator."""
+        rich_due: bool = True,
+    ) -> _MetadataRead:
+        """Read metadata using rich discovery or a conditional REST validator.
+
+        ``rich_due`` is whether the *expensive* clock says a GraphQL relist is
+        owed. When it is False this call is a cheap validation pass on
+        ``LIST_VALIDATION_INTERVAL``: it may prune from the probe's own
+        authoritative open-PR list, but it must not spend GraphQL and must not
+        advance the rich relist's clocks (BOU-3095).
+        """
 
         if force or root not in self._metadata_cache:
-            return await self._rich_metadata_list(root, now, force=force)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         # Lightweight test/embedding adapters historically replace the rich
         # list boundary but do not provide a REST probe. Preserve that adapter
@@ -1203,13 +1660,21 @@ class Orchestrator:
             github_api.list_open_prs.__module__ != github_api.__name__
             and github_api.probe_open_prs_rest.__module__ == github_api.__name__
         ):
-            return await self._rich_metadata_list(root, now, force=force)
+            if not rich_due:
+                return _MetadataRead(self._metadata_cache[root], False, None)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         identity = self._root_repo_identity.get(root, "")
         if "/" not in identity:
             # A legacy fixture may have supplied metadata without a URL.  The
             # rich list is the only way to establish a REST repository target.
-            return await self._rich_metadata_list(root, now, force=force)
+            if not rich_due:
+                return _MetadataRead(self._metadata_cache[root], False, None)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         owner, repo_name = identity.split("/", 1)
         etag, last_modified = self._metadata_validators.get(root, (None, None))
@@ -1226,14 +1691,26 @@ class Orchestrator:
             probe = github_api.ConditionalPRListProbe(
                 None, [], etag=etag, last_modified=last_modified, error=str(exc)
             )
-        self._metadata_last_attempt[root] = now
+        # The cheap validator has its own clock. Only a probe run because the
+        # rich clock was owed may stamp that clock — otherwise a 60-second
+        # validator would keep resetting the 15-minute reconciliation and the
+        # rich relist would never come due (BOU-3095).
+        self._list_validation_last_attempt[root] = now
+        if rich_due:
+            self._metadata_last_attempt[root] = now
         if probe.not_modified:
             self._metadata_validators[root] = (
                 probe.etag or etag,
                 probe.last_modified or last_modified,
             )
+            # A 304 revalidates the representation the ETag was built from. If
+            # that was a full first page, an older tracked PR outside it can
+            # close without changing page 1 — so this confirms a page, not the
+            # open set, and must not refresh the observation timestamp
+            # (BOU-3095 PR #169 review round 4).
+            validator_complete = not self._metadata_validator_truncated.get(root, False)
             last_rich = self._metadata_last_rich_success.get(root)
-            if (
+            if rich_due and (
                 last_rich is None
                 or now >= last_rich + RICH_METADATA_RECONCILIATION_INTERVAL
             ):
@@ -1241,9 +1718,19 @@ class Orchestrator:
                 # unchanged, but it cannot validate GraphQL-only fields such
                 # as reviewDecision or mergeability. Periodically refresh the
                 # rich snapshot independently of that validator.
-                return await self._rich_metadata_list(
-                    root, now, force=force, bootstrap=False
+                return self._rich_read(
+                    *await self._rich_metadata_list(
+                        root, now, force=force, bootstrap=False
+                    )
                 )
+            cached = self._metadata_cache[root]
+            if not rich_due:
+                # A cheap confirmation that nothing changed. It is not a
+                # metadata reconciliation, so it must not advance the expensive
+                # clocks — and it yields no authoritative open set, because only
+                # a successful rich relist may drive pruning. Nothing to prune
+                # here anyway: a 304 means the open list is byte-identical.
+                return _MetadataRead(cached, False, None, observed=validator_complete)
             self._metadata_last_success[root] = now
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:
@@ -1263,9 +1750,101 @@ class Orchestrator:
             # A validator-confirmed 304 is an authoritative metadata
             # observation. The cached list is unchanged, but the controller
             # must acknowledge any metadata invalidation carried by this plan.
-            return self._metadata_cache[root], True
+            # It still supplies no open set: pruning is reserved for a
+            # successful rich relist, and a 304 has nothing to prune.
+            cached = self._metadata_cache[root]
+            return _MetadataRead(cached, True, None, observed=validator_complete)
 
         if probe.changed:
+            # The 200 body is an authoritative, author-filtered open-PR list in
+            # its own right. Derive the open set from it FIRST, so a merged PR
+            # leaves the board even when the rich relist below is deferred or
+            # quota-denied — that deferral is exactly how a merged PR used to
+            # sit on the board for hours (BOU-3095).
+            cached = self._metadata_cache[root]
+            # Compare BEFORE merging: _merge_probe_activity copies the probe's
+            # updatedAt into the cache, which would erase the difference we are
+            # about to look for.
+            projection = _tracked_projection(probe.prs)
+            previous = self._probe_projection.get(root)
+            if previous is None:
+                previous = _tracked_projection(cached)
+            # Truncation is UNCERTAINTY, not a declared change. Folding it in
+            # here meant a repository with more than one page of open PRs — where
+            # ``truncated`` is permanently true — declared every 200 a tracked
+            # change and bypassed this comparison entirely, restoring the
+            # round-6 quota drain in exactly the busy repositories where it costs
+            # most (round-11 review).
+            #
+            # Truncation still does its work where it belongs: it bars the probe
+            # from counting as an observation (so the freshness label ages
+            # honestly while PRs outside page 1 are unseen) and from having its
+            # validator adopted. It just no longer manufactures change events.
+            projection_changed = projection != previous
+            # The baseline is "what has been RECONCILED", not "what was last
+            # seen". Advancing it here would forget a detected change whose
+            # relist then failed or was quota-denied: the pending event gets
+            # postponed by a full reconciliation interval and later probes,
+            # comparing against the new baseline, see nothing to re-schedule
+            # (BOU-3095 PR #169 round 8). It is committed after a successful
+            # rich read instead.
+            self._merge_probe_activity(root, probe.prs)
+            if not rich_due:
+                # The probe is a CHANGE DETECTOR, never an authority on removal.
+                #
+                # Three review rounds found three different ways for a
+                # page-limited, author-filtered REST body to be wrong about
+                # which PRs are open — an App-spelled author matching nothing,
+                # a full first page hiding an older PR, an empty body during an
+                # outage — and each one prunes real PRs off the board. Rather
+                # than keep adding guards for individual instances, only a
+                # successful rich relist may ever produce an authoritative open
+                # set (BOU-3095 PR #169 review round 3). The probe's job is to
+                # notice that something moved and get that relist scheduled
+                # promptly, which is what keeps a merged PR clearing in about a
+                # minute instead of fifteen.
+                #
+                # "Moved" means OUR projection moved. A raw 200 is not enough:
+                # another author's activity flips it in a busy repo, and when no
+                # ETag can be installed at all every probe is a 200 — either way
+                # scheduling unconditionally would spend a rich GraphQL relist
+                # every ~60s per root, draining the very budget whose exhaustion
+                # caused this ticket (round-6 review).
+                if projection_changed:
+                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                else:
+                    # Adopt the new validator. Without this, an ETag moved by
+                    # another author is never accepted on the cheap path, so
+                    # every window re-sends the obsolete one and downloads a
+                    # full 200 body instead of settling back to 304s — REST
+                    # quota and bandwidth, once per window, until a rich
+                    # reconciliation happens to refresh it (round-10 review).
+                    #
+                    # Safe precisely BECAUSE the projection was confirmed
+                    # unchanged: the tracked PRs are identical, so this is not
+                    # accepting a validator against an un-ingested list. Not
+                    # done when the projection changed (a later 304 would hide
+                    # the pending change) nor when truncated (nothing was
+                    # confirmed) — both pinned by tests.
+                    if not probe.truncated and (probe.etag or probe.last_modified):
+                        self._metadata_validators[root] = (
+                            probe.etag or etag,
+                            probe.last_modified or last_modified,
+                        )
+                        self._metadata_validator_truncated[root] = False
+                # An UNCHANGED projection behind a 200 is a successful
+                # confirmation that our open set is current — the 200 only means
+                # the repo-wide page moved, which is a different question. Not
+                # counting it aged the freshness label while every probe was
+                # succeeding (round-8 review). A changed projection is NOT an
+                # observation of the board: it says the board is out of date and
+                # has not been reconciled yet. Truncation cannot confirm either.
+                return _MetadataRead(
+                    cached,
+                    False,
+                    None,
+                    observed=not projection_changed and not probe.truncated,
+                )
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
             )
@@ -1274,19 +1853,46 @@ class Orchestrator:
                     probe.etag or etag,
                     probe.last_modified or last_modified,
                 )
-            return raw_prs, rich_read
+                # Remember whether the page this validator was built from was
+                # complete: a later 304 revalidates only that page.
+                self._metadata_validator_truncated[root] = probe.truncated
+                # This is the tick on which the probe actually saw a change, and
+                # the rich list carries no ``updatedAt`` at all. Dropping the
+                # probe's timestamps here loses the activity signal precisely
+                # when it exists — and the validator has just been advanced, so
+                # the following probes come back 304 and the review slice is
+                # never invalidated (BOU-3095 PR #169 review). Merge them into
+                # the freshly cached list and return that, so ``_note_pr_activity``
+                # sees them.
+                self._merge_probe_activity(root, probe.prs)
+                merged = self._metadata_cache.get(root)
+                # The change has now been reconciled into the projection, so
+                # this is the point at which the comparison baseline may
+                # advance (round-8 review).
+                self._probe_projection[root] = _tracked_projection(
+                    merged if merged is not None else (raw_prs or [])
+                )
+                if merged is not None:
+                    return _MetadataRead(merged, True, _open_numbers(merged), observed=True)
+                return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []), observed=True)
+            # The relist failed or was quota-denied. The probe detected a change
+            # but cannot say what it was, so nothing may be pruned on it.
+            return _MetadataRead(raw_prs, False, None)
 
         # Keep the old validator when the probe failed.  Reusing a new ETag
         # from a failed/partial response could turn a temporary outage into a
         # permanent 304 and leave the dashboard stale forever.
         detail = probe.error or "REST open-PR probe unavailable"
+        self._open_set_degraded_reason[root] = detail
         self.log(
             f"Skipping metadata reconciliation for {root}: {detail}",
             level="warn",
         )
-        # ``_metadata_last_attempt`` is the 15-minute backoff clock.  The raw
-        # cache remains authoritative for projection but cannot prove pruning.
-        return self._metadata_cache[root], False
+        # The raw cache remains authoritative for projection but cannot prove
+        # pruning. The failure costs one validation window, not a full
+        # reconciliation interval — ``_list_validation_last_attempt`` is what
+        # was stamped above.
+        return _MetadataRead(self._metadata_cache[root], False, None)
 
     async def _refresh_repo(
         self, root: str | None, now: datetime, *, force: bool = False
@@ -1299,42 +1905,51 @@ class Orchestrator:
         whose poll just failed) are never dropped.
         """
         metadata_due = self._metadata_refresh_due(root, now, force=force)
+        # The cheap conditional validator runs on its own fast clock, so a
+        # merged PR is pruned within a validation window instead of waiting out
+        # the rich relist's reconciliation interval (BOU-3095).
+        validation_due = not metadata_due and self._list_validation_due(root, now)
         raw_prs: list[dict] | None
         metadata_read = False
-        if metadata_due:
-            raw_prs, metadata_read = await self._read_metadata(
-                root, now, force=force
+        open_numbers: set[int] | None = None
+        observed = False
+        if metadata_due or validation_due:
+            read = await self._read_metadata(
+                root, now, force=force, rich_due=metadata_due
             )
+            raw_prs = read.raw_prs
+            metadata_read = read.rich_read
+            open_numbers = read.open_numbers
+            observed = read.observed
             if raw_prs is None:
                 return
-            event_due = self._metadata_event_due.get(root)
-            if (
-                not metadata_read
-                and event_due is not None
-                and now >= event_due
-            ):
-                self._metadata_event_due[root] = now + self._metadata_interval()
-            if not metadata_read:
-                if self._has_pending_opened(root, now):
-                    self._opened_event_retry_due[root] = (
-                        now + METADATA_COLD_START_RETRY_INTERVAL
-                    )
-                else:
-                    self._opened_event_retry_due.pop(root, None)
+            if metadata_due:
+                event_due = self._metadata_event_due.get(root)
+                if (
+                    not metadata_read
+                    and event_due is not None
+                    and now >= event_due
+                ):
+                    self._metadata_event_due[root] = now + self._metadata_interval()
+                if not metadata_read:
+                    if self._has_pending_opened(root, now):
+                        self._opened_event_retry_due[root] = (
+                            now + METADATA_COLD_START_RETRY_INTERVAL
+                        )
+                    else:
+                        self._opened_event_retry_due.pop(root, None)
         else:
             raw_prs = self._metadata_cache.get(root)
             if raw_prs is None:
                 return
 
-        # Prune merged/closed PRs FIRST, but only after a successful metadata
-        # list. A cached list is observationally useful yet cannot prove that a
-        # missing PR is closed, so it must never prune current state.
-        if metadata_read:
-            open_numbers = {
-                raw["number"]
-                for raw in raw_prs
-                if isinstance(raw.get("number"), int)
-            }
+        # Prune merged/closed PRs FIRST, but only against a positively observed
+        # open set. A cached list is observationally useful yet cannot prove
+        # that a missing PR is closed, so it must never prune current state.
+        if observed:
+            self._open_set_last_observed[root] = now
+            self._open_set_degraded_reason.pop(root, None)
+        if open_numbers is not None:
             for key in list(self.prs.keys()):
                 if self._pr_root.get(key) != root:
                     continue
@@ -1344,11 +1959,31 @@ class Orchestrator:
                     self._observation_keys.pop(key, None)
                     self._event_head_overrides.pop(key, None)
                     self._event_head_override_observed_at.pop(key, None)
+                    self._pr_last_updated_at.pop(key, None)
                     self.log(
                         f"PR #{key[1]} closed/merged: {old.title}",
                         pr_number=key[1],
                         level="success",
                     )
+            # The projection below rebuilds ``self.prs`` from ``raw_prs``. When
+            # the open set came from the cheap validator the cached rich list is
+            # still the pre-merge one, so without this the PR just pruned would
+            # be re-discovered on the same tick. Narrow the cache to the
+            # observed open set so it stays consistent until the next rich
+            # relist replaces it wholesale.
+            if any(
+                isinstance(raw.get("number"), int)
+                and raw["number"] not in open_numbers
+                for raw in raw_prs
+            ):
+                raw_prs = [
+                    raw
+                    for raw in raw_prs
+                    if isinstance(raw.get("number"), int)
+                    and raw["number"] in open_numbers
+                ]
+                if root in self._metadata_cache:
+                    self._metadata_cache[root] = raw_prs
 
         # Drop the previous tick's batch entries before planning. A CI-only
         # refresh must reach the live CI accessor rather than reusing a stale
@@ -1370,6 +2005,7 @@ class Orchestrator:
 
             # Get or create PR data
             pr = self.prs.get(key)
+            newly_discovered = pr is None
             if pr is None:
                 pr = PRData(
                     number=num,
@@ -1410,6 +2046,9 @@ class Orchestrator:
                 observation_repo, observation_number, head_sha
             )
             self._observation_keys[key] = observation_key
+            self._note_pr_activity(
+                key, observation_key, raw, now, newly_discovered=newly_discovered
+            )
             plan = self.observation_controller.plan_for(
                 observation_key.repo,
                 observation_key.number,

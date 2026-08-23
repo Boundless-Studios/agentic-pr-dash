@@ -34,6 +34,7 @@ from .models import (
     humanize_relative,
     worktree_started_at,
 )
+from . import orchestrator as _orchestrator_module
 from .orchestrator import Orchestrator
 from .quota import QuotaDecisionReason, QuotaTelemetry
 from .runner_monitor import get_runner_fleet_load
@@ -81,6 +82,103 @@ def _asset_version() -> str:
         except OSError:
             continue
     return h.hexdigest()[:8]
+
+
+def _stale_after_seconds() -> float:
+    """Age past which the board should say its data is old.
+
+    Three validation windows: one missed probe is noise, three is a pattern.
+    Derived rather than hardcoded, because ``APD_LIST_VALIDATION_INTERVAL_S`` is
+    tunable — a fixed 180s would call healthy data stale two minutes before the
+    next probe was even due at a five-minute interval, and would sit through
+    eighteen missed probes at a ten-second one (BOU-3095 PR #169 review round 4).
+    """
+
+    return 3 * _orchestrator_module.LIST_VALIDATION_INTERVAL.total_seconds()
+
+
+def _format_observation_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _observation_context() -> dict[str, object]:
+    """Age of the board's GitHub observation, for the header indicator.
+
+    Deliberately not derived from any PR's ``updatedAt``: that value travels
+    inside the payload, so a stale board quotes a stale timestamp and reads as
+    plausibly recent. This is the age of the observation itself.
+    """
+
+    freshness = orchestrator.open_set_freshness()
+    age = freshness.age_seconds(orchestrator.observation_controller.now())
+    if age is None:
+        # Never observed. That is "still starting up" only until an attempt has
+        # actually failed — a daemon that starts while discovery is quota-denied
+        # would otherwise show a calm, non-stale "loading" forever, which is
+        # precisely the outage this indicator exists to expose (BOU-3095
+        # PR #169 review).
+        reason = freshness.degraded_reason
+        if reason:
+            return {
+                "known": False,
+                "stale": True,
+                "label": "PR data unavailable",
+                "detail": reason,
+            }
+        return {
+            "known": False,
+            "stale": False,
+            "label": "PR data loading",
+            "detail": "no GitHub observation yet",
+        }
+    stale = age > _stale_after_seconds() or not freshness.complete
+    label = f"PR data {_format_observation_age(age)} old"
+    if not freshness.complete:
+        label = f"{label} (partial)"
+    detail = freshness.degraded_reason or (
+        "some watched repositories have not been observed yet"
+        if not freshness.complete
+        else "GitHub open-PR set observed this recently"
+    )
+    return {"known": True, "stale": stale, "label": label, "detail": detail}
+
+
+def _open_set_is_complete() -> bool:
+    """Whether every watched repo root's open set has been observed."""
+
+    freshness = orchestrator.open_set_freshness()
+    return freshness.observed_at is not None and freshness.complete
+
+
+def _with_header_oob(
+    ctx: dict[str, object], *, board_oob: bool = False
+) -> dict[str, object]:
+    """Context for an HTMX partial that must refresh the shared header.
+
+    Every polled partial needs this: the header lives outside each tab's swap
+    target, so a tab that omits it renders the freshness indicator once and then
+    freezes it — which reads as "current" right through an outage (BOU-3095).
+
+    Always COPIES. ``_dashboard_context_async`` hands back the cached dict, and
+    setting these flags on it in place leaks them into later full-page renders,
+    which then emit a duplicate slot id — and htmx swaps the first match.
+
+    ``observation`` is recomputed so the swapped-in value reflects this request
+    rather than whenever the context was last built.
+    """
+
+    extra: dict[str, object] = {
+        "observation_oob": True,
+        "observation": _observation_context(),
+    }
+    if board_oob:
+        extra["board_oob"] = True
+    return {**ctx, **extra}
 
 
 def _quota_context(telemetry: QuotaTelemetry) -> dict[str, object]:
@@ -1186,6 +1284,7 @@ def _dashboard_context_from_cards(
     *,
     show_agent_worktrees: bool,
     active_tab: str,
+    loaded: bool = True,
 ) -> dict[str, object]:
     runner_summary = orchestrator.weekly_runner_execution_summary
     runner_issues = _runner_issues(cards)
@@ -1217,6 +1316,23 @@ def _dashboard_context_from_cards(
         "no_pr_cards": no_pr_cards(cards),
         "quota": _quota_context(orchestrator.quota_telemetry),
         "asset_version": _asset_version(),
+        # An empty board asserts "you have no PRs", which is the most wrong
+        # thing this dashboard can say; the template renders a loading state
+        # instead (BOU-3095).
+        #
+        # It takes BOTH the local card scan finishing and GitHub actually having
+        # been observed. The local scan is independent of GitHub, so a daemon
+        # starting during an outage would otherwise complete its scan, mark the
+        # board loaded, and render confident "No worktrees" columns for the whole
+        # outage — the false-empty board arriving through a second door
+        # (PR #169 review round 4).
+        # ``complete`` as well as ``observed_at``: in a multi-repo deployment the
+        # anchor can be observed while a configured sibling is not, and an empty
+        # board is then not an answer about the watched set — it is an answer
+        # about the half that replied (round-8 review). Cards still render
+        # either way; this only governs the count and the empty-state text.
+        "board_loaded": loaded and _open_set_is_complete(),
+        "observation": _observation_context(),
     }
 
 
@@ -1345,6 +1461,15 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
         "board_partial_url": "/partials/board?show_agents=1" if show_agent_worktrees else "/partials/board",
         "runner_issues_partial_url": "/partials/runner-issues?show_agents=1" if show_agent_worktrees else "/partials/runner-issues",
         "asset_version": _asset_version(),
+        # This tab builds its own context rather than going through
+        # _dashboard_context_from_cards, so the shared header include would
+        # otherwise fall back to "PR data loading" forever on it (BOU-3095
+        # PR #169 review). The board's out-of-band swap does not reach this tab,
+        # so the value is correct at render and refreshes on the tab's own poll.
+        "observation": _observation_context(),
+        # Same rule as the board: this tab's panels are equally wrong if they
+        # render as authoritative before GitHub has been observed.
+        "board_loaded": _open_set_is_complete(),
     }
 
 
@@ -1362,10 +1487,16 @@ async def _dashboard_context_async(
     cached = _dashboard_context_cache.get(key)
     if cached is None:
         # A cold process has no materialized worktree/session snapshot yet.
-        # Serve a valid empty board immediately and let the normal stale-cache
-        # path populate it in the background. Browser polling replaces this
-        # skeleton as soon as discovery completes, while a slow local scan can
-        # no longer make the dashboard look dead after an upgrade/restart.
+        # Serve a valid board skeleton immediately and let the normal
+        # stale-cache path populate it in the background. Browser polling
+        # replaces this skeleton as soon as discovery completes, while a slow
+        # local scan can no longer make the dashboard look dead after an
+        # upgrade/restart.
+        #
+        # The skeleton is marked NOT loaded (BOU-3095): rendered as a normal
+        # empty board it claimed "no worktrees" in every column, so a forced
+        # refresh — which clears this cache — made the dashboard assert zero
+        # PRs for as long as the rebuild took.
         cached = (
             0.0,
             _dashboard_context_from_cards(
@@ -1374,6 +1505,7 @@ async def _dashboard_context_async(
                 0,
                 show_agent_worktrees=show_agent_worktrees,
                 active_tab=active_tab,
+                loaded=False,
             ),
         )
         _dashboard_context_cache[key] = cached
@@ -1385,11 +1517,26 @@ async def _dashboard_context_async(
         context_func = runner_dashboard_context if active_tab == "runner_issues" else dashboard_context
 
         async def rebuild() -> dict[str, object]:
-            context = await asyncio.to_thread(
-                context_func,
-                show_agent_worktrees=show_agent_worktrees,
-                active_tab=active_tab,
-            )
+            try:
+                context = await asyncio.to_thread(
+                    context_func,
+                    show_agent_worktrees=show_agent_worktrees,
+                    active_tab=active_tab,
+                )
+            except Exception as exc:  # noqa: BLE001 — a failed rebuild must be visible
+                # Nothing awaits this task once a cached context exists, so an
+                # exception here was silently swallowed and the cold skeleton
+                # could persist across polls with no explanation (BOU-3095).
+                orchestrator.log(
+                    f"Dashboard context rebuild failed: {exc}", level="error"
+                )
+                # Only clear the entry if it is still OURS. A refresh may have
+                # cleared the map and a later poll installed a replacement;
+                # popping that would start duplicate scans and strand the
+                # replacement's result (BOU-3095 PR #169 review).
+                if _dashboard_context_tasks.get(key) is asyncio.current_task():
+                    _dashboard_context_tasks.pop(key, None)
+                raise
             current_task = asyncio.current_task()
             if _dashboard_context_tasks.get(key) is current_task:
                 _dashboard_context_tasks.pop(key, None)
@@ -1837,10 +1984,17 @@ async def pr_dashboard_proof_fixture_worktrees(request: Request, scenario: str):
 async def board_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
     ctx = await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees)
-    # board_oob: emit the out-of-band escalation-banner swap only for the HTMX
-    # partial poll, so the title-bar banner refreshes with the board (the
-    # full-page include must NOT duplicate the slot id) — codex PR #50 review.
-    ctx["board_oob"] = True
+    # board_oob: emit the out-of-band header swaps only for the HTMX partial
+    # poll, so the title-bar banner refreshes with the board (the full-page
+    # include must NOT duplicate the slot id) — codex PR #50 review.
+    #
+    # Copy first. ``_dashboard_context_async`` returns the CACHED dict, so
+    # setting the flag on it in place leaked board_oob=True into every later
+    # full-page render — which emitted the slot twice, and a duplicate id makes
+    # htmx swap the wrong one (BOU-3095). Observed in the browser as the
+    # observation-age indicator rendering both in the header and inside the
+    # board.
+    ctx = _with_header_oob(ctx, board_oob=True)
     return templates.TemplateResponse(
         request=request,
         name="partials/board.html",
@@ -1851,26 +2005,29 @@ async def board_partial(request: Request):
 @app.get("/partials/runner-issues", response_class=HTMLResponse)
 async def runner_issues_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(
+        show_agent_worktrees=show_agent_worktrees,
+        active_tab="runner_issues",
+    )
+    ctx = _with_header_oob(ctx)
     return templates.TemplateResponse(
         request=request,
         name="partials/runner_issues.html",
-        context=await _dashboard_context_async(
-            show_agent_worktrees=show_agent_worktrees,
-            active_tab="runner_issues",
-        ),
+        context=ctx,
     )
 
 
 @app.get("/partials/worktrees", response_class=HTMLResponse)
 async def worktrees_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
+    ctx = await _dashboard_context_async(
+        show_agent_worktrees=show_agent_worktrees,
+        active_tab="worktrees",
+    )
     return templates.TemplateResponse(
         request=request,
         name="partials/worktrees.html",
-        context=await _dashboard_context_async(
-            show_agent_worktrees=show_agent_worktrees,
-            active_tab="worktrees",
-        ),
+        context=_with_header_oob(ctx),
     )
 
 

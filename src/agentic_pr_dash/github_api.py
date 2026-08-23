@@ -113,6 +113,13 @@ class ConditionalPRListProbe:
     etag: str | None = None
     last_modified: str | None = None
     error: str | None = None
+    #: Whether the underlying REST page was full, i.e. there may be open PRs
+    #: this response never saw. The endpoint is repo-wide and paged, and the
+    #: author filter runs *after* the fetch, so on a repo with more than one
+    #: page of open PRs the configured author's older PR can fall outside it.
+    #: A truncated body is still a fine cache validator, but it is NOT an
+    #: authoritative open set and must never drive pruning (BOU-3095 PR #169).
+    truncated: bool = False
 
     @property
     def observable(self) -> bool:
@@ -899,6 +906,36 @@ def _parse_included_rest_response(
     return status, headers, body
 
 
+def _rest_page_is_truncated(
+    headers: dict[str, str], returned: int, per_page: int
+) -> bool:
+    """Whether a REST page leaves more results unseen.
+
+    GitHub advertises further pages with ``Link: <...>; rel="next"`` and omits
+    the header entirely on a single-page result, so the header is authoritative
+    when present. Falling back to ``returned >= per_page`` misreports the exact
+    boundary case — a repository with precisely ``per_page`` open PRs — and that
+    misreport is not harmless: it permanently disqualifies the conditional 304s
+    built on that validator from counting as observations.
+    """
+
+    link = headers.get("link") or headers.get("Link") or ""
+    if 'rel="next"' in link.replace("'", '"'):
+        return True
+    if link:
+        return False
+    # No Link header at all. GitHub omits it on a single-page result, so the
+    # common reading is "complete" — and that is the case the reviewer flagged
+    # (exactly per_page open PRs). A short page is unambiguous either way.
+    #
+    # A proxy that strips Link would make us under-report truncation, but since
+    # the probe can no longer prune anything (only a rich relist may), the worst
+    # case is a slightly optimistic freshness label in a rare setup — far
+    # cheaper than breaking the indicator for every repo sitting exactly on the
+    # page boundary.
+    return False
+
+
 def probe_open_prs_rest(
     owner: str,
     repo: str,
@@ -920,9 +957,10 @@ def probe_open_prs_rest(
     if not owner or not repo:
         return ConditionalPRListProbe(None, [], error="repository identity unavailable")
 
+    per_page = 100
     endpoint = (
         f"repos/{owner}/{repo}/pulls?state=open&sort=updated&direction=desc"
-        "&per_page=100&page=1"
+        f"&per_page={per_page}&page=1"
     )
     cmd = ["gh", "api", "--include", endpoint]
     if etag:
@@ -980,8 +1018,37 @@ def probe_open_prs_rest(
         configured_author = load_config(cwd).pr_author
     configured_author = (configured_author or "").strip()
     if configured_author.casefold() in {"@me", "me"}:
-        configured_author = _rest_viewer_login(cwd)
-    expected_author = configured_author.casefold()
+        resolved_viewer = _rest_viewer_login(cwd)
+        if not resolved_viewer:
+            # ``_rest_viewer_login`` returns "" on any failure, notably a GitHub
+            # App installation token, which cannot call ``/user`` — and its
+            # docstring requires callers to fail closed rather than adopt a PR
+            # whose author they cannot verify.
+            #
+            # Falling through with an empty author skips filtering entirely, so
+            # the "projection" would be every author's PRs. That is wrong on its
+            # own terms, and it feeds the scheduling comparison: unrelated
+            # activity would read as a tracked change and spend a rich GraphQL
+            # relist, reintroducing the drain that comparison prevents
+            # (BOU-3095 PR #169 round 9).
+            return ConditionalPRListProbe(
+                status,
+                [],
+                etag=headers.get("etag") or etag,
+                last_modified=headers.get("last-modified") or last_modified,
+                error=(
+                    "cannot resolve the @me PR author via REST; refusing to "
+                    "report an unfiltered open-PR list"
+                ),
+            )
+        configured_author = resolved_viewer
+    # Canonicalize BOTH sides. A GitHub App identity is spelled ``app/<name>``
+    # in configuration and ``<name>[bot]`` in REST payloads, so a raw casefold
+    # comparison silently matches nothing and the probe reports an empty
+    # open-PR list. That used to cost only a wasted relist; now that the probe
+    # body is authoritative for pruning, it would take every open PR off the
+    # board (BOU-3095 PR #169 review).
+    expected_author = _login_key(configured_author)
     normalized: list[dict] = []
     for item in payload:
         if not isinstance(item, dict):
@@ -989,7 +1056,7 @@ def probe_open_prs_rest(
         if expected_author:
             user = item.get("user")
             login = user.get("login") if isinstance(user, dict) else ""
-            if str(login or "").casefold() != expected_author:
+            if _login_key(str(login or "")) != expected_author:
                 continue
         converted = _normalize_rest_pr_payload(item)
         if converted is not None:
@@ -999,6 +1066,14 @@ def probe_open_prs_rest(
         normalized,
         etag=headers.get("etag") or etag,
         last_modified=headers.get("last-modified") or last_modified,
+        # Truncation is what the Link header says, not what a full page implies:
+        # a repository with exactly ``per_page`` open PRs has a full FIRST page
+        # and no second one, and calling that truncated stops every later 304
+        # counting as an observation, so the freshness indicator goes stale
+        # while every probe is in fact succeeding (BOU-3095 PR #169 round 7).
+        # Without a Link header we genuinely cannot tell, so a full page stays
+        # conservatively truncated.
+        truncated=_rest_page_is_truncated(headers, len(payload), per_page),
     )
 
 
@@ -1687,6 +1762,12 @@ def _normalize_rest_pr_payload(pr: dict) -> dict | None:
         "baseRefName": str(base.get("ref") or ""),
         "mergedAt": pr.get("merged_at"),
         "mergeable": _REST_MERGEABLE_ENUM.get(pr.get("mergeable"), "UNKNOWN"),
+        # GitHub advances ``updated_at`` when a comment is posted or resolved
+        # without a push. That is the only cheap signal the dashboard has that
+        # a review re-scan is worth spending on an otherwise unchanged head
+        # (BOU-3095), so it must survive this REST -> GraphQL field mapping.
+        "createdAt": pr.get("created_at"),
+        "updatedAt": pr.get("updated_at"),
     }
 
 

@@ -1,0 +1,9 @@
+{# Age of the GitHub open-PR observation the board is rendered from.
+
+   Distinct from the "Live" chip beside it: that one reports whether the
+   browser's poll of this server is succeeding (BOU-2193), which says nothing
+   about how old the GitHub data in the response is. A board can poll perfectly
+   while showing hours-old state — the failure BOU-3095 reported. #}
+{% set obs = observation | default({}, true) %}
+<span class="observation-age{% if obs.stale %} observation-age-stale{% endif %}"
+      title="{{ obs.detail | default('', true) }}">{{ obs.label | default('PR data loading', true) }}</span>

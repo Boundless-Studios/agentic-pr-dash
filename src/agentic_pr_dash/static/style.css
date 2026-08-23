@@ -287,6 +287,18 @@ header h1 {
     font-weight: 600;
 }
 
+/* Age of the GitHub observation, not of the local poll (BOU-3095). */
+.observation-age {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.observation-age-stale {
+    color: var(--danger);
+    font-weight: 600;
+}
+
 /* ─── Buttons ────────────────────────────────────────────────────────────── */
 .btn {
     display: inline-flex;
@@ -466,6 +478,13 @@ header h1 {
 }
 
 .column-empty-search[hidden] { display: none; }
+
+/* The board has not observed anything yet — distinct from an observed-empty
+   column, which reads "No worktrees" (BOU-3095). */
+.column-loading {
+    font-style: italic;
+    opacity: 0.75;
+}
 
 /* ─── Cards ──────────────────────────────────────────────────────────────── */
 .card {

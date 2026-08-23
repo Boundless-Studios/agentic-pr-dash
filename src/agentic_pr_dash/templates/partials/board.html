@@ -6,6 +6,7 @@
     {% include 'partials/escalation_banner.html' %}
 </div>
 {% endif %}
+{% include 'partials/observation_age_oob.html' %}
 
 {# ── Ownership summary bar ── #}
 {% set ns = namespace(owned_live=0, unowned=0, stale=0) %}
@@ -24,7 +25,7 @@
 <div class="kanban-column col-{{ col.id }}" id="col-{{ col.id }}">
     <div class="column-header">
         <span class="column-title">{{ col.title }}</span>
-        <span class="column-count">{{ col.count }}</span>
+        <span class="column-count">{% if board_loaded is not defined or board_loaded %}{{ col.count }}{% endif %}</span>
     </div>
     <div class="column-cards">
         {% for card in col.cards %}
@@ -298,7 +299,14 @@
             </div>
         </div>
         {% else %}
+        {# An empty column is only "no worktrees" once discovery has actually
+           run. Before that the board must say it is still loading rather than
+           assert a PR set it has not observed (BOU-3095). #}
+        {% if board_loaded is not defined or board_loaded %}
         <div class="column-empty">No worktrees</div>
+        {% else %}
+        <div class="column-empty column-loading">Loading…</div>
+        {% endif %}
         {% endfor %}
         <div class="column-empty-search" hidden>No matching cards</div>
     </div>
