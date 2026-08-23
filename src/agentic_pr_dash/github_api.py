@@ -1018,7 +1018,30 @@ def probe_open_prs_rest(
         configured_author = load_config(cwd).pr_author
     configured_author = (configured_author or "").strip()
     if configured_author.casefold() in {"@me", "me"}:
-        configured_author = _rest_viewer_login(cwd)
+        resolved_viewer = _rest_viewer_login(cwd)
+        if not resolved_viewer:
+            # ``_rest_viewer_login`` returns "" on any failure, notably a GitHub
+            # App installation token, which cannot call ``/user`` — and its
+            # docstring requires callers to fail closed rather than adopt a PR
+            # whose author they cannot verify.
+            #
+            # Falling through with an empty author skips filtering entirely, so
+            # the "projection" would be every author's PRs. That is wrong on its
+            # own terms, and it feeds the scheduling comparison: unrelated
+            # activity would read as a tracked change and spend a rich GraphQL
+            # relist, reintroducing the drain that comparison prevents
+            # (BOU-3095 PR #169 round 9).
+            return ConditionalPRListProbe(
+                status,
+                [],
+                etag=headers.get("etag") or etag,
+                last_modified=headers.get("last-modified") or last_modified,
+                error=(
+                    "cannot resolve the @me PR author via REST; refusing to "
+                    "report an unfiltered open-PR list"
+                ),
+            )
+        configured_author = resolved_viewer
     # Canonicalize BOTH sides. A GitHub App identity is spelled ``app/<name>``
     # in configuration and ``<name>[bot]`` in REST payloads, so a raw casefold
     # comparison silently matches nothing and the probe reports an empty
