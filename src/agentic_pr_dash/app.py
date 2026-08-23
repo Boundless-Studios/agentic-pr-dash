@@ -1905,10 +1905,17 @@ async def pr_dashboard_proof_fixture_worktrees(request: Request, scenario: str):
 async def board_partial(request: Request):
     show_agent_worktrees = _show_agent_worktrees(request)
     ctx = await _dashboard_context_async(show_agent_worktrees=show_agent_worktrees)
-    # board_oob: emit the out-of-band escalation-banner swap only for the HTMX
-    # partial poll, so the title-bar banner refreshes with the board (the
-    # full-page include must NOT duplicate the slot id) — codex PR #50 review.
-    ctx["board_oob"] = True
+    # board_oob: emit the out-of-band header swaps only for the HTMX partial
+    # poll, so the title-bar banner refreshes with the board (the full-page
+    # include must NOT duplicate the slot id) — codex PR #50 review.
+    #
+    # Copy first. ``_dashboard_context_async`` returns the CACHED dict, so
+    # setting the flag on it in place leaked board_oob=True into every later
+    # full-page render — which emitted the slot twice, and a duplicate id makes
+    # htmx swap the wrong one (BOU-3095). Observed in the browser as the
+    # observation-age indicator rendering both in the header and inside the
+    # board.
+    ctx = {**ctx, "board_oob": True}
     return templates.TemplateResponse(
         request=request,
         name="partials/board.html",
