@@ -151,16 +151,28 @@ class _MetadataRead:
     """One metadata read's result.
 
     ``open_numbers`` is the authoritative set of open PR numbers this read
-    proved, or ``None`` when it proved nothing. Keeping it separate from
-    ``rich_read`` is what lets a cheap REST validator prune a merged PR while
-    the expensive GraphQL relist stays quota-deferred (BOU-3095): a stale
-    projection is still worth rendering, but only a positive observation may
-    remove a PR from the board.
+    proved, or ``None`` when it proved nothing. A stale projection is still
+    worth rendering, but only a positive observation may remove a PR.
+
+    Only a successful rich relist populates it. The cheap REST probe is a change
+    detector: it decides *when* to spend that relist, not *what* is open. Three
+    review rounds on BOU-3095 PR #169 found three separate ways for a
+    page-limited, author-filtered REST body to be wrong about the open set, each
+    of which pruned real PRs off the board, so the capability was removed rather
+    than guarded case by case. The latency win survives — the probe still gets a
+    merged PR reconciled in about a minute instead of fifteen — but under GraphQL
+    exhaustion the board now holds stale entries rather than risking wrong ones.
     """
 
     raw_prs: list[dict] | None
     rich_read: bool
     open_numbers: set[int] | None
+    #: Whether GitHub positively confirmed this root's open set — which a
+    #: conditional 304 does (it proves the list is unchanged) even though it
+    #: supplies no set to prune against. Kept separate from ``open_numbers`` so
+    #: withdrawing the probe's authority over *removal* did not also make the
+    #: freshness indicator claim staleness that isn't there.
+    observed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -1455,7 +1467,7 @@ class Orchestrator:
         """
 
         if rich_read and raw_prs is not None:
-            return _MetadataRead(raw_prs, True, _open_numbers(raw_prs))
+            return _MetadataRead(raw_prs, True, _open_numbers(raw_prs), observed=True)
         return _MetadataRead(raw_prs, rich_read, None)
 
     async def _read_metadata(
@@ -1547,10 +1559,12 @@ class Orchestrator:
                 )
             cached = self._metadata_cache[root]
             if not rich_due:
-                # A cheap confirmation: the open set is proven unchanged, which
-                # is enough to keep the board honest, but it is not a metadata
-                # reconciliation and must not advance the expensive clocks.
-                return _MetadataRead(cached, False, _open_numbers(cached))
+                # A cheap confirmation that nothing changed. It is not a
+                # metadata reconciliation, so it must not advance the expensive
+                # clocks — and it yields no authoritative open set, because only
+                # a successful rich relist may drive pruning. Nothing to prune
+                # here anyway: a 304 means the open list is byte-identical.
+                return _MetadataRead(cached, False, None, observed=True)
             self._metadata_last_success[root] = now
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:
@@ -1570,8 +1584,10 @@ class Orchestrator:
             # A validator-confirmed 304 is an authoritative metadata
             # observation. The cached list is unchanged, but the controller
             # must acknowledge any metadata invalidation carried by this plan.
+            # It still supplies no open set: pruning is reserved for a
+            # successful rich relist, and a 304 has nothing to prune.
             cached = self._metadata_cache[root]
-            return _MetadataRead(cached, True, _open_numbers(cached))
+            return _MetadataRead(cached, True, None, observed=True)
 
         if probe.changed:
             # The 200 body is an authoritative, author-filtered open-PR list in
@@ -1580,52 +1596,23 @@ class Orchestrator:
             # quota-denied — that deferral is exactly how a merged PR used to
             # sit on the board for hours (BOU-3095).
             cached = self._metadata_cache[root]
-            cached_open = _open_numbers(cached)
-            probe_open: set[int] | None = _open_numbers(probe.prs)
-            # Decide ONCE whether this body may be treated as the authoritative
-            # open set, so the answer is the same on the cheap pass and on the
-            # rich-due pass. Deciding it per-branch is how the first version of
-            # this safeguard ended up not covering the follow-up tick — where a
-            # failing relist would expose the empty set and wipe the board,
-            # i.e. it failed exactly when it was needed (BOU-3095 PR #169).
-            unconfirmed: str | None = None
-            if probe.truncated:
-                # The REST page was full and the author filter runs after the
-                # fetch, so this body may never have reached one of the author's
-                # older open PRs. Fine as a cache validator; cannot prove a
-                # close-out.
-                unconfirmed = (
-                    "the REST page was full, so it may not have reached every "
-                    "open PR of this author"
-                )
-            elif cached_open and not probe_open:
-                # "Every PR I own closed at once" is rare; "my author filter
-                # stopped matching" is not, and its blast radius is the whole
-                # board. A partial shrink still prunes immediately.
-                unconfirmed = (
-                    "the probe reported an empty open set while PRs are tracked"
-                )
-            if unconfirmed is not None:
-                probe_open = None
             self._merge_probe_activity(root, probe.prs)
             if not rich_due:
-                if probe_open is None:
-                    self.log(
-                        f"Deferring prune for {root} to a rich relist: {unconfirmed}",
-                        level="warn",
-                    )
-                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
-                    return _MetadataRead(cached, False, None)
-                # A PR the probe knows about but the cached rich list does not
-                # cannot be projected from this cheap body — it carries none of
-                # the GraphQL-only fields a card needs. Schedule the rich relist
-                # now instead of leaving it invisible until the 15-minute clock.
-                if probe_open - cached_open:
-                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
-                # Cheap pass: prune from the probe, spend no GraphQL, and leave
-                # the validator untouched so the next rich-due window still
-                # sees this change and refreshes the GraphQL-only fields.
-                return _MetadataRead(cached, False, probe_open)
+                # The probe is a CHANGE DETECTOR, never an authority on removal.
+                #
+                # Three review rounds found three different ways for a
+                # page-limited, author-filtered REST body to be wrong about
+                # which PRs are open — an App-spelled author matching nothing,
+                # a full first page hiding an older PR, an empty body during an
+                # outage — and each one prunes real PRs off the board. Rather
+                # than keep adding guards for individual instances, only a
+                # successful rich relist may ever produce an authoritative open
+                # set (BOU-3095 PR #169 review round 3). The probe's job is to
+                # notice that something moved and get that relist scheduled
+                # promptly, which is what keeps a merged PR clearing in about a
+                # minute instead of fifteen.
+                self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                return _MetadataRead(cached, False, None)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
             )
@@ -1645,18 +1632,11 @@ class Orchestrator:
                 self._merge_probe_activity(root, probe.prs)
                 merged = self._metadata_cache.get(root)
                 if merged is not None:
-                    return _MetadataRead(merged, True, _open_numbers(merged))
-                return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []))
-            # The relist that would have confirmed an unconfirmed probe failed.
-            # ``probe_open`` is already None in exactly those cases, so this
-            # cannot prune on an unproven body.
-            if probe_open is None and unconfirmed is not None:
-                self.log(
-                    f"Rich relist for {root} failed while the probe was "
-                    f"unconfirmed ({unconfirmed}); leaving tracked PRs in place",
-                    level="warn",
-                )
-            return _MetadataRead(raw_prs, False, probe_open)
+                    return _MetadataRead(merged, True, _open_numbers(merged), observed=True)
+                return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []), observed=True)
+            # The relist failed or was quota-denied. The probe detected a change
+            # but cannot say what it was, so nothing may be pruned on it.
+            return _MetadataRead(raw_prs, False, None)
 
         # Keep the old validator when the probe failed.  Reusing a new ETag
         # from a failed/partial response could turn a temporary outage into a
@@ -1691,6 +1671,7 @@ class Orchestrator:
         raw_prs: list[dict] | None
         metadata_read = False
         open_numbers: set[int] | None = None
+        observed = False
         if metadata_due or validation_due:
             read = await self._read_metadata(
                 root, now, force=force, rich_due=metadata_due
@@ -1698,6 +1679,7 @@ class Orchestrator:
             raw_prs = read.raw_prs
             metadata_read = read.rich_read
             open_numbers = read.open_numbers
+            observed = read.observed
             if raw_prs is None:
                 return
             if metadata_due:
@@ -1723,9 +1705,10 @@ class Orchestrator:
         # Prune merged/closed PRs FIRST, but only against a positively observed
         # open set. A cached list is observationally useful yet cannot prove
         # that a missing PR is closed, so it must never prune current state.
-        if open_numbers is not None:
+        if observed:
             self._open_set_last_observed[root] = now
             self._open_set_degraded_reason.pop(root, None)
+        if open_numbers is not None:
             for key in list(self.prs.keys()):
                 if self._pr_root.get(key) != root:
                     continue

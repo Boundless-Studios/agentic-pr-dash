@@ -138,27 +138,22 @@ def _tracked_numbers(orch: orchestrator.Orchestrator) -> set[int]:
 
 
 @pytest.mark.asyncio
-async def test_merged_pr_is_pruned_from_the_probe_while_graphql_is_denied(
+async def test_merged_pr_clears_within_the_validation_window(
     monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
 ) -> None:
     """The reported symptom: a merged PR keeps rendering as open.
 
-    The board is seeded by an operator-class force refresh, then the background
-    GraphQL budget is exhausted — exactly the live state observed on
-    2026-08-22, where ``/api/quota`` reported
-    ``"last_denial_reason": "background_hourly_budget"``. A PR then merges. The
-    conditional REST probe returns a 200 whose body no longer contains it, and
-    that body is authoritative about which PRs are open: the merged PR must be
-    pruned without any GraphQL spend at all.
+    The probe detects the change on its 60-second clock and schedules the
+    authoritative relist immediately, instead of the board waiting out the
+    15-minute reconciliation interval. The relist is what actually prunes — the
+    probe never removes a PR on its own (see the review-round-3 tests).
     """
     clock = ManualClock()
-    ledger = QuotaLedger(clock=clock, background_hourly_budget=0)
-    calls = {"list": 0, "probe": 0}
+    ledger = QuotaLedger(clock=clock, background_hourly_budget=500)
+    calls = {"probe": 0}
     open_prs = [_raw_pr(7), _raw_pr(8)]
 
-    def list_open_prs(cwd=None):
-        calls["list"] += 1
-        return list(open_prs)
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: list(open_prs))
 
     def probe(owner, repo, *, etag=None, last_modified=None, author=None, cwd=None):
         calls["probe"] += 1
@@ -166,30 +161,75 @@ async def test_merged_pr_is_pruned_from_the_probe_while_graphql_is_denied(
             200, [_probe_pr(raw["number"]) for raw in open_prs], etag='"v2"'
         )
 
-    monkeypatch.setattr(github_api, "list_open_prs", list_open_prs)
     monkeypatch.setattr(github_api, "probe_open_prs_rest", probe)
 
     orch = _orchestrator(clock, ledger)
 
     await orch.refresh_prs(force=True)
     assert _tracked_numbers(orch) == {7, 8}
-    seeded_list_calls = calls["list"]
 
     # PR 7 merges: it disappears from the open-PR list GitHub serves.
     open_prs[:] = [_raw_pr(8)]
 
     clock.advance(timedelta(seconds=90))
     await orch.refresh_prs()
-
     assert calls["probe"] > 1, (
         "the cheap conditional probe must run on its own fast clock, not inherit "
         "the 15-minute rich-relist interval"
     )
-    assert calls["list"] == seeded_list_calls, (
-        "pruning must not require the quota-gated GraphQL relist"
-    )
+
+    # The probe scheduled the relist; the next tick performs it and prunes.
+    clock.advance(timedelta(seconds=orchestrator.POLL_INTERVAL_SECONDS))
+    await orch.refresh_prs()
+
     assert _tracked_numbers(orch) == {8}, (
         "the merged PR is still on the board — this is BOU-3095"
+    )
+    assert clock.current - ManualClock().current < orchestrator.METADATA_RECONCILIATION_INTERVAL, (
+        "it must clear well inside the 15-minute reconciliation interval"
+    )
+
+
+@pytest.mark.asyncio
+async def test_graphql_exhaustion_holds_stale_entries_rather_than_wrong_ones(
+    monkeypatch: pytest.MonkeyPatch, dashboard_boundaries
+) -> None:
+    """The deliberate tradeoff, pinned so it cannot be changed by accident.
+
+    An earlier version of this fix let the probe body prune on its own, which
+    kept merged PRs clearing under GraphQL exhaustion. Three review rounds found
+    three distinct ways for that page-limited, author-filtered body to be wrong
+    about the open set — each one removing real PRs — so the capability was
+    withdrawn. Under exhaustion the board now holds a stale entry rather than
+    risking a wrong removal.
+    """
+    clock = ManualClock()
+    ledger = QuotaLedger(clock=clock, background_hourly_budget=0)
+    open_prs = [_raw_pr(7), _raw_pr(8)]
+
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: list(open_prs))
+    monkeypatch.setattr(
+        github_api,
+        "probe_open_prs_rest",
+        lambda owner, repo, *, etag=None, last_modified=None, author=None, cwd=None: (
+            github_api.ConditionalPRListProbe(
+                200, [_probe_pr(raw["number"]) for raw in open_prs], etag='"v2"'
+            )
+        ),
+    )
+
+    orch = _orchestrator(clock, ledger)
+    await orch.refresh_prs(force=True)
+    open_prs[:] = [_raw_pr(8)]
+
+    clock.advance(timedelta(seconds=90))
+    await orch.refresh_prs()
+    clock.advance(timedelta(seconds=orchestrator.POLL_INTERVAL_SECONDS))
+    await orch.refresh_prs()
+
+    assert _tracked_numbers(orch) == {7, 8}, (
+        "with GraphQL denied there is no authoritative observation, so nothing "
+        "may be pruned"
     )
 
 
@@ -241,13 +281,14 @@ async def test_failed_probe_retries_on_the_next_validation_window(
     ``metadata_read`` is False so nothing was pruned either.
     """
     clock = ManualClock()
-    ledger = QuotaLedger(clock=clock, background_hourly_budget=0)
+    ledger = QuotaLedger(clock=clock, background_hourly_budget=500)
     calls = {"probe": 0}
     failing = {"value": True}
+    # Both the probe and the rich list see the same world: PR 7 merges while the
+    # probe is down. The rich list is what prunes, so it has to agree.
+    open_prs = [_raw_pr(7), _raw_pr(8)]
 
-    monkeypatch.setattr(
-        github_api, "list_open_prs", lambda cwd=None: [_raw_pr(7), _raw_pr(8)]
-    )
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: list(open_prs))
 
     def probe(owner, repo, *, etag=None, last_modified=None, author=None, cwd=None):
         calls["probe"] += 1
@@ -255,7 +296,9 @@ async def test_failed_probe_retries_on_the_next_validation_window(
             return github_api.ConditionalPRListProbe(
                 None, [], etag=etag, error="probe unavailable"
             )
-        return github_api.ConditionalPRListProbe(200, [_probe_pr(8)], etag='"v2"')
+        return github_api.ConditionalPRListProbe(
+            200, [_probe_pr(raw["number"]) for raw in open_prs], etag='"v2"'
+        )
 
     monkeypatch.setattr(github_api, "probe_open_prs_rest", probe)
 
@@ -277,9 +320,13 @@ async def test_failed_probe_retries_on_the_next_validation_window(
         "a failed probe suppressed the next one for a full metadata interval"
     )
 
-    # Once the probe recovers, the merged PR is pruned from its body.
+    # PR 7 merges while the probe is unavailable, then the probe recovers and
+    # schedules the relist, which prunes on the following tick.
+    open_prs[:] = [_raw_pr(8)]
     failing["value"] = False
     clock.advance(timedelta(seconds=90))
+    await orch.refresh_prs()
+    clock.advance(timedelta(seconds=orchestrator.POLL_INTERVAL_SECONDS))
     await orch.refresh_prs()
     assert _tracked_numbers(orch) == {8}
 

@@ -211,14 +211,20 @@ async def test_truncated_probe_never_prunes(
 
 
 @pytest.mark.asyncio
-async def test_untruncated_probe_still_prunes(
+async def test_an_untruncated_probe_still_only_schedules_the_relist(
     monkeypatch: pytest.MonkeyPatch, boundaries
 ) -> None:
-    """The common case must stay fast — this is the whole point of the fix."""
+    """Even a complete page does not remove a PR by itself.
+
+    Review round 3 withdrew the probe's authority over removal entirely rather
+    than keep guarding individual ways it can be wrong, so ``truncated`` no
+    longer changes what may be pruned — it only remains as an accurate signal.
+    What the probe still does, and what makes the merged PR clear in about a
+    minute, is get the authoritative relist scheduled promptly.
+    """
     clock = ManualClock()
-    monkeypatch.setattr(
-        github_api, "list_open_prs", lambda cwd=None: [_raw_pr(7), _raw_pr(8)]
-    )
+    open_prs = [_raw_pr(7), _raw_pr(8)]
+    monkeypatch.setattr(github_api, "list_open_prs", lambda cwd=None: list(open_prs))
     monkeypatch.setattr(
         github_api,
         "probe_open_prs_rest",
@@ -229,12 +235,19 @@ async def test_untruncated_probe_still_prunes(
         ),
     )
 
-    orch = _orchestrator(clock, budget=0)
+    orch = _orchestrator(clock, budget=500)
     await orch.refresh_prs(force=True)
+    assert _tracked_numbers(orch) == {7, 8}
 
+    open_prs[:] = [_raw_pr(8)]
+
+    # The probe alone changes nothing...
     clock.advance(timedelta(seconds=90))
     await orch.refresh_prs()
 
+    # ...the relist it scheduled is what prunes.
+    clock.advance(timedelta(seconds=orchestrator_module.POLL_INTERVAL_SECONDS))
+    await orch.refresh_prs()
     assert _tracked_numbers(orch) == {8}
 
 
