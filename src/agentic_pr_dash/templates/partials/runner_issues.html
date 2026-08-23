@@ -5,7 +5,14 @@
         <h2>Runner Issues</h2>
         <p>{{ runner_summary_label }}</p>
     </div>
+    {# Every panel below is derived from the GitHub PR projection, so none of it
+       may read as authoritative before an open-set observation has succeeded.
+       board_loaded protected only the board tab (BOU-3095 round-6 review). #}
+    {% if board_loaded is defined and not board_loaded %}
+    <span class="runner-issues-loading">Loading…</span>
+    {% else %}
     <span>{{ runner_issues | length }} issue{{ 's' if runner_issues | length != 1 }}</span>
+    {% endif %}
 </div>
 
 <section class="desktop-docker-summary">
@@ -73,7 +80,11 @@
         {% endfor %}
     </div>
     {% else %}
+    {% if board_loaded is defined and not board_loaded %}
+    <div class="runner-issues-empty runner-issues-loading">Waiting for GitHub…</div>
+    {% else %}
     <div class="runner-issues-empty">No GitHub jobs currently running.</div>
+    {% endif %}
     {% endif %}
 </section>
 
@@ -111,5 +122,9 @@
     {% endfor %}
 </div>
 {% else %}
+{% if board_loaded is defined and not board_loaded %}
+<div class="runner-issues-empty runner-issues-loading">Waiting for GitHub…</div>
+{% else %}
 <div class="runner-issues-empty">No runner issues identified.</div>
+{% endif %}
 {% endif %}

@@ -195,6 +195,28 @@ class ObservationFreshness:
         return max(0.0, (now - self.observed_at).total_seconds())
 
 
+def _tracked_projection(raw_prs: list[dict]) -> set[tuple[int, str]]:
+    """The part of a PR list this dashboard actually tracks.
+
+    A conditional 200 says the repo-wide ``/pulls`` page changed, which is a far
+    coarser signal than "something we care about changed": the ETag covers every
+    author's PRs, and the author filter runs client-side afterwards. Comparing
+    THIS projection instead lets an unchanged result be recognised as unchanged
+    even when the raw response was a 200 — whether that is because another
+    author is busy, or because no validator could be installed at all and every
+    probe is unconditional (BOU-3095 PR #169 review round 6).
+
+    ``updatedAt`` is part of the identity because a comment moving it is exactly
+    the change the review-slice re-plan depends on.
+    """
+
+    return {
+        (raw["number"], str(raw.get("updatedAt") or ""))
+        for raw in raw_prs
+        if isinstance(raw.get("number"), int)
+    }
+
+
 def _open_numbers(raw_prs: list[dict]) -> set[int]:
     return {
         raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
@@ -384,6 +406,10 @@ class Orchestrator:
         # validator that was established from a full page only revalidates that
         # page, so it cannot count as observing the whole open set.
         self._metadata_validator_truncated: dict[str | None, bool] = {}
+        # Last tracked-author projection each root's probe reported, so an
+        # unchanged result is recognised as unchanged even when the raw
+        # conditional response was a 200 (round-6 review).
+        self._probe_projection: dict[str | None, set[tuple[int, str]]] = {}
         # Last ``updatedAt`` observed per PR key. GitHub advances it when a
         # comment is posted or resolved without a push, which is the only cheap
         # signal that a review re-scan is worth spending (BOU-3095).
@@ -1707,6 +1733,15 @@ class Orchestrator:
             # quota-denied — that deferral is exactly how a merged PR used to
             # sit on the board for hours (BOU-3095).
             cached = self._metadata_cache[root]
+            # Compare BEFORE merging: _merge_probe_activity copies the probe's
+            # updatedAt into the cache, which would erase the difference we are
+            # about to look for.
+            projection = _tracked_projection(probe.prs)
+            previous = self._probe_projection.get(root)
+            if previous is None:
+                previous = _tracked_projection(cached)
+            projection_changed = probe.truncated or projection != previous
+            self._probe_projection[root] = projection
             self._merge_probe_activity(root, probe.prs)
             if not rich_due:
                 # The probe is a CHANGE DETECTOR, never an authority on removal.
@@ -1722,7 +1757,15 @@ class Orchestrator:
                 # notice that something moved and get that relist scheduled
                 # promptly, which is what keeps a merged PR clearing in about a
                 # minute instead of fifteen.
-                self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                #
+                # "Moved" means OUR projection moved. A raw 200 is not enough:
+                # another author's activity flips it in a busy repo, and when no
+                # ETag can be installed at all every probe is a 200 — either way
+                # scheduling unconditionally would spend a rich GraphQL relist
+                # every ~60s per root, draining the very budget whose exhaustion
+                # caused this ticket (round-6 review).
+                if projection_changed:
+                    self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
                 return _MetadataRead(cached, False, None)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
