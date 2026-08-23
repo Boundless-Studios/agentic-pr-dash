@@ -24,6 +24,7 @@ import pytest
 
 from agentic_pr_dash import config
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash import ownership as _ownership_mod
 from agentic_pr_dash._maintenance import ownership_resolution as _ownres_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
@@ -426,4 +427,122 @@ def test_adopted_worktree_is_excluded_on_every_outcome(tmp_path, monkeypatch, co
         f"an ADOPTED worktree returning code {code} must be excluded from the "
         "waiter's watch probes too — provenance has to be resolved for every "
         "owned worktree, not just the code==10 ones"
+    )
+
+
+# --- Detached (worktree-less) adopted PRs -------------------------------------
+#
+# The exclusions above are keyed on OWNED WORKTREES. A PR whose worktree has
+# been torn down never appears there: it reaches the waiter through
+# `_detached_pr_records`, which had no provenance check at all. So an adopted
+# PR with standing feedback and no worktree still made the waiter exit 10 on
+# its first tick — leaving the session's own freshly-armed PR unwatched.
+
+
+def _adopted_detached_record(pr: int = 3546, repo: str = "acme/widgets") -> dict:
+    return {
+        "pr": pr,
+        "url": f"https://github.com/{repo}/pull/{pr}",
+        "branch": "some-adopted-branch",
+        "repo": repo,
+        "unresolved_threads": 2,
+        "ci_failing": False,
+        "changes_requested": False,
+        "merge_conflict": False,
+        "gh_state_unknown": False,
+        "p1": True,
+    }
+
+
+def _snapshot_with_provenance(provenance_by_pr: dict[int, str]):
+    class _View:
+        def __init__(self, provenance):
+            self.provenance = provenance
+
+    class _Snap:
+        def known(self):
+            return True
+
+        def owner_for(self, repo, pr_number):
+            prov = provenance_by_pr.get(pr_number)
+            return _View(prov) if prov else None
+
+        def live_owner_for(self, repo, pr_number):
+            return self.owner_for(repo, pr_number)
+
+    return lambda *a, **k: _Snap()
+
+
+def test_waiter_does_not_block_on_an_adopted_detached_prs_feedback(
+    tmp_path, monkeypatch
+):
+    """An adopted PR whose worktree is gone must not make the waiter exit 10.
+
+    This is the shape that actually broke: the stop gate reports the adopted PR
+    as "(no worktree) ... NOT blocking your stop" and prescribes a waiter; the
+    waiter then saw it as a detached record with unresolved threads and exited
+    immediately, so the PR the session had just armed was never watched.
+    """
+    record = _adopted_detached_record()
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: []
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [record],
+    )
+    monkeypatch.setattr(
+        _ownership_mod, "snapshot",
+        _snapshot_with_provenance({record["pr"]: "adopted"}),
+    )
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "1",
+        "--max-wait", "0",
+    ])
+
+    assert rc != 10, (
+        "waiter exited 'feedback arrived' on an ADOPTED detached PR — the stop "
+        "gate calls that PR non-blocking, so the waiter it prescribes must not "
+        "treat it as actionable feedback either (BOU-2430, detached path)"
+    )
+
+
+def test_waiter_still_blocks_on_an_armed_detached_prs_feedback(tmp_path, monkeypatch):
+    """Positive control: an armed detached PR must still wake the waiter.
+
+    Without this, the fix above could be a blanket "ignore detached records"
+    and the suite would not notice.
+    """
+    record = _adopted_detached_record(pr=3548)
+
+    monkeypatch.setattr(mc, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: []
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [record],
+    )
+    monkeypatch.setattr(
+        _ownership_mod, "snapshot",
+        _snapshot_with_provenance({record["pr"]: "armed"}),
+    )
+
+    rc = mc.main([
+        "await",
+        "--cwd", str(tmp_path),
+        "--session-id", SID,
+        "--owner-pid", "1",
+        "--max-wait", "0",
+    ])
+
+    assert rc == 10, (
+        "an ARMED detached PR with unresolved threads must still exit 10 — this "
+        "session armed it and nothing else is watching it"
     )

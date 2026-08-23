@@ -1702,6 +1702,28 @@ def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = ""
         pass
 
 
+def _detached_record_is_adopted(record: dict, snap) -> bool:
+    """Was this worktree-less PR auto-adopted rather than armed by the session?
+
+    A detached record has no worktree, so the marker-based
+    ``resolve_worktree`` path the owned-worktree loop uses cannot answer this.
+    The ownership store still holds the claim, keyed by ``(repo, pr)``.
+
+    Fails CLOSED — an unreadable snapshot, a missing claim, or any resolution
+    error yields ``False`` (treat as armed). Guessing "adopted" would silently
+    drop real feedback on a PR this session is responsible for, which is a
+    strictly worse failure than the FYI-instead-of-wake this suppresses.
+    """
+    try:
+        if not snap.known():
+            return False
+        owner = snap.owner_for(record.get("repo", ""), record["pr"])
+    except Exception:  # noqa: BLE001 — ownership must never crash the waiter
+        return False
+    from agentic_pr_dash.ownership import PROVENANCE_ADOPTED  # noqa: PLC0415
+    return owner is not None and owner.provenance == PROVENANCE_ADOPTED
+
+
 def _unbound_exit(session_id: str, why: str) -> int:
     """Leave the waiter with NO verdict, loudly (BOU-2294).
 
@@ -1892,8 +1914,26 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # this tick from concluding "clean" for the same record;
                     # this just stops it from being wrongly treated as
                     # CONFIRMED feedback (PR #119 review).
-                    if _record_has_blockers(r, unknown_state_blocks=False):
-                        pending.append(_detached_pending_entry(r))
+                    if not _record_has_blockers(r, unknown_state_blocks=False):
+                        continue
+                    # BOU-2430, detached path. The adopted exclusion above is
+                    # keyed on owned WORKTREES, so a PR whose worktree was torn
+                    # down skipped it entirely and went straight into `pending`.
+                    # The stop gate reports exactly that PR as "(no worktree)
+                    # ... NOT blocking your stop" and then prescribes this
+                    # waiter, which exited 10 on its first tick — leaving the
+                    # PR the session had just armed unwatched. Same scope, all
+                    # three places.
+                    if _detached_record_is_adopted(r, _await_snap):
+                        print(
+                            f"[pr-watch] FYI: adopted PR #{r['pr']} has pending "
+                            "work — auto-adopted, not armed by this session, so "
+                            "the maintenance loop owns it and it does not wake "
+                            "this waiter.",
+                            file=sys.stderr,
+                        )
+                        continue
+                    pending.append(_detached_pending_entry(r))
 
             if pending:
                 # Feedback arrived — any earlier clean-exit verdict is stale.
