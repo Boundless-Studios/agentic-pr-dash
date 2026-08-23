@@ -163,6 +163,25 @@ class _MetadataRead:
     open_numbers: set[int] | None
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationFreshness:
+    """How current the board's open-PR set is, and why when it is not.
+
+    ``complete`` is False while some watched repo root has never been observed,
+    so the UI can say "partial" instead of quoting an age that only covers the
+    roots that happen to have answered.
+    """
+
+    observed_at: datetime | None
+    degraded_reason: str | None
+    complete: bool
+
+    def age_seconds(self, now: datetime) -> float | None:
+        if self.observed_at is None:
+            return None
+        return max(0.0, (now - self.observed_at).total_seconds())
+
+
 def _open_numbers(raw_prs: list[dict]) -> set[int]:
     return {
         raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
@@ -333,6 +352,13 @@ class Orchestrator:
         # The cheap open-PR validator runs on ``LIST_VALIDATION_INTERVAL``,
         # independent of the rich relist's clocks above (BOU-3095).
         self._list_validation_last_attempt: dict[str | None, datetime] = {}
+        # When each root's open-PR set was last positively observed, and why the
+        # last attempt failed when it was not. This is what the board reports as
+        # its observation age — the PR's own ``updatedAt`` cannot serve, because
+        # a stale payload carries a stale timestamp and reads as plausibly
+        # recent (BOU-3095).
+        self._open_set_last_observed: dict[str | None, datetime] = {}
+        self._open_set_degraded_reason: dict[str | None, str] = {}
         # Last ``updatedAt`` observed per PR key. GitHub advances it when a
         # comment is posted or resolved without a push, which is the only cheap
         # signal that a review re-scan is worth spending (BOU-3095).
@@ -627,6 +653,45 @@ class Orchestrator:
             reason="mergeability_fallback_unavailable"
         )
         return "", ""
+
+    def open_set_freshness(self) -> ObservationFreshness:
+        """How current the board's open-PR set actually is.
+
+        Reports the OLDEST root's observation, because the board mixes repos and
+        the age shown has to be true for everything on it. ``observed_at`` is
+        ``None`` until some root has been observed at least once.
+
+        This is deliberately distinct from the header's "Live" chip, which
+        tracks whether the browser's poll of *localhost* is succeeding
+        (BOU-2193). A board can poll perfectly while showing hours-old GitHub
+        state — that is the failure BOU-3095 reported.
+        """
+
+        roots = [root for root in self._repo_roots()]
+        observed = [
+            self._open_set_last_observed[root]
+            for root in roots
+            if root in self._open_set_last_observed
+        ]
+        reasons = [
+            self._open_set_degraded_reason[root]
+            for root in roots
+            if root in self._open_set_degraded_reason
+        ]
+        if len(observed) < len(roots):
+            # A root that has never been observed is not "fresh"; report it as
+            # unknown rather than borrowing a sibling root's timestamp.
+            oldest = min(observed) if observed else None
+            return ObservationFreshness(
+                observed_at=oldest,
+                degraded_reason=reasons[0] if reasons else None,
+                complete=False,
+            )
+        return ObservationFreshness(
+            observed_at=min(observed) if observed else None,
+            degraded_reason=reasons[0] if reasons else None,
+            complete=True,
+        )
 
     def _merge_probe_activity(
         self, root: str | None, probe_prs: list[dict]
@@ -1464,6 +1529,7 @@ class Orchestrator:
         # from a failed/partial response could turn a temporary outage into a
         # permanent 304 and leave the dashboard stale forever.
         detail = probe.error or "REST open-PR probe unavailable"
+        self._open_set_degraded_reason[root] = detail
         self.log(
             f"Skipping metadata reconciliation for {root}: {detail}",
             level="warn",
@@ -1525,6 +1591,8 @@ class Orchestrator:
         # open set. A cached list is observationally useful yet cannot prove
         # that a missing PR is closed, so it must never prune current state.
         if open_numbers is not None:
+            self._open_set_last_observed[root] = now
+            self._open_set_degraded_reason.pop(root, None)
             for key in list(self.prs.keys()):
                 if self._pr_root.get(key) != root:
                     continue

@@ -75,6 +75,10 @@
                the board response never arrives, so the server cannot report on it. #}
             <span id="live-dot" class="live-dot"></span>
             <span id="live-label" class="live-label" title="Board is polling normally">Live</span>
+            {# Server-rendered and refreshed out-of-band with each board poll:
+               this one IS something the server can report on, unlike the chip
+               above (BOU-3095). #}
+            <span id="observation-age-slot">{% include 'partials/observation_age.html' %}</span>
             <form method="post" action="/api/refresh" style="display:inline">
                 <button type="submit" class="btn btn-ghost">Refresh</button>
             </form>

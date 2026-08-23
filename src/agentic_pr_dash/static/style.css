@@ -287,6 +287,18 @@ header h1 {
     font-weight: 600;
 }
 
+/* Age of the GitHub observation, not of the local poll (BOU-3095). */
+.observation-age {
+    font-size: 11px;
+    color: var(--text-muted);
+    white-space: nowrap;
+}
+
+.observation-age-stale {
+    color: var(--danger);
+    font-weight: 600;
+}
+
 /* ─── Buttons ────────────────────────────────────────────────────────────── */
 .btn {
     display: inline-flex;

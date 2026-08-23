@@ -83,6 +83,50 @@ def _asset_version() -> str:
     return h.hexdigest()[:8]
 
 
+# Past this, the board's open-PR set is old enough that it should say so rather
+# than let a green "Live" chip imply the data is current (BOU-3095). Three
+# validation windows: one missed probe is noise, three is a pattern.
+OBSERVATION_STALE_AFTER_SECONDS = 180.0
+
+
+def _format_observation_age(seconds: float) -> str:
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    minutes = int(seconds // 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def _observation_context() -> dict[str, object]:
+    """Age of the board's GitHub observation, for the header indicator.
+
+    Deliberately not derived from any PR's ``updatedAt``: that value travels
+    inside the payload, so a stale board quotes a stale timestamp and reads as
+    plausibly recent. This is the age of the observation itself.
+    """
+
+    freshness = orchestrator.open_set_freshness()
+    age = freshness.age_seconds(orchestrator.observation_controller.now())
+    if age is None:
+        return {
+            "known": False,
+            "stale": False,
+            "label": "PR data loading",
+            "detail": freshness.degraded_reason or "no GitHub observation yet",
+        }
+    stale = age > OBSERVATION_STALE_AFTER_SECONDS or not freshness.complete
+    label = f"PR data {_format_observation_age(age)} old"
+    if not freshness.complete:
+        label = f"{label} (partial)"
+    detail = freshness.degraded_reason or (
+        "some watched repositories have not been observed yet"
+        if not freshness.complete
+        else "GitHub open-PR set observed this recently"
+    )
+    return {"known": True, "stale": stale, "label": label, "detail": detail}
+
+
 def _quota_context(telemetry: QuotaTelemetry) -> dict[str, object]:
     latest = telemetry.latest
     degraded_reason = telemetry.degraded_reason
@@ -1223,6 +1267,7 @@ def _dashboard_context_from_cards(
         # thing this dashboard can say; the template renders a loading state
         # instead (BOU-3095).
         "board_loaded": loaded,
+        "observation": _observation_context(),
     }
 
 
