@@ -1587,6 +1587,16 @@ class Orchestrator:
             # A truncated body cannot be compared, so it is not evidence of a
             # mismatch; its 304s are already barred from counting as
             # observations by the truncation guard.
+            # Carry the bootstrap body's activity timestamps into the cache
+            # before anything else. A comment landing between the rich list and
+            # this second request leaves the open NUMBERS identical, so the
+            # mismatch check below passes and this ETag is stored — and since
+            # production rich snapshots carry no ``updatedAt``, every later probe
+            # is then a 304 that never delivers it, so ``_note_pr_activity``
+            # never sees the change and the review slice is never re-planned
+            # (round-11 review). Merging costs nothing and closes that window.
+            if probe.changed:
+                self._merge_probe_activity(root, probe.prs)
             cached = self._metadata_cache.get(root)
             mismatched = (
                 probe.changed
@@ -1759,7 +1769,18 @@ class Orchestrator:
             previous = self._probe_projection.get(root)
             if previous is None:
                 previous = _tracked_projection(cached)
-            projection_changed = probe.truncated or projection != previous
+            # Truncation is UNCERTAINTY, not a declared change. Folding it in
+            # here meant a repository with more than one page of open PRs — where
+            # ``truncated`` is permanently true — declared every 200 a tracked
+            # change and bypassed this comparison entirely, restoring the
+            # round-6 quota drain in exactly the busy repositories where it costs
+            # most (round-11 review).
+            #
+            # Truncation still does its work where it belongs: it bars the probe
+            # from counting as an observation (so the freshness label ages
+            # honestly while PRs outside page 1 are unseen) and from having its
+            # validator adopted. It just no longer manufactures change events.
+            projection_changed = projection != previous
             # The baseline is "what has been RECONCILED", not "what was last
             # seen". Advancing it here would forget a detected change whose
             # relist then failed or was quota-denied: the pending event gets
