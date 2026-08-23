@@ -239,6 +239,27 @@ def test_resolve_owner_pid_recognizes_codex_ancestor(monkeypatch):
     assert pid == 50, f"Expected codex ancestor pid 50, got {pid}"
 
 
+def test_resolve_owner_pid_recognizes_pi_ancestor(monkeypatch):
+    """When a PI process is an ancestor, _resolve_owner_pid returns its pid."""
+    ps_responses = {
+        999: "50 bash",
+        50: "1 pi",
+    }
+
+    def fake_run(cmd, **kwargs):
+        pid = int(cmd[-1])
+        import types
+        result = types.SimpleNamespace()
+        result.stdout = ps_responses.get(pid, "")
+        return result
+
+    monkeypatch.setattr(mc.subprocess, "run", fake_run)
+    monkeypatch.setattr(mc.os, "getppid", lambda: 999)
+
+    pid = mc._resolve_owner_pid()
+    assert pid == 50, f"Expected PI ancestor pid 50, got {pid}"
+
+
 def test_resolve_owner_pid_still_recognizes_claude_ancestor(monkeypatch):
     """Existing behavior: claude ancestor still recognized after the fix."""
     # ps -o ppid=,comm= -p 999  → "50 claude"  ← match immediately
