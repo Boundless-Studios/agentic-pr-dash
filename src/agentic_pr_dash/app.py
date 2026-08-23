@@ -148,6 +148,13 @@ def _observation_context() -> dict[str, object]:
     return {"known": True, "stale": stale, "label": label, "detail": detail}
 
 
+def _open_set_is_complete() -> bool:
+    """Whether every watched repo root's open set has been observed."""
+
+    freshness = orchestrator.open_set_freshness()
+    return freshness.observed_at is not None and freshness.complete
+
+
 def _with_header_oob(
     ctx: dict[str, object], *, board_oob: bool = False
 ) -> dict[str, object]:
@@ -1319,7 +1326,12 @@ def _dashboard_context_from_cards(
         # board loaded, and render confident "No worktrees" columns for the whole
         # outage — the false-empty board arriving through a second door
         # (PR #169 review round 4).
-        "board_loaded": loaded and orchestrator.open_set_freshness().observed_at is not None,
+        # ``complete`` as well as ``observed_at``: in a multi-repo deployment the
+        # anchor can be observed while a configured sibling is not, and an empty
+        # board is then not an answer about the watched set — it is an answer
+        # about the half that replied (round-8 review). Cards still render
+        # either way; this only governs the count and the empty-state text.
+        "board_loaded": loaded and _open_set_is_complete(),
         "observation": _observation_context(),
     }
 
@@ -1457,7 +1469,7 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
         "observation": _observation_context(),
         # Same rule as the board: this tab's panels are equally wrong if they
         # render as authoritative before GitHub has been observed.
-        "board_loaded": orchestrator.open_set_freshness().observed_at is not None,
+        "board_loaded": _open_set_is_complete(),
     }
 
 

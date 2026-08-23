@@ -1760,7 +1760,13 @@ class Orchestrator:
             if previous is None:
                 previous = _tracked_projection(cached)
             projection_changed = probe.truncated or projection != previous
-            self._probe_projection[root] = projection
+            # The baseline is "what has been RECONCILED", not "what was last
+            # seen". Advancing it here would forget a detected change whose
+            # relist then failed or was quota-denied: the pending event gets
+            # postponed by a full reconciliation interval and later probes,
+            # comparing against the new baseline, see nothing to re-schedule
+            # (BOU-3095 PR #169 round 8). It is committed after a successful
+            # rich read instead.
             self._merge_probe_activity(root, probe.prs)
             if not rich_due:
                 # The probe is a CHANGE DETECTOR, never an authority on removal.
@@ -1785,7 +1791,19 @@ class Orchestrator:
                 # caused this ticket (round-6 review).
                 if projection_changed:
                     self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
-                return _MetadataRead(cached, False, None)
+                # An UNCHANGED projection behind a 200 is a successful
+                # confirmation that our open set is current — the 200 only means
+                # the repo-wide page moved, which is a different question. Not
+                # counting it aged the freshness label while every probe was
+                # succeeding (round-8 review). A changed projection is NOT an
+                # observation of the board: it says the board is out of date and
+                # has not been reconciled yet. Truncation cannot confirm either.
+                return _MetadataRead(
+                    cached,
+                    False,
+                    None,
+                    observed=not projection_changed and not probe.truncated,
+                )
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
             )
@@ -1807,6 +1825,12 @@ class Orchestrator:
                 # sees them.
                 self._merge_probe_activity(root, probe.prs)
                 merged = self._metadata_cache.get(root)
+                # The change has now been reconciled into the projection, so
+                # this is the point at which the comparison baseline may
+                # advance (round-8 review).
+                self._probe_projection[root] = _tracked_projection(
+                    merged if merged is not None else (raw_prs or [])
+                )
                 if merged is not None:
                     return _MetadataRead(merged, True, _open_numbers(merged), observed=True)
                 return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []), observed=True)
