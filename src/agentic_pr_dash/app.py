@@ -34,6 +34,7 @@ from .models import (
     humanize_relative,
     worktree_started_at,
 )
+from . import orchestrator as _orchestrator_module
 from .orchestrator import Orchestrator
 from .quota import QuotaDecisionReason, QuotaTelemetry
 from .runner_monitor import get_runner_fleet_load
@@ -83,10 +84,17 @@ def _asset_version() -> str:
     return h.hexdigest()[:8]
 
 
-# Past this, the board's open-PR set is old enough that it should say so rather
-# than let a green "Live" chip imply the data is current (BOU-3095). Three
-# validation windows: one missed probe is noise, three is a pattern.
-OBSERVATION_STALE_AFTER_SECONDS = 180.0
+def _stale_after_seconds() -> float:
+    """Age past which the board should say its data is old.
+
+    Three validation windows: one missed probe is noise, three is a pattern.
+    Derived rather than hardcoded, because ``APD_LIST_VALIDATION_INTERVAL_S`` is
+    tunable — a fixed 180s would call healthy data stale two minutes before the
+    next probe was even due at a five-minute interval, and would sit through
+    eighteen missed probes at a ten-second one (BOU-3095 PR #169 review round 4).
+    """
+
+    return 3 * _orchestrator_module.LIST_VALIDATION_INTERVAL.total_seconds()
 
 
 def _format_observation_age(seconds: float) -> str:
@@ -128,7 +136,7 @@ def _observation_context() -> dict[str, object]:
             "label": "PR data loading",
             "detail": "no GitHub observation yet",
         }
-    stale = age > OBSERVATION_STALE_AFTER_SECONDS or not freshness.complete
+    stale = age > _stale_after_seconds() or not freshness.complete
     label = f"PR data {_format_observation_age(age)} old"
     if not freshness.complete:
         label = f"{label} (partial)"
@@ -1301,11 +1309,17 @@ def _dashboard_context_from_cards(
         "no_pr_cards": no_pr_cards(cards),
         "quota": _quota_context(orchestrator.quota_telemetry),
         "asset_version": _asset_version(),
-        # False only for the skeleton served while the first card scan runs.
         # An empty board asserts "you have no PRs", which is the most wrong
         # thing this dashboard can say; the template renders a loading state
         # instead (BOU-3095).
-        "board_loaded": loaded,
+        #
+        # It takes BOTH the local card scan finishing and GitHub actually having
+        # been observed. The local scan is independent of GitHub, so a daemon
+        # starting during an outage would otherwise complete its scan, mark the
+        # board loaded, and render confident "No worktrees" columns for the whole
+        # outage — the false-empty board arriving through a second door
+        # (PR #169 review round 4).
+        "board_loaded": loaded and orchestrator.open_set_freshness().observed_at is not None,
         "observation": _observation_context(),
     }
 
@@ -1441,7 +1455,9 @@ def runner_dashboard_context(show_agent_worktrees: bool = False, active_tab: str
         # PR #169 review). The board's out-of-band swap does not reach this tab,
         # so the value is correct at render and refreshes on the tab's own poll.
         "observation": _observation_context(),
-        "board_loaded": True,
+        # Same rule as the board: this tab's panels are equally wrong if they
+        # render as authoritative before GitHub has been observed.
+        "board_loaded": orchestrator.open_set_freshness().observed_at is not None,
     }
 
 

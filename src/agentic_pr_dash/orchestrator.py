@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -371,6 +372,18 @@ class Orchestrator:
         # recent (BOU-3095).
         self._open_set_last_observed: dict[str | None, datetime] = {}
         self._open_set_degraded_reason: dict[str | None, str] = {}
+        # Roots the dashboard considers itself responsible for, refreshed once
+        # per poll tick. Rendering reads THIS and never resolves, because
+        # ``_resolve_maintenance_roots`` shells out ``git worktree list`` with a
+        # 10-second timeout per root — doing that on the request path put it on
+        # the event loop on every five-second poll, from three tabs (BOU-3095
+        # PR #169 review round 4).
+        self._watched_roots: set[str | None] = set()
+        self._resolved_roots: set[str | None] = set()
+        # Truncation state of each root's stored REST validator. A 304 against a
+        # validator that was established from a full page only revalidates that
+        # page, so it cannot count as observing the whole open set.
+        self._metadata_validator_truncated: dict[str | None, bool] = {}
         # Last ``updatedAt`` observed per PR key. GitHub advances it when a
         # comment is posted or resolved without a push, which is the only cheap
         # signal that a review re-scan is worth spending (BOU-3095).
@@ -666,6 +679,54 @@ class Orchestrator:
         )
         return "", ""
 
+    def _configured_roots(self) -> set[str]:
+        """Watched roots taken from configuration, with no subprocess at all.
+
+        ``_resolve_maintenance_roots`` proves each root is a git repo by running
+        ``git worktree list``, and drops any root whose call fails. That makes it
+        useless for answering "what are we responsible for?": a sibling whose
+        very first resolution fails has never been observed, degraded, or
+        assigned a PR, so retention logic keyed on past success cannot see it
+        either, and the board reports complete while that repo is absent
+        (BOU-3095 PR #169 review round 4).
+
+        Existence is checked with a stat rather than a git call: it keeps an
+        uncloned/removed root from being reported as permanently missing, which
+        would be a standing false alarm, while costing nothing on the hot path.
+        """
+
+        if not self.repo_cwd:
+            return set()
+        try:
+            cfg = load_config(self.repo_cwd)
+        except Exception:  # noqa: BLE001 — freshness must never raise
+            return {os.path.abspath(os.path.expanduser(self.repo_cwd))}
+        roots: set[str] = set()
+        for candidate in (
+            self.repo_cwd,
+            *(getattr(cfg, "maintenance_repo_roots", ()) or ()),
+        ):
+            path = os.path.abspath(os.path.expanduser(str(candidate)))
+            if os.path.isdir(path):
+                roots.add(path)
+        return roots
+
+    def _refresh_watched_roots(self, resolved: Iterable[str | None]) -> None:
+        """Recompute the watched set from one poll tick's resolution."""
+
+        resolved_set = set(resolved)
+        watched: set[str | None] = set(self._configured_roots())
+        watched |= resolved_set
+        watched |= set(self._open_set_last_observed)
+        watched |= set(self._open_set_degraded_reason)
+        watched |= set(self._pr_root.values())
+        self._watched_roots = watched
+        # Kept separately so freshness can tell "watched but not resolved this
+        # tick" from "watched and resolving fine". A root that resolved before
+        # and has since vanished keeps a stale observation timestamp, so
+        # observation alone cannot detect it (round-3 review).
+        self._resolved_roots = resolved_set
+
     def open_set_freshness(self) -> ObservationFreshness:
         """How current the board's open-PR set actually is.
 
@@ -679,36 +740,41 @@ class Orchestrator:
         state — that is the failure BOU-3095 reported.
         """
 
-        current = set(self._repo_roots())
-        # ``_resolve_maintenance_roots`` silently omits a configured sibling
-        # whose ``git worktree list`` fails, but that repo's cards are still on
-        # the board and have stopped being refreshed. Computing completeness
-        # from the reduced list would report the board fully fresh while a whole
-        # repo went dark (BOU-3095 PR #169 review), so keep every root we have
-        # ever observed or that still owns a tracked PR.
-        known = (
-            current
-            | set(self._open_set_last_observed)
-            | set(self._open_set_degraded_reason)
-            | set(self._pr_root.values())
-        )
-        dropped = known - current
+        # Read the cached watched set — never resolve here. This runs on the
+        # request path for every partial poll (BOU-3095 PR #169 review round 4).
+        known = set(self._watched_roots)
+        if not known:
+            # Before the first poll tick has populated the cache, fall back to
+            # configuration, which is a stat rather than a git call.
+            known = set(self._configured_roots()) or {self.repo_cwd}
         observed = [
             self._open_set_last_observed[root]
             for root in known
             if root in self._open_set_last_observed
         ]
+        # "Watched but never observed" is the single completeness test, and it
+        # covers both shapes the reviews found: a root that resolved before and
+        # has since disappeared, and a configured root whose very first
+        # resolution failed so it was never seen at all.
         unobserved = [root for root in known if root not in self._open_set_last_observed]
+        # A root that resolved before and has since disappeared keeps a stale
+        # observation timestamp, so "never observed" cannot catch it — compare
+        # against what actually resolved on the last tick.
+        dropped = (
+            [root for root in known if root not in self._resolved_roots]
+            if self._resolved_roots
+            else []
+        )
         reasons = [
             self._open_set_degraded_reason[root]
             for root in known
             if root in self._open_set_degraded_reason
         ]
-        if dropped:
-            reasons.insert(
-                0,
-                f"{len(dropped)} watched repo root(s) could not be resolved on "
-                "this poll and are no longer being refreshed",
+        if not reasons and (unobserved or dropped):
+            missing = len({*unobserved, *dropped})
+            reasons.append(
+                f"{missing} watched repo root(s) are not being refreshed and "
+                "may be absent from the board"
             )
         return ObservationFreshness(
             # The oldest root bounds the whole board: the age shown has to be
@@ -1296,7 +1362,11 @@ class Orchestrator:
                 self._weekly_runner_summary_polled_at = now
                 github_api.save_runner_execution_summary_cache(runner_summary, now.isoformat())
 
-        for root in self._repo_roots():
+        resolved_roots = self._repo_roots()
+        # Recompute what we consider ourselves responsible for once per tick, so
+        # rendering can read it without resolving anything (round-4 review).
+        self._refresh_watched_roots(resolved_roots)
+        for root in resolved_roots:
             try:
                 await self._refresh_repo(root, now, force=force)
             except Exception as exc:
@@ -1456,6 +1526,7 @@ class Orchestrator:
             return
         if probe.observable and (probe.etag or probe.last_modified):
             self._metadata_validators[root] = (probe.etag, probe.last_modified)
+            self._metadata_validator_truncated[root] = probe.truncated
 
     def _rich_read(
         self, raw_prs: list[dict] | None, rich_read: bool
@@ -1543,6 +1614,12 @@ class Orchestrator:
                 probe.etag or etag,
                 probe.last_modified or last_modified,
             )
+            # A 304 revalidates the representation the ETag was built from. If
+            # that was a full first page, an older tracked PR outside it can
+            # close without changing page 1 — so this confirms a page, not the
+            # open set, and must not refresh the observation timestamp
+            # (BOU-3095 PR #169 review round 4).
+            validator_complete = not self._metadata_validator_truncated.get(root, False)
             last_rich = self._metadata_last_rich_success.get(root)
             if rich_due and (
                 last_rich is None
@@ -1564,7 +1641,7 @@ class Orchestrator:
                 # clocks — and it yields no authoritative open set, because only
                 # a successful rich relist may drive pruning. Nothing to prune
                 # here anyway: a 304 means the open list is byte-identical.
-                return _MetadataRead(cached, False, None, observed=True)
+                return _MetadataRead(cached, False, None, observed=validator_complete)
             self._metadata_last_success[root] = now
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:
@@ -1587,7 +1664,7 @@ class Orchestrator:
             # It still supplies no open set: pruning is reserved for a
             # successful rich relist, and a 304 has nothing to prune.
             cached = self._metadata_cache[root]
-            return _MetadataRead(cached, True, None, observed=True)
+            return _MetadataRead(cached, True, None, observed=validator_complete)
 
         if probe.changed:
             # The 200 body is an authoritative, author-filtered open-PR list in
@@ -1621,6 +1698,9 @@ class Orchestrator:
                     probe.etag or etag,
                     probe.last_modified or last_modified,
                 )
+                # Remember whether the page this validator was built from was
+                # complete: a later 304 revalidates only that page.
+                self._metadata_validator_truncated[root] = probe.truncated
                 # This is the tick on which the probe actually saw a change, and
                 # the rich list carries no ``updatedAt`` at all. Dropping the
                 # probe's timestamps here loses the activity signal precisely

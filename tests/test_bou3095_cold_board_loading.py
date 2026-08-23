@@ -12,14 +12,37 @@ and stayed there across repeated polls while two PRs were open.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
-from agentic_pr_dash import app
+import pytest
+
+from agentic_pr_dash import app, orchestrator as orchestrator_module
 
 
 def _render_board(context: dict) -> str:
     template = app.templates.env.get_template("partials/board.html")
     return template.render(**context)
+
+
+@pytest.fixture
+def github_observed(monkeypatch):
+    """Pretend GitHub's open set has been observed.
+
+    ``board_loaded`` requires BOTH the local card scan finishing and a
+    successful GitHub observation (PR #169 review round 4). A test about the
+    *local scan* has to supply the other half, or it is really exercising the
+    outage path instead.
+    """
+    monkeypatch.setattr(
+        app.orchestrator,
+        "open_set_freshness",
+        lambda: orchestrator_module.ObservationFreshness(
+            observed_at=datetime(2026, 8, 22, tzinfo=timezone.utc),
+            degraded_reason=None,
+            complete=True,
+        ),
+    )
 
 
 def test_cold_skeleton_is_marked_not_loaded() -> None:
@@ -45,7 +68,7 @@ def test_cold_board_renders_loading_not_an_empty_pr_set() -> None:
     )
 
 
-def test_observed_empty_board_still_says_no_worktrees() -> None:
+def test_observed_empty_board_still_says_no_worktrees(github_observed) -> None:
     """An observed-empty board is a real answer and must keep saying so."""
     context = app._dashboard_context_from_cards(
         [], 0, 0, show_agent_worktrees=False, active_tab="board"
@@ -58,7 +81,7 @@ def test_observed_empty_board_still_says_no_worktrees() -> None:
     assert "column-loading" not in html
 
 
-def test_force_refresh_never_serves_a_confident_empty_board(monkeypatch) -> None:
+def test_force_refresh_never_serves_a_confident_empty_board(monkeypatch, github_observed) -> None:
     """The reported reproduction: refresh, then poll during the rebuild."""
 
     async def scenario() -> None:
