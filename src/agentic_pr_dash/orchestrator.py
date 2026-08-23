@@ -1791,6 +1791,26 @@ class Orchestrator:
                 # caused this ticket (round-6 review).
                 if projection_changed:
                     self._metadata_event_due[root] = now + EVENT_DEBOUNCE_WINDOW
+                else:
+                    # Adopt the new validator. Without this, an ETag moved by
+                    # another author is never accepted on the cheap path, so
+                    # every window re-sends the obsolete one and downloads a
+                    # full 200 body instead of settling back to 304s — REST
+                    # quota and bandwidth, once per window, until a rich
+                    # reconciliation happens to refresh it (round-10 review).
+                    #
+                    # Safe precisely BECAUSE the projection was confirmed
+                    # unchanged: the tracked PRs are identical, so this is not
+                    # accepting a validator against an un-ingested list. Not
+                    # done when the projection changed (a later 304 would hide
+                    # the pending change) nor when truncated (nothing was
+                    # confirmed) — both pinned by tests.
+                    if not probe.truncated and (probe.etag or probe.last_modified):
+                        self._metadata_validators[root] = (
+                            probe.etag or etag,
+                            probe.last_modified or last_modified,
+                        )
+                        self._metadata_validator_truncated[root] = False
                 # An UNCHANGED projection behind a 200 is a successful
                 # confirmation that our open set is current — the 200 only means
                 # the repo-wide page moved, which is a different question. Not
