@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -133,6 +134,39 @@ METADATA_RECONCILIATION_INTERVAL = timedelta(minutes=15)
 # cheap 15-minute probe while forcing one rich snapshot per hour so those
 # fields cannot remain stale forever behind an unchanged REST validator.
 RICH_METADATA_RECONCILIATION_INTERVAL = timedelta(hours=1)
+# The conditional REST validator is cheap in a way the rich relist is not: it
+# spends REST budget rather than GraphQL points, and a 304 costs no rate limit
+# at all. Gating it behind the rich relist's 15-minute clock (BOU-3095) meant a
+# merged PR kept rendering as open for the whole interval — and far longer in
+# practice, because a quota-denied or failed rich relist stamped that same clock
+# and bought another full interval without pruning anything. Validate the
+# open-PR list on its own fast cadence; keep the slow clocks for the slow read.
+LIST_VALIDATION_INTERVAL = timedelta(
+    seconds=float(os.environ.get("APD_LIST_VALIDATION_INTERVAL_S", "60"))
+)
+
+
+@dataclass(frozen=True, slots=True)
+class _MetadataRead:
+    """One metadata read's result.
+
+    ``open_numbers`` is the authoritative set of open PR numbers this read
+    proved, or ``None`` when it proved nothing. Keeping it separate from
+    ``rich_read`` is what lets a cheap REST validator prune a merged PR while
+    the expensive GraphQL relist stays quota-deferred (BOU-3095): a stale
+    projection is still worth rendering, but only a positive observation may
+    remove a PR from the board.
+    """
+
+    raw_prs: list[dict] | None
+    rich_read: bool
+    open_numbers: set[int] | None
+
+
+def _open_numbers(raw_prs: list[dict]) -> set[int]:
+    return {
+        raw["number"] for raw in raw_prs if isinstance(raw.get("number"), int)
+    }
 # Cold start has no cached projection to fall back on, so the board is simply
 # empty until the first list succeeds. One transient at daemon startup must not
 # hold it empty for a whole reconciliation interval; retry on the next poll tick
@@ -296,6 +330,13 @@ class Orchestrator:
         self._metadata_validators: dict[
             str | None, tuple[str | None, str | None]
         ] = {}
+        # The cheap open-PR validator runs on ``LIST_VALIDATION_INTERVAL``,
+        # independent of the rich relist's clocks above (BOU-3095).
+        self._list_validation_last_attempt: dict[str | None, datetime] = {}
+        # Last ``updatedAt`` observed per PR key. GitHub advances it when a
+        # comment is posted or resolved without a push, which is the only cheap
+        # signal that a review re-scan is worth spending (BOU-3095).
+        self._pr_last_updated_at: dict[PRKey, str] = {}
         self._root_repo_identity: dict[str | None, str] = {}
         self._root_repo_slugs: dict[str | None, set[str]] = {}
         self._repo_roots_by_slug: dict[str, str | None] = {}
@@ -586,6 +627,24 @@ class Orchestrator:
             reason="mergeability_fallback_unavailable"
         )
         return "", ""
+
+    def _list_validation_due(self, root: str | None, now: datetime) -> bool:
+        """Whether the cheap conditional open-PR validator should run.
+
+        This clock is deliberately separate from the rich relist's (BOU-3095).
+        It is stamped on every attempt, successful or not — but the interval is
+        short, so a failed probe costs one validation window rather than a full
+        15-minute reconciliation interval in which nothing can be pruned.
+
+        A root with no cached metadata is not validated here: there is nothing
+        to validate, and ``_metadata_refresh_due`` already owns the cold-start
+        fast retry.
+        """
+
+        if root not in self._metadata_cache:
+            return False
+        last_attempt = self._list_validation_last_attempt.get(root)
+        return last_attempt is None or now >= last_attempt + LIST_VALIDATION_INTERVAL
 
     def _metadata_refresh_due(self, root: str | None, now: datetime, *, force: bool) -> bool:
         """Whether ``root`` needs a real, successful-capable metadata read."""
@@ -1183,17 +1242,40 @@ class Orchestrator:
         if probe.observable and (probe.etag or probe.last_modified):
             self._metadata_validators[root] = (probe.etag, probe.last_modified)
 
+    def _rich_read(
+        self, raw_prs: list[dict] | None, rich_read: bool
+    ) -> _MetadataRead:
+        """Wrap a rich-relist result, deriving its authoritative open set.
+
+        A successful rich list is authoritative about which PRs are open; a
+        failed or quota-denied one proves nothing and must not prune.
+        """
+
+        if rich_read and raw_prs is not None:
+            return _MetadataRead(raw_prs, True, _open_numbers(raw_prs))
+        return _MetadataRead(raw_prs, rich_read, None)
+
     async def _read_metadata(
         self,
         root: str | None,
         now: datetime,
         *,
         force: bool,
-    ) -> tuple[list[dict] | None, bool]:
-        """Read metadata using rich discovery or a conditional REST validator."""
+        rich_due: bool = True,
+    ) -> _MetadataRead:
+        """Read metadata using rich discovery or a conditional REST validator.
+
+        ``rich_due`` is whether the *expensive* clock says a GraphQL relist is
+        owed. When it is False this call is a cheap validation pass on
+        ``LIST_VALIDATION_INTERVAL``: it may prune from the probe's own
+        authoritative open-PR list, but it must not spend GraphQL and must not
+        advance the rich relist's clocks (BOU-3095).
+        """
 
         if force or root not in self._metadata_cache:
-            return await self._rich_metadata_list(root, now, force=force)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         # Lightweight test/embedding adapters historically replace the rich
         # list boundary but do not provide a REST probe. Preserve that adapter
@@ -1203,13 +1285,21 @@ class Orchestrator:
             github_api.list_open_prs.__module__ != github_api.__name__
             and github_api.probe_open_prs_rest.__module__ == github_api.__name__
         ):
-            return await self._rich_metadata_list(root, now, force=force)
+            if not rich_due:
+                return _MetadataRead(self._metadata_cache[root], False, None)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         identity = self._root_repo_identity.get(root, "")
         if "/" not in identity:
             # A legacy fixture may have supplied metadata without a URL.  The
             # rich list is the only way to establish a REST repository target.
-            return await self._rich_metadata_list(root, now, force=force)
+            if not rich_due:
+                return _MetadataRead(self._metadata_cache[root], False, None)
+            return self._rich_read(
+                *await self._rich_metadata_list(root, now, force=force)
+            )
 
         owner, repo_name = identity.split("/", 1)
         etag, last_modified = self._metadata_validators.get(root, (None, None))
@@ -1226,14 +1316,20 @@ class Orchestrator:
             probe = github_api.ConditionalPRListProbe(
                 None, [], etag=etag, last_modified=last_modified, error=str(exc)
             )
-        self._metadata_last_attempt[root] = now
+        # The cheap validator has its own clock. Only a probe run because the
+        # rich clock was owed may stamp that clock — otherwise a 60-second
+        # validator would keep resetting the 15-minute reconciliation and the
+        # rich relist would never come due (BOU-3095).
+        self._list_validation_last_attempt[root] = now
+        if rich_due:
+            self._metadata_last_attempt[root] = now
         if probe.not_modified:
             self._metadata_validators[root] = (
                 probe.etag or etag,
                 probe.last_modified or last_modified,
             )
             last_rich = self._metadata_last_rich_success.get(root)
-            if (
+            if rich_due and (
                 last_rich is None
                 or now >= last_rich + RICH_METADATA_RECONCILIATION_INTERVAL
             ):
@@ -1241,9 +1337,17 @@ class Orchestrator:
                 # unchanged, but it cannot validate GraphQL-only fields such
                 # as reviewDecision or mergeability. Periodically refresh the
                 # rich snapshot independently of that validator.
-                return await self._rich_metadata_list(
-                    root, now, force=force, bootstrap=False
+                return self._rich_read(
+                    *await self._rich_metadata_list(
+                        root, now, force=force, bootstrap=False
+                    )
                 )
+            cached = self._metadata_cache[root]
+            if not rich_due:
+                # A cheap confirmation: the open set is proven unchanged, which
+                # is enough to keep the board honest, but it is not a metadata
+                # reconciliation and must not advance the expensive clocks.
+                return _MetadataRead(cached, False, _open_numbers(cached))
             self._metadata_last_success[root] = now
             event_due = self._metadata_event_due.get(root)
             if event_due is not None and now >= event_due:
@@ -1263,9 +1367,21 @@ class Orchestrator:
             # A validator-confirmed 304 is an authoritative metadata
             # observation. The cached list is unchanged, but the controller
             # must acknowledge any metadata invalidation carried by this plan.
-            return self._metadata_cache[root], True
+            cached = self._metadata_cache[root]
+            return _MetadataRead(cached, True, _open_numbers(cached))
 
         if probe.changed:
+            # The 200 body is an authoritative, author-filtered open-PR list in
+            # its own right. Derive the open set from it FIRST, so a merged PR
+            # leaves the board even when the rich relist below is deferred or
+            # quota-denied — that deferral is exactly how a merged PR used to
+            # sit on the board for hours (BOU-3095).
+            probe_open = _open_numbers(probe.prs)
+            if not rich_due:
+                # Cheap pass: prune from the probe, spend no GraphQL, and leave
+                # the validator untouched so the next rich-due window still
+                # sees this change and refreshes the GraphQL-only fields.
+                return _MetadataRead(self._metadata_cache[root], False, probe_open)
             raw_prs, rich_read = await self._rich_metadata_list(
                 root, now, force=force, bootstrap=False
             )
@@ -1274,7 +1390,8 @@ class Orchestrator:
                     probe.etag or etag,
                     probe.last_modified or last_modified,
                 )
-            return raw_prs, rich_read
+                return _MetadataRead(raw_prs, True, _open_numbers(raw_prs or []))
+            return _MetadataRead(raw_prs, False, probe_open)
 
         # Keep the old validator when the probe failed.  Reusing a new ETag
         # from a failed/partial response could turn a temporary outage into a
@@ -1284,9 +1401,11 @@ class Orchestrator:
             f"Skipping metadata reconciliation for {root}: {detail}",
             level="warn",
         )
-        # ``_metadata_last_attempt`` is the 15-minute backoff clock.  The raw
-        # cache remains authoritative for projection but cannot prove pruning.
-        return self._metadata_cache[root], False
+        # The raw cache remains authoritative for projection but cannot prove
+        # pruning. The failure costs one validation window, not a full
+        # reconciliation interval — ``_list_validation_last_attempt`` is what
+        # was stamped above.
+        return _MetadataRead(self._metadata_cache[root], False, None)
 
     async def _refresh_repo(
         self, root: str | None, now: datetime, *, force: bool = False
@@ -1299,42 +1418,46 @@ class Orchestrator:
         whose poll just failed) are never dropped.
         """
         metadata_due = self._metadata_refresh_due(root, now, force=force)
+        # The cheap conditional validator runs on its own fast clock, so a
+        # merged PR is pruned within a validation window instead of waiting out
+        # the rich relist's reconciliation interval (BOU-3095).
+        validation_due = not metadata_due and self._list_validation_due(root, now)
         raw_prs: list[dict] | None
         metadata_read = False
-        if metadata_due:
-            raw_prs, metadata_read = await self._read_metadata(
-                root, now, force=force
+        open_numbers: set[int] | None = None
+        if metadata_due or validation_due:
+            read = await self._read_metadata(
+                root, now, force=force, rich_due=metadata_due
             )
+            raw_prs = read.raw_prs
+            metadata_read = read.rich_read
+            open_numbers = read.open_numbers
             if raw_prs is None:
                 return
-            event_due = self._metadata_event_due.get(root)
-            if (
-                not metadata_read
-                and event_due is not None
-                and now >= event_due
-            ):
-                self._metadata_event_due[root] = now + self._metadata_interval()
-            if not metadata_read:
-                if self._has_pending_opened(root, now):
-                    self._opened_event_retry_due[root] = (
-                        now + METADATA_COLD_START_RETRY_INTERVAL
-                    )
-                else:
-                    self._opened_event_retry_due.pop(root, None)
+            if metadata_due:
+                event_due = self._metadata_event_due.get(root)
+                if (
+                    not metadata_read
+                    and event_due is not None
+                    and now >= event_due
+                ):
+                    self._metadata_event_due[root] = now + self._metadata_interval()
+                if not metadata_read:
+                    if self._has_pending_opened(root, now):
+                        self._opened_event_retry_due[root] = (
+                            now + METADATA_COLD_START_RETRY_INTERVAL
+                        )
+                    else:
+                        self._opened_event_retry_due.pop(root, None)
         else:
             raw_prs = self._metadata_cache.get(root)
             if raw_prs is None:
                 return
 
-        # Prune merged/closed PRs FIRST, but only after a successful metadata
-        # list. A cached list is observationally useful yet cannot prove that a
-        # missing PR is closed, so it must never prune current state.
-        if metadata_read:
-            open_numbers = {
-                raw["number"]
-                for raw in raw_prs
-                if isinstance(raw.get("number"), int)
-            }
+        # Prune merged/closed PRs FIRST, but only against a positively observed
+        # open set. A cached list is observationally useful yet cannot prove
+        # that a missing PR is closed, so it must never prune current state.
+        if open_numbers is not None:
             for key in list(self.prs.keys()):
                 if self._pr_root.get(key) != root:
                     continue
@@ -1349,6 +1472,25 @@ class Orchestrator:
                         pr_number=key[1],
                         level="success",
                     )
+            # The projection below rebuilds ``self.prs`` from ``raw_prs``. When
+            # the open set came from the cheap validator the cached rich list is
+            # still the pre-merge one, so without this the PR just pruned would
+            # be re-discovered on the same tick. Narrow the cache to the
+            # observed open set so it stays consistent until the next rich
+            # relist replaces it wholesale.
+            if any(
+                isinstance(raw.get("number"), int)
+                and raw["number"] not in open_numbers
+                for raw in raw_prs
+            ):
+                raw_prs = [
+                    raw
+                    for raw in raw_prs
+                    if isinstance(raw.get("number"), int)
+                    and raw["number"] in open_numbers
+                ]
+                if root in self._metadata_cache:
+                    self._metadata_cache[root] = raw_prs
 
         # Drop the previous tick's batch entries before planning. A CI-only
         # refresh must reach the live CI accessor rather than reusing a stale
