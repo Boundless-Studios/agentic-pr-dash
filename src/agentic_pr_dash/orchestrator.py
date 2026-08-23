@@ -741,12 +741,31 @@ class Orchestrator:
         """Recompute the watched set from one poll tick's resolution."""
 
         resolved_set = set(resolved)
-        watched: set[str | None] = set(self._configured_roots())
-        watched |= resolved_set
-        watched |= set(self._open_set_last_observed)
-        watched |= set(self._open_set_degraded_reason)
-        watched |= set(self._pr_root.values())
-        self._watched_roots = watched
+        # A root stays watched while configuration still names it, while it is
+        # still resolving, or while it still owns tracked state. Historical
+        # observation/degradation keys are NOT enough on their own: unioning
+        # them back every tick meant a root deliberately removed from
+        # ``maintenance_repo_roots`` was remembered forever and reported as
+        # dropped, so the header stayed partial after an intentional config
+        # change (BOU-3095 PR #169 round 7).
+        live: set[str | None] = set(self._configured_roots())
+        live |= resolved_set
+        live |= set(self._pr_root.values())
+        for root in (
+            set(self._open_set_last_observed)
+            | set(self._open_set_degraded_reason)
+        ) - live:
+            self._open_set_last_observed.pop(root, None)
+            self._open_set_degraded_reason.pop(root, None)
+            self._probe_projection.pop(root, None)
+            self._metadata_validators.pop(root, None)
+            self._metadata_validator_truncated.pop(root, None)
+            self.log(
+                f"Repo root {root} is no longer configured or tracked; "
+                "dropping its observation history",
+                level="info",
+            )
+        self._watched_roots = live
         # Kept separately so freshness can tell "watched but not resolved this
         # tick" from "watched and resolving fine". A root that resolved before
         # and has since vanished keeps a stale observation timestamp, so

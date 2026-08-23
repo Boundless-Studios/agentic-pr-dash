@@ -117,8 +117,16 @@ def _tracked_numbers(orch) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
-def test_probe_reports_a_full_page_as_truncated(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A full page means "there may be more", and the author filter runs after."""
+def test_probe_reports_a_paginated_page_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """More pages means "there may be more", and the author filter runs after.
+
+    Round 7 corrected how this is detected: a full page is NOT itself proof of
+    further results (a repo with exactly ``per_page`` open PRs has one full page
+    and no second), so truncation is read from the ``Link: rel="next"`` header.
+    This test therefore supplies one.
+    """
     items = [
         {
             "number": n,
@@ -130,13 +138,14 @@ def test_probe_reports_a_full_page_as_truncated(monkeypatch: pytest.MonkeyPatch)
         for n in range(1, 101)
     ]
     payload = json.dumps(items)
+    link = '<https://api.github.com/repositories/1/pulls?page=2>; rel="next"'
     monkeypatch.setattr(
         github_api,
         "_run",
         lambda *a, **k: subprocess.CompletedProcess(
             a[0] if a else [],
             0,
-            stdout=f'HTTP/2 200 OK\r\nETag: "v2"\r\n\r\n{payload}',
+            stdout=f'HTTP/2 200 OK\r\nETag: "v2"\r\nLink: {link}\r\n\r\n{payload}',
             stderr="",
         ),
     )
@@ -145,7 +154,7 @@ def test_probe_reports_a_full_page_as_truncated(monkeypatch: pytest.MonkeyPatch)
 
     assert probe.changed is True
     assert probe.prs == []          # none authored by alice on this page
-    assert probe.truncated is True  # ...but the page was full, so we cannot say
+    assert probe.truncated is True  # ...and page 2 exists, so we cannot say
 
 
 def test_probe_reports_a_partial_page_as_complete(

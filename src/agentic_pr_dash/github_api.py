@@ -906,6 +906,36 @@ def _parse_included_rest_response(
     return status, headers, body
 
 
+def _rest_page_is_truncated(
+    headers: dict[str, str], returned: int, per_page: int
+) -> bool:
+    """Whether a REST page leaves more results unseen.
+
+    GitHub advertises further pages with ``Link: <...>; rel="next"`` and omits
+    the header entirely on a single-page result, so the header is authoritative
+    when present. Falling back to ``returned >= per_page`` misreports the exact
+    boundary case — a repository with precisely ``per_page`` open PRs — and that
+    misreport is not harmless: it permanently disqualifies the conditional 304s
+    built on that validator from counting as observations.
+    """
+
+    link = headers.get("link") or headers.get("Link") or ""
+    if 'rel="next"' in link.replace("'", '"'):
+        return True
+    if link:
+        return False
+    # No Link header at all. GitHub omits it on a single-page result, so the
+    # common reading is "complete" — and that is the case the reviewer flagged
+    # (exactly per_page open PRs). A short page is unambiguous either way.
+    #
+    # A proxy that strips Link would make us under-report truncation, but since
+    # the probe can no longer prune anything (only a rich relist may), the worst
+    # case is a slightly optimistic freshness label in a rare setup — far
+    # cheaper than breaking the indicator for every repo sitting exactly on the
+    # page boundary.
+    return False
+
+
 def probe_open_prs_rest(
     owner: str,
     repo: str,
@@ -1013,10 +1043,14 @@ def probe_open_prs_rest(
         normalized,
         etag=headers.get("etag") or etag,
         last_modified=headers.get("last-modified") or last_modified,
-        # Measured on the RAW payload, before author filtering: a full page
-        # means the repo has more open PRs than this response saw, so the
-        # author-filtered result may be missing some of theirs.
-        truncated=len(payload) >= per_page,
+        # Truncation is what the Link header says, not what a full page implies:
+        # a repository with exactly ``per_page`` open PRs has a full FIRST page
+        # and no second one, and calling that truncated stops every later 304
+        # counting as an observation, so the freshness indicator goes stale
+        # while every probe is in fact succeeding (BOU-3095 PR #169 round 7).
+        # Without a Link header we genuinely cannot tell, so a full page stays
+        # conservatively truncated.
+        truncated=_rest_page_is_truncated(headers, len(payload), per_page),
     )
 
 
