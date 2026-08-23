@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 _CODEX_TO_CLAUDE_TOOL: dict[str, str] = {
+    "bash": "Bash",
     "exec_command": "Bash",
     "functions.exec_command": "Bash",
     "request_user_input": "request_user_input",
