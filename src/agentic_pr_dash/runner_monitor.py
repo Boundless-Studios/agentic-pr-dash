@@ -8,7 +8,7 @@ It is optional: when no runner label is configured, the runner panel disappears.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 import json
 import os
@@ -75,6 +75,23 @@ def _runner_probe_failure(detail: str) -> RunnerFleetLoad:
     return _degraded_load(f"Runner probe failed: {detail}")
 
 
+@dataclass(frozen=True)
+class LocalRunnerHost:
+    """One Docker daemon that hosts part of the self-hosted fleet.
+
+    `docker_host` is a Docker endpoint URL (`ssh://user@host`, `tcp://...`), or
+    None to use the ambient daemon the dashboard process already points at.
+    """
+
+    prefix: str
+    docker_host: str | None = None
+    name: str | None = None
+
+    @property
+    def display(self) -> str:
+        return self.name or self.docker_host or "local"
+
+
 def _configured_local_container_prefix(cwd: str | None) -> str:
     raw = os.environ.get("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX")
     if raw is None:
@@ -82,24 +99,66 @@ def _configured_local_container_prefix(cwd: str | None) -> str:
     return str(raw or "").strip()
 
 
-def _local_docker_runner_load(
-    prefix: str,
+def _configured_local_runner_hosts(cwd: str | None) -> list[LocalRunnerHost]:
+    """Resolve the fleet's Docker daemons; the multi-host key wins when present.
+
+    A fleet routinely spans more than one box — a large CI fleet plus a small
+    reserve elsewhere, say. The single-prefix form probes only the AMBIENT
+    daemon, so on a multi-box fleet it can describe only whichever box
+    DOCKER_HOST happens to name and reports the rest as simply absent.
+    `local_runner_hosts` names each daemon explicitly.
+    """
+    raw_hosts = load_config(cwd).extra.get("local_runner_hosts")
+    hosts: list[LocalRunnerHost] = []
+    if isinstance(raw_hosts, list):
+        for entry in raw_hosts:
+            if not isinstance(entry, dict):
+                continue
+            prefix = str(entry.get("prefix") or "").strip()
+            if not prefix:
+                continue
+            docker_host = str(entry.get("docker_host") or "").strip() or None
+            name = str(entry.get("name") or "").strip() or None
+            hosts.append(
+                LocalRunnerHost(prefix=prefix, docker_host=docker_host, name=name)
+            )
+    if hosts:
+        return hosts
+    prefix = _configured_local_container_prefix(cwd)
+    return [LocalRunnerHost(prefix=prefix)] if prefix else []
+
+
+def _docker(host: LocalRunnerHost, *args: str) -> list[str]:
+    """Build a docker argv pinned to one daemon.
+
+    `--host` rather than a DOCKER_HOST environment variable: RunCommand carries
+    no environment, and the flag keeps each call's target visible in the argv.
+    """
+    if host.docker_host:
+        return ["docker", "--host", host.docker_host, *args]
+    return ["docker", *args]
+
+
+def _host_runner_rows(
+    host: LocalRunnerHost,
     label: str,
     cwd: str | None,
     run: RunCommand,
-) -> RunnerFleetLoad | None:
-    """Read a co-located Docker runner fleet without GitHub credentials."""
+    *,
+    qualify_names: bool,
+) -> list[dict[str, Any]] | None:
+    """Runner rows for one daemon, or None when that daemon cannot be read."""
     try:
         listed = run(
-            [
-                "docker",
+            _docker(
+                host,
                 "ps",
                 "-a",
                 "--filter",
-                f"name={prefix}",
+                f"name={host.prefix}",
                 "--format",
                 "{{json .}}",
-            ],
+            ),
             cwd,
             10,
         )
@@ -114,19 +173,14 @@ def _local_docker_runner_load(
             if not line.strip():
                 continue
             item = json.loads(line)
-            if isinstance(item, dict) and str(item.get("Names", "")).startswith(prefix):
+            if isinstance(item, dict) and str(item.get("Names", "")).startswith(
+                host.prefix
+            ):
                 containers.append(item)
     except json.JSONDecodeError:
         return None
-    if not containers:
-        # A successful listing that matches nothing is an authoritative zero,
-        # not an unavailable probe. Configuring a container prefix declares the
-        # fleet local; returning None here would fall through to the GitHub
-        # runner endpoint, which needs Administration: Read and may report
-        # unrelated registered runners in place of the real local total.
-        return parse_runner_inventory({"runners": []}, label=label)
 
-    runners: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for index, container in enumerate(containers, start=1):
         name = str(container.get("Names") or "")
         state = str(container.get("State") or "").casefold()
@@ -134,9 +188,10 @@ def _local_docker_runner_load(
         busy = False
         if online:
             try:
-                processes = run(
-                    ["docker", "top", name, "-eo", "args"], cwd, 5
-                )
+                # `-eo pid,args`, never `-eo args`: docker >= 29.2 rejects a ps
+                # selection with no PID column ("Couldn't find PID field in ps
+                # output") and exits non-zero, which would drop this whole host.
+                processes = run(_docker(host, "top", name, "-eo", "pid,args"), cwd, 5)
             except (OSError, subprocess.TimeoutExpired):
                 return None
             if processes.returncode != 0:
@@ -147,16 +202,69 @@ def _local_docker_runner_load(
             runner_id = int(raw_id[:12], 16)
         except ValueError:
             runner_id = index
-        runners.append(
+        rows.append(
             {
                 "id": runner_id,
-                "name": name,
+                # Container names repeat across boxes (both fleets name theirs
+                # gha-runner-N), so an unqualified merge renders indistinguishable
+                # duplicates.
+                "name": f"{host.display}/{name}" if qualify_names else name,
                 "status": "online" if online else "offline",
                 "busy": busy,
                 "labels": [{"name": label}],
             }
         )
-    return parse_runner_inventory({"runners": runners}, label=label)
+    return rows
+
+
+def _local_docker_runner_load(
+    hosts: list[LocalRunnerHost] | str,
+    label: str,
+    cwd: str | None,
+    run: RunCommand,
+) -> RunnerFleetLoad | None:
+    """Read a co-located Docker runner fleet without GitHub credentials.
+
+    Accepts a bare prefix string for backward compatibility.
+    """
+    if isinstance(hosts, str):
+        hosts = [LocalRunnerHost(prefix=hosts)]
+    if not hosts:
+        return None
+
+    qualify = len(hosts) > 1
+    rows: list[dict[str, Any]] = []
+    unreachable: list[str] = []
+    for host in hosts:
+        host_rows = _host_runner_rows(host, label, cwd, run, qualify_names=qualify)
+        if host_rows is None:
+            unreachable.append(host.display)
+            continue
+        rows.extend(host_rows)
+
+    if len(unreachable) == len(hosts):
+        # Every declared daemon is unreadable: fall through to the GitHub
+        # endpoint rather than assert an authoritative zero.
+        return None
+
+    # A successful listing that matches nothing is an authoritative zero, not an
+    # unavailable probe. Configuring hosts declares the fleet local; returning
+    # None here would fall through to the GitHub runner endpoint, which needs
+    # Administration: Read and may report unrelated registered runners in place
+    # of the real local total.
+    load = parse_runner_inventory({"runners": rows}, label=label)
+    if unreachable:
+        # Partial coverage must not read as a complete picture: the counts are
+        # real but describe only the daemons that answered.
+        detail = ", ".join(sorted(unreachable))
+        return replace(
+            load,
+            error=f"Runner probe could not reach: {detail}",
+            recommendation=(
+                f"{load.recommendation} Counts exclude unreachable host(s): {detail}."
+            ),
+        )
+    return load
 
 
 def _run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
@@ -227,13 +335,15 @@ def get_runner_fleet_load(
     label = label or _runner_label()
     if label is None:
         return RunnerFleetLoad()
-    prefix = (
-        _configured_local_container_prefix(cwd)
+    hosts = (
+        _configured_local_runner_hosts(cwd)
         if local_container_prefix is None
-        else local_container_prefix.strip()
+        else [LocalRunnerHost(prefix=local_container_prefix.strip())]
+        if local_container_prefix.strip()
+        else []
     )
-    if prefix:
-        local_load = _local_docker_runner_load(prefix, label, cwd, run)
+    if hosts:
+        local_load = _local_docker_runner_load(hosts, label, cwd, run)
         if local_load is not None:
             return local_load
     repo_name = repo or _get_repo_full_name(cwd=cwd, run=run)
