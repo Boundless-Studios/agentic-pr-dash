@@ -792,24 +792,6 @@ class GhFailure:
 _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 
 
-def _record_list_open_prs_failure(
-    command: list[str], result: subprocess.CompletedProcess, *, reason: str | None = None
-) -> None:
-    """Record a failed PR-list-shaped probe for quota-safe REST fallback."""
-    global _LAST_LIST_OPEN_PRS_FAILURE
-    _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
-        command=command,
-        returncode=result.returncode,
-        stderr=result.stderr or "",
-        reason=reason or ("rate-limit" if _is_rate_limit_failure(result) else "exit"),
-    )
-
-
-def _clear_list_open_prs_failure() -> None:
-    """Clear a prior list failure after a successful PR-list-shaped probe."""
-    global _LAST_LIST_OPEN_PRS_FAILURE
-    _LAST_LIST_OPEN_PRS_FAILURE = None
-
 # --------------------------------------------------------------------------- #
 # One PR-state resolution per repo, shared by every reader (BOU-2810)
 # --------------------------------------------------------------------------- #
