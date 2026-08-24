@@ -174,3 +174,40 @@
   covered separately. Focused retry/diagnostic/author suite: **36 passed**.
 - Bounded full-suite rerun reached 425 passed before the pre-existing retry fixture
   expectation failed; the fixture correction then passed in the focused rerun.
+
+# BOU-2760 — backstop observation diagnostics
+
+## Implementation
+
+- Branch: `bou-2760-backstop-diagnostics`.
+- Added typed `ObservationState` outcomes (`observed`, `unavailable`, and
+  `capability_refused`) to the GitHub observation contract.
+- Added the strict review-submission observation boundary. Empty readable
+  review data remains a real missing backstop; auth/rate-limit/permission and
+  malformed reads are unavailable and never render `backstop:N`.
+- Rate-limited review reads retry once with `GH_TOKEN` blanked so `gh` can use
+  the user keyring; no token values are logged or persisted.
+- Codex quota/capability refusal comments are classified explicitly and thread
+  through finalization without fabricating a `ReviewSubmission`.
+- Finalization records the typed observation state, redacted diagnostics, and a
+  settlement-state key that excludes rendered guidance wording. Unavailable
+  review state is fail-closed; capability refusal follows the explicit release
+  policy; no waiter is entered after the finalization read fails.
+- RED coverage is in `tests/test_bou2760_backstop_diagnostics.py`.
+
+## Verification
+
+- RED baseline: 6 failures for the missing typed observer/finalization
+  contract.
+- Focused BOU-2760 suite: 7 passed.
+- Existing review/finalization/settlement/monitor/defer suites: 109 passed.
+- Full APD suite: 2215 passed, 1 pre-existing FastAPI/Starlette deprecation
+  warning, in 367.94s.
+- Compileall and `git diff --check`: passed.
+
+## Handoff
+
+- Upstream PR and Gaia pin PR still need to be created after the implementation
+  commit is pushed.
+- Do not merge. Linear `BOU-2760` remains In Progress until the ready PR(s),
+  review-local, and harness validation are complete.
