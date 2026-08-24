@@ -317,6 +317,29 @@ def test_non_string_configured_host_prefix_returns_configuration_failure(monkeyp
     assert "integer-prefix" in (load.error or "")
 
 
+def test_non_string_configured_docker_host_returns_configuration_failure(monkeypatch) -> None:
+    """A present non-string endpoint must not probe the ambient Docker daemon."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": "gha-runner-", "docker_host": False, "name": "reserve"},
+            ]
+        }
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+
+    assert hosts[0].configuration_error == "docker_host must be a string"
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "reserve" in (load.error or "")
+    assert "docker_host must be a string" in (load.error or "")
+
+
 def test_configured_hosts_falls_back_to_legacy_prefix(monkeypatch) -> None:
     """Without the new key the ambient-daemon behaviour is unchanged."""
 

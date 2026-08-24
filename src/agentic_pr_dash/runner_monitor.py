@@ -138,8 +138,22 @@ def _configured_local_runner_hosts(cwd: str | None) -> list[LocalRunnerHost]:
                 )
                 continue
             raw_prefix = entry.get("prefix")
-            docker_host = str(entry.get("docker_host") or "").strip() or None
+            raw_docker_host = entry.get("docker_host")
+            docker_host = (
+                raw_docker_host.strip() or None
+                if isinstance(raw_docker_host, str)
+                else None
+            )
             name = str(entry.get("name") or "").strip() or None
+            if "docker_host" in entry and not isinstance(raw_docker_host, str):
+                hosts.append(
+                    LocalRunnerHost(
+                        prefix="",
+                        name=name or f"local_runner_hosts[{index}]",
+                        configuration_error="docker_host must be a string",
+                    )
+                )
+                continue
             if not isinstance(raw_prefix, str) or not raw_prefix.strip():
                 hosts.append(
                     LocalRunnerHost(

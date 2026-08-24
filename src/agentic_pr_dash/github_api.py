@@ -801,6 +801,47 @@ PR_SNAPSHOT_FIELDS = (
 #: be handed a field the snapshot did not actually fetch.
 _SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
 
+# ``gh pr list`` defaults to 30 items and has no explicit ``--paginate`` flag.
+# Its implementation keeps fetching pages until ``--limit`` is reached or
+# GitHub reports no next page.  Use the CLI's maximum signed-int count as the
+# conventional "drain every page" sentinel so client-side author filtering is
+# not applied to an arbitrarily capped repository population.
+_GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
+
+
+def _repo_hostname(cwd: str | None = None) -> str:
+    """Return the current repository's GitHub host without an API call."""
+
+    gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
+    if len(gh_repo_parts) >= 3:
+        return gh_repo_parts[0]
+    try:
+        remote = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        remote = None
+    url = (remote.stdout or "").strip() if remote and remote.returncode == 0 else ""
+    if url.startswith("git@") and ":" in url:
+        return url[4:].split(":", 1)[0]
+    if "://" in url:
+        hostname = urllib.parse.urlparse(url).hostname
+        if hostname:
+            return hostname
+    return os.environ.get("GH_HOST", "").strip() or "github.com"
+
+
+def _viewer_login_result(
+    cwd: str | None = None, *, timeout_s: float = 15,
+) -> subprocess.CompletedProcess:
+    """Resolve ``@me`` on the same GitHub host as the working repository."""
+
+    return _run(
+        ["gh", "api", "user", "--hostname", _repo_hostname(cwd), "--jq", ".login"],
+        cwd=cwd, timeout_s=timeout_s,
+    )
+
 
 def last_list_open_prs_failure() -> GhFailure | None:
     """Return diagnostics for the most recent failed :func:`list_open_prs` call.
@@ -833,8 +874,8 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
 
     global _LAST_LIST_OPEN_PRS_FAILURE
     cmd = [
-        "gh", "pr", "list", "--author", _load_config(cwd).pr_author, "--state", "open",
-        "--json", PR_SNAPSHOT_FIELDS,
+        "gh", "pr", "list", "--state", "open",
+        "--limit", _GH_COMPLETE_LIST_LIMIT, "--json", PR_SNAPSHOT_FIELDS,
     ]
     r = _run(cmd, cwd=cwd, timeout_s=30)
     if r.returncode != 0:
@@ -863,6 +904,24 @@ def list_open_prs(cwd: str | None = None) -> list[dict] | None:
             reason="not-a-list",
         )
         return None
+    author = _load_config(cwd).pr_author
+    if author == "@me":
+        viewer = _viewer_login_result(cwd)
+        author = viewer.stdout.strip() if viewer.returncode == 0 else ""
+        if not author:
+            _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+                command=viewer.args if isinstance(viewer.args, list) else ["gh", "api", "user"],
+                returncode=viewer.returncode,
+                stderr=(viewer.stderr or "authenticated GitHub login is unavailable"),
+                reason="viewer-unavailable",
+            )
+            return None
+    prs = [
+        pr for pr in prs
+        if isinstance(pr, dict)
+        and isinstance(pr.get("author"), dict)
+        and pr["author"].get("login") == author
+    ]
     _LAST_LIST_OPEN_PRS_FAILURE = None
     return prs
 

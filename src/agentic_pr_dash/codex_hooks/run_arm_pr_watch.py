@@ -38,6 +38,10 @@ def normalized_payload(payload: dict) -> dict:
     no) PR. Surface it as the normalized ``cwd`` so the workdir wins.
     """
     tool_name = payload.get("tool_name")
+    if tool_name == "bash":
+        normalized = dict(payload)
+        normalized["tool_name"] = "Bash"
+        return normalized
     if tool_name in {"exec_command", "functions.exec_command"}:
         tool_input = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
         command = tool_input.get("cmd", "")

@@ -250,9 +250,12 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
     * **Live PR.** An owned, non-draft open PR exists for the pushed branch.
     * **No duplicate.** No waiter is already alive for this session.
     """
-    codex_tool_names = {"exec_command", "functions.exec_command"}
-    is_codex = raw_tool_name in codex_tool_names or os.environ.get("PR_WATCH_NO_WAITER") == "1"
-    if raw_tool_name not in ("Bash", *codex_tool_names):
+    foreground_tool_names = {"bash", "exec_command", "functions.exec_command"}
+    requires_foreground = (
+        raw_tool_name in foreground_tool_names
+        or os.environ.get("PR_WATCH_NO_WAITER") == "1"
+    )
+    if raw_tool_name not in ("Bash", *foreground_tool_names):
         return None
     branch = current_branch(Path(push_cwd))
     if branch in ("", "main", "master"):
@@ -274,10 +277,10 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
         return None
     if _pr_is_draft(pr_number, push_cwd):
         return None
-    if not is_codex and _await_alive(push_cwd, session_id):
+    if not requires_foreground and _await_alive(push_cwd, session_id):
         return None
     sha = head_sha(Path(push_cwd))
-    if is_codex:
+    if requires_foreground:
         monitor_python = shlex.quote(sys.executable)
         policy_path = os.environ.get("AGENTIC_PR_DASH_REVIEW_POLICY", "")
         if policy_path and not os.path.isabs(policy_path):
@@ -298,7 +301,7 @@ def build_post_push_waiter_nudge(push_cwd: str, raw_tool_name: str) -> str | Non
                 ledger_path = str(candidate)
         ledger_arg = f" --ledger {shlex.quote(ledger_path)}" if policy_path and ledger_path else ""
         return (
-            f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). Codex has "
+            f"[pr-watch] You pushed to PR #{pr_number} (HEAD {sha[:8]}). This runtime has "
             "no asynchronous wake/resumption channel. Poll settlement in the "
             "FOREGROUND now until two clean observations 30 seconds apart or the "
             f"exact 30-minute bound:\n  {monitor_python} -m agentic_pr_dash.maintenance_check "

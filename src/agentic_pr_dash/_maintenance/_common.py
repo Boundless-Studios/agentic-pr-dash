@@ -96,7 +96,7 @@ def _resolve_owner_pid() -> int:
             break
         ppid_str, _sep, comm = line.partition(" ")
         comm_base = os.path.basename(comm.strip()).lower()
-        if "claude" in comm_base or "codex" in comm_base:
+        if "claude" in comm_base or "codex" in comm_base or comm_base == "pi":
             return pid
         if not ppid_str.isdigit():
             break

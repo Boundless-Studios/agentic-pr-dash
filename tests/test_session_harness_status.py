@@ -85,6 +85,15 @@ def test_status_report_rejects_invalid_contract(tmp_path):
         )
 
 
+def test_status_report_accepts_pi_runtime(tmp_path):
+    registry = tmp_path / "events.jsonl"
+
+    session_registry.record_status_report(_report(runtime="pi"), path=registry)
+
+    state = session_registry.summarize_sessions(path=registry).sessions["conversation-1"]
+    assert state.cli == "pi"
+
+
 @pytest.mark.parametrize(
     "private_field",
     (
