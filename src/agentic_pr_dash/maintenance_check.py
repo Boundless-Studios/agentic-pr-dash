@@ -677,7 +677,11 @@ def _await_watch_pending_this_tick(
     )
 
 
-def _owned_pr_pairs_for_await(owned: list[str]) -> list[tuple[str, int]]:
+def _owned_pr_pairs_for_await(
+    owned: list[str],
+    *,
+    bindings: dict | None = None,
+) -> list[tuple[str, int]]:
     """``(worktree, pr)`` pairs for the waiter, claim-first with marker fallback.
 
     ``_owned_open_pr_pairs`` reads ``pr-watch.armed`` and nothing else. Stage 4 of
@@ -691,19 +695,33 @@ def _owned_pr_pairs_for_await(owned: list[str]) -> list[tuple[str, int]]:
     left exactly as it is (several tests monkeypatch it directly and it is the
     specification) and the live claim is added alongside it.
     """
-    from ._maintenance.ownership_resolution import resolve_worktree  # noqa: PLC0415
-    from agentic_pr_dash import ownership  # noqa: PLC0415
+    from ._maintenance.ownership_resolution import resolve_current_prs  # noqa: PLC0415
 
     pairs = dict(_owned_open_pr_pairs(owned))
-    missing = [wt for wt in owned if wt not in pairs]
-    if missing:
-        # ONE store read for every worktree still unresolved, never one each.
-        snap = ownership.snapshot()
-        for wt in missing:
-            pr = resolve_worktree(wt, kind="waiter_divergence", snap=snap).pr_number
-            if pr is not None:
-                pairs[wt] = pr
-    return list(pairs.items())
+    current = bindings or resolve_current_prs(owned, kind="waiter_divergence")
+    for wt, binding in current.items():
+        if not binding.resolved:
+            # A detached/invalid branch has no current-branch evidence; retain
+            # the legacy marker fallback rather than inventing a rebind. A
+            # claim-only worktree has no marker to provide that fallback, so
+            # preserve its recorded PR only when the branch itself could not be
+            # established; a branch with an unknown GitHub lookup is marked
+            # resolved/unknown and must never fall back to stale ownership.
+            if (
+                wt not in pairs
+                and binding.branch is None
+                and binding.stale_pr_number is not None
+            ):
+                pairs[wt] = binding.stale_pr_number
+            continue
+        if binding.pr_number is None:
+            # The marker/claim may still name a closed PR A. Once the current
+            # branch was positively resolved to "no open PR", A is not a PR the
+            # waiter may watch or report as coverage.
+            pairs.pop(wt, None)
+        else:
+            pairs[wt] = binding.pr_number
+    return [(wt, pairs[wt]) for wt in owned if wt in pairs]
 
 
 def _marker_pr_still_current(worktree: str, pr_number: int) -> bool:
@@ -1827,6 +1845,20 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             else:
                 owned = [cwd]
 
+            # Resolve the current branch/PR once for this waiter tick. The same
+            # shared resolver is used by the stop gate, so a stale marker for PR
+            # A cannot make this waiter report A while the gate has already
+            # rebound the worktree to PR B.
+            from ._maintenance.ownership_resolution import (  # noqa: PLC0415
+                resolve_current_prs as _resolve_current_prs,
+            )
+            current_pr_bindings = _resolve_current_prs(
+                owned,
+                session_id,
+                kind="await_pr_watch_divergence",
+                snap=_await_snap,
+            )
+
             pending: list[tuple[str, str]] = []
             adopted_worktrees: set[str] = set()
             gh_unobservable = False
@@ -2022,7 +2054,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # verified (round 5).
                     verified = {
                         _clean_exit_key(_repo_slug(wt), n)
-                        for wt, n in _owned_pr_pairs_for_await(watched_owned)
+                        for wt, n in _owned_pr_pairs_for_await(
+                            watched_owned,
+                            bindings=current_pr_bindings,
+                        )
                         if _marker_pr_still_current(wt, n)
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])

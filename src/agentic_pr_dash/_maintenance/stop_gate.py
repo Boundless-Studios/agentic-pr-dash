@@ -223,7 +223,12 @@ def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
     return pairs
 
 
-def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[str, int]]:
+def _effective_pr_pairs(
+    owned: list[str],
+    pr_for: dict[str, int],
+    *,
+    current_resolved: set[str] | None = None,
+) -> list[tuple[str, int]]:
     """``(worktree, pr)`` pairs, preferring the claim-derived ``pr_for`` map
     (``ownership_resolution.resolve_owned``, BOU-2223 Stage 2) per worktree and
     falling back to the marker-derived :func:`_owned_open_pr_pairs` otherwise.
@@ -235,7 +240,13 @@ def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[
     marker_by_wt = dict(_owned_open_pr_pairs(owned))
     pairs: list[tuple[str, int]] = []
     for wt in owned:
-        pr = pr_for.get(wt, marker_by_wt.get(wt))
+        if current_resolved is not None and wt in current_resolved:
+            # A positive current-branch lookup is authoritative, including a
+            # definite "no open PR" answer. Do not fall back to a closed marker
+            # or claim PR after a branch switch.
+            pr = pr_for.get(wt)
+        else:
+            pr = pr_for.get(wt, marker_by_wt.get(wt))
         if pr is not None:
             pairs.append((wt, pr))
     return pairs
@@ -426,6 +437,34 @@ def _stop_gate_impl(args) -> int:
     pr_for = resolution.pr_for if resolution is not None else {}
     provenance_for = resolution.provenance_for if resolution is not None else {}
 
+    from .ownership_resolution import resolve_current_prs  # noqa: PLC0415
+    current_pr_bindings = resolve_current_prs(
+        owned,
+        session_id,
+        kind="stop_gate_pr_watch_divergence",
+        snap=resolution_snapshot,
+    )
+    current_pr_for = {
+        worktree: binding.pr_number
+        for worktree, binding in current_pr_bindings.items()
+        if binding.resolved and binding.pr_number is not None
+    }
+    current_resolved_worktrees = {
+        worktree
+        for worktree, binding in current_pr_bindings.items()
+        if binding.resolved
+    }
+    current_unknown_worktrees = [
+        worktree
+        for worktree, binding in current_pr_bindings.items()
+        if binding.unknown
+    ]
+    stale_current_pr_numbers = {
+        binding.stale_pr_number
+        for binding in current_pr_bindings.values()
+        if binding.resolved and binding.stale_pr_number is not None
+    }
+
     # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
     # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
     # Stop-hook timeout at seven (the incident this fixes). Prefetch all of
@@ -438,7 +477,11 @@ def _stop_gate_impl(args) -> int:
     # the loop falls back to its original per-PR calls (never a wrong answer,
     # only a slower one).
     github_api.clear_pr_batch_cache()
-    effective_pr_pairs = _effective_pr_pairs(owned, pr_for)
+    effective_pr_pairs = _effective_pr_pairs(
+        owned,
+        {**pr_for, **current_pr_for},
+        current_resolved=current_resolved_worktrees,
+    )
     _prefetch_owned_pr_state(effective_pr_pairs)
 
     # BOU-2556: give the per-worktree loop below a wall-clock budget so a
@@ -644,6 +687,15 @@ def _stop_gate_impl(args) -> int:
             file=sys.stderr,
         )
 
+    if current_unknown_worktrees:
+        print(
+            "[pr-watch] current PR ownership could not be observed for "
+            f"{len(current_unknown_worktrees)} owned worktree(s); refusing to "
+            "treat stale PR state as clean. Retry when GitHub state is observable.",
+            file=sys.stderr,
+        )
+        return 2
+
     if not pending and not unknown_worktrees:
         # BOU-2567: surface the deferred count on every otherwise-clean path
         # through this branch (idle, escalation, waiter-demand, clean-exit) —
@@ -677,8 +729,14 @@ def _stop_gate_impl(args) -> int:
             # alone, and a session owning a live open PR would never be told to
             # start a waiter — arriving review comments and red CI would stop
             # waking it. That is a fail-OPEN regression on a fail-closed path.
+            # Use the effective current/claim/marker pairs here rather than
+            # only ``current_pr_for``. A claim-only worktree without a usable
+            # local branch (for example a detached maintenance record) has no
+            # current binding, but it still needs coverage. When a branch was
+            # positively resolved, ``_effective_pr_pairs`` has already removed
+            # any stale PR and therefore remains safe for rebinds.
             claim_open_pr_numbers = {
-                pr for wt, pr in pr_for.items() if wt not in draft_worktrees
+                pr for wt, pr in effective_pr_pairs if wt not in draft_worktrees
             }
             draft_pr_numbers = {
                 pr for wt, pr in effective_pr_pairs if wt in draft_worktrees
@@ -688,7 +746,9 @@ def _stop_gate_impl(args) -> int:
             }
             exclusively_draft_pr_numbers = draft_pr_numbers - non_draft_pr_numbers
             marker_open_pr_numbers = (
-                _owned_open_pr_numbers(owned) - exclusively_draft_pr_numbers
+                _owned_open_pr_numbers(owned)
+                - stale_current_pr_numbers
+                - exclusively_draft_pr_numbers
             )
             owned_pr_numbers = (
                 marker_open_pr_numbers | claim_open_pr_numbers

@@ -101,7 +101,7 @@ def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     return _login_key(actual) == _login_key(expected)
 
 
-def _rest_fallback_entry_for_branch(branch: str, cwd: str):
+def _rest_fallback_entry_for_branch(branch: str, cwd: str, *, force: bool = False):
     """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
 
     Resolves owner (REST) → exact owner-qualified head numbers (REST) → full
@@ -118,7 +118,7 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str):
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
-    if not _list_failure_is_rate_limited():
+    if not force and not _list_failure_is_rate_limited():
         return None
     owner = github_api._rest_repo_owner(cwd)
     if not owner:
@@ -136,6 +136,84 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str):
             continue
         return raw
     return None
+
+
+def _resolve_pr_entry_for_branch(
+    cwd: str,
+    branch: str,
+    *,
+    head_oid: str = "",
+    validate_snapshot_state: bool = False,
+):
+    """Resolve one exact, tracked open-PR entry for ``branch``.
+
+    The ordinary branch helper intentionally serves the shared snapshot without
+    another network call. Ownership readers have a stricter contract: a cached
+    entry can be the PR that was closed immediately before a worktree switched
+    branches, so a snapshot candidate is revalidated through the REST resource
+    before it is used. If that candidate is stale, a forced REST head lookup gets
+    the replacement PR without trusting the author-wide GraphQL list.
+
+    ``None`` means a successful lookup found no open PR. ``_GH_UNAVAILABLE``
+    means the current branch could not be established with sufficient evidence.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not branch:
+        return None
+
+    def _pick(entries: list[dict]) -> dict | None:
+        exact = [
+            entry for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("number"), int)
+        ]
+        if not exact:
+            return None
+        if head_oid:
+            matching_head = [entry for entry in exact if entry.get("headRefOid") == head_oid]
+            if matching_head:
+                exact = matching_head
+        return exact[0]
+
+    snapshot = github_api.peek_pr_snapshot(cwd)
+    if snapshot is not None:
+        candidate = _pick(snapshot)
+        if candidate is None:
+            return None
+        if not validate_snapshot_state:
+            return candidate
+
+        # A snapshot hit is not proof that the PR is still open. REST is the
+        # quota-safe, current-state check and also detects a reused branch whose
+        # open PR changed while the list snapshot was still warm.
+        live = github_api._rest_pr_payload(int(candidate["number"]), cwd=cwd)
+        if live is not None:
+            if (
+                str(live.get("state") or "").lower() == "open"
+                and live.get("headRefName") == branch
+            ):
+                return live
+        # The cached candidate was closed, changed head, or could not be
+        # verified. Ask REST for the exact current head before declaring the
+        # worktree unbound. This path is deliberately not gated on a prior
+        # GraphQL error: the snapshot itself may be the stale source.
+        replacement = _rest_fallback_entry_for_branch(branch, cwd, force=True)
+        if replacement is not None:
+            return replacement
+        if live is None:
+            return _GH_UNAVAILABLE
+        return None
+
+    data = _gh_pr_list_json(cwd, ["--head", branch], "number,isDraft,headRefName,headRefOid")
+    if data is None:
+        # On a GraphQL/list failure, REST is the only authoritative fallback.
+        # A failed REST verification remains unknown rather than becoming a
+        # false "no PR" answer (the BOU-2798 waiter must stay fail-loud).
+        replacement = _rest_fallback_entry_for_branch(branch, cwd)
+        return replacement if replacement is not None else _GH_UNAVAILABLE
+    return _pick(data)
 
 
 def _resolve_pr_for_branch(cwd: str, *, force: bool = False):

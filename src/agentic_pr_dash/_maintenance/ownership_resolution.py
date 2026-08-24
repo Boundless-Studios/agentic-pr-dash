@@ -362,6 +362,150 @@ class WorktreeOwnership:
         return session_id == self.marker_session_id or session_id in self.claim_session_ids
 
 
+@dataclass(frozen=True)
+class CurrentPRResolution:
+    """The current branch/PR answer shared by the stop gate and waiter.
+
+    ``resolved`` means the worktree branch was known and GitHub returned a
+    definite open-PR answer (including "no open PR"). ``unknown`` is separate:
+    a stale cache or rate-limited lookup must not be mistaken for an unbound
+    worktree or a clean stop. ``stale_pr_number`` is retained only for pruning
+    and diagnostics; callers must never watch it after the branch moved on.
+    """
+
+    worktree: str
+    branch: str | None
+    pr_number: int | None
+    head_sha: str = ""
+    is_draft: bool = False
+    resolved: bool = False
+    unknown: bool = False
+    stale_pr_number: int | None = None
+
+
+def _current_head(worktree_path: str) -> str:
+    """Return the checked-out HEAD, or an empty string on local git failure."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def resolve_current_pr(
+    worktree_path: str,
+    *,
+    session_id: str = "",
+    kind: str = "pr_watch_divergence",
+    owner: WorktreeOwnership | None = None,
+    snap=None,
+) -> CurrentPRResolution:
+    """Resolve one owned worktree to its exact current branch/PR.
+
+    Ownership is established from the session/worktree claim first. Only then
+    is the checked-out branch (and local HEAD when available) used to select an
+    open PR. This prevents an author-wide PR list from binding a session to a
+    sibling worktree and lets the waiter follow a same-worktree PR replacement.
+    """
+    path = os.path.abspath(worktree_path)
+    resolved_owner = owner or resolve_worktree(path, kind=kind, snap=snap)
+    owns = getattr(resolved_owner, "owned_by", None)
+    if session_id and callable(owns) and not owns(session_id):
+        return CurrentPRResolution(path, None, None)
+
+    from ._common import _current_branch  # noqa: PLC0415
+    from .pr_state import _GH_UNAVAILABLE, _resolve_pr_entry_for_branch  # noqa: PLC0415
+
+    branch = _current_branch(path)
+    stale_pr = resolved_owner.pr_number
+    if not branch:
+        return CurrentPRResolution(path, None, None, stale_pr_number=stale_pr)
+
+    head_sha = _current_head(path)
+    # A cold lookup failure is left for the normal per-PR checker to report.
+    # The strict unknown result is needed when a warm snapshot could otherwise
+    # make a closed/rebound PR look current; with no snapshot there is no stale
+    # candidate to invalidate and existing callers still have their own
+    # fail-closed observation path.
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+    had_pr_snapshot = github_api.peek_pr_snapshot(path) is not None
+    entry = _resolve_pr_entry_for_branch(
+        path,
+        branch,
+        head_oid=head_sha,
+        validate_snapshot_state=True,
+    )
+    if entry is _GH_UNAVAILABLE:
+        if not had_pr_snapshot:
+            return CurrentPRResolution(
+                path,
+                branch,
+                None,
+                head_sha=head_sha,
+                stale_pr_number=stale_pr,
+            )
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            unknown=True,
+            stale_pr_number=stale_pr,
+        )
+    if entry is None:
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            stale_pr_number=stale_pr,
+        )
+
+    number = int(entry["number"])
+    return CurrentPRResolution(
+        path,
+        branch,
+        number,
+        head_sha=str(entry.get("headRefOid") or head_sha),
+        is_draft=bool(entry.get("isDraft", False)),
+        resolved=True,
+        stale_pr_number=(stale_pr if stale_pr is not None and stale_pr != number else None),
+    )
+
+
+def resolve_current_prs(
+    worktrees: list[str],
+    session_id: str = "",
+    *,
+    kind: str = "pr_watch_divergence",
+    snap=None,
+) -> dict[str, CurrentPRResolution]:
+    """Resolve all worktrees from one ownership snapshot and current PR pass."""
+    out: dict[str, CurrentPRResolution] = {}
+    for worktree in dict.fromkeys(os.path.abspath(path) for path in worktrees):
+        owner = resolve_worktree(worktree, kind=kind, snap=snap)
+        owns = getattr(owner, "owned_by", None)
+        if session_id and callable(owns) and not owns(session_id):
+            continue
+        out[worktree] = resolve_current_pr(
+            worktree,
+            session_id=session_id,
+            kind=kind,
+            owner=owner,
+            snap=snap,
+        )
+    return out
+
+
 def resolve_worktree(
     worktree_path: str,
     *,
