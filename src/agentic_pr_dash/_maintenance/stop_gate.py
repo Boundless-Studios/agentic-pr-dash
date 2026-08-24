@@ -8,7 +8,7 @@ import re
 import time as _time
 
 from agentic_pr_dash.config import load as load_config
-from ._common import _env_int
+from ._common import _current_branch, _env_int
 from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance, _write_arm_marker
 
 # BOU-2567 PR #122 review, P1 #3: `_check_worktree`'s clean-check text ends in
@@ -113,6 +113,24 @@ def _cached_clean_binding_matches(
         and cached_entry.get("code") == 0
         and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
     )
+
+
+def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
+    """Return whether a prefetched PR binding still names this checkout."""
+    return bool(
+        binding is not None
+        and binding.branch == branch
+        and binding.head_sha == head_sha
+    )
+
+
+def _durable_stop_gate_pid(pid: int | None) -> int:
+    """Prefer an explicit owner pid; otherwise resolve the durable session pid."""
+    if pid is not None:
+        return int(pid)
+    from .worktrees import _resolve_owner_pid  # noqa: PLC0415
+
+    return _resolve_owner_pid()
 
 
 def _fence_current_pr_rebindings(
@@ -421,6 +439,7 @@ def _stop_gate_impl(args) -> int:
     cwd = os.path.abspath(args.cwd)
 
     session_id = args.session_id or _read_session_marker(cwd)
+    owner_pid = _durable_stop_gate_pid(getattr(args, "pid", None))
 
     # Reconcile FIRST: run list-owned-equivalent adoption with the durable owner
     # pid, bounded by a short shared budget for Stop-hook deadline safety. A PR
@@ -436,7 +455,7 @@ def _stop_gate_impl(args) -> int:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
         _owned, newly_adopted = _reconcile_owned_across_roots(
-            session_id, cwd, getattr(args, "pid", None), deadline
+            session_id, cwd, owner_pid, deadline
         )
 
     interval = _env_int("STOP_INTERVAL", 180)
@@ -504,7 +523,7 @@ def _stop_gate_impl(args) -> int:
         current_pr_bindings, ownership_conflicts = _fence_current_pr_rebindings(
             current_pr_bindings,
             session_id=session_id,
-            pid=int(getattr(args, "pid", None) or os.getpid()),
+            pid=owner_pid,
             provenance_for=provenance_for,
         )
     current_pr_for = {
@@ -612,6 +631,25 @@ def _stop_gate_impl(args) -> int:
         local_sha = _local_head_sha(worktree)
         cached_entry = pr_head_cache.get(worktree)
         binding = current_pr_bindings.get(worktree)
+        live_branch = _current_branch(worktree)
+        if (
+            binding is not None
+            and binding.resolved
+            and not _binding_matches_live_checkout(binding, live_branch, local_sha)
+        ):
+            from dataclasses import replace  # noqa: PLC0415
+
+            binding = replace(
+                binding,
+                branch=live_branch,
+                pr_number=None,
+                head_sha=local_sha,
+                unknown=True,
+            )
+            current_pr_bindings[worktree] = binding
+            current_pr_for.pop(worktree, None)
+            if worktree not in current_unknown_worktrees:
+                current_unknown_worktrees.append(worktree)
         if _cached_clean_binding_matches(
             cached_entry, local_sha, binding, now=now, interval=interval
         ):

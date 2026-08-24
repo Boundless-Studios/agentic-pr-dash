@@ -147,6 +147,7 @@ def _rest_fallback_entry_for_branch(
     )
     if not numbers:
         return None
+    matches = []
     for number in numbers:
         raw = (
             github_api._rest_pr_payload(number, cwd=cwd, deadline=deadline)
@@ -159,8 +160,8 @@ def _rest_fallback_entry_for_branch(
             continue
         if not _rest_payload_author_is_tracked(raw, cwd, deadline=deadline):
             continue
-        return raw
-    return None
+        matches.append(raw)
+    return matches[0] if len(matches) == 1 else None
 
 
 def _resolve_pr_entry_for_branch(

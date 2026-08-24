@@ -16,7 +16,9 @@ from agentic_pr_dash._maintenance import (
 )
 from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
 from agentic_pr_dash._maintenance.stop_gate import (
+    _binding_matches_live_checkout,
     _cached_clean_binding_matches,
+    _durable_stop_gate_pid,
     _effective_pr_pairs,
     _fence_current_pr_rebindings,
 )
@@ -141,6 +143,31 @@ def test_rate_limit_fallback_refuses_foreign_author(monkeypatch, tmp_path: Path)
     assert result is pr_state._GH_UNAVAILABLE
 
 
+def test_rate_limit_fallback_rejects_multiple_author_matching_prs(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(pr_state, "_list_failure_is_rate_limited", lambda: True)
+    monkeypatch.setattr(github_api, "_rest_repo_owner", lambda cwd: "owner")
+    monkeypatch.setattr(
+        github_api, "_exact_head_pr_numbers", lambda *args, **kwargs: [77, 78]
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda number, cwd=None: {
+            "number": number,
+            "headRefName": "shared-branch",
+            "author": {"login": "tracked-owner"},
+        },
+    )
+    monkeypatch.setattr(github_api, "_rest_viewer_login", lambda cwd: "tracked-owner")
+
+    assert (
+        pr_state._rest_fallback_entry_for_branch("shared-branch", str(tmp_path))
+        is None
+    )
+
+
 def test_gate_current_resolution_does_not_fall_back_to_stale_marker(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
 
@@ -252,6 +279,23 @@ def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Pat
     assert rebound[worktree].unknown is True
     assert rebound[worktree].pr_number is None
     assert rebound[worktree].stale_pr_number == 3017
+
+
+def test_stop_gate_uses_durable_pid_when_cli_pid_is_absent(monkeypatch):
+    monkeypatch.setattr(worktrees, "_resolve_owner_pid", lambda: 4242)
+
+    assert _durable_stop_gate_pid(None) == 4242
+    assert _durable_stop_gate_pid(123) == 123
+
+
+def test_live_checkout_must_still_match_prefetched_binding():
+    binding = CurrentPRResolution(
+        "/worktree", "feature-b", 3062, head_sha="head-b", resolved=True
+    )
+
+    assert _binding_matches_live_checkout(binding, "feature-b", "head-b")
+    assert not _binding_matches_live_checkout(binding, "feature-c", "head-c")
+    assert not _binding_matches_live_checkout(binding, "feature-b", "new-head")
 
 
 def test_failed_claim_does_not_append_replacement_to_session_ledger(
