@@ -101,14 +101,29 @@ def session_id_from_payload(payload: dict) -> str:
     # claim a sibling via the shared launcher id when its native id is absent.
     runtime = _hook_runtime(payload)
     if runtime == "codex":
-        return os.environ.get("CODEX_SESSION_ID", "")
+        native_id = os.environ.get("CODEX_SESSION_ID", "")
+        if native_id:
+            return native_id
+        # Older Codex hosts only expose the Gaia launcher id. Preserve that
+        # compatibility fallback, but never use it when a Claude id leaked
+        # into the Codex environment: that would claim the parent session.
+        if os.environ.get("CLAUDE_SESSION_ID"):
+            return ""
+        return os.environ.get("GAIA_SESSION_ID", "")
     if runtime == "claude":
-        return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get("GAIA_SESSION_ID", "")
+        return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get(
+            "GAIA_SESSION_ID", ""
+        )
     # A native Codex id is safe even when an older host does not expose its
-    # runtime name. Do not make the symmetric fallback for Claude: an inherited
-    # Claude id is exactly the cross-runtime ownership collision this marker
-    # must avoid.
-    return os.environ.get("CODEX_SESSION_ID", "")
+    # runtime name. Preserve the legacy launcher fallback only when no Claude
+    # id is present; an inherited Claude id is exactly the cross-runtime
+    # ownership collision this marker must avoid.
+    native_id = os.environ.get("CODEX_SESSION_ID", "")
+    if native_id:
+        return native_id
+    if os.environ.get("CLAUDE_SESSION_ID"):
+        return ""
+    return os.environ.get("GAIA_SESSION_ID", "")
 
 
 def _strip_optional_quotes(value: str) -> str:
