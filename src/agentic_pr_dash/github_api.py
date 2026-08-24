@@ -674,6 +674,25 @@ def _run(
     return result
 
 
+def _run_with_optional_deadline(
+    cmd: list[str],
+    *,
+    cwd: str | None,
+    timeout_s: float,
+    deadline: float | None,
+) -> subprocess.CompletedProcess:
+    """Run a command while preserving the legacy no-deadline call shape.
+
+    A number of callers replace :func:`_run` with a small test double.  The
+    deadline is an opt-in budget threaded by maintenance callers, so omit the
+    keyword when no budget is active; this keeps those doubles compatible while
+    still enforcing a shared deadline whenever one was supplied.
+    """
+    if deadline is None:
+        return _run(cmd, cwd=cwd, timeout_s=timeout_s)
+    return _run(cmd, cwd=cwd, timeout_s=timeout_s, deadline=deadline)
+
+
 def _is_infra_check(name: str) -> bool:
     lower = name.lower()
     return any(pat in lower for pat in INFRA_CHECK_PATTERNS)
@@ -1607,7 +1626,7 @@ def _exact_head_pr_numbers(
     numbers: list[int] = []
     page = 1
     while True:
-        r = _run(
+        r = _run_with_optional_deadline(
             [
                 "gh", "api",
                 "-H", "Accept: application/vnd.github+json",
@@ -1729,7 +1748,7 @@ def _rest_repo_owner(cwd: str | None = None, *, deadline: float | None = None) -
     remote — no API call is spent on the placeholder resolution itself.
     Returns ``""`` on any failure.
     """
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "repos/{owner}/{repo}", "--jq", ".owner.login"],
         cwd=cwd, timeout_s=30, deadline=deadline,
@@ -1748,7 +1767,7 @@ def _rest_viewer_login(cwd: str | None = None, *, deadline: float | None = None)
     (including a GitHub App installation token, which cannot call ``/user``) —
     the fallback caller must then fail closed rather than adopt a PR whose
     author it cannot verify (PR #77 review)."""
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "user", "--jq", ".login"],
         cwd=cwd, timeout_s=30, deadline=deadline,
@@ -1777,7 +1796,7 @@ def _rest_pr_payload(
     interchangeably. Returns ``None`` on any failure — the quota-fallback
     caller stays fail-closed.
     """
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          f"repos/{{owner}}/{{repo}}/pulls/{number}"],
         cwd=cwd, timeout_s=30, deadline=deadline,
