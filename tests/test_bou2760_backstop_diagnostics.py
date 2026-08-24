@@ -145,7 +145,20 @@ def test_codex_capability_refusal_is_distinct_from_missing_review(monkeypatch):
             part for part in cmd if isinstance(part, str) and part.startswith("repos/")
         )
         if endpoint.endswith("/pulls/24/reviews"):
-            return _cp(json.dumps([[]]))
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 701,
+                            "user": {"login": "review-bot"},
+                            "state": "COMMENTED",
+                            "commit_id": HEAD,
+                            "submitted_at": "2026-08-24T00:00:00Z",
+                            "body": "",
+                        }
+                    ]]
+                )
+            )
         if endpoint.endswith("/issues/24/comments"):
             return _cp(
                 json.dumps(
@@ -174,6 +187,155 @@ def test_codex_capability_refusal_is_distinct_from_missing_review(monkeypatch):
     assert result.observable
     assert result.state.value == "capability_refused"
     assert "quota" in (result.error or "").lower()
+
+
+def test_codex_capability_refusal_is_preserved_with_partial_submission(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 701,
+                            "user": {"login": "review-bot"},
+                            "state": "COMMENTED",
+                            "commit_id": HEAD,
+                            "submitted_at": "2026-08-24T00:00:00Z",
+                            "body": "",
+                        }
+                    ]]
+                )
+            )
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 901,
+                            "user": {"login": "chatgpt-codex-connector[bot]"},
+                            "created_at": "2026-08-24T00:01:00Z",
+                            "body": (
+                                "You have reached your Codex usage limits "
+                                "for code reviews.\n\n"
+                                f"**Reviewed commit:** `{HEAD}`"
+                            ),
+                        }
+                    ]]
+                )
+            )
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(24, HEAD, ".")
+
+    assert result.state.value == "capability_refused"
+    assert [review.review_id for review in result.value or []] == [701]
+
+
+def test_abbreviated_codex_head_lookup_retries_with_user_keyring(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+    calls: list[tuple[str, dict[str, str] | None]] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        calls.append((endpoint, kwargs.get("env")))
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(json.dumps([[]]))
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 901,
+                            "user": {"login": "chatgpt-codex-connector[bot]"},
+                            "created_at": "2026-08-24T00:00:00Z",
+                            "body": (
+                                "You have reached your Codex usage limits "
+                                "for code reviews.\n\n"
+                                f"**Reviewed commit:** `{HEAD[:10]}`"
+                            ),
+                        }
+                    ]]
+                )
+            )
+        if endpoint.endswith(f"/commits/{HEAD[:10]}"):
+            if kwargs.get("env", {}).get("GH_TOKEN") == "":
+                return _cp(json.dumps({"sha": HEAD}))
+            return _cp("", 1, "API rate limit exceeded")
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(24, HEAD, ".")
+
+    assert result.state.value == "capability_refused"
+    assert any(
+        endpoint.endswith(f"/commits/{HEAD[:10]}")
+        and env is not None
+        and env.get("GH_TOKEN") == ""
+        for endpoint, env in calls
+    )
+
+
+def test_abbreviated_codex_head_lookup_failure_is_unavailable(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 701,
+                            "user": {"login": "review-bot"},
+                            "state": "COMMENTED",
+                            "commit_id": HEAD,
+                            "submitted_at": "2026-08-24T00:00:00Z",
+                            "body": "",
+                        }
+                    ]]
+                )
+            )
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [[
+                        {
+                            "id": 901,
+                            "user": {"login": "chatgpt-codex-connector[bot]"},
+                            "created_at": "2026-08-24T00:00:00Z",
+                            "body": (
+                                "You have reached your Codex usage limits "
+                                "for code reviews.\n\n"
+                                f"**Reviewed commit:** `{HEAD[:10]}`"
+                            ),
+                        }
+                    ]]
+                )
+            )
+        if endpoint.endswith(f"/commits/{HEAD[:10]}"):
+            return _cp("", 1, "HTTP 401: Bad credentials")
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(24, HEAD, ".")
+
+    assert result.state.value == "unavailable"
+    assert not result.observable
+    assert "commit" in (result.error or "").lower()
+    assert [review.review_id for review in result.value or []] == [701]
 
 
 def test_codex_capability_refusal_for_earlier_head_is_ignored(monkeypatch):

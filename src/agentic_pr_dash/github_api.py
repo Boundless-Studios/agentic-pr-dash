@@ -2547,20 +2547,31 @@ def _comment_reviews_head(
     if commit_prefix == normalized_head:
         return True
 
-    commit_result = _run(
+    commit_result = _run_review_read(
         ["gh", "api", f"repos/{owner}/{repo}/commits/{commit_prefix}"],
         cwd=cwd,
         timeout_s=30,
     )
     if commit_result.returncode != 0:
-        return False
+        raise RuntimeError(
+            "review observation unavailable: abbreviated reviewed commit "
+            f"lookup failed (gh exit {commit_result.returncode})"
+        )
     try:
         commit_payload = json.loads(commit_result.stdout)
     except json.JSONDecodeError:
-        return False
+        raise RuntimeError(
+            "review observation unavailable: malformed abbreviated reviewed "
+            "commit lookup"
+        )
     resolved_commit = (
         commit_payload.get("sha") if isinstance(commit_payload, dict) else None
     )
+    if not isinstance(resolved_commit, str):
+        raise RuntimeError(
+            "review observation unavailable: malformed abbreviated reviewed "
+            "commit lookup"
+        )
     return resolved_commit == head_sha
 
 
@@ -2780,7 +2791,7 @@ def _read_review_submissions(
                         source="issue-comment",
                     )
                 )
-    except (json.JSONDecodeError, TypeError) as exc:
+    except (json.JSONDecodeError, TypeError, RuntimeError) as exc:
         sorted_submissions = tuple(
             sorted(
                 submissions,
@@ -2795,8 +2806,12 @@ def _read_review_submissions(
             sorted_submissions,
             comments_observable=False,
             comments_error=(
-                f"review observation unavailable: malformed issue comments "
-                f"for PR #{pr_number} ({type(exc).__name__})"
+                str(exc)
+                if isinstance(exc, RuntimeError)
+                else (
+                    f"review observation unavailable: malformed issue comments "
+                    f"for PR #{pr_number} ({type(exc).__name__})"
+                )
             ),
             capability_refused=capability_refused,
         )
@@ -2874,7 +2889,7 @@ def get_review_submissions_observation(
             or f"review observation unavailable for PR #{pr_number}",
             submissions,
         )
-    if read.capability_refused and not submissions:
+    if read.capability_refused:
         return ObservationReadResult.capability_refused(
             f"reviewer capability/quota refusal observed for PR #{pr_number}",
             submissions,
