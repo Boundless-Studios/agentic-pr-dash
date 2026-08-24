@@ -157,7 +157,8 @@ def test_codex_capability_refusal_is_distinct_from_missing_review(monkeypatch):
                                 "created_at": "2026-08-24T00:00:00Z",
                                 "body": (
                                     "You have reached your Codex usage limits "
-                                    "for code reviews."
+                                    "for code reviews.\n\n"
+                                    f"**Reviewed commit:** `{HEAD}`"
                                 ),
                             }
                         ]
@@ -173,6 +174,80 @@ def test_codex_capability_refusal_is_distinct_from_missing_review(monkeypatch):
     assert result.observable
     assert result.state.value == "capability_refused"
     assert "quota" in (result.error or "").lower()
+
+
+def test_codex_capability_refusal_for_earlier_head_is_ignored(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(json.dumps([[]]))
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "id": 901,
+                                "user": {"login": "chatgpt-codex-connector[bot]"},
+                                "created_at": "2026-08-23T00:00:00Z",
+                                "body": (
+                                    "You have reached your Codex usage limits for code reviews.\n\n"
+                                    "**Reviewed commit:** `bbbbbbbbbb`"
+                                ),
+                            }
+                        ]
+                    ]
+                )
+            )
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(24, HEAD, ".")
+
+    assert result.state.value == "observed"
+    assert result.value == []
+
+
+def test_formal_review_with_unreadable_comments_remains_unavailable(monkeypatch):
+    monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoint = next(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        if endpoint.endswith("/pulls/24/reviews"):
+            return _cp(
+                json.dumps(
+                    [
+                        [
+                            {
+                                "id": 701,
+                                "user": {"login": "review-bot"},
+                                "state": "COMMENTED",
+                                "commit_id": HEAD,
+                                "submitted_at": "2026-08-24T00:00:00Z",
+                                "body": "",
+                            }
+                        ]
+                    ]
+                )
+            )
+        if endpoint.endswith("/issues/24/comments"):
+            return _cp("", 1, "HTTP 401: Bad credentials")
+        raise AssertionError(endpoint)
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(24, HEAD, ".")
+
+    assert result.state.value == "unavailable"
+    assert not result.observable
+    assert [review.review_id for review in result.value or []] == [701]
 
 
 @pytest.mark.parametrize("state", ["unavailable", "capability_refused"])
@@ -217,9 +292,7 @@ def test_settlement_loop_key_ignores_rendered_diagnostic_wording():
             "first provider wording"
         ),
     )
-    second = first.model_copy(
-        update={"diagnostics": ["different provider wording"]}
-    )
+    second = first.model_copy(update={"diagnostics": ["different provider wording"]})
 
     assert _observation_key(first) == _observation_key(second)
     assert combine_clean_observations(first, second).settled

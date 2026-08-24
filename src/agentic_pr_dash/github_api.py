@@ -2527,6 +2527,43 @@ def _run_review_read(
     return _run(cmd, cwd=cwd, timeout_s=timeout_s, env=user_env)
 
 
+def _comment_reviews_head(
+    body: str,
+    head_sha: str,
+    *,
+    owner: str,
+    repo: str,
+    cwd: str | None,
+) -> bool:
+    """Return whether a Codex issue comment names the immutable PR head."""
+
+    reviewed_commit = _REVIEWED_COMMIT_RE.search(body)
+    if reviewed_commit is None:
+        return False
+    commit_prefix = reviewed_commit.group(1).lower()
+    normalized_head = head_sha.lower()
+    if not normalized_head.startswith(commit_prefix):
+        return False
+    if commit_prefix == normalized_head:
+        return True
+
+    commit_result = _run(
+        ["gh", "api", f"repos/{owner}/{repo}/commits/{commit_prefix}"],
+        cwd=cwd,
+        timeout_s=30,
+    )
+    if commit_result.returncode != 0:
+        return False
+    try:
+        commit_payload = json.loads(commit_result.stdout)
+    except json.JSONDecodeError:
+        return False
+    resolved_commit = (
+        commit_payload.get("sha") if isinstance(commit_payload, dict) else None
+    )
+    return resolved_commit == head_sha
+
+
 def _read_review_submissions(
     pr_number: int,
     head_sha: str,
@@ -2698,40 +2735,29 @@ def _read_review_submissions(
                 ):
                     continue
                 body = item.get("body")
-                if isinstance(body, str) and _CODEX_CAPABILITY_REFUSAL_RE.search(body):
+                if (
+                    isinstance(body, str)
+                    and _CODEX_CAPABILITY_REFUSAL_RE.search(body)
+                    and _comment_reviews_head(
+                        body,
+                        head_sha,
+                        owner=owner,
+                        repo=repo,
+                        cwd=cwd,
+                    )
+                ):
                     capability_refused = True
                     continue
                 if not isinstance(body, str) or not _CODEX_CLEAN_REVIEW_RE.match(body):
                     continue
-                reviewed_commit = _REVIEWED_COMMIT_RE.search(body)
-                if reviewed_commit is None:
+                if not _comment_reviews_head(
+                    body,
+                    head_sha,
+                    owner=owner,
+                    repo=repo,
+                    cwd=cwd,
+                ):
                     continue
-                commit_prefix = reviewed_commit.group(1).lower()
-                if not head_sha.lower().startswith(commit_prefix):
-                    continue
-                if commit_prefix != head_sha.lower():
-                    commit_result = _run(
-                        [
-                            "gh",
-                            "api",
-                            f"repos/{owner}/{repo}/commits/{commit_prefix}",
-                        ],
-                        cwd=cwd,
-                        timeout_s=30,
-                    )
-                    if commit_result.returncode != 0:
-                        continue
-                    try:
-                        commit_payload = json.loads(commit_result.stdout)
-                        resolved_commit = (
-                            commit_payload.get("sha")
-                            if isinstance(commit_payload, dict)
-                            else None
-                        )
-                    except json.JSONDecodeError:
-                        continue
-                    if resolved_commit != head_sha:
-                        continue
                 submitted_at = item.get("created_at")
                 comment_id = item.get("id")
                 malformed = (
@@ -2843,14 +2869,10 @@ def get_review_submissions_observation(
 
     submissions = list(read.submissions)
     if not read.comments_observable:
-        if submissions:
-            return ObservationReadResult.observed(
-                submissions,
-                error=read.comments_error,
-            )
         return ObservationReadResult.unavailable(
             read.comments_error
-            or f"review observation unavailable for PR #{pr_number}"
+            or f"review observation unavailable for PR #{pr_number}",
+            submissions,
         )
     if read.capability_refused and not submissions:
         return ObservationReadResult.capability_refused(
