@@ -240,12 +240,24 @@ def _resolve_pr_entry_for_branch(
             if deadline is not None
             else github_api._rest_pr_payload(int(candidate["number"]), cwd=cwd)
         )
-        if live is not None:
-            if (
-                str(live.get("state") or "").lower() == "open"
-                and live.get("headRefName") == branch
-            ):
+        if (
+            live is not None
+            and str(live.get("state") or "").lower() == "open"
+            and live.get("headRefName") == branch
+        ):
+            # The resource proves this cached PR is still open, but not that it
+            # remains the only open PR for the exact head. A new PR can appear
+            # after the author-wide snapshot was cached.
+            unique = (
+                _rest_fallback_entry_for_branch(
+                    branch, cwd, force=True, deadline=deadline
+                )
+                if deadline is not None
+                else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+            )
+            if unique is not None and unique.get("number") == live.get("number"):
                 return live
+            return _GH_UNAVAILABLE
         # The cached candidate was closed, changed head, or could not be
         # verified. Ask REST for the exact current head before declaring the
         # worktree unbound. This path is deliberately not gated on a prior

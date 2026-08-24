@@ -23,10 +23,13 @@ from pathlib import Path
 
 import pytest
 
-from agentic_pr_dash import config, github_api, maintenance_check as mc, ownership
+from agentic_pr_dash import config, github_api, ownership
+from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash._maintenance import ownership_resolution
+from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
-from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
 
 
 def _force_rate_limit_seen(monkeypatch, value):
@@ -283,6 +286,21 @@ def test_await_honors_max_wait_on_hard_gh_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr(mc, "_check_worktree", lambda p, sid, *, claim=True: (2, "gh unavailable"))
+    monkeypatch.setattr(
+        ownership_resolution,
+        "resolve_current_prs",
+        lambda worktrees, *args, **kwargs: {
+            worktree: CurrentPRResolution(
+                worktree,
+                "feature-a",
+                None,
+                resolved=True,
+                unknown=True,
+                stale_pr_number=42,
+            )
+            for worktree in worktrees
+        },
+    )
 
     rc = mc.main(["await", "--cwd", str(tmp_path), "--session-id", SID,
                   "--owner-pid", "12345", "--max-wait", "0", "--interval", "1"])

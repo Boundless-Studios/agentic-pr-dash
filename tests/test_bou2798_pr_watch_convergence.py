@@ -23,8 +23,8 @@ from agentic_pr_dash._maintenance.stop_gate import (
     _durable_stop_gate_pid,
     _effective_pr_pairs,
     _fence_current_pr_rebindings,
-    _unknown_binding_blocks_stop,
     _prefetch_owned_pr_state,
+    _unknown_binding_blocks_stop,
 )
 
 
@@ -97,6 +97,50 @@ def test_current_branch_resolution_rejects_closed_cached_pr_and_rebinds(
 
     assert result["number"] == 3062
     assert result["headRefOid"] == "head-b"
+
+
+def test_current_branch_resolution_rechecks_warm_candidate_uniqueness(
+    monkeypatch, tmp_path: Path
+):
+    """A newly opened same-head PR must make a warm binding ambiguous."""
+    monkeypatch.setattr(
+        github_api,
+        "peek_pr_snapshot",
+        lambda cwd: [{
+            "number": 3017,
+            "headRefName": "feature-b",
+            "headRefOid": "head-b",
+            "isDraft": False,
+        }],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda number, cwd=None, **kwargs: {
+            "number": number,
+            "state": "open",
+            "headRefName": "feature-b",
+            "headRefOid": "head-b",
+        },
+    )
+    exact_head_checks: list[bool] = []
+
+    def _ambiguous_exact_head(branch, cwd, *, force=False, **kwargs):
+        exact_head_checks.append(force)
+
+    monkeypatch.setattr(
+        pr_state, "_rest_fallback_entry_for_branch", _ambiguous_exact_head
+    )
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path),
+        "feature-b",
+        head_oid="head-b",
+        validate_snapshot_state=True,
+    )
+
+    assert result is pr_state._GH_UNAVAILABLE
+    assert exact_head_checks == [True]
 
 
 def test_branch_resolution_rejects_ambiguous_same_branch_without_head_match(
@@ -710,7 +754,7 @@ def test_waiter_marks_tick_unknown_when_binding_changes_before_ci_probe(
 
     assert mc._await_watch_pending_this_tick(
         [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
-    )
+    ) is None
     assert probed == []
 
 

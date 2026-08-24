@@ -662,7 +662,7 @@ def _await_watch_pending_this_tick(
     session_id: str,
     *,
     bindings: dict | None = None,
-) -> bool:
+) -> bool | None:
     """Watch-pending across BOTH live worktrees and detached (ledger-only) PRs.
 
     A session can own a PR solely through the ledger, so ``owned`` may be empty
@@ -690,12 +690,13 @@ def _await_watch_pending_this_tick(
             continue
         # The resolver snapshot was taken at the start of the waiter tick. A
         # checkout can move while another worktree is doing GitHub I/O; never
-        # probe CI for the old PR in that race. Unknown must keep this tick
-        # alive until a fresh resolver pass can bind the new checkout.
+        # probe CI for the old PR in that race. Preserve unknown separately
+        # from CI-pending: it blocks a clean verdict, but only observed running
+        # CI (or an explicit rate limit) may extend a finite waiter deadline.
         binding = _revalidate_waiter_binding(worktree, binding)
         if binding.unknown:
-            return True
-        if binding.unknown or binding.pr_number is None or binding.is_draft:
+            return None
+        if binding.pr_number is None or binding.is_draft:
             continue
         if github_api.required_checks_pending(binding.pr_number, worktree):
             return True
