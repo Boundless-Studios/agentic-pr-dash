@@ -2117,14 +2117,12 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         "can be observed.",
                         file=sys.stderr,
                     )
-                elif gh_unobservable or unknown_detached:
-                    print(
-                        "[pr-watch] waiter max-wait reached but current PR "
-                        "ownership was unobservable this tick — staying alive "
-                        "until GitHub state can be observed.",
-                        file=sys.stderr,
-                    )
                 elif not watch_pending:
+                    # Hard GitHub/ownership failures suppress the clean-state
+                    # verdict above, but they do not extend a finite waiter
+                    # deadline. Only a rate-limit (which has an explicit retry
+                    # policy) or running CI keeps this waiter alive past
+                    # max-wait.
                     print(
                         "[pr-watch] waiter max-wait reached with no feedback; "
                         "will re-arm on next stop."

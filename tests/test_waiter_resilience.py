@@ -18,11 +18,12 @@ Both belong to the harness-maturity Phase 1 correctness sweep (BOU-1862):
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
-from agentic_pr_dash import config, github_api, maintenance_check as mc
+from agentic_pr_dash import config, github_api, maintenance_check as mc, ownership
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
@@ -263,6 +264,17 @@ def test_await_honors_max_wait_on_hard_gh_failure(tmp_path, monkeypatch):
     _force_rate_limit_seen(monkeypatch, False)  # HARD failure did NOT set the rate-limit flag
     wt = tmp_path / "worktree"
     wt.mkdir()
+    # Keep this max-wait assertion focused on waiter control flow.  The real
+    # maintenance-root discovery walks every configured repository and can
+    # spend up to its per-root git timeout when the temporary test cwd is not a
+    # repository; that is unrelated to the hard-failure policy under test.
+    monkeypatch.setattr(_worktrees_mod, "_maint_roots_for", lambda cwd: [str(tmp_path)])
+    monkeypatch.setattr(mc, "_publishable_anchors", lambda anchors, cwd, snap=None: anchors)
+    monkeypatch.setattr(mc, "_update_await_coverage", lambda *args, **kwargs: None)
+    empty_snapshot = ownership.OwnershipSnapshot(
+        {}, now=datetime.now(timezone.utc)
+    )
+    monkeypatch.setattr(ownership, "snapshot", lambda **kwargs: empty_snapshot)
     monkeypatch.setattr(_worktrees_mod, "_collect_stop_gate_worktrees", lambda sid, cwd: [str(wt)])
     monkeypatch.setattr(
         _reconcile_mod, "_detached_pr_records",
