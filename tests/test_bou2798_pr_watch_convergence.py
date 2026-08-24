@@ -24,6 +24,7 @@ from agentic_pr_dash._maintenance.stop_gate import (
     _effective_pr_pairs,
     _fence_current_pr_rebindings,
     _unknown_binding_blocks_stop,
+    _prefetch_owned_pr_state,
 )
 
 
@@ -514,6 +515,35 @@ def test_failed_claim_does_not_replace_session_marker(monkeypatch, tmp_path: Pat
 
     assert not markers._write_arm_marker(str(tmp_path), "session-loser", 123, 3062)
     assert session_marker.read_text(encoding="utf-8") == "session-owner\n"
+
+
+def test_stop_prefetch_propagates_gate_deadline(monkeypatch):
+    calls: list[dict] = []
+    deadline = time.monotonic() + 100
+    monkeypatch.setattr(
+        github_api, "repo_slug_for_prefetch", lambda cwd: "owner/repo"
+    )
+    monkeypatch.setattr(
+        github_api,
+        "batch_fetch_pr_review_and_ci",
+        lambda owner, repo, numbers, *, cwd=None, deadline=None: calls.append(
+            {"owner": owner, "repo": repo, "numbers": numbers, "deadline": deadline}
+        )
+        or {},
+    )
+
+    _prefetch_owned_pr_state(
+        [("/worktree-a", 3017), ("/worktree-b", 3062)], deadline=deadline
+    )
+
+    assert calls == [
+        {
+            "owner": "owner",
+            "repo": "repo",
+            "numbers": [3017, 3062],
+            "deadline": deadline,
+        }
+    ]
 
 
 def test_pruning_stale_pr_preserves_replacement_marker(monkeypatch, tmp_path: Path):
