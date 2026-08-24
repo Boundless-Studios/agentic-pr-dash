@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import subprocess
 import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from agentic_pr_dash import github_api, models, session_ledger
+from agentic_pr_dash import config, github_api, models, session_ledger
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import (
     _common,
@@ -234,6 +235,44 @@ def test_rate_limit_fallback_refuses_foreign_author(monkeypatch, tmp_path: Path)
     result = pr_state._resolve_pr_entry_for_branch(str(tmp_path), "shared-branch")
 
     assert result is pr_state._GH_UNAVAILABLE
+
+
+def test_strict_list_probe_classifies_rate_limit_for_rest_fallback(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 1, "", "GraphQL: API rate limit already exceeded"
+        ),
+    )
+
+    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") is None
+    failure = github_api.last_list_open_prs_failure()
+    assert failure is not None
+    assert failure.is_rate_limited
+
+
+def test_successful_strict_list_probe_clears_stale_failure(
+    monkeypatch, tmp_path: Path
+):
+    github_api._record_list_open_prs_failure(
+        ["gh", "pr", "list"],
+        subprocess.CompletedProcess(
+            ["gh", "pr", "list"], 1, "", "API rate limit exceeded"
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "[]", ""),
+    )
+    monkeypatch.setenv("AGENTIC_PR_DASH_PR_AUTHOR", "tracked-owner")
+    config.load.cache_clear()
+
+    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == []
+    assert github_api.last_list_open_prs_failure() is None
 
 
 def test_rate_limit_fallback_rejects_multiple_author_matching_prs(

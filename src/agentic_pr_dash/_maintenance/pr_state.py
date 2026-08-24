@@ -679,20 +679,30 @@ def _gh_pr_list_json(
     if timeout <= 0:
         return None
     call_deadline = deadline if deadline is not None else time.monotonic() + timeout
+    command = [
+        "gh", "pr", "list", "--state", "open", "--limit",
+        github_api._GH_COMPLETE_LIST_LIMIT, *extra_args, "--json",
+        ",".join(dict.fromkeys([*fields.split(","), "author"])),
+    ]
     result = github_api._run(
-        ["gh", "pr", "list", "--state", "open", "--limit",
-         github_api._GH_COMPLETE_LIST_LIMIT, *extra_args, "--json",
-         ",".join(dict.fromkeys([*fields.split(","), "author"]))],
+        command,
         timeout_s=timeout, deadline=call_deadline,
         cwd=cwd,
     )
     if result.returncode != 0:
+        github_api._record_list_open_prs_failure(command, result)
         return None
     try:
         data = json.loads(result.stdout or "[]")
     except ValueError:
+        github_api._record_list_open_prs_failure(
+            command, result, reason="invalid-json"
+        )
         return None
     if not isinstance(data, list):
+        github_api._record_list_open_prs_failure(
+            command, result, reason="not-a-list"
+        )
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
@@ -707,16 +717,33 @@ def _gh_pr_list_json(
             cwd, timeout_s=viewer_timeout, deadline=deadline
         )
         if viewer.returncode != 0:
+            viewer_command = (
+                viewer.args
+                if isinstance(viewer.args, list)
+                else ["gh", "api", "user"]
+            )
+            github_api._record_list_open_prs_failure(
+                viewer_command, viewer, reason="viewer-unavailable"
+            )
             return None
         author = viewer.stdout.strip()
         if not author:
+            github_api._record_list_open_prs_failure(
+                ["gh", "api", "user"],
+                subprocess.CompletedProcess(
+                    ["gh", "api", "user"], 1, "", "authenticated GitHub login is unavailable"
+                ),
+                reason="viewer-unavailable",
+            )
             return None
-    return [
+    filtered = [
         pr for pr in data
         if isinstance(pr, dict)
         and isinstance(pr.get("author"), dict)
         and pr["author"].get("login") == author
     ]
+    github_api._clear_list_open_prs_failure()
+    return filtered
 
 
 def _resolve_open_pr_for_branch(cwd: str, branch: str):

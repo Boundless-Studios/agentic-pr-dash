@@ -791,6 +791,25 @@ class GhFailure:
 # can't bleed into a later healthy call.
 _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 
+
+def _record_list_open_prs_failure(
+    command: list[str], result: subprocess.CompletedProcess, *, reason: str | None = None
+) -> None:
+    """Record a failed PR-list-shaped probe for quota-safe REST fallback."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+        command=command,
+        returncode=result.returncode,
+        stderr=result.stderr or "",
+        reason=reason or ("rate-limit" if _is_rate_limit_failure(result) else "exit"),
+    )
+
+
+def _clear_list_open_prs_failure() -> None:
+    """Clear a prior list failure after a successful PR-list-shaped probe."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    _LAST_LIST_OPEN_PRS_FAILURE = None
+
 # --------------------------------------------------------------------------- #
 # One PR-state resolution per repo, shared by every reader (BOU-2810)
 # --------------------------------------------------------------------------- #
@@ -874,6 +893,30 @@ def last_list_open_prs_failure() -> GhFailure | None:
     ``None`` once a list has succeeded (or before any failure). Callers read
     this immediately after a ``None`` return from :func:`list_open_prs`."""
     return _LAST_LIST_OPEN_PRS_FAILURE
+
+
+def _record_list_open_prs_failure(
+    command: list[str],
+    result: subprocess.CompletedProcess,
+    *,
+    reason: str | None = None,
+) -> None:
+    """Classify a branch-list failure for the shared REST fallback gate."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    if reason is None:
+        reason = "rate-limit" if _is_rate_limit_failure(result) else "exit"
+    _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+        command=command,
+        returncode=result.returncode,
+        stderr=result.stderr or "",
+        reason=reason,
+    )
+
+
+def _clear_list_open_prs_failure() -> None:
+    """Prevent a stale list failure from influencing a later healthy probe."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    _LAST_LIST_OPEN_PRS_FAILURE = None
 
 
 def list_open_prs(cwd: str | None = None) -> list[dict] | None:
