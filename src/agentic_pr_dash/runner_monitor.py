@@ -86,6 +86,7 @@ class LocalRunnerHost:
     prefix: str
     docker_host: str | None = None
     name: str | None = None
+    configuration_error: str | None = None
 
     @property
     def display(self) -> str:
@@ -108,17 +109,39 @@ def _configured_local_runner_hosts(cwd: str | None) -> list[LocalRunnerHost]:
     DOCKER_HOST happens to name and reports the rest as simply absent.
     `local_runner_hosts` names each daemon explicitly.
     """
+    environment_prefix = os.environ.get(
+        "AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX"
+    )
+    if environment_prefix is not None:
+        prefix = environment_prefix.strip()
+        return [LocalRunnerHost(prefix=prefix)] if prefix else []
+
     raw_hosts = load_config(cwd).extra.get("local_runner_hosts")
     hosts: list[LocalRunnerHost] = []
     if isinstance(raw_hosts, list):
-        for entry in raw_hosts:
+        for index, entry in enumerate(raw_hosts, start=1):
             if not isinstance(entry, dict):
+                hosts.append(
+                    LocalRunnerHost(
+                        prefix="",
+                        name=f"local_runner_hosts[{index}]",
+                        configuration_error="entry must be a table",
+                    )
+                )
                 continue
             prefix = str(entry.get("prefix") or "").strip()
-            if not prefix:
-                continue
             docker_host = str(entry.get("docker_host") or "").strip() or None
             name = str(entry.get("name") or "").strip() or None
+            if not prefix:
+                hosts.append(
+                    LocalRunnerHost(
+                        prefix="",
+                        docker_host=docker_host,
+                        name=name or f"local_runner_hosts[{index}]",
+                        configuration_error="missing prefix",
+                    )
+                )
+                continue
             hosts.append(
                 LocalRunnerHost(prefix=prefix, docker_host=docker_host, name=name)
             )
@@ -235,7 +258,13 @@ def _local_docker_runner_load(
     qualify = len(hosts) > 1
     rows: list[dict[str, Any]] = []
     unreachable: list[str] = []
+    configuration_errors: list[str] = []
     for host in hosts:
+        if host.configuration_error:
+            configuration_errors.append(
+                f"{host.display} ({host.configuration_error})"
+            )
+            continue
         host_rows = _host_runner_rows(host, label, cwd, run, qualify_names=qualify)
         if host_rows is None:
             unreachable.append(host.display)
@@ -247,16 +276,22 @@ def _local_docker_runner_load(
         # endpoint rather than assert an authoritative zero.
         return None
 
+    if len(configuration_errors) == len(hosts):
+        return _degraded_load(
+            "Runner configuration invalid: " + ", ".join(configuration_errors)
+        )
+
     # A successful listing that matches nothing is an authoritative zero, not an
     # unavailable probe. Configuring hosts declares the fleet local; returning
     # None here would fall through to the GitHub runner endpoint, which needs
     # Administration: Read and may report unrelated registered runners in place
     # of the real local total.
     load = parse_runner_inventory({"runners": rows}, label=label)
-    if unreachable:
+    unavailable = [*unreachable, *configuration_errors]
+    if unavailable:
         # Partial coverage must not read as a complete picture: the counts are
         # real but describe only the daemons that answered.
-        detail = ", ".join(sorted(unreachable))
+        detail = ", ".join(sorted(unavailable))
         return replace(
             load,
             error=f"Runner probe could not reach: {detail}",
