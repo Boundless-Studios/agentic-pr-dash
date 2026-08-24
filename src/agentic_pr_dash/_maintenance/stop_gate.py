@@ -94,6 +94,58 @@ def _local_head_sha(cwd: str) -> str:
         return ""
 
 
+def _cached_clean_binding_matches(
+    cached_entry: dict | None,
+    local_sha: str,
+    binding,
+    *,
+    now: float,
+    interval: float,
+) -> bool:
+    """Return whether a clean cache entry belongs to this exact PR binding."""
+    return bool(
+        cached_entry
+        and binding is not None
+        and local_sha
+        and cached_entry.get("head_sha") == local_sha
+        and cached_entry.get("branch") == binding.branch
+        and cached_entry.get("pr_number") == binding.pr_number
+        and cached_entry.get("code") == 0
+        and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+    )
+
+
+def _fence_current_pr_rebindings(
+    bindings: dict,
+    *,
+    session_id: str,
+    pid: int,
+    provenance_for: dict[str, str],
+    arm=_write_arm_marker,
+) -> tuple[dict, list[str]]:
+    """Acquire replacement ownership before exposing a rebound PR in memory."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    rebound = dict(bindings)
+    conflicts: list[str] = []
+    for worktree, binding in bindings.items():
+        if binding.pr_number is None or binding.stale_pr_number is None:
+            continue
+        if arm(
+            worktree,
+            session_id,
+            pid,
+            binding.pr_number,
+            provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
+        ):
+            continue
+        conflicts.append(worktree)
+        rebound[worktree] = replace(
+            binding, pr_number=None, resolved=True, unknown=True
+        )
+    return rebound, conflicts
+
+
 def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
     """Stable hash of the pending (worktree, prompt) set."""
     h = hashlib.sha256()
@@ -447,6 +499,14 @@ def _stop_gate_impl(args) -> int:
         snap=resolution_snapshot,
         deadline=gate_deadline,
     )
+    ownership_conflicts: list[str] = []
+    if session_id:
+        current_pr_bindings, ownership_conflicts = _fence_current_pr_rebindings(
+            current_pr_bindings,
+            session_id=session_id,
+            pid=int(getattr(args, "pid", None) or os.getpid()),
+            provenance_for=provenance_for,
+        )
     current_pr_for = {
         worktree: binding.pr_number
         for worktree, binding in current_pr_bindings.items()
@@ -463,26 +523,16 @@ def _stop_gate_impl(args) -> int:
         if binding.unknown
         and provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
     ]
+    current_unknown_worktrees.extend(
+        worktree
+        for worktree in ownership_conflicts
+        if worktree not in current_unknown_worktrees
+    )
     stale_current_pr_numbers = {
         binding.stale_pr_number
         for binding in current_pr_bindings.values()
         if binding.resolved and binding.stale_pr_number is not None
     }
-    # Transfer the durable marker/claim before the clean-path prune can release
-    # the superseded PR. The replacement must remain owned on the next waiter
-    # tick, not merely for this stop-gate process's in-memory bookkeeping.
-    if session_id:
-        for worktree, binding in current_pr_bindings.items():
-            if binding.pr_number is None or binding.stale_pr_number is None:
-                continue
-            _write_arm_marker(
-                worktree,
-                session_id,
-                int(getattr(args, "pid", None) or os.getpid()),
-                binding.pr_number,
-                provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
-            )
-
     # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
     # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
     # Stop-hook timeout at seven (the incident this fixes). Prefetch all of
@@ -561,12 +611,9 @@ def _stop_gate_impl(args) -> int:
     for worktree in owned:
         local_sha = _local_head_sha(worktree)
         cached_entry = pr_head_cache.get(worktree)
-        if (
-            cached_entry
-            and local_sha
-            and cached_entry.get("head_sha") == local_sha
-            and cached_entry.get("code") == 0
-            and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+        binding = current_pr_bindings.get(worktree)
+        if _cached_clean_binding_matches(
+            cached_entry, local_sha, binding, now=now, interval=interval
         ):
             code, text = 0, cached_entry.get("text", "nothing pending")
             checked_count += 1
@@ -589,12 +636,16 @@ def _stop_gate_impl(args) -> int:
             unknown_worktrees.append(worktree)
             continue
         else:
-            binding = current_pr_bindings.get(worktree)
             with _use_current_pr_binding(binding):
                 code, text = _check_worktree(worktree, session_id, claim=False)
             checked_count += 1
             pr_head_cache[worktree] = {
-                "head_sha": local_sha, "checked_at": now, "code": code, "text": text,
+                "head_sha": local_sha,
+                "branch": binding.branch if binding is not None else None,
+                "pr_number": binding.pr_number if binding is not None else None,
+                "checked_at": now,
+                "code": code,
+                "text": text,
             }
             pr_head_cache_dirty = True
         # BOU-2567: accumulate from WHICHEVER branch above produced `text` —

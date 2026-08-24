@@ -256,12 +256,27 @@ def _resolve_pr_entry_for_branch(
         # candidate itself was positively confirmed closed.
         return _GH_UNAVAILABLE
 
-    data = _gh_pr_list_json(cwd, ["--head", branch], "number,isDraft,headRefName,headRefOid")
+    data = (
+        _gh_pr_list_json(
+            cwd,
+            ["--head", branch],
+            "number,isDraft,headRefName,headRefOid",
+            deadline=deadline,
+        )
+        if deadline is not None
+        else _gh_pr_list_json(
+            cwd, ["--head", branch], "number,isDraft,headRefName,headRefOid"
+        )
+    )
     if data is None:
         # On a GraphQL/list failure, REST is the only authoritative fallback.
         # A failed REST verification remains unknown rather than becoming a
         # false "no PR" answer (the BOU-2798 waiter must stay fail-loud).
-        replacement = _rest_fallback_entry_for_branch(branch, cwd)
+        replacement = (
+            _rest_fallback_entry_for_branch(branch, cwd, deadline=deadline)
+            if deadline is not None
+            else _rest_fallback_entry_for_branch(branch, cwd)
+        )
         return replacement if replacement is not None else _GH_UNAVAILABLE
     return _pick(data)
 
@@ -586,7 +601,12 @@ def _pr_head_branch(cwd: str, pr_number: int):
 
 
 def _gh_pr_list_json(
-    cwd: str, extra_args: list[str], fields: str, timeout: float = 15
+    cwd: str,
+    extra_args: list[str],
+    fields: str,
+    timeout: float = 15,
+    *,
+    deadline: float | None = None,
 ) -> list | None:
     """Run `gh pr list --author <pr_author> --state open --json <fields> <extra>`.
 
@@ -618,14 +638,16 @@ def _gh_pr_list_json(
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
+    if deadline is not None:
+        timeout = min(timeout, max(0.0, deadline - time.monotonic()))
     if timeout <= 0:
         return None
-    deadline = time.monotonic() + timeout
+    call_deadline = deadline if deadline is not None else time.monotonic() + timeout
     result = github_api._run(
         ["gh", "pr", "list", "--state", "open", "--limit",
          github_api._GH_COMPLETE_LIST_LIMIT, *extra_args, "--json",
          ",".join(dict.fromkeys([*fields.split(","), "author"]))],
-        timeout_s=timeout, deadline=deadline,
+        timeout_s=timeout, deadline=call_deadline,
         cwd=cwd,
     )
     if result.returncode != 0:

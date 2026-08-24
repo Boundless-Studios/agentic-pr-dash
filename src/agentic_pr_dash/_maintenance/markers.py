@@ -511,22 +511,6 @@ def _write_arm_marker(
     except Exception:  # noqa: BLE001
         repo = ""
 
-    try:
-        import subprocess  # noqa: PLC0415
-        from agentic_pr_dash import session_ledger  # noqa: PLC0415
-        baseline = None
-        try:
-            rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                                 capture_output=True, text=True, timeout=10)
-            if rev.returncode == 0:
-                baseline = rev.stdout.strip() or None
-        except (OSError, subprocess.TimeoutExpired):
-            baseline = None
-        session_ledger.append(session_id, pr_number, branch, cwd, baseline,
-                              repo=repo)
-    except Exception:  # noqa: BLE001
-        pass
-
     # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
     # ``fix_lease_until``, so it satisfies neither time-based liveness tier and its
     # ownership rests entirely on the owner pid. The mirrored claim must start in
@@ -536,6 +520,30 @@ def _write_arm_marker(
         cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
         pid_tier_only=True,
     )
+    marker_authoritative = marker_writes_enabled()
+    if not claimed and not marker_authoritative:
+        return False
+
+    # The session ledger describes ownership that was actually acquired. Keep
+    # it behind the claim fence so a refused replacement cannot be attributed
+    # to the losing session.
+    try:
+        import subprocess  # noqa: PLC0415
+
+        from agentic_pr_dash import session_ledger  # noqa: PLC0415
+        baseline = None
+        try:
+            rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
+                                 capture_output=True, text=True, timeout=10,
+                                 check=False)
+            if rev.returncode == 0:
+                baseline = rev.stdout.strip() or None
+        except (OSError, subprocess.TimeoutExpired):
+            baseline = None
+        session_ledger.append(session_id, pr_number, branch, cwd, baseline,
+                              repo=repo)
+    except Exception:  # noqa: BLE001
+        pass
     # From Stage 4 the claim IS the ownership write, so its outcome is this
     # function's outcome. That makes arming genuinely fenced: when another LIVE
     # session already holds (repo, pr), `record_ownership` refuses and adoption
@@ -545,7 +553,7 @@ def _write_arm_marker(
     #
     # With marker writes still enabled the marker remains authoritative, so a
     # claim-store hiccup must not turn a successful arm into a failure.
-    if marker_writes_enabled():
+    if marker_authoritative:
         return True
     return claimed
 

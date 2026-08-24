@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 from agentic_pr_dash import github_api
 from agentic_pr_dash import maintenance_check as mc
-from agentic_pr_dash._maintenance import _common, ownership_resolution, pr_state
-from agentic_pr_dash._maintenance.stop_gate import _effective_pr_pairs
+from agentic_pr_dash._maintenance import (
+    _common,
+    markers,
+    ownership_resolution,
+    pr_state,
+)
+from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
+from agentic_pr_dash._maintenance.stop_gate import (
+    _cached_clean_binding_matches,
+    _effective_pr_pairs,
+    _fence_current_pr_rebindings,
+)
 
 
 def test_waiter_pairs_rebind_to_current_branch_pr_after_stale_marker(
@@ -171,3 +182,89 @@ def test_strict_replacement_miss_is_unknown_for_fork_backed_heads(
     )
 
     assert result is pr_state._GH_UNAVAILABLE
+
+
+def test_cold_current_pr_resolution_shares_the_stop_gate_deadline(
+    monkeypatch, tmp_path: Path
+):
+    deadline = time.monotonic() + 1
+    observed: list[tuple[str, float | None]] = []
+
+    monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: None)
+
+    def _list(cwd, args, fields, *, timeout=15, deadline=None):
+        observed.append(("list", deadline))
+
+    def _rest(branch, cwd, *, force=False, deadline=None):
+        observed.append(("rest", deadline))
+
+    monkeypatch.setattr(pr_state, "_gh_pr_list_json", _list)
+    monkeypatch.setattr(pr_state, "_rest_fallback_entry_for_branch", _rest)
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path), "feature-b", validate_snapshot_state=True, deadline=deadline
+    )
+
+    assert result is pr_state._GH_UNAVAILABLE
+    assert observed == [("list", deadline), ("rest", deadline)]
+
+
+def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Path):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        resolved=True,
+        stale_pr_number=3017,
+    )
+
+    rebound, conflicts = _fence_current_pr_rebindings(
+        {worktree: binding},
+        session_id="session-a",
+        pid=123,
+        provenance_for={worktree: "armed"},
+        arm=lambda *args: False,
+    )
+
+    assert conflicts == [worktree]
+    assert rebound[worktree].unknown is True
+    assert rebound[worktree].pr_number is None
+    assert rebound[worktree].stale_pr_number == 3017
+
+
+def test_failed_claim_does_not_append_replacement_to_session_ledger(
+    monkeypatch, tmp_path: Path
+):
+    appended: list[tuple] = []
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(markers, "_current_branch", lambda cwd: "feature-b")
+    monkeypatch.setattr(markers, "_repo_slug", lambda cwd: "owner/repo")
+    monkeypatch.setattr(markers, "_dual_write_ownership_claim", lambda *a, **k: False)
+    monkeypatch.setattr(
+        "agentic_pr_dash.session_ledger.append",
+        lambda *args, **kwargs: appended.append((args, kwargs)),
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path), "session-a", 123, 3062
+    )
+    assert appended == []
+
+
+def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree, "feature-b", 3062, head_sha="same-sha", resolved=True
+    )
+    cached = {
+        "head_sha": "same-sha",
+        "branch": "feature-a",
+        "pr_number": 3017,
+        "checked_at": 100,
+        "code": 0,
+    }
+
+    assert not _cached_clean_binding_matches(
+        cached, "same-sha", binding, now=101, interval=180
+    )
