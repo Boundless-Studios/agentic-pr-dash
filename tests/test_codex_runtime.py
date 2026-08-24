@@ -221,6 +221,23 @@ def test_run_shared_hook_forwards_to_target(tmp_path):
     assert rc == 7
 
 
+def test_run_shared_hook_preserves_codex_runtime_after_bash_normalization(tmp_path):
+    target = tmp_path / "target.py"
+    target.write_text(
+        "import json, sys\n"
+        "data = json.load(sys.stdin)\n"
+        "print(data['_gaia_hook_runtime'])\n",
+        encoding="utf-8",
+    )
+    rc = runners_mod.run_shared_hook(
+        {"tool_name": "functions.exec_command", "tool_input": {"cmd": "ls"}},
+        normalize=lambda p: payload_mod.normalized_payload(p, repo_root=_root(tmp_path)),
+        apply_env=lambda p: None,
+        target=str(target),
+    )
+
+    assert rc == 0
+
 # --------------------------------------------------------------------------- #
 # runners: session commands
 # --------------------------------------------------------------------------- #

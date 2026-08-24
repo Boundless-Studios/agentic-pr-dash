@@ -78,6 +78,10 @@ def _git_worktree_root(path: str) -> str | None:
 
 def _hook_runtime(payload: dict) -> str:
     """Return the hook host identity when the launcher exposes it."""
+    normalized_runtime = payload.get("_gaia_hook_runtime")
+    if normalized_runtime in {"claude", "codex"}:
+        return normalized_runtime
+
     tool_name = payload.get("tool_name")
     if tool_name in {"exec_command", "functions.exec_command"}:
         return "codex"

@@ -251,7 +251,7 @@ def test_malformed_configured_host_degrades_valid_fleet(monkeypatch) -> None:
     assert load.online == 1
     assert load.is_degraded
     assert "reserve" in (load.error or "")
-    assert "missing prefix" in (load.error or "")
+    assert "prefix must be a non-empty string" in (load.error or "")
 
 
 def test_all_malformed_configured_hosts_return_configuration_failure(monkeypatch) -> None:
@@ -270,7 +270,7 @@ def test_all_malformed_configured_hosts_return_configuration_failure(monkeypatch
     assert load is not None
     assert load.is_degraded
     assert "reserve" in (load.error or "")
-    assert "missing prefix" in (load.error or "")
+    assert "prefix must be a non-empty string" in (load.error or "")
 
 
 def test_non_list_configured_hosts_return_configuration_failure(monkeypatch) -> None:
@@ -289,6 +289,32 @@ def test_non_list_configured_hosts_return_configuration_failure(monkeypatch) -> 
     assert load is not None
     assert load.is_degraded
     assert "local_runner_hosts" in (load.error or "")
+
+
+def test_non_string_configured_host_prefix_returns_configuration_failure(monkeypatch) -> None:
+    """A typed-but-invalid prefix must remain visible as configuration error."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": ["gha-runner-"], "name": "list-prefix"},
+                {"prefix": 42, "name": "integer-prefix"},
+            ]
+        }
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+    assert all(
+        host.configuration_error == "prefix must be a non-empty string" for host in hosts
+    )
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "list-prefix" in (load.error or "")
+    assert "integer-prefix" in (load.error or "")
 
 
 def test_configured_hosts_falls_back_to_legacy_prefix(monkeypatch) -> None:

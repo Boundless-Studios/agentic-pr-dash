@@ -137,19 +137,20 @@ def _configured_local_runner_hosts(cwd: str | None) -> list[LocalRunnerHost]:
                     )
                 )
                 continue
-            prefix = str(entry.get("prefix") or "").strip()
+            raw_prefix = entry.get("prefix")
             docker_host = str(entry.get("docker_host") or "").strip() or None
             name = str(entry.get("name") or "").strip() or None
-            if not prefix:
+            if not isinstance(raw_prefix, str) or not raw_prefix.strip():
                 hosts.append(
                     LocalRunnerHost(
                         prefix="",
                         docker_host=docker_host,
                         name=name or f"local_runner_hosts[{index}]",
-                        configuration_error="missing prefix",
+                        configuration_error="prefix must be a non-empty string",
                     )
                 )
                 continue
+            prefix = raw_prefix.strip()
             hosts.append(
                 LocalRunnerHost(prefix=prefix, docker_host=docker_host, name=name)
             )

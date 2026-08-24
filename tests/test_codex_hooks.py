@@ -247,6 +247,26 @@ def test_codex_payload_tool_identity_beats_inherited_claude_runtime(
     ) == []
 
 
+def test_normalized_codex_runtime_marker_beats_bash_tool_name(
+    monkeypatch, tmp_path
+):
+    """The shared runner's runtime marker survives Bash normalization."""
+    _run_arm_hook(
+        monkeypatch,
+        {
+            "cwd": str(tmp_path),
+            "tool_name": "Bash",
+            "_gaia_hook_runtime": "codex",
+            "tool_input": {"command": "gh pr create --fill"},
+        },
+        argv=["PostToolUse"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+        },
+    )
+
+
 def test_codex_without_native_session_id_does_not_inherit_claude_id(
     monkeypatch, tmp_path
 ):
