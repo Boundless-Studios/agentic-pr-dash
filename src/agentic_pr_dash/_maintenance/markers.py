@@ -738,10 +738,15 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> bool:
     if state not in ("merged", "closed"):
         return False
 
-    try:
-        os.remove(_marker_path(cwd))
-    except OSError:
-        pass
+    # The caller may hold a pre-rebind ownership snapshot for stale PR A while
+    # this same tick has already armed replacement PR B. Never delete B's
+    # marker while pruning A's ledger/claim artifacts.
+    current_marker = _read_marker(cwd) or {}
+    if current_marker.get("pr") == str(pr_number):
+        try:
+            os.remove(_marker_path(cwd))
+        except OSError:
+            pass
 
     try:
         os.remove(_stop_state_path(cwd))

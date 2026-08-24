@@ -516,6 +516,22 @@ def test_failed_claim_does_not_replace_session_marker(monkeypatch, tmp_path: Pat
     assert session_marker.read_text(encoding="utf-8") == "session-owner\n"
 
 
+def test_pruning_stale_pr_preserves_replacement_marker(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(pr_state, "_pr_open_state", lambda number, cwd: ("closed",))
+    monkeypatch.setattr(markers, "release_ownership_claims", lambda *args: None)
+    monkeypatch.setattr(markers, "_repo_slug", lambda cwd: "owner/repo")
+    monkeypatch.setattr(session_ledger, "prune", lambda *args, **kwargs: None)
+    monkeypatch.setattr("agentic_pr_dash.maintenance.prune_state", lambda *args: None)
+    marker_path = tmp_path / ".agentic-pr-dash" / "pr-watch.armed"
+    marker_path.parent.mkdir()
+    marker_path.write_text("pr=3062\nsession_id=session-a\n", encoding="utf-8")
+
+    assert markers._prune_stale_marker(
+        str(tmp_path), {"pr": "3017"}, "session-a"
+    )
+    assert markers._read_marker(str(tmp_path))["pr"] == "3062"
+
+
 def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
