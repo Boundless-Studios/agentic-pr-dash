@@ -86,7 +86,7 @@ def test_waiter_does_not_block_on_an_adopted_worktrees_blockers(tmp_path, monkey
     watched = []
     monkeypatch.setattr(
         mc, "_await_watch_pending_this_tick",
-        lambda owned, detached, cwd, sid: watched.extend(owned) or False,
+        lambda owned, detached, cwd, sid, **kwargs: watched.extend(owned) or False,
     )
 
     rc = mc.main([
@@ -150,7 +150,7 @@ def test_waiter_does_not_publish_or_refresh_adopted_worktree_coverage(
     monkeypatch.setattr(
         mc,
         "_await_watch_pending_this_tick",
-        lambda owned, detached, cwd, sid: False,
+        lambda owned, detached, cwd, sid, **kwargs: False,
     )
 
     published = []
@@ -230,7 +230,7 @@ def test_waiter_never_publishes_an_adopted_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr(
         mc,
         "_await_watch_pending_this_tick",
-        lambda owned, detached, cwd, sid: False,
+        lambda owned, detached, cwd, sid, **kwargs: False,
     )
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda wt, sid, pending: None)
 
@@ -412,7 +412,7 @@ def test_adopted_worktree_is_excluded_on_every_outcome(tmp_path, monkeypatch, co
     watched = []
     monkeypatch.setattr(
         mc, "_await_watch_pending_this_tick",
-        lambda owned, detached, cwd, sid: watched.extend(owned) or False,
+        lambda owned, detached, cwd, sid, **kwargs: watched.extend(owned) or False,
     )
 
     mc.main([

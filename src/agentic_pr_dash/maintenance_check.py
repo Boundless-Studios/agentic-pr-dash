@@ -659,6 +659,8 @@ def _await_watch_pending_this_tick(
     detached_records: list[dict],
     cwd: str,
     session_id: str,
+    *,
+    bindings: dict | None = None,
 ) -> bool:
     """Watch-pending across BOTH live worktrees and detached (ledger-only) PRs.
 
@@ -672,8 +674,25 @@ def _await_watch_pending_this_tick(
         and r.get("state") not in ("merged", "closed", "draft", "unknown")
         for r in detached_records
     )
-    return detached_watch_pending or _collect_await_watch_pending(
-        owned, cwd, session_id
+    if detached_watch_pending:
+        return True
+    if bindings is None:
+        return _collect_await_watch_pending(owned, cwd, session_id)
+
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    unresolved: list[str] = []
+    for worktree in owned:
+        binding = bindings.get(worktree)
+        if binding is None or not binding.resolved:
+            unresolved.append(worktree)
+            continue
+        if binding.unknown or binding.pr_number is None or binding.is_draft:
+            continue
+        if github_api.required_checks_pending(binding.pr_number, worktree):
+            return True
+    return bool(unresolved) and _collect_await_watch_pending(
+        unresolved, cwd, session_id
     )
 
 
@@ -2037,7 +2056,11 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             watch_pending: bool | None = None
             if not getattr(args, "keep_alive_without_prs", False):
                 watch_pending = _await_watch_pending_this_tick(
-                    watched_owned, _detached_this_tick, cwd, session_id
+                    watched_owned,
+                    _detached_this_tick,
+                    cwd,
+                    session_id,
+                    bindings=current_pr_bindings,
                 )
                 if (
                     not watch_pending
@@ -2101,7 +2124,11 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 # compute it here otherwise (keep_alive_without_prs sessions).
                 if watch_pending is None:
                     watch_pending = _await_watch_pending_this_tick(
-                        watched_owned, _detached_this_tick, cwd, session_id
+                        watched_owned,
+                        _detached_this_tick,
+                        cwd,
+                        session_id,
+                        bindings=current_pr_bindings,
                     )
                 # Read the flag AFTER the watch-pending probe so a quota wall hit
                 # by THAT call is captured too (a PR with running CI must not lose

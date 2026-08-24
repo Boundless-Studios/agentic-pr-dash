@@ -7,11 +7,13 @@ from pathlib import Path
 
 from agentic_pr_dash import github_api
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash import session_ledger
 from agentic_pr_dash._maintenance import (
     _common,
     markers,
     ownership_resolution,
     pr_state,
+    worktrees,
 )
 from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
 from agentic_pr_dash._maintenance.stop_gate import (
@@ -268,3 +270,53 @@ def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
     assert not _cached_clean_binding_matches(
         cached, "same-sha", binding, now=101, interval=180
     )
+
+
+def test_waiter_ci_probe_uses_strict_current_binding(monkeypatch, tmp_path: Path):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree, "feature-b", 3062, resolved=True, is_draft=False
+    )
+    probed: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: probed.append((pr, cwd)) or True,
+    )
+    monkeypatch.setattr(
+        mc,
+        "_collect_await_watch_pending",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("strict binding must avoid branch re-resolution")
+        ),
+    )
+
+    assert mc._await_watch_pending_this_tick(
+        [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
+    )
+    assert probed == [(3062, worktree)]
+
+
+def test_repointed_worktree_no_longer_hides_old_pr_from_detached_records(
+    monkeypatch, tmp_path: Path
+):
+    entry = session_ledger.LedgerEntry(
+        pr=3017,
+        branch="feature-a",
+        worktree=str(tmp_path),
+        opened_at="",
+        baseline_sha=None,
+        repo="owner/repo",
+    )
+    owner = ownership_resolution.WorktreeOwnership(
+        worktree=str(tmp_path),
+        session_id="session-a",
+        pr_number=3017,
+        provenance="armed",
+        marker_session_id="session-a",
+        source="marker",
+    )
+    monkeypatch.setattr(ownership_resolution, "resolve_worktree", lambda *a, **k: owner)
+    monkeypatch.setattr(worktrees, "_current_branch", lambda path: "feature-b")
+
+    assert not worktrees._worktree_is_for_entry(str(tmp_path), entry)

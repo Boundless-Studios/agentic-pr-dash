@@ -115,7 +115,7 @@ def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
             raise AssertionError("await did not exit once the probe was observable")
         return 0, "nothing pending"
 
-    def fake_collect_watch_pending(owned, cwd, session_id):
+    def fake_required_checks_pending(pr, cwd):
         probe_calls[0] += 1
         if probe_calls[0] == 1:
             # Simulate required_checks_pending failing on a non-rate-limit gh
@@ -124,7 +124,9 @@ def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
         return False
 
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
-    monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
+    monkeypatch.setattr(
+        github_api, "required_checks_pending", fake_required_checks_pending
+    )
     _bind_pr(monkeypatch)
 
     rc = mc.main(_await_args(tmp_path))
