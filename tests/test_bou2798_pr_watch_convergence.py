@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import github_api
+from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import _common, ownership_resolution, pr_state
 from agentic_pr_dash._maintenance.stop_gate import _effective_pr_pairs
 
@@ -122,3 +122,52 @@ def test_gate_current_resolution_does_not_fall_back_to_stale_marker(tmp_path: Pa
         {},
         current_resolved={worktree},
     ) == []
+
+
+def test_strict_current_resolution_revalidates_a_warm_snapshot_miss(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: [])
+    monkeypatch.setattr(
+        pr_state,
+        "_rest_fallback_entry_for_branch",
+        lambda branch, cwd, **kwargs: {
+            "number": 3062,
+            "state": "open",
+            "headRefName": branch,
+        },
+    )
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path), "feature-b", validate_snapshot_state=True
+    )
+
+    assert result["number"] == 3062
+
+
+def test_strict_replacement_miss_is_unknown_for_fork_backed_heads(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(
+        github_api,
+        "peek_pr_snapshot",
+        lambda cwd: [{"number": 3017, "headRefName": "feature-b"}],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda number, cwd=None, **kwargs: {
+            "number": number,
+            "state": "closed",
+            "headRefName": "feature-b",
+        },
+    )
+    monkeypatch.setattr(
+        pr_state, "_rest_fallback_entry_for_branch", lambda *args, **kwargs: None
+    )
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path), "feature-b", validate_snapshot_state=True
+    )
+
+    assert result is pr_state._GH_UNAVAILABLE

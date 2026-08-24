@@ -1858,7 +1858,6 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 kind="await_pr_watch_divergence",
                 snap=_await_snap,
             )
-
             pending: list[tuple[str, str]] = []
             adopted_worktrees: set[str] = set()
             gh_unobservable = False
@@ -1890,7 +1889,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 is_adopted = provenance == "adopted"
                 if is_adopted:
                     adopted_worktrees.add(worktree)
-                code, text = _check_worktree(worktree, session_id, claim=False)
+                binding = current_pr_bindings.get(worktree)
+                if binding is not None and binding.unknown and not is_adopted:
+                    gh_unobservable = True
+                from ._maintenance.worktree_check import (  # noqa: PLC0415
+                    _use_current_pr_binding,
+                )
+                with _use_current_pr_binding(binding):
+                    code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     if is_adopted:
                         # Reported via the same adopted-work FYI as the stop
@@ -2100,6 +2106,13 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         "[pr-watch] waiter max-wait reached but GitHub was "
                         "rate-limited this tick — staying alive until PR state "
                         "can be observed.",
+                        file=sys.stderr,
+                    )
+                elif gh_unobservable or unknown_detached:
+                    print(
+                        "[pr-watch] waiter max-wait reached but current PR "
+                        "ownership was unobservable this tick — staying alive "
+                        "until GitHub state can be observed.",
                         file=sys.stderr,
                     )
                 elif not watch_pending:

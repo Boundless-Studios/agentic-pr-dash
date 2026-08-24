@@ -350,7 +350,7 @@ RECONCILES_BEFORE_RATE_LIMIT = True
 
 def _stop_gate_impl(args) -> int:
     from agentic_pr_dash import github_api  # noqa: PLC0415
-    from .worktree_check import _check_worktree  # noqa: PLC0415
+    from .worktree_check import _check_worktree, _use_current_pr_binding  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
     from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_keys, _clean_exit_key  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -438,11 +438,14 @@ def _stop_gate_impl(args) -> int:
     provenance_for = resolution.provenance_for if resolution is not None else {}
 
     from .ownership_resolution import resolve_current_prs  # noqa: PLC0415
+    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
+    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
     current_pr_bindings = resolve_current_prs(
         owned,
         session_id,
         kind="stop_gate_pr_watch_divergence",
         snap=resolution_snapshot,
+        deadline=gate_deadline,
     )
     current_pr_for = {
         worktree: binding.pr_number
@@ -495,8 +498,6 @@ def _stop_gate_impl(args) -> int:
     # package). Default (60s) is chosen with real headroom under the observed
     # ~108s external timeout so this budget — not that outer one — is what
     # actually governs completion.
-    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
-    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
     checked_count = 0
     unknown_worktrees: list[str] = []
 
@@ -573,7 +574,9 @@ def _stop_gate_impl(args) -> int:
             unknown_worktrees.append(worktree)
             continue
         else:
-            code, text = _check_worktree(worktree, session_id, claim=False)
+            binding = current_pr_bindings.get(worktree)
+            with _use_current_pr_binding(binding):
+                code, text = _check_worktree(worktree, session_id, claim=False)
             checked_count += 1
             pr_head_cache[worktree] = {
                 "head_sha": local_sha, "checked_at": now, "code": code, "text": text,
@@ -694,7 +697,8 @@ def _stop_gate_impl(args) -> int:
             "treat stale PR state as clean. Retry when GitHub state is observable.",
             file=sys.stderr,
         )
-        return 2
+        if not pending:
+            return 2
 
     if not pending and not unknown_worktrees:
         # BOU-2567: surface the deferred count on every otherwise-clean path

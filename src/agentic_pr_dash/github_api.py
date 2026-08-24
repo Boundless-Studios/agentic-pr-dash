@@ -1590,7 +1590,8 @@ def find_pr_by_head(
 
 
 def _exact_head_pr_numbers(
-    owner: str, branch: str, rest_state: str, cwd: str | None = None
+    owner: str, branch: str, rest_state: str, cwd: str | None = None,
+    *, deadline: float | None = None,
 ) -> list[int] | None:
     """Return PR numbers whose head is *exactly* ``owner:branch`` via REST.
 
@@ -1616,6 +1617,7 @@ def _exact_head_pr_numbers(
             ],
             cwd=cwd,
             timeout_s=30,
+            deadline=deadline,
         )
         if r.returncode != 0:
             return None
@@ -1714,7 +1716,7 @@ def _pr_full_payload(number: int, cwd: str | None = None) -> dict | None:
     return pr if isinstance(pr, dict) else None
 
 
-def _rest_repo_owner(cwd: str | None = None) -> str:
+def _rest_repo_owner(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Base-repo owner login via the REST ``repos`` endpoint (quota fallback).
 
     :func:`get_repo_info` (``gh repo view``) resolves through GraphQL and
@@ -1727,14 +1729,14 @@ def _rest_repo_owner(cwd: str | None = None) -> str:
     r = _run(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "repos/{owner}/{repo}", "--jq", ".owner.login"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return ""
     return (r.stdout or "").strip()
 
 
-def _rest_viewer_login(cwd: str | None = None) -> str:
+def _rest_viewer_login(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Authenticated identity's login via REST ``GET /user`` (quota fallback).
 
     Resolves the ``@me`` author sentinel without GraphQL — ``gh pr list
@@ -1746,7 +1748,7 @@ def _rest_viewer_login(cwd: str | None = None) -> str:
     r = _run(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "user", "--jq", ".login"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return ""
@@ -1758,7 +1760,9 @@ def _rest_viewer_login(cwd: str | None = None) -> str:
 _REST_MERGEABLE_ENUM = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
 
 
-def _rest_pr_payload(number: int, cwd: str | None = None) -> dict | None:
+def _rest_pr_payload(
+    number: int, cwd: str | None = None, *, deadline: float | None = None
+) -> dict | None:
     """Full PR payload via REST ``pulls/{number}`` — the quota-safe twin of
     :func:`_pr_full_payload` (BOU-1966).
 
@@ -1773,7 +1777,7 @@ def _rest_pr_payload(number: int, cwd: str | None = None) -> dict | None:
     r = _run(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          f"repos/{{owner}}/{{repo}}/pulls/{number}"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return None

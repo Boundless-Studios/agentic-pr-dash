@@ -57,8 +57,9 @@ snapshot per worktree.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
+import time
+from dataclasses import dataclass, field
 
 
 def claim_reads_enabled() -> bool:
@@ -406,6 +407,7 @@ def resolve_current_pr(
     kind: str = "pr_watch_divergence",
     owner: WorktreeOwnership | None = None,
     snap=None,
+    deadline: float | None = None,
 ) -> CurrentPRResolution:
     """Resolve one owned worktree to its exact current branch/PR.
 
@@ -441,6 +443,7 @@ def resolve_current_pr(
         branch,
         head_oid=head_sha,
         validate_snapshot_state=True,
+        deadline=deadline,
     )
     if entry is _GH_UNAVAILABLE:
         if not had_pr_snapshot:
@@ -488,10 +491,16 @@ def resolve_current_prs(
     *,
     kind: str = "pr_watch_divergence",
     snap=None,
+    deadline: float | None = None,
 ) -> dict[str, CurrentPRResolution]:
     """Resolve all worktrees from one ownership snapshot and current PR pass."""
     out: dict[str, CurrentPRResolution] = {}
     for worktree in dict.fromkeys(os.path.abspath(path) for path in worktrees):
+        if deadline is not None and time.monotonic() >= deadline:
+            out[worktree] = CurrentPRResolution(
+                worktree, None, None, resolved=True, unknown=True
+            )
+            continue
         owner = resolve_worktree(worktree, kind=kind, snap=snap)
         owns = getattr(owner, "owned_by", None)
         if session_id and callable(owns) and not owns(session_id):
@@ -502,6 +511,7 @@ def resolve_current_prs(
             kind=kind,
             owner=owner,
             snap=snap,
+            deadline=deadline,
         )
     return out
 

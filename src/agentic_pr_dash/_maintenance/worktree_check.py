@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from agentic_pr_dash import observability
 from agentic_pr_dash.config import load as load_config
@@ -408,6 +410,21 @@ def _blocked_defer_text(*, pr_number: int, blockers: list[str], owner_desc: str)
     )
 
 
+_CURRENT_PR_BINDING: ContextVar[object | None] = ContextVar(
+    "pr_watch_current_pr_binding", default=None
+)
+
+
+@contextmanager
+def _use_current_pr_binding(binding):
+    """Make one strict current-branch resolution drive the blocker probe."""
+    token = _CURRENT_PR_BINDING.set(binding)
+    try:
+        yield
+    finally:
+        _CURRENT_PR_BINDING.reset(token)
+
+
 def _resolve_and_blockers(cwd: str):
     """Resolve the worktree's branch→PR and compute its live blockers.
 
@@ -420,7 +437,18 @@ def _resolve_and_blockers(cwd: str):
     """
     from agentic_pr_dash import maintenance  # noqa: PLC0415 — avoid import cycle
 
-    pr = pr_state._resolve_pr_for_branch(cwd)
+    binding = _CURRENT_PR_BINDING.get()
+    if binding is not None and getattr(binding, "unknown", False):
+        pr = pr_state._GH_UNAVAILABLE
+    elif binding is not None and getattr(binding, "resolved", False):
+        number = getattr(binding, "pr_number", None)
+        pr = (
+            pr_state._resolve_pr_by_number(number, cwd)
+            if number is not None
+            else None
+        )
+    else:
+        pr = pr_state._resolve_pr_for_branch(cwd)
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415

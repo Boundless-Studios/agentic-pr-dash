@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 from ._common import _current_branch
 
@@ -80,7 +81,9 @@ def _payload_author_login(raw: dict) -> str:
     return str(author.get("login") or "") if isinstance(author, dict) else ""
 
 
-def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
+def _rest_payload_author_is_tracked(
+    raw: dict, cwd: str, *, deadline: float | None = None
+) -> bool:
     """True when a REST fallback payload's author is the configured ``pr_author``.
 
     The normal branch resolution only considers ``gh pr list --author
@@ -93,7 +96,13 @@ def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
     configured = _load_config(cwd).pr_author
-    expected = github_api._rest_viewer_login(cwd) if configured == "@me" else configured
+    expected = configured
+    if configured == "@me":
+        expected = (
+            github_api._rest_viewer_login(cwd, deadline=deadline)
+            if deadline is not None
+            else github_api._rest_viewer_login(cwd)
+        )
     author = raw.get("author")
     actual = str(author.get("login") or "") if isinstance(author, dict) else ""
     if not expected or not actual:
@@ -101,7 +110,9 @@ def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     return _login_key(actual) == _login_key(expected)
 
 
-def _rest_fallback_entry_for_branch(branch: str, cwd: str, *, force: bool = False):
+def _rest_fallback_entry_for_branch(
+    branch: str, cwd: str, *, force: bool = False, deadline: float | None = None
+):
     """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
 
     Resolves owner (REST) → exact owner-qualified head numbers (REST) → full
@@ -120,19 +131,33 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str, *, force: bool = Fals
 
     if not force and not _list_failure_is_rate_limited():
         return None
-    owner = github_api._rest_repo_owner(cwd)
+    owner = (
+        github_api._rest_repo_owner(cwd, deadline=deadline)
+        if deadline is not None
+        else github_api._rest_repo_owner(cwd)
+    )
     if not owner:
         return None
-    numbers = github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    numbers = (
+        github_api._exact_head_pr_numbers(
+            owner, branch, "open", cwd=cwd, deadline=deadline
+        )
+        if deadline is not None
+        else github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    )
     if not numbers:
         return None
     for number in numbers:
-        raw = github_api._rest_pr_payload(number, cwd=cwd)
+        raw = (
+            github_api._rest_pr_payload(number, cwd=cwd, deadline=deadline)
+            if deadline is not None
+            else github_api._rest_pr_payload(number, cwd=cwd)
+        )
         if raw is None:
             return None  # REST failure mid-verification → fail closed
         if str(raw.get("headRefName") or "") != branch:
             continue
-        if not _rest_payload_author_is_tracked(raw, cwd):
+        if not _rest_payload_author_is_tracked(raw, cwd, deadline=deadline):
             continue
         return raw
     return None
@@ -144,6 +169,7 @@ def _resolve_pr_entry_for_branch(
     *,
     head_oid: str = "",
     validate_snapshot_state: bool = False,
+    deadline: float | None = None,
 ):
     """Resolve one exact, tracked open-PR entry for ``branch``.
 
@@ -161,6 +187,8 @@ def _resolve_pr_entry_for_branch(
 
     if not branch:
         return None
+    if deadline is not None and time.monotonic() >= deadline:
+        return _GH_UNAVAILABLE
 
     def _pick(entries: list[dict]) -> dict | None:
         exact = [
@@ -181,14 +209,29 @@ def _resolve_pr_entry_for_branch(
     if snapshot is not None:
         candidate = _pick(snapshot)
         if candidate is None:
-            return None
+            if not validate_snapshot_state:
+                return None
+            replacement = (
+                _rest_fallback_entry_for_branch(
+                    branch, cwd, force=True, deadline=deadline
+                )
+                if deadline is not None
+                else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+            )
+            return replacement if replacement is not None else _GH_UNAVAILABLE
         if not validate_snapshot_state:
             return candidate
 
         # A snapshot hit is not proof that the PR is still open. REST is the
         # quota-safe, current-state check and also detects a reused branch whose
         # open PR changed while the list snapshot was still warm.
-        live = github_api._rest_pr_payload(int(candidate["number"]), cwd=cwd)
+        live = (
+            github_api._rest_pr_payload(
+                int(candidate["number"]), cwd=cwd, deadline=deadline
+            )
+            if deadline is not None
+            else github_api._rest_pr_payload(int(candidate["number"]), cwd=cwd)
+        )
         if live is not None:
             if (
                 str(live.get("state") or "").lower() == "open"
@@ -199,12 +242,19 @@ def _resolve_pr_entry_for_branch(
         # verified. Ask REST for the exact current head before declaring the
         # worktree unbound. This path is deliberately not gated on a prior
         # GraphQL error: the snapshot itself may be the stale source.
-        replacement = _rest_fallback_entry_for_branch(branch, cwd, force=True)
+        replacement = (
+            _rest_fallback_entry_for_branch(
+                branch, cwd, force=True, deadline=deadline
+            )
+            if deadline is not None
+            else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+        )
         if replacement is not None:
             return replacement
-        if live is None:
-            return _GH_UNAVAILABLE
-        return None
+        # The owner-qualified REST head query cannot exclude a fork-backed
+        # replacement.  A miss is therefore unobservable even when the stale
+        # candidate itself was positively confirmed closed.
+        return _GH_UNAVAILABLE
 
     data = _gh_pr_list_json(cwd, ["--head", branch], "number,isDraft,headRefName,headRefOid")
     if data is None:
