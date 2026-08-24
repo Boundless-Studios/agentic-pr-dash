@@ -55,17 +55,16 @@ def normalized_cwd(payload: dict) -> str:
     cwd = payload.get("cwd")
     if isinstance(cwd, str) and cwd:
         return os.path.abspath(cwd)
-    # SessionStart payloads from some hook hosts omit cwd. The hook launcher
-    # changes into the active worktree before invoking us, so prefer that
-    # worktree over a stale inherited project-dir variable. This matters when a
-    # long-lived launcher starts a sibling worktree in the same shell.
-    process_root = _git_worktree_root(os.getcwd())
-    if process_root is not None:
-        return process_root
+    # SessionStart payloads from some hook hosts omit cwd. Project-dir values
+    # are supplied by the hook host and remain authoritative even when the
+    # hook process runs from a coordinator or shared-scripts checkout.
     for env_name in ("CLAUDE_PROJECT_DIR", "GAIA_PROJECT_DIR"):
         env_cwd = os.environ.get(env_name)
         if env_cwd:
             return os.path.abspath(env_cwd)
+    process_root = _git_worktree_root(os.getcwd())
+    if process_root is not None:
+        return process_root
     return os.getcwd()
 
 
@@ -79,16 +78,16 @@ def _git_worktree_root(path: str) -> str | None:
 
 def _hook_runtime(payload: dict) -> str:
     """Return the hook host identity when the launcher exposes it."""
-    for env_name in ("GAIA_HOOK_RUNTIME", "GAIA_SESSION_CLI"):
-        runtime = os.environ.get(env_name, "").strip().lower()
-        if runtime in {"claude", "codex"}:
-            return runtime
-
     tool_name = payload.get("tool_name")
     if tool_name in {"exec_command", "functions.exec_command"}:
         return "codex"
     if tool_name == "Bash":
         return "claude"
+
+    for env_name in ("GAIA_HOOK_RUNTIME", "GAIA_SESSION_CLI"):
+        runtime = os.environ.get(env_name, "").strip().lower()
+        if runtime in {"claude", "codex"}:
+            return runtime
     return ""
 
 

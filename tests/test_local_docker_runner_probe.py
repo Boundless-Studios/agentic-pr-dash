@@ -273,6 +273,24 @@ def test_all_malformed_configured_hosts_return_configuration_failure(monkeypatch
     assert "missing prefix" in (load.error or "")
 
 
+def test_non_list_configured_hosts_return_configuration_failure(monkeypatch) -> None:
+    """A table-shaped host setting must not silently fall back to GitHub."""
+
+    class _Cfg:
+        extra = {"local_runner_hosts": {"prefix": "gha-runner-"}}
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+    assert hosts[0].configuration_error == "must be a list of tables"
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "local_runner_hosts" in (load.error or "")
+
+
 def test_configured_hosts_falls_back_to_legacy_prefix(monkeypatch) -> None:
     """Without the new key the ambient-daemon behaviour is unchanged."""
 

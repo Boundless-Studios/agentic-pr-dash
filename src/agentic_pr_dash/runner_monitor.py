@@ -118,6 +118,14 @@ def _configured_local_runner_hosts(cwd: str | None) -> list[LocalRunnerHost]:
 
     raw_hosts = load_config(cwd).extra.get("local_runner_hosts")
     hosts: list[LocalRunnerHost] = []
+    if raw_hosts is not None and not isinstance(raw_hosts, list):
+        return [
+            LocalRunnerHost(
+                prefix="",
+                name="local_runner_hosts",
+                configuration_error="must be a list of tables",
+            )
+        ]
     if isinstance(raw_hosts, list):
         for index, entry in enumerate(raw_hosts, start=1):
             if not isinstance(entry, dict):

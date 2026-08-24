@@ -194,16 +194,16 @@ def test_session_start_uses_project_dir_when_payload_omits_cwd(monkeypatch, tmp_
     assert marker.read_text(encoding="utf-8").strip() == "session-in-project"
 
 
-def test_session_start_prefers_current_worktree_over_stale_project_dir(
+def test_session_start_prefers_explicit_project_dir_over_shared_process_checkout(
     monkeypatch, tmp_path
 ):
-    """A stale launcher variable must not redirect a marker to another worktree."""
-    current_dir = tmp_path / "current"
-    current_dir.mkdir()
-    (current_dir / ".git").mkdir()
-    stale_dir = tmp_path / "stale"
-    stale_dir.mkdir()
-    monkeypatch.chdir(current_dir)
+    """Project-dir context wins when the hook runs from another checkout."""
+    shared_checkout = tmp_path / "shared-checkout"
+    shared_checkout.mkdir()
+    (shared_checkout / ".git").mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.chdir(shared_checkout)
 
     _run_arm_hook(
         monkeypatch,
@@ -211,15 +211,40 @@ def test_session_start_prefers_current_worktree_over_stale_project_dir(
         argv=["SessionStart"],
         env={
             "CODEX_SESSION_ID": "codex-session",
-            "GAIA_PROJECT_DIR": str(stale_dir),
+            "GAIA_PROJECT_DIR": str(project_dir),
             "GAIA_SESSION_CLI": "codex",
         },
     )
 
-    marker = run_arm_pr_watch.load_config(str(current_dir)).session_marker_for(str(current_dir))
+    marker = run_arm_pr_watch.load_config(str(project_dir)).session_marker_for(str(project_dir))
     assert marker.read_text(encoding="utf-8").strip() == "codex-session"
-    stale_marker = run_arm_pr_watch.load_config(str(stale_dir)).session_marker_for(str(stale_dir))
-    assert not stale_marker.exists()
+    process_marker = run_arm_pr_watch.load_config(str(shared_checkout)).session_marker_for(
+        str(shared_checkout)
+    )
+    assert not process_marker.exists()
+
+
+def test_codex_payload_tool_identity_beats_inherited_claude_runtime(
+    monkeypatch, tmp_path
+):
+    """Codex payload identity wins over inherited Claude runtime hints."""
+    payload = {
+        "cwd": str(tmp_path),
+        "tool_name": "functions.exec_command",
+        "tool_input": {"cmd": "gh pr create --fill"},
+    }
+
+    assert _run_arm_hook(
+        monkeypatch,
+        payload,
+        argv=["PostToolUse"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_HOOK_RUNTIME": "claude",
+            "GAIA_SESSION_CLI": "claude",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+        },
+    ) == []
 
 
 def test_codex_without_native_session_id_does_not_inherit_claude_id(
