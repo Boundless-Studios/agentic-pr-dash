@@ -55,6 +55,14 @@ def normalized_cwd(payload: dict) -> str:
     cwd = payload.get("cwd")
     if isinstance(cwd, str) and cwd:
         return os.path.abspath(cwd)
+    # SessionStart payloads from some hook hosts omit cwd. Prefer the runtime's
+    # project root over the hook process directory so a hook launched from a
+    # coordinator or shared scripts checkout cannot stamp that worktree's
+    # marker with this session's id.
+    for env_name in ("CLAUDE_PROJECT_DIR", "GAIA_PROJECT_DIR"):
+        env_cwd = os.environ.get(env_name)
+        if env_cwd:
+            return os.path.abspath(env_cwd)
     return os.getcwd()
 
 
@@ -62,7 +70,17 @@ def session_id_from_payload(payload: dict) -> str:
     raw = payload.get("session_id")
     if isinstance(raw, str) and raw:
         return raw
-    return os.environ.get("CODEX_SESSION_ID") or os.environ.get("GAIA_SESSION_ID") or ""
+    # Payload identity is authoritative. When it is absent, keep Codex's
+    # per-conversation id ahead of Claude's inherited id, then use Claude's
+    # per-conversation id, and only use the shared launcher id as legacy
+    # fallback. The launcher id is intentionally shared across conversations
+    # and must never win when a native conversation id is available.
+    return (
+        os.environ.get("CODEX_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+        or os.environ.get("GAIA_SESSION_ID")
+        or ""
+    )
 
 
 def _strip_optional_quotes(value: str) -> str:
