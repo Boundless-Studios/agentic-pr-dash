@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from agent_review_coordinator import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
+from agentic_pr_dash.github_api import ObservationReadResult, ObservationState
 from agentic_pr_dash.maintenance import terminal_clean_blockers
 from agentic_pr_dash.models import PRData
 
@@ -39,6 +41,9 @@ class FinalizationObservation(BaseModel):
     clean: bool
     blockers: list[str] = Field(default_factory=list)
     review: SettlementReport
+    review_observation_state: ObservationState = ObservationState.OBSERVED
+    diagnostics: list[str] = Field(default_factory=list)
+    settlement_key: str = ""
 
 
 class FinalizationReport(BaseModel):
@@ -53,6 +58,9 @@ class FinalizationReport(BaseModel):
     observations: int
     blockers: list[str] = Field(default_factory=list)
     review: SettlementReport
+    review_observation_state: ObservationState = ObservationState.OBSERVED
+    diagnostics: list[str] = Field(default_factory=list)
+    settlement_key: str = ""
 
 
 def _thread_title(body: str) -> str:
@@ -362,6 +370,32 @@ def _append_once(items: list[str], item: str) -> None:
         items.append(item)
 
 
+def _settlement_state_key(
+    *,
+    repository: str,
+    head_sha: str,
+    blockers: Sequence[str],
+    review: SettlementReport,
+    review_observation_state: ObservationState,
+) -> str:
+    """Hash structured settlement state, excluding rendered guidance text."""
+
+    review_state = review.model_dump(
+        mode="json",
+        include={"settled", "required_actions", "missing_slots", "finding_states"},
+    )
+    payload = {
+        "repository": repository,
+        "head_sha": head_sha,
+        "blockers": sorted(blockers),
+        "review": review_state,
+        "review_observation_state": review_observation_state.value,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
 def evaluate_pr_snapshot(
     *,
     pr: PRData,
@@ -370,6 +404,7 @@ def evaluate_pr_snapshot(
     threads: Sequence,
     deferrals: Mapping[str, Mapping[str, object]],
     review_submissions: Sequence = (),
+    review_observation: ObservationReadResult[Sequence] | None = None,
 ) -> FinalizationObservation:
     """Combine one live PR snapshot with provider-neutral review settlement."""
 
@@ -416,15 +451,41 @@ def evaluate_pr_snapshot(
         ):
             _append_once(blockers, "ci_not_successful")
 
+    if review_observation is None:
+        review_observation = ObservationReadResult.observed(list(review_submissions))
+    review_observation_state = review_observation.state
+    diagnostics: list[str] = []
+    if review_observation.error:
+        diagnostics.append(review_observation.error)
+    if review_observation_state is ObservationState.CAPABILITY_REFUSED:
+        diagnostics.insert(0, "reviewer capability refusal is policy-visible")
+
     current_threads = [thread for thread in threads if not thread.is_resolved]
     settled_ledger = overlay_backstop_evidence(
         ledger,
         threads=current_threads,
         deferrals=deferrals,
-        reviews=review_submissions,
+        reviews=review_observation.value or (),
         reviewer_count=policy.review.backstop.reviewer_count,
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
+    if review_observation_state is ObservationState.UNAVAILABLE:
+        _append_once(blockers, "review_observation_unavailable")
+    if review_observation_state in {
+        ObservationState.UNAVAILABLE,
+        ObservationState.CAPABILITY_REFUSED,
+    }:
+        missing_slots = [
+            slot
+            for slot in review.missing_slots
+            if not slot.startswith(f"{ReviewStage.BACKSTOP.value}:")
+        ]
+        review_updates = {"missing_slots": missing_slots}
+        if review_observation_state is ObservationState.CAPABILITY_REFUSED:
+            review_updates["settled"] = not missing_slots and not review.required_actions
+        else:
+            review_updates["settled"] = False
+        review = review.model_copy(update=review_updates)
     if pr.is_draft:
         # A draft never becomes a ship candidate, so its backstop quorum is not
         # applicable. Keep local-slot and finding actions intact.
@@ -439,18 +500,32 @@ def evaluate_pr_snapshot(
                 "missing_slots": missing_slots,
             }
         )
+    final_repository = repository or ledger.repository
+    settlement_key = _settlement_state_key(
+        repository=final_repository,
+        head_sha=head_sha,
+        blockers=blockers,
+        review=review,
+        review_observation_state=review_observation_state,
+    )
     return FinalizationObservation(
-        repository=repository or ledger.repository,
+        repository=final_repository,
         head_sha=head_sha,
         clean=not blockers and review.settled,
         blockers=blockers,
         review=review,
+        review_observation_state=review_observation_state,
+        diagnostics=diagnostics,
+        settlement_key=settlement_key,
     )
 
 
 def _observation_key(observation: FinalizationObservation) -> str:
-    payload = observation.model_dump_json(exclude={"clean"})
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if isinstance(observation, FinalizationObservation) and observation.settlement_key:
+        return observation.settlement_key
+    return hashlib.sha256(
+        observation.model_dump_json(exclude={"clean"}).encode("utf-8")
+    ).hexdigest()
 
 
 def combine_clean_observations(
@@ -471,6 +546,9 @@ def combine_clean_observations(
             observations=1,
             blockers=blockers,
             review=first.review,
+            review_observation_state=first.review_observation_state,
+            diagnostics=first.diagnostics,
+            settlement_key=first.settlement_key,
         )
 
     stable = _observation_key(first) == _observation_key(second)
@@ -485,4 +563,7 @@ def combine_clean_observations(
         observations=2,
         blockers=blockers,
         review=second.review,
+        review_observation_state=second.review_observation_state,
+        diagnostics=second.diagnostics,
+        settlement_key=second.settlement_key,
     )

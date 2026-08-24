@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover - non-POSIX
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Final, Generic, TypeVar
 
@@ -50,6 +51,14 @@ from .quota import QuotaCaller, QuotaContext, QuotaLedger, QuotaWorkClass
 ObservationValue = TypeVar("ObservationValue")
 
 
+class ObservationState(str, Enum):
+    """Typed outcome of a remote observation boundary."""
+
+    OBSERVED = "observed"
+    UNAVAILABLE = "unavailable"
+    CAPABILITY_REFUSED = "capability_refused"
+
+
 @dataclass(frozen=True, slots=True)
 class ObservationReadResult(Generic[ObservationValue]):
     """Result of a dashboard observation boundary read.
@@ -66,18 +75,22 @@ class ObservationReadResult(Generic[ObservationValue]):
     observable: bool
     error: str | None = None
     graphql_observed: bool = False
+    state: ObservationState = ObservationState.OBSERVED
 
     @classmethod
     def observed(
         cls,
         value: ObservationValue,
         *,
+        error: str | None = None,
         graphql_observed: bool = False,
     ) -> ObservationReadResult[ObservationValue]:
         return cls(
             value=value,
             observable=True,
+            error=error,
             graphql_observed=graphql_observed,
+            state=ObservationState.OBSERVED,
         )
 
     @classmethod
@@ -93,6 +106,22 @@ class ObservationReadResult(Generic[ObservationValue]):
             observable=False,
             error=error,
             graphql_observed=graphql_observed,
+            state=ObservationState.UNAVAILABLE,
+        )
+
+    @classmethod
+    def capability_refused(
+        cls,
+        error: str,
+        value: ObservationValue | None = None,
+    ) -> ObservationReadResult[ObservationValue]:
+        """Return a verified provider refusal, distinct from an unreadable read."""
+
+        return cls(
+            value=value,
+            observable=True,
+            error=error,
+            state=ObservationState.CAPABILITY_REFUSED,
         )
 
 
@@ -183,6 +212,17 @@ _CODEX_CLEAN_REVIEW_RE = re.compile(
     r"^\s*Codex Review:\s*Didn't find any major issues\.\s*(?::rocket:|🚀)?",
     re.IGNORECASE,
 )
+_CODEX_CAPABILITY_REFUSAL_RE = re.compile(
+    r"(?:"
+    r"(?:codex|code\s+reviews?).{0,120}"
+    r"(?:usage\s+limits?|quota|rate\s+limits?|capacity|"
+    r"unable\s+to\s+review|cannot\s+review|can't\s+review)"
+    r"|"
+    r"(?:usage\s+limits?|quota|rate\s+limits?|capacity).{0,120}"
+    r"(?:codex|code\s+reviews?)"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
 _CODEX_REVIEW_AUTHOR_KEY = "chatgpt-codex-connector"
 _REVIEWED_COMMIT_RE = re.compile(
     r"\*\*Reviewed commit:\*\*\s*`([0-9a-f]{7,40})`",
@@ -259,6 +299,16 @@ class ReviewSubmission:
     submitted_at: str
     body: str = ""
     source: str = "review"
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewSubmissionRead:
+    """Internal review read with optional-comment and refusal diagnostics."""
+
+    submissions: tuple[ReviewSubmission, ...]
+    comments_observable: bool = True
+    comments_error: str | None = None
+    capability_refused: bool = False
 
 
 def _login_key(login: str) -> str:
@@ -2427,14 +2477,64 @@ def get_review_threads(
     return threads
 
 
-def get_review_submissions(
+def _review_command_error(
+    pr_number: int,
+    endpoint: str,
+    result: subprocess.CompletedProcess,
+) -> str:
+    """Return a redacted, classified diagnostic for a failed review read."""
+
+    stderr = (result.stderr or "").casefold()
+    if _is_rate_limit_failure(result):
+        category = "rate_limit"
+    elif (
+        result.returncode == 401
+        or "bad credentials" in stderr
+        or "authentication" in stderr
+        or "unauthorized" in stderr
+    ):
+        category = "authentication"
+    elif (
+        result.returncode == 403
+        or "forbidden" in stderr
+        or "resource not accessible" in stderr
+    ):
+        category = "authorization"
+    else:
+        category = "github_api"
+    return (
+        f"review observation unavailable ({category}) for PR #{pr_number}: "
+        f"{endpoint} read failed (gh exit {result.returncode})"
+    )
+
+
+def _run_review_read(
+    cmd: list[str],
+    *,
+    cwd: str | None,
+    timeout_s: float,
+) -> subprocess.CompletedProcess:
+    """Read GitHub reviews, retrying a rate-limited App token via user auth."""
+
+    result = _run(cmd, cwd=cwd, timeout_s=timeout_s)
+    if result.returncode == 0 or not _is_rate_limit_failure(result):
+        return result
+
+    user_env = dict(os.environ)
+    user_env["GH_TOKEN"] = ""
+    user_env.pop("GITHUB_TOKEN", None)
+    user_env.pop("AGENTIC_PR_DASH_TOKEN_FROM_FILE", None)
+    return _run(cmd, cwd=cwd, timeout_s=timeout_s, env=user_env)
+
+
+def _read_review_submissions(
     pr_number: int,
     head_sha: str,
     cwd: str | None = None,
     *,
     excluded_authors: set[str] | None = None,
     strict: bool = False,
-) -> list[ReviewSubmission]:
+) -> _ReviewSubmissionRead:
     """Return completed GitHub review evidence against ``head_sha``.
 
     The review coordinator requires affirmative evidence that the configured
@@ -2456,9 +2556,9 @@ def get_review_submissions(
                 "get_review_submissions: could not resolve the repository; "
                 "refusing to synthesize completed review submissions"
             )
-        return []
+        return _ReviewSubmissionRead(())
 
-    result = _run(
+    result = _run_review_read(
         [
             "gh",
             "api",
@@ -2472,10 +2572,9 @@ def get_review_submissions(
     if result.returncode != 0:
         if strict:
             raise RuntimeError(
-                f"get_review_submissions: GitHub review submissions failed for "
-                f"PR #{pr_number} (gh exit {result.returncode})"
+                _review_command_error(pr_number, "review submissions", result)
             )
-        return []
+        return _ReviewSubmissionRead(())
 
     excluded = {
         _login_key(author)
@@ -2543,9 +2642,9 @@ def get_review_submissions(
                 f"get_review_submissions: malformed review submissions for "
                 f"PR #{pr_number}"
             ) from exc
-        return []
+        return _ReviewSubmissionRead(())
 
-    comments_result = _run(
+    comments_result = _run_review_read(
         [
             "gh",
             "api",
@@ -2557,15 +2656,25 @@ def get_review_submissions(
         timeout_s=30,
     )
     if comments_result.returncode != 0:
-        return sorted(
-            submissions,
-            key=lambda review: (
-                review.submitted_at,
-                review.source,
-                review.review_id,
+        sorted_submissions = tuple(
+            sorted(
+                submissions,
+                key=lambda review: (
+                    review.submitted_at,
+                    review.source,
+                    review.review_id,
+                ),
+            )
+        )
+        return _ReviewSubmissionRead(
+            sorted_submissions,
+            comments_observable=False,
+            comments_error=_review_command_error(
+                pr_number, "issue comments", comments_result
             ),
         )
 
+    capability_refused = False
     try:
         comments_payload = json.loads(comments_result.stdout)
         if not isinstance(comments_payload, list):
@@ -2589,6 +2698,9 @@ def get_review_submissions(
                 ):
                     continue
                 body = item.get("body")
+                if isinstance(body, str) and _CODEX_CAPABILITY_REFUSAL_RE.search(body):
+                    capability_refused = True
+                    continue
                 if not isinstance(body, str) or not _CODEX_CLEAN_REVIEW_RE.match(body):
                     continue
                 reviewed_commit = _REVIEWED_COMMIT_RE.search(body)
@@ -2642,17 +2754,110 @@ def get_review_submissions(
                         source="issue-comment",
                     )
                 )
-    except (json.JSONDecodeError, TypeError):
-        pass
+    except (json.JSONDecodeError, TypeError) as exc:
+        sorted_submissions = tuple(
+            sorted(
+                submissions,
+                key=lambda review: (
+                    review.submitted_at,
+                    review.source,
+                    review.review_id,
+                ),
+            )
+        )
+        return _ReviewSubmissionRead(
+            sorted_submissions,
+            comments_observable=False,
+            comments_error=(
+                f"review observation unavailable: malformed issue comments "
+                f"for PR #{pr_number} ({type(exc).__name__})"
+            ),
+            capability_refused=capability_refused,
+        )
 
-    return sorted(
-        submissions,
-        key=lambda review: (
-            review.submitted_at,
-            review.source,
-            review.review_id,
+    return _ReviewSubmissionRead(
+        tuple(
+            sorted(
+                submissions,
+                key=lambda review: (
+                    review.submitted_at,
+                    review.source,
+                    review.review_id,
+                ),
+            )
         ),
+        capability_refused=capability_refused,
     )
+
+
+def get_review_submissions(
+    pr_number: int,
+    head_sha: str,
+    cwd: str | None = None,
+    *,
+    excluded_authors: set[str] | None = None,
+    strict: bool = False,
+) -> list[ReviewSubmission]:
+    """Return the historical list view of current-head review submissions."""
+
+    return list(
+        _read_review_submissions(
+            pr_number,
+            head_sha,
+            cwd,
+            excluded_authors=excluded_authors,
+            strict=strict,
+        ).submissions
+    )
+
+
+def get_review_submissions_observation(
+    pr_number: int,
+    head_sha: str,
+    cwd: str | None = None,
+    *,
+    excluded_authors: set[str] | None = None,
+) -> ObservationReadResult[list[ReviewSubmission]]:
+    """Read current-head review evidence without collapsing failure into missing.
+
+    An empty, readable response is ``observed`` and therefore legitimately
+    leaves the configured backstop slot missing. An unreadable reviews or issue
+    comments response is ``unavailable`` and never becomes ``backstop:N``.
+    A Codex quota/capability refusal is a verified ``capability_refused`` result
+    so settlement can follow its explicit release policy.
+    """
+
+    try:
+        read = _read_review_submissions(
+            pr_number,
+            head_sha,
+            cwd,
+            excluded_authors=excluded_authors,
+            strict=True,
+        )
+    except RuntimeError as exc:
+        return ObservationReadResult.unavailable(
+            f"review observation unavailable for PR #{pr_number}: "
+            f"{exc}"
+        )
+
+    submissions = list(read.submissions)
+    if not read.comments_observable:
+        if submissions:
+            return ObservationReadResult.observed(
+                submissions,
+                error=read.comments_error,
+            )
+        return ObservationReadResult.unavailable(
+            read.comments_error
+            or f"review observation unavailable for PR #{pr_number}"
+        )
+    if read.capability_refused and not submissions:
+        return ObservationReadResult.capability_refused(
+            f"reviewer capability/quota refusal observed for PR #{pr_number}",
+            submissions,
+        )
+    return ObservationReadResult.observed(submissions)
 
 
 # ---------------------------------------------------------------------------
