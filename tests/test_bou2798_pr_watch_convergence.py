@@ -5,9 +5,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-from agentic_pr_dash import github_api
+from agentic_pr_dash import github_api, session_ledger
 from agentic_pr_dash import maintenance_check as mc
-from agentic_pr_dash import session_ledger
 from agentic_pr_dash._maintenance import (
     _common,
     markers,
