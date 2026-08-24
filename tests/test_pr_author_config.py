@@ -186,3 +186,28 @@ def test_gh_pr_list_json_propagates_deadline_to_at_me_viewer_lookup(
     )
     assert seen[0]["deadline"] == deadline
     assert seen[1]["deadline"] == deadline
+
+
+def test_gh_pr_list_json_recomputes_viewer_timeout_from_shared_deadline(
+    tmp_path, monkeypatch
+):
+    now = [100.0]
+    seen: list[dict] = []
+
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            now[0] = 108.0
+            return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}]')
+        return _cp(stdout="viewer\n")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    assert pr_state._gh_pr_list_json(
+        str(tmp_path), [], "number", timeout=15, deadline=110.0
+    )
+    assert seen[0]["timeout_s"] == 10.0
+    assert seen[1]["timeout_s"] == 2.0
+    assert seen[1]["deadline"] == 110.0

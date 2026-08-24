@@ -667,8 +667,15 @@ def _gh_pr_list_json(
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
+        viewer_timeout = timeout
+        if deadline is not None:
+            viewer_timeout = min(
+                viewer_timeout, max(0.0, deadline - time.monotonic())
+            )
+        if viewer_timeout <= 0:
+            return None
         viewer = github_api._viewer_login_result(
-            cwd, timeout_s=timeout, deadline=deadline
+            cwd, timeout_s=viewer_timeout, deadline=deadline
         )
         if viewer.returncode != 0:
             return None
