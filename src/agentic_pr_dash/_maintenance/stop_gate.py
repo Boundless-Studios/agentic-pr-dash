@@ -110,6 +110,10 @@ def _cached_clean_binding_matches(
         and cached_entry.get("head_sha") == local_sha
         and cached_entry.get("branch") == binding.branch
         and cached_entry.get("pr_number") == binding.pr_number
+        # A draft verdict is not reusable after the same PR becomes ready (or
+        # the inverse transition). Older cache entries lack this field and
+        # therefore fail closed into a fresh check.
+        and cached_entry.get("is_draft") == bool(binding.is_draft)
         and cached_entry.get("code") == 0
         and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
     )
@@ -122,6 +126,13 @@ def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
         and binding.branch == branch
         and binding.head_sha == head_sha
     )
+
+
+def _unknown_binding_blocks_stop(
+    worktree: str, provenance_for: dict[str, str]
+) -> bool:
+    """Return whether an unknown current binding belongs to this stop gate."""
+    return provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
 
 
 def _revalidate_current_pr_binding(worktree: str, binding):
@@ -572,7 +583,7 @@ def _stop_gate_impl(args) -> int:
         worktree
         for worktree, binding in current_pr_bindings.items()
         if binding.unknown
-        and provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
+        and _unknown_binding_blocks_stop(worktree, provenance_for)
     ]
     current_unknown_worktrees.extend(
         worktree
@@ -680,7 +691,18 @@ def _stop_gate_impl(args) -> int:
             )
             current_pr_bindings[worktree] = binding
             current_pr_for.pop(worktree, None)
-            if worktree not in current_unknown_worktrees:
+            is_adopted = not _unknown_binding_blocks_stop(worktree, provenance_for)
+            # A replacement binding that changed underneath an adopted
+            # worktree is informational maintenance-loop scope, not a blocker
+            # for this session. Drop the prefetched stale pair as well so the
+            # later waiter-coverage pass cannot resurrect the old PR.
+            if is_adopted:
+                effective_pr_pairs = [
+                    (path, pr)
+                    for path, pr in effective_pr_pairs
+                    if path != worktree
+                ]
+            if not is_adopted and worktree not in current_unknown_worktrees:
                 current_unknown_worktrees.append(worktree)
         if _cached_clean_binding_matches(
             cached_entry, local_sha, binding, now=now, interval=interval
@@ -713,6 +735,7 @@ def _stop_gate_impl(args) -> int:
                 "head_sha": local_sha,
                 "branch": binding.branch if binding is not None else None,
                 "pr_number": binding.pr_number if binding is not None else None,
+                "is_draft": bool(binding.is_draft) if binding is not None else False,
                 "checked_at": now,
                 "code": code,
                 "text": text,

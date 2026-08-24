@@ -6,13 +6,14 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from agentic_pr_dash import github_api, session_ledger
+from agentic_pr_dash import github_api, models, session_ledger
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import (
     _common,
     markers,
     ownership_resolution,
     pr_state,
+    worktree_check,
     worktrees,
 )
 from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
@@ -22,6 +23,7 @@ from agentic_pr_dash._maintenance.stop_gate import (
     _durable_stop_gate_pid,
     _effective_pr_pairs,
     _fence_current_pr_rebindings,
+    _unknown_binding_blocks_stop,
 )
 
 
@@ -516,6 +518,64 @@ def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
     assert not _cached_clean_binding_matches(
         cached, "same-sha", binding, now=101, interval=180
     )
+
+
+def test_clean_cache_identity_includes_validated_draft_state():
+    binding = CurrentPRResolution(
+        "/worktree",
+        "feature-a",
+        3017,
+        head_sha="same-sha",
+        is_draft=False,
+        resolved=True,
+    )
+    cached = {
+        "head_sha": "same-sha",
+        "branch": "feature-a",
+        "pr_number": 3017,
+        "is_draft": True,
+        "checked_at": 100,
+        "code": 0,
+    }
+
+    assert not _cached_clean_binding_matches(
+        cached, "same-sha", binding, now=101, interval=180
+    )
+
+
+def test_revalidated_unknown_adopted_worktree_does_not_block_stop():
+    assert not _unknown_binding_blocks_stop(
+        "/adopted-worktree", {"/adopted-worktree": "adopted"}
+    )
+    assert _unknown_binding_blocks_stop(
+        "/armed-worktree", {"/armed-worktree": "armed"}
+    )
+
+
+def test_strict_binding_draft_state_overrides_stale_pr_snapshot(monkeypatch):
+    binding = CurrentPRResolution(
+        "/worktree",
+        "feature-a",
+        3017,
+        head_sha="same-sha",
+        is_draft=True,
+        resolved=True,
+    )
+    stale_pr = models.PRData(
+        number=3017,
+        title="PR",
+        branch="feature-a",
+        url="https://example.test/pull/3017",
+        is_draft=False,
+        latest_commit_sha="same-sha",
+    )
+    monkeypatch.setattr(pr_state, "_resolve_pr_by_number", lambda number, cwd: stale_pr)
+
+    with worktree_check._use_current_pr_binding(binding):
+        pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr.is_draft is True
+    assert blockers == []
 
 
 def test_waiter_ci_probe_uses_strict_current_binding(monkeypatch, tmp_path: Path):

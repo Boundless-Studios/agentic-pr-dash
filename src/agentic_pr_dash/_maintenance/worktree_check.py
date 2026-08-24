@@ -447,6 +447,14 @@ def _resolve_and_blockers(cwd: str):
             if number is not None
             else None
         )
+        if pr is not None and pr is not pr_state._GH_UNAVAILABLE:
+            # The strict resolver validated draft state for this checkout. The
+            # explicit-number detail lookup may still be served by a warm list
+            # snapshot from before a draft/ready transition, so its state must
+            # not override the binding that selected this PR.
+            pr = pr.model_copy(
+                update={"is_draft": bool(getattr(binding, "is_draft", False))}
+            )
     else:
         pr = pr_state._resolve_pr_for_branch(cwd)
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
