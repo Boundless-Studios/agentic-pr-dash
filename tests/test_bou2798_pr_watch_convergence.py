@@ -502,6 +502,20 @@ def test_failed_claim_does_not_append_replacement_to_session_ledger(
     assert appended == []
 
 
+def test_failed_claim_does_not_replace_session_marker(monkeypatch, tmp_path: Path):
+    state_dir = tmp_path / ".agentic-pr-dash"
+    state_dir.mkdir()
+    session_marker = state_dir / "pr-watch.session"
+    session_marker.write_text("session-owner\n", encoding="utf-8")
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(markers, "_current_branch", lambda cwd: "feature-b")
+    monkeypatch.setattr(markers, "_repo_slug", lambda cwd: "owner/repo")
+    monkeypatch.setattr(markers, "_dual_write_ownership_claim", lambda *a, **k: False)
+
+    assert not markers._write_arm_marker(str(tmp_path), "session-loser", 123, 3062)
+    assert session_marker.read_text(encoding="utf-8") == "session-owner\n"
+
+
 def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(

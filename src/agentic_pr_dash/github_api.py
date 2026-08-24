@@ -3416,6 +3416,7 @@ def batch_fetch_pr_review_and_ci(
     quota_ledger: QuotaLedger | None = None,
     caller: QuotaCaller = QuotaCaller.DASHBOARD,
     work_class: QuotaWorkClass = QuotaWorkClass.BACKGROUND_OBSERVATION,
+    deadline: float | None = None,
 ) -> dict[int, dict]:
     """Fetch review threads + the required-checks rollup for MANY PRs in as few
     round trips as possible (BOU-2556).
@@ -3541,7 +3542,9 @@ def batch_fetch_pr_review_and_ci(
                 continue
 
         try:
-            r = _run(cmd, cwd=cwd, timeout_s=45)
+            r = _run_with_optional_deadline(
+                cmd, cwd=cwd, timeout_s=45, deadline=deadline
+            )
             if r.returncode != 0:
                 if quota_context is not None:
                     quota_context.ledger.record_failure(

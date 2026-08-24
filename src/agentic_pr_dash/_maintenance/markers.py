@@ -506,12 +506,6 @@ def _write_arm_marker(
                     pass
             return False
 
-    try:
-        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
-            fh.write(session_id + "\n")
-    except OSError:
-        pass
-
     # Probed once and shared with the ownership dual-write below: both are `git`
     # subprocesses on the Stop-hook path, which has a hard deadline.
     #
@@ -542,6 +536,12 @@ def _write_arm_marker(
     marker_authoritative = marker_writes_enabled()
     if not claimed and not marker_authoritative:
         return False
+
+    try:
+        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
+            fh.write(session_id + "\n")
+    except OSError:
+        pass
 
     # The session ledger describes ownership that was actually acquired. Keep
     # it behind the claim fence so a refused replacement cannot be attributed

@@ -41,6 +41,13 @@ def _load_stop_state(cwd: str) -> dict:
 
 def _save_stop_state(cwd: str, state: dict) -> None:
     try:
+        # Preserve the cheap branch/HEAD identity across later fingerprint
+        # updates in the same stop-gate tick. Without this, the clean-path
+        # writes below would erase it and force a full probe on every stop.
+        if "checkout_identity" not in state:
+            previous = _load_stop_state(cwd)
+            if "checkout_identity" in previous:
+                state = {**state, "checkout_identity": previous["checkout_identity"]}
         path = _stop_state_path(cwd)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -365,7 +372,9 @@ def _effective_pr_pairs(
     return pairs
 
 
-def _prefetch_owned_pr_state(pairs: list[tuple[str, int]]) -> None:
+def _prefetch_owned_pr_state(
+    pairs: list[tuple[str, int]], *, deadline: float | None = None
+) -> None:
     """Batch-fetch review-thread + CI-rollup data for every owned PR in as few
     GraphQL round trips as possible (BOU-2556), priming
     ``github_api``'s per-process cache before the per-worktree loop runs.
@@ -396,10 +405,13 @@ def _prefetch_owned_pr_state(pairs: list[tuple[str, int]]) -> None:
     for repo, pr_numbers in by_repo.items():
         if len(pr_numbers) < 2:
             continue  # no batching win for a single PR in this repo
+        if deadline is not None and _time.monotonic() >= deadline:
+            return
         try:
             owner, name = repo.split("/", 1)
             entries = github_api.batch_fetch_pr_review_and_ci(
                 owner, name, sorted(pr_numbers), cwd=repo_cwd[repo],
+                deadline=deadline,
             )
             if entries:
                 github_api.prime_pr_batch_cache(repo, entries)
@@ -497,9 +509,11 @@ def _stop_gate_impl(args) -> int:
     if session_id:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
-        _owned, newly_adopted = _reconcile_owned_across_roots(
+        reconciled_owned, newly_adopted = _reconcile_owned_across_roots(
             session_id, cwd, owner_pid, deadline
         )
+    else:
+        reconciled_owned = [cwd]
 
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
@@ -516,9 +530,17 @@ def _stop_gate_impl(args) -> int:
         and not last_pending
         and (now - float(state.get("ts", 0) or 0)) < interval
     )
-    if rate_limited and not newly_adopted:
+    checkout_identity = [
+        [worktree, _current_branch(worktree), _local_head_sha(worktree)]
+        for worktree in sorted(reconciled_owned)
+    ]
+    if (
+        rate_limited
+        and not newly_adopted
+        and state.get("checkout_identity") == checkout_identity
+    ):
         return 0
-    _save_stop_state(cwd, {**state, "ts": now})
+    _save_stop_state(cwd, {**state, "ts": now, "checkout_identity": checkout_identity})
 
     # BOU-2223 Stage 2: flip ownership reads onto the claim store, with the
     # marker as fallback whenever the two disagree. `resolve_owned` takes (or
@@ -612,7 +634,7 @@ def _stop_gate_impl(args) -> int:
         {**pr_for, **current_pr_for},
         current_resolved=current_resolved_worktrees,
     )
-    _prefetch_owned_pr_state(effective_pr_pairs)
+    _prefetch_owned_pr_state(effective_pr_pairs, deadline=gate_deadline)
 
     # BOU-2556: give the per-worktree loop below a wall-clock budget so a
     # session owning many PRs degrades gracefully instead of blowing the
