@@ -28,6 +28,7 @@ from agentic_pr_dash import config, github_api, maintenance_check as mc, ownersh
 from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
+from agentic_pr_dash._maintenance import ownership_resolution as _ownership_resolution_mod
 
 SID = "sess-bou2294"
 
@@ -228,6 +229,19 @@ def test_claim_owned_waiter_records_its_clean_verdict(tmp_path, monkeypatch, cap
     monkeypatch.setattr(mc, "_touch_owner_heartbeat", lambda cwd, sid, work: None)
     monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
     monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt_, n: True)
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="test-branch",
+                pr_number=2707,
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
     monkeypatch.setattr("time.sleep", lambda s: None)
 
     rc = mc.main(_await_args(tmp_path))

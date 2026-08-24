@@ -23,6 +23,7 @@ from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance import ownership_resolution as _ownership_resolution_mod
 from agentic_pr_dash._maintenance._common import _repo_slug
 
 SID = "sess-codex-pr75"
@@ -67,6 +68,19 @@ def _bind_pr(monkeypatch, pr: int = 42) -> None:
     """
     monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
     monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="test-branch",
+                pr_number=pr,
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
 
 
 def _wire_await(tmp_path, monkeypatch, wt):
@@ -214,6 +228,19 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch, legacy_marker_wri
     # actually observed may be recorded verified-clean).
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature-42")
     monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: (42, False))
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="feature-42",
+                pr_number=42,
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
