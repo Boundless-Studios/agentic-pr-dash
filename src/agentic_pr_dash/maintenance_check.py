@@ -2064,7 +2064,16 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                             watched_owned,
                             bindings=current_pr_bindings,
                         )
-                        if _marker_pr_still_current(wt, n)
+                        if (
+                            (binding := current_pr_bindings.get(wt)) is not None
+                            and binding.resolved
+                            and not binding.unknown
+                            and binding.pr_number == n
+                        )
+                        or (
+                            current_pr_bindings.get(wt) is None
+                            and _marker_pr_still_current(wt, n)
+                        )
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick

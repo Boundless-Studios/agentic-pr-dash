@@ -636,7 +636,10 @@ def _run(
             return timeout_s
         return max(0.0, min(timeout_s, deadline - time.monotonic()))
 
-    result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
+    initial_timeout = remaining_timeout()
+    if initial_timeout <= 0:
+        return subprocess.CompletedProcess(cmd, 124, "", "deadline exceeded")
+    result = _run_once(cmd, timeout_s=initial_timeout, cwd=cwd, env=env)
     for attempt in range(1, _GH_RETRY_ATTEMPTS):
         if _is_transient_connectivity_failure(result):
             delay = _GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))

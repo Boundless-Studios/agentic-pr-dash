@@ -9,7 +9,7 @@ import time as _time
 
 from agentic_pr_dash.config import load as load_config
 from ._common import _env_int
-from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance
+from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance, _write_arm_marker
 
 # BOU-2567 PR #122 review, P1 #3: `_check_worktree`'s clean-check text ends in
 # "(deferred: N)" (see worktree_check._check_worktree) whenever a PR has
@@ -461,12 +461,27 @@ def _stop_gate_impl(args) -> int:
         worktree
         for worktree, binding in current_pr_bindings.items()
         if binding.unknown
+        and provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
     ]
     stale_current_pr_numbers = {
         binding.stale_pr_number
         for binding in current_pr_bindings.values()
         if binding.resolved and binding.stale_pr_number is not None
     }
+    # Transfer the durable marker/claim before the clean-path prune can release
+    # the superseded PR. The replacement must remain owned on the next waiter
+    # tick, not merely for this stop-gate process's in-memory bookkeeping.
+    if session_id:
+        for worktree, binding in current_pr_bindings.items():
+            if binding.pr_number is None or binding.stale_pr_number is None:
+                continue
+            _write_arm_marker(
+                worktree,
+                session_id,
+                int(getattr(args, "pid", None) or os.getpid()),
+                binding.pr_number,
+                provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
+            )
 
     # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
     # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
