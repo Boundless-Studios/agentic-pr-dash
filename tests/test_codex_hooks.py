@@ -27,6 +27,10 @@ def _run_arm_hook(
     monkeypatch.delenv("CODEX_SESSION_ID", raising=False)
     monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
     monkeypatch.delenv("GAIA_SESSION_ID", raising=False)
+    monkeypatch.delenv("GAIA_SESSION_CLI", raising=False)
+    monkeypatch.delenv("GAIA_HOOK_RUNTIME", raising=False)
+    monkeypatch.delenv("GAIA_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     monkeypatch.delenv("GAIA_PR_WATCH_AUTOLOOP", raising=False)
     monkeypatch.delenv("AGENTIC_PR_DASH_PR_WATCH_AUTOLOOP", raising=False)
     monkeypatch.delenv("WORKTREE_CONSOLE_CONFIG", raising=False)
@@ -162,6 +166,7 @@ def test_claude_session_id_beats_shared_gaia_session_id(monkeypatch, tmp_path):
         env={
             "CLAUDE_SESSION_ID": "claude-conversation",
             "GAIA_SESSION_ID": "shared-launcher-v7",
+            "GAIA_SESSION_CLI": "claude",
         },
     )
 
@@ -173,16 +178,67 @@ def test_session_start_uses_project_dir_when_payload_omits_cwd(monkeypatch, tmp_
     """A missing payload cwd must not redirect the marker to the hook process."""
     project_dir = tmp_path / "project"
     project_dir.mkdir()
+    hook_process_dir = tmp_path / "hook-process"
+    hook_process_dir.mkdir()
+    monkeypatch.chdir(hook_process_dir)
     monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project_dir))
 
     _run_arm_hook(
         monkeypatch,
         {"hook_event_name": "SessionStart", "session_id": "session-in-project"},
         argv=["SessionStart"],
+        env={"CLAUDE_PROJECT_DIR": str(project_dir)},
     )
 
     marker = run_arm_pr_watch.load_config(str(project_dir)).session_marker_for(str(project_dir))
     assert marker.read_text(encoding="utf-8").strip() == "session-in-project"
+
+
+def test_session_start_prefers_current_worktree_over_stale_project_dir(
+    monkeypatch, tmp_path
+):
+    """A stale launcher variable must not redirect a marker to another worktree."""
+    current_dir = tmp_path / "current"
+    current_dir.mkdir()
+    (current_dir / ".git").mkdir()
+    stale_dir = tmp_path / "stale"
+    stale_dir.mkdir()
+    monkeypatch.chdir(current_dir)
+
+    _run_arm_hook(
+        monkeypatch,
+        {"hook_event_name": "SessionStart"},
+        argv=["SessionStart"],
+        env={
+            "CODEX_SESSION_ID": "codex-session",
+            "GAIA_PROJECT_DIR": str(stale_dir),
+            "GAIA_SESSION_CLI": "codex",
+        },
+    )
+
+    marker = run_arm_pr_watch.load_config(str(current_dir)).session_marker_for(str(current_dir))
+    assert marker.read_text(encoding="utf-8").strip() == "codex-session"
+    stale_marker = run_arm_pr_watch.load_config(str(stale_dir)).session_marker_for(str(stale_dir))
+    assert not stale_marker.exists()
+
+
+def test_codex_without_native_session_id_does_not_inherit_claude_id(
+    monkeypatch, tmp_path
+):
+    """Codex must leave ownership unbound when only a parent Claude id exists."""
+    _run_arm_hook(
+        monkeypatch,
+        {"hook_event_name": "SessionStart"},
+        argv=["SessionStart"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+            "GAIA_SESSION_CLI": "codex",
+        },
+    )
+
+    marker = run_arm_pr_watch.load_config(str(tmp_path)).session_marker_for(str(tmp_path))
+    assert not marker.exists()
 
 
 def test_pr_open_arms_without_autoloop_opt_in(monkeypatch, tmp_path):
