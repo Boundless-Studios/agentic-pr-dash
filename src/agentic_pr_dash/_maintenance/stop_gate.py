@@ -124,6 +124,27 @@ def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
     )
 
 
+def _revalidate_current_pr_binding(worktree: str, binding):
+    """Fail closed when a prefetched binding no longer names the checkout."""
+    if binding is None or not binding.resolved:
+        return binding
+
+    branch = _current_branch(worktree)
+    head_sha = _local_head_sha(worktree)
+    if _binding_matches_live_checkout(binding, branch, head_sha):
+        return binding
+
+    from dataclasses import replace  # noqa: PLC0415
+
+    return replace(
+        binding,
+        branch=branch,
+        pr_number=None,
+        head_sha=head_sha,
+        unknown=True,
+    )
+
+
 def _durable_stop_gate_pid(pid: int | None) -> int:
     """Prefer an explicit owner pid; otherwise resolve the durable session pid."""
     if pid is not None:
@@ -152,6 +173,11 @@ def _fence_current_pr_rebindings(
             or binding.stale_pr_number is None
             or binding.is_draft
         ):
+            continue
+        binding = _revalidate_current_pr_binding(worktree, binding)
+        if binding.unknown:
+            conflicts.append(worktree)
+            rebound[worktree] = binding
             continue
         if arm(
             worktree,

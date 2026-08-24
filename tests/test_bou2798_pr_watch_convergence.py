@@ -339,6 +339,42 @@ def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Pat
     assert rebound[worktree].stale_pr_number == 3017
 
 
+def test_fenced_rebind_revalidates_checkout_before_acquiring(
+    monkeypatch, tmp_path: Path
+):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        head_sha="head-b",
+        resolved=True,
+        stale_pr_number=3017,
+    )
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-c",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-c",
+    )
+
+    rebound, conflicts = _fence_current_pr_rebindings(
+        {worktree: binding},
+        session_id="session-a",
+        pid=123,
+        provenance_for={worktree: "armed"},
+        arm=lambda *args: calls.append(args) or True,
+    )
+
+    assert calls == []
+    assert conflicts == [worktree]
+    assert rebound[worktree].unknown is True
+    assert rebound[worktree].pr_number is None
+
+
 def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -441,6 +477,29 @@ def test_waiter_ci_probe_uses_strict_current_binding(monkeypatch, tmp_path: Path
         [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
     )
     assert probed == [(3062, worktree)]
+
+
+def test_waiter_revalidates_checkout_before_using_bound_pr(
+    monkeypatch, tmp_path: Path
+):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree, "feature-b", 3062, head_sha="head-b", resolved=True
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-c",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-c",
+    )
+    refreshed = mc._revalidate_waiter_binding(worktree, binding)
+
+    assert refreshed.unknown is True
+    assert refreshed.pr_number is None
+    assert refreshed.branch == "feature-c"
+    assert refreshed.head_sha == "head-c"
 
 
 def test_repointed_worktree_no_longer_hides_old_pr_from_detached_records(
