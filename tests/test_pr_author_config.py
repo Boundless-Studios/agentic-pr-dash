@@ -13,6 +13,7 @@ the operator had open PRs, and ``await`` waiters exited ``{"outcome": "idle",
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
@@ -165,3 +166,23 @@ def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatc
     assert seen[0][seen[0].index("--json") + 1] == "number,author"
     assert seen[1][:3] == ["gh", "api", "user"]
     assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"
+
+
+def test_gh_pr_list_json_propagates_deadline_to_at_me_viewer_lookup(
+    tmp_path, monkeypatch
+):
+    seen: list[dict] = []
+    deadline = time.monotonic() + 30
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        if cmd[:3] == ["gh", "api", "user"]:
+            return _cp(stdout="viewer\n")
+        return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}]')
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    assert pr_state._gh_pr_list_json(
+        str(tmp_path), [], "number", deadline=deadline
+    )
+    assert seen[0]["deadline"] == deadline
+    assert seen[1]["deadline"] == deadline

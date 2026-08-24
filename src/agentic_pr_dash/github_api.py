@@ -855,13 +855,16 @@ def _repo_hostname(cwd: str | None = None) -> str:
 
 
 def _viewer_login_result(
-    cwd: str | None = None, *, timeout_s: float = 15,
+    cwd: str | None = None,
+    *,
+    timeout_s: float = 15,
+    deadline: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Resolve ``@me`` on the same GitHub host as the working repository."""
 
-    return _run(
+    return _run_with_optional_deadline(
         ["gh", "api", "user", "--hostname", _repo_hostname(cwd), "--jq", ".login"],
-        cwd=cwd, timeout_s=timeout_s,
+        cwd=cwd, timeout_s=timeout_s, deadline=deadline,
     )
 
 

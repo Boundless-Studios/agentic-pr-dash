@@ -190,7 +190,7 @@ def _resolve_pr_entry_for_branch(
     if deadline is not None and time.monotonic() >= deadline:
         return _GH_UNAVAILABLE
 
-    def _pick(entries: list[dict]) -> dict | None:
+    def _pick(entries: list[dict]):
         exact = [
             entry for entry in entries
             if isinstance(entry, dict)
@@ -202,12 +202,19 @@ def _resolve_pr_entry_for_branch(
         if head_oid:
             matching_head = [entry for entry in exact if entry.get("headRefOid") == head_oid]
             if matching_head:
-                exact = matching_head
+                return matching_head[0] if len(matching_head) == 1 else _GH_UNAVAILABLE
+        if len(exact) > 1:
+            # A branch name is not an ownership proof: fork/base PRs can share
+            # it. If the local head cannot disambiguate them, fail closed
+            # instead of binding arbitrarily to ``exact[0]``.
+            return _GH_UNAVAILABLE
         return exact[0]
 
     snapshot = github_api.peek_pr_snapshot(cwd)
     if snapshot is not None:
         candidate = _pick(snapshot)
+        if candidate is _GH_UNAVAILABLE:
+            return _GH_UNAVAILABLE
         if candidate is None:
             if not validate_snapshot_state:
                 return None
@@ -660,7 +667,9 @@ def _gh_pr_list_json(
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
-        viewer = github_api._viewer_login_result(cwd, timeout_s=timeout)
+        viewer = github_api._viewer_login_result(
+            cwd, timeout_s=timeout, deadline=deadline
+        )
         if viewer.returncode != 0:
             return None
         author = viewer.stdout.strip()

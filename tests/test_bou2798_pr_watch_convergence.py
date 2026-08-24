@@ -93,6 +93,26 @@ def test_current_branch_resolution_rejects_closed_cached_pr_and_rebinds(
     assert result["headRefOid"] == "head-b"
 
 
+def test_branch_resolution_rejects_ambiguous_same_branch_without_head_match(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: None)
+    monkeypatch.setattr(
+        pr_state,
+        "_gh_pr_list_json",
+        lambda *args, **kwargs: [
+            {"number": 3017, "headRefName": "shared", "headRefOid": "head-a"},
+            {"number": 3062, "headRefName": "shared", "headRefOid": "head-b"},
+        ],
+    )
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path), "shared", head_oid="unpushed-local-head"
+    )
+
+    assert result is pr_state._GH_UNAVAILABLE
+
+
 def test_rate_limit_fallback_refuses_foreign_author(monkeypatch, tmp_path: Path):
     """REST fallback must not turn a shared branch's foreign PR into ownership."""
     monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: None)
