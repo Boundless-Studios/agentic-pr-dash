@@ -67,24 +67,64 @@ def test_list_open_prs_uses_configured_author(tmp_path, monkeypatch):
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
-        return _cp()
+        return _cp(stdout='[{"number": 1, "author": {"login": "ilganeli"}}]')
 
     monkeypatch.setattr(github_api, "_run", fake_run)
-    assert github_api.list_open_prs(str(tmp_path)) == []
-    assert seen and "--author" in seen[0]
-    assert seen[0][seen[0].index("--author") + 1] == "ilganeli"
+    assert github_api.list_open_prs(str(tmp_path)) == [{"number": 1, "author": {"login": "ilganeli"}}]
+    assert seen and "--author" not in seen[0]
 
 
 def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     seen: list[list[str]] = []
+    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
-        return _cp()
+        if cmd[:3] == ["gh", "api", "user"]:
+            return _cp(stdout="viewer\n")
+        return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}, '
+                          '{"number": 2, "author": {"login": "someone-else"}}]')
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    assert github_api.list_open_prs(str(tmp_path)) == [
+        {"number": 1, "author": {"login": "viewer"}}
+    ]
+    assert "--author" not in seen[0]
+    assert seen[1][:3] == ["gh", "api", "user"]
+    assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"
+
+
+def test_repo_hostname_prefers_host_qualified_gh_repo(monkeypatch):
+    monkeypatch.setenv("GH_REPO", "enterprise.example/owner/repo")
+    monkeypatch.setattr(
+        github_api.subprocess,
+        "run",
+        lambda *args, **kwargs: pytest.fail("GH_REPO must avoid consulting origin"),
+    )
+
+    assert github_api._repo_hostname("/repo") == "enterprise.example"
+
+
+def test_list_open_prs_rejects_non_list_before_author_filtering(tmp_path, monkeypatch):
+    monkeypatch.setattr(github_api, "_run", lambda *args, **kwargs: _cp(stdout='{"number": 1}'))
+
+    assert github_api.list_open_prs(str(tmp_path)) is None
+    failure = github_api.last_list_open_prs_failure()
+    assert failure is not None
+    assert failure.reason == "not-a-list"
+
+
+def test_list_open_prs_requests_complete_pagination(tmp_path, monkeypatch):
+    seen: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        return _cp(stdout="[]")
 
     monkeypatch.setattr(github_api, "_run", fake_run)
     assert github_api.list_open_prs(str(tmp_path)) == []
-    assert seen[0][seen[0].index("--author") + 1] == "@me"
+    limits = [seen[0][i + 1] for i, value in enumerate(seen[0][:-1]) if value == "--limit"]
+    assert limits == [str(2**31 - 1)]
 
 
 # --------------------------------------------------------------------------- #
@@ -99,8 +139,29 @@ def test_gh_pr_list_json_uses_configured_author(tmp_path, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)
-        return _cp()
+        return _cp(stdout='[{"number": 1, "author": {"login": "ilganeli"}}]')
 
     monkeypatch.setattr(pr_state.subprocess, "run", fake_run)
-    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == []
-    assert seen and seen[0][seen[0].index("--author") + 1] == "ilganeli"
+    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == [{"number": 1, "author": {"login": "ilganeli"}}]
+    assert seen and "--author" not in seen[0]
+    assert seen[0][seen[0].index("--json") + 1] == "number,author"
+
+
+def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatch):
+    seen: list[list[str]] = []
+    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
+
+    def fake_run(cmd, **kwargs):
+        seen.append(cmd)
+        if cmd[:3] == ["gh", "api", "user"]:
+            return _cp(stdout="viewer\n")
+        return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}, '
+                          '{"number": 2, "author": {"login": "other"}}]')
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    assert pr_state._gh_pr_list_json(str(tmp_path), [], "number") == [
+        {"number": 1, "author": {"login": "viewer"}}
+    ]
+    assert seen[0][seen[0].index("--json") + 1] == "number,author"
+    assert seen[1][:3] == ["gh", "api", "user"]
+    assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"

@@ -161,3 +161,16 @@
 - `complete` run against baseline `025101f…`: auto-resolved the two P2 threads (`…SCgUq`, `…SCgUv`) on anchor evidence; left the P1 thread (`…SCgUs`) open as ambiguous (shields.io badge-URL misparse `//img.sh, ields.io`, anchor not outdated) — resolved it manually via GraphQL `resolveReviewThread` (`isResolved: true`). Post-resolve unresolved-thread count on PR #76 = **0**; head `f7a1b2f`.
 - Note: the post-push `await` waiter (`scripts/pr-cli.sh`) exits 127 in this worktree — that script is not present in the pr-agent-ops checkout; the machine-wide detached maintenance loop provides CI/feedback coverage. Did not wedge on it.
 - Shared git stash untouched.
+# BOU-2776 follow-up
+
+- PR: #161
+- Commits: `fe39391`, `e1fcb32`
+- Discovery no longer uses `gh pr list --author`; exact `author.login` filtering is client-side.
+- Focused tests: 6 passed; compileall passed. Full suite launched under isolated uv environment but exceeded the execution window.
+- Follow-up `5ebe8ba` preserves `@me` viewer scoping, requests author JSON fields, validates list shape before filtering, and raises the unfiltered limit for pagination coverage.
+- Shared bead closed. CI rerun is pending on Python 3.11/3.12/3.13; setup and CLA pass.
+- Follow-up retry-sequencing fix is on `67ef164`; explicit-author fixture keeps the
+  retry test focused on the list call while production `@me` resolution remains
+  covered separately. Focused retry/diagnostic/author suite: **36 passed**.
+- Bounded full-suite rerun reached 425 passed before the pre-existing retry fixture
+  expectation failed; the fixture correction then passed in the focused rerun.

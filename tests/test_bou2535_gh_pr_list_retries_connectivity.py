@@ -35,6 +35,17 @@ def _no_sleep(monkeypatch):
 def test_transient_connection_failure_is_retried_then_succeeds(monkeypatch):
     calls = []
 
+    # Keep this retry contract focused on the list subprocess.  ``@me`` is
+    # intentionally resolved by a separate ``gh api user`` call in the
+    # production path; an explicit author makes that seam deterministic and
+    # prevents the viewer lookup from consuming the retry fixture's sequence.
+    from agentic_pr_dash import config as config_mod
+    import types
+
+    fake_load = lambda cwd=None: types.SimpleNamespace(pr_author="viewer")  # noqa: E731
+    fake_load.cache_clear = lambda: None
+    monkeypatch.setattr(config_mod, "load", fake_load)
+
     def fake_run(cmd, *args, **kwargs):
         calls.append(1)
         if len(calls) < 2:
@@ -45,14 +56,16 @@ def test_transient_connection_failure_is_retried_then_succeeds(monkeypatch):
             )
         return _Result(
             returncode=0,
-            stdout='[{"number": 42, "isDraft": false}]',
+            stdout='[{"number": 42, "isDraft": false, "author": {"login": "viewer"}}]',
         )
 
     import subprocess as _subprocess
     monkeypatch.setattr(_subprocess, "run", fake_run)
 
     data = pr_state._gh_pr_list_json("/repo", [], "number,isDraft")
-    assert data == [{"number": 42, "isDraft": False}], (
+    assert data == [
+        {"number": 42, "isDraft": False, "author": {"login": "viewer"}}
+    ], (
         "a transient connection failure must be retried rather than giving "
         f"up on the first attempt (BOU-2535). calls={len(calls)}"
     )
