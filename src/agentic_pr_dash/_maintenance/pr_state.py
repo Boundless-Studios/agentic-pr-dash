@@ -111,7 +111,12 @@ def _rest_payload_author_is_tracked(
 
 
 def _rest_fallback_entry_for_branch(
-    branch: str, cwd: str, *, force: bool = False, deadline: float | None = None
+    branch: str,
+    cwd: str,
+    *,
+    force: bool = False,
+    deadline: float | None = None,
+    head_owner: str | None = None,
 ):
     """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
 
@@ -131,7 +136,7 @@ def _rest_fallback_entry_for_branch(
 
     if not force and not _list_failure_is_rate_limited():
         return None
-    owner = (
+    owner = head_owner or (
         github_api._rest_repo_owner(cwd, deadline=deadline)
         if deadline is not None
         else github_api._rest_repo_owner(cwd)
@@ -248,12 +253,23 @@ def _resolve_pr_entry_for_branch(
             # The resource proves this cached PR is still open, but not that it
             # remains the only open PR for the exact head. A new PR can appear
             # after the author-wide snapshot was cached.
+            live_head_owner = live.get("headRepositoryOwner")
+            if isinstance(live_head_owner, dict):
+                live_head_owner = live_head_owner.get("login")
+            if not isinstance(live_head_owner, str):
+                live_head_owner = None
             unique = (
                 _rest_fallback_entry_for_branch(
-                    branch, cwd, force=True, deadline=deadline
+                    branch,
+                    cwd,
+                    force=True,
+                    deadline=deadline,
+                    head_owner=live_head_owner,
                 )
                 if deadline is not None
-                else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+                else _rest_fallback_entry_for_branch(
+                    branch, cwd, force=True, head_owner=live_head_owner
+                )
             )
             if unique is not None and unique.get("number") == live.get("number"):
                 return live

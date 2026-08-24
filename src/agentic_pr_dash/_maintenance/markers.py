@@ -524,6 +524,15 @@ def _write_arm_marker(
     except Exception:  # noqa: BLE001
         repo = ""
 
+    # The checkout can move while the branch/repository probes above run. Fence
+    # the claim itself, not just the marker write, so a replacement checkout
+    # cannot acquire durable ownership for the stale PR.
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+    ):
+        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        return False
+
     # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
     # ``fix_lease_until``, so it satisfies neither time-based liveness tier and its
     # ownership rests entirely on the owner pid. The mirrored claim must start in
@@ -533,6 +542,15 @@ def _write_arm_marker(
         cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
         pid_tier_only=True,
     )
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+    ):
+        if claimed:
+            _release_dual_write_claim(
+                repo, pr_number, session_id, reason="checkout_changed_during_arm"
+            )
+        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        return False
     marker_authoritative = marker_writes_enabled()
     if not claimed and not marker_authoritative:
         return False
@@ -614,6 +632,34 @@ def _checkout_matches_expected(
         and (expected_branch is None or branch == expected_branch)
         and (expected_head_sha is None or head_sha == expected_head_sha)
     )
+
+
+def _discard_matching_arm_marker(cwd: str, session_id: str, pr_number: int) -> None:
+    """Remove only the marker this failed arm attempt wrote."""
+    fields = _read_marker(cwd) or {}
+    if fields.get("session_id") != session_id or fields.get("pr") != str(pr_number):
+        return
+    try:
+        os.remove(_marker_path(cwd))
+    except OSError:
+        pass
+
+
+def _release_dual_write_claim(
+    repo: str, pr_number: int, session_id: str, *, reason: str = "released"
+) -> None:
+    """Best-effort rollback for a claim acquired across a checkout race."""
+    try:
+        from agentic_pr_dash import ownership
+
+        ownership.release_ownership(
+            repo=repo,
+            pr_number=pr_number,
+            session_id=session_id,
+            reason=reason,
+        )
+    except Exception:  # noqa: BLE001 - rollback must not mask the fence
+        pass
 
 
 def _dual_write_ownership_claim(

@@ -683,6 +683,7 @@ def _await_watch_pending_this_tick(
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     unresolved: list[str] = []
+    unknown = False
     for worktree in owned:
         binding = bindings.get(worktree)
         if binding is None or not binding.resolved:
@@ -695,14 +696,15 @@ def _await_watch_pending_this_tick(
         # CI (or an explicit rate limit) may extend a finite waiter deadline.
         binding = _revalidate_waiter_binding(worktree, binding)
         if binding.unknown:
-            return None
+            unknown = True
+            continue
         if binding.pr_number is None or binding.is_draft:
             continue
         if github_api.required_checks_pending(binding.pr_number, worktree):
             return True
-    return bool(unresolved) and _collect_await_watch_pending(
-        unresolved, cwd, session_id
-    )
+    if unresolved and _collect_await_watch_pending(unresolved, cwd, session_id):
+        return True
+    return None if unknown else False
 
 
 def _owned_pr_pairs_for_await(

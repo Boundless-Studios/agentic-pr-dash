@@ -143,6 +143,52 @@ def test_current_branch_resolution_rechecks_warm_candidate_uniqueness(
     assert exact_head_checks == [True]
 
 
+def test_warm_fork_candidate_rechecks_against_head_repository_owner(
+    monkeypatch, tmp_path: Path
+):
+    """Warm fork-backed candidates must use the live head owner for uniqueness."""
+    monkeypatch.setattr(
+        github_api,
+        "peek_pr_snapshot",
+        lambda cwd: [{
+            "number": 3017,
+            "headRefName": "feature-b",
+            "headRefOid": "head-b",
+            "isDraft": False,
+        }],
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda number, cwd=None, **kwargs: {
+            "number": number,
+            "state": "open",
+            "headRefName": "feature-b",
+            "headRefOid": "head-b",
+            "headRepositoryOwner": {"login": "fork-owner"},
+        },
+    )
+    owners: list[str | None] = []
+
+    def _unique(branch, cwd, *, head_owner=None, **kwargs):
+        owners.append(head_owner)
+        return {
+            "number": 3017,
+            "state": "open",
+            "headRefName": branch,
+            "headRefOid": "head-b",
+        }
+
+    monkeypatch.setattr(pr_state, "_rest_fallback_entry_for_branch", _unique)
+
+    result = pr_state._resolve_pr_entry_for_branch(
+        str(tmp_path), "feature-b", validate_snapshot_state=True
+    )
+
+    assert result["number"] == 3017
+    assert owners == ["fork-owner"]
+
+
 def test_branch_resolution_rejects_ambiguous_same_branch_without_head_match(
     monkeypatch, tmp_path: Path
 ):
@@ -486,6 +532,63 @@ def test_arm_rejects_mismatched_checkout_before_claim(
     assert claimed == []
 
 
+def test_arm_rechecks_checkout_immediately_before_claim(
+    monkeypatch, tmp_path: Path
+):
+    checks = iter([True, False])
+    claimed: list[tuple] = []
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(
+        markers, "_checkout_matches_expected", lambda *args, **kwargs: next(checks)
+    )
+    monkeypatch.setattr(
+        markers,
+        "_dual_write_ownership_claim",
+        lambda *args, **kwargs: claimed.append((args, kwargs)) or True,
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path),
+        "session-a",
+        123,
+        3062,
+        expected_branch="feature-b",
+        expected_head_sha="head-b",
+    )
+    assert claimed == []
+
+
+def test_arm_releases_claim_when_checkout_changes_after_acquisition(
+    monkeypatch, tmp_path: Path
+):
+    checks = iter([True, True, False])
+    released: list[tuple] = []
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(
+        markers, "_checkout_matches_expected", lambda *args, **kwargs: next(checks)
+    )
+    monkeypatch.setattr(
+        markers, "_dual_write_ownership_claim", lambda *args, **kwargs: True
+    )
+    monkeypatch.setattr(
+        markers,
+        "_release_dual_write_claim",
+        lambda *args, **kwargs: released.append((args, kwargs)),
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path),
+        "session-a",
+        123,
+        3062,
+        expected_branch="feature-b",
+        expected_head_sha="head-b",
+    )
+    assert released == [
+        (("", 3062, "session-a"), {"reason": "checkout_changed_during_arm"})
+    ]
+
+
 def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -756,6 +859,46 @@ def test_waiter_marks_tick_unknown_when_binding_changes_before_ci_probe(
         [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
     ) is None
     assert probed == []
+
+
+def test_waiter_continues_after_unknown_binding_to_find_pending_ci(
+    monkeypatch, tmp_path: Path
+):
+    first = str(tmp_path / "first")
+    second = str(tmp_path / "second")
+    first_binding = CurrentPRResolution(
+        first, "feature-a", 3017, head_sha="head-a", resolved=True
+    )
+    second_binding = CurrentPRResolution(
+        second, "feature-b", 3062, head_sha="head-b", resolved=True
+    )
+    probed: list[tuple[int, str]] = []
+
+    def _revalidate(cwd, current):
+        if cwd == first:
+            return CurrentPRResolution(
+                cwd,
+                "feature-c",
+                None,
+                head_sha="head-c",
+                resolved=True,
+                unknown=True,
+                stale_pr_number=3017,
+            )
+        return current
+
+    monkeypatch.setattr(mc, "_revalidate_waiter_binding", _revalidate)
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: probed.append((pr, cwd)) or pr == 3062,
+    )
+
+    assert mc._await_watch_pending_this_tick(
+        [first, second], [], str(tmp_path), "session-a",
+        bindings={first: first_binding, second: second_binding},
+    )
+    assert probed == [(3062, second)]
 
 
 def test_waiter_revalidates_checkout_before_using_bound_pr(
