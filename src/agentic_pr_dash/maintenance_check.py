@@ -688,6 +688,13 @@ def _await_watch_pending_this_tick(
         if binding is None or not binding.resolved:
             unresolved.append(worktree)
             continue
+        # The resolver snapshot was taken at the start of the waiter tick. A
+        # checkout can move while another worktree is doing GitHub I/O; never
+        # probe CI for the old PR in that race. Unknown must keep this tick
+        # alive until a fresh resolver pass can bind the new checkout.
+        binding = _revalidate_waiter_binding(worktree, binding)
+        if binding.unknown:
+            return True
         if binding.unknown or binding.pr_number is None or binding.is_draft:
             continue
         if github_api.required_checks_pending(binding.pr_number, worktree):

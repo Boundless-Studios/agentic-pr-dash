@@ -375,6 +375,70 @@ def test_fenced_rebind_revalidates_checkout_before_acquiring(
     assert rebound[worktree].pr_number is None
 
 
+def test_fenced_rebind_passes_checkout_identity_to_arm(
+    monkeypatch, tmp_path: Path
+):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        head_sha="head-b",
+        resolved=True,
+        stale_pr_number=3017,
+    )
+    calls: list[tuple[tuple, dict]] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-b",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-b",
+    )
+
+    rebound, conflicts = _fence_current_pr_rebindings(
+        {worktree: binding},
+        session_id="session-a",
+        pid=123,
+        provenance_for={worktree: "armed"},
+        arm=lambda *args, **kwargs: calls.append((args, kwargs)) or True,
+    )
+
+    assert conflicts == []
+    assert rebound[worktree] == binding
+    assert calls == [
+        (
+            (worktree, "session-a", 123, 3062, "armed"),
+            {"expected_branch": "feature-b", "expected_head_sha": "head-b"},
+        )
+    ]
+
+
+def test_arm_rejects_mismatched_checkout_before_claim(
+    monkeypatch, tmp_path: Path
+):
+    claimed: list[tuple] = []
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(markers, "_current_branch", lambda cwd: "feature-c")
+    monkeypatch.setattr(markers, "_current_head_sha", lambda cwd: "head-c")
+    monkeypatch.setattr(
+        markers,
+        "_dual_write_ownership_claim",
+        lambda *args, **kwargs: claimed.append((args, kwargs)) or True,
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path),
+        "session-a",
+        123,
+        3062,
+        expected_branch="feature-b",
+        expected_head_sha="head-b",
+    )
+    assert claimed == []
+
+
 def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -457,7 +521,12 @@ def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
 def test_waiter_ci_probe_uses_strict_current_binding(monkeypatch, tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
-        worktree, "feature-b", 3062, resolved=True, is_draft=False
+        worktree,
+        "feature-b",
+        3062,
+        head_sha="head-b",
+        resolved=True,
+        is_draft=False,
     )
     probed: list[tuple[int, str]] = []
     monkeypatch.setattr(
@@ -472,11 +541,57 @@ def test_waiter_ci_probe_uses_strict_current_binding(monkeypatch, tmp_path: Path
             AssertionError("strict binding must avoid branch re-resolution")
         ),
     )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-b",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-b",
+    )
 
     assert mc._await_watch_pending_this_tick(
         [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
     )
     assert probed == [(3062, worktree)]
+
+
+def test_waiter_marks_tick_unknown_when_binding_changes_before_ci_probe(
+    monkeypatch, tmp_path: Path
+):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        head_sha="head-b",
+        resolved=True,
+        is_draft=False,
+    )
+    probed: list[tuple[int, str]] = []
+    monkeypatch.setattr(
+        mc,
+        "_revalidate_waiter_binding",
+        lambda cwd, current: CurrentPRResolution(
+            cwd,
+            "feature-c",
+            None,
+            head_sha="head-c",
+            resolved=True,
+            unknown=True,
+            stale_pr_number=3062,
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "required_checks_pending",
+        lambda pr, cwd: probed.append((pr, cwd)) or False,
+    )
+
+    assert mc._await_watch_pending_this_tick(
+        [worktree], [], str(tmp_path), "session-a", bindings={worktree: binding}
+    )
+    assert probed == []
 
 
 def test_waiter_revalidates_checkout_before_using_bound_pr(

@@ -441,6 +441,9 @@ def _write_arm_marker(
     pid: int,
     pr_number: int,
     provenance: str = "armed",
+    *,
+    expected_branch: str | None = None,
+    expected_head_sha: str | None = None,
 ) -> bool:
     """Write the pr-watch.armed ownership marker (the single writer).
 
@@ -462,6 +465,15 @@ def _write_arm_marker(
     except OSError:
         return False
 
+    # A replacement binding was resolved before this writer ran. Re-read the
+    # checkout at the ownership boundary so a concurrent branch switch cannot
+    # stamp the new PR onto a different checkout. The caller supplies both
+    # identities; missing local evidence is unknown, not a match.
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+    ):
+        return False
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     fields = {
         "pr": str(pr_number),
@@ -478,6 +490,13 @@ def _write_arm_marker(
             fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(content)
+            if not _checkout_matches_expected(
+                cwd,
+                expected_branch=expected_branch,
+                expected_head_sha=expected_head_sha,
+            ):
+                os.remove(tmp)
+                return False
             os.replace(tmp, target)
         except OSError:
             if tmp is not None:
@@ -556,6 +575,45 @@ def _write_arm_marker(
     if marker_authoritative:
         return True
     return claimed
+
+
+def _current_head_sha(cwd: str) -> str:
+    """Return the checkout HEAD, or an empty string when git is unavailable."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _checkout_matches_expected(
+    cwd: str,
+    *,
+    expected_branch: str | None,
+    expected_head_sha: str | None,
+) -> bool:
+    """Return whether the live checkout still matches an expected binding."""
+    if expected_branch is None and expected_head_sha is None:
+        return True
+    try:
+        branch = _current_branch(cwd)
+        head_sha = _current_head_sha(cwd)
+    except Exception:  # noqa: BLE001 — fail closed at the arm boundary
+        return False
+    return bool(
+        branch
+        and head_sha
+        and (expected_branch is None or branch == expected_branch)
+        and (expected_head_sha is None or head_sha == expected_head_sha)
+    )
 
 
 def _dual_write_ownership_claim(

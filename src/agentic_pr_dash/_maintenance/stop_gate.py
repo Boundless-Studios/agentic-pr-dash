@@ -185,6 +185,8 @@ def _fence_current_pr_rebindings(
             pid,
             binding.pr_number,
             provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
+            expected_branch=binding.branch,
+            expected_head_sha=binding.head_sha,
         ):
             continue
         conflicts.append(worktree)

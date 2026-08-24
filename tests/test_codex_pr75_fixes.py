@@ -76,10 +76,19 @@ def _bind_pr(monkeypatch, pr: int = 42) -> None:
                 worktree=worktree,
                 branch="test-branch",
                 pr_number=pr,
+                head_sha="test-head",
                 resolved=True,
             )
             for worktree in worktrees
         },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "test-branch",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "test-head",
     )
 
 
