@@ -2091,6 +2091,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                             (binding := current_pr_bindings.get(wt)) is not None
                             and binding.resolved
                             and not binding.unknown
+                            and not binding.is_draft
                             and binding.pr_number == n
                         )
                         or (

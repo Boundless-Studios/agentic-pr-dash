@@ -431,13 +431,10 @@ def resolve_current_pr(
         return CurrentPRResolution(path, None, None, stale_pr_number=stale_pr)
 
     head_sha = _current_head(path)
-    # A cold lookup failure is left for the normal per-PR checker to report.
-    # The strict unknown result is needed when a warm snapshot could otherwise
-    # make a closed/rebound PR look current; with no snapshot there is no stale
-    # candidate to invalidate and existing callers still have their own
-    # fail-closed observation path.
-    from agentic_pr_dash import github_api  # noqa: PLC0415
-    had_pr_snapshot = github_api.peek_pr_snapshot(path) is not None
+    # A cold lookup failure is just as unobservable as a warm failure. In
+    # particular, an ambiguous same-branch result must not fall through to the
+    # legacy branch resolver, which may choose an arbitrary PR and then prune
+    # or watch stale ownership.
     entry = _resolve_pr_entry_for_branch(
         path,
         branch,
@@ -446,14 +443,6 @@ def resolve_current_pr(
         deadline=deadline,
     )
     if entry is _GH_UNAVAILABLE:
-        if not had_pr_snapshot:
-            return CurrentPRResolution(
-                path,
-                branch,
-                None,
-                head_sha=head_sha,
-                stale_pr_number=stale_pr,
-            )
         return CurrentPRResolution(
             path,
             branch,
@@ -478,7 +467,10 @@ def resolve_current_pr(
         path,
         branch,
         number,
-        head_sha=str(entry.get("headRefOid") or head_sha),
+        # Keep the local checkout identity separate from the remote PR head.
+        # A force-push or unpushed local commit is a checkout change, not a
+        # reason to rewrite the identity used by the stop-gate race check.
+        head_sha=head_sha,
         is_draft=bool(entry.get("isDraft", False)),
         resolved=True,
         stale_pr_number=(stale_pr if stale_pr is not None and stale_pr != number else None),

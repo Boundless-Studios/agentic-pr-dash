@@ -147,7 +147,11 @@ def _fence_current_pr_rebindings(
     rebound = dict(bindings)
     conflicts: list[str] = []
     for worktree, binding in bindings.items():
-        if binding.pr_number is None or binding.stale_pr_number is None:
+        if (
+            binding.pr_number is None
+            or binding.stale_pr_number is None
+            or binding.is_draft
+        ):
             continue
         if arm(
             worktree,

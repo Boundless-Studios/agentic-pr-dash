@@ -249,6 +249,37 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch, legacy_marker_wri
     assert _waiter_mod._read_clean_exit_keys(SID) == {_marker_key(wt, 42)}
 
 
+def test_await_clean_exit_excludes_draft_binding(
+    tmp_path, monkeypatch, legacy_marker_writes
+):
+    """Draft PRs are not waiter coverage and must not be recorded clean."""
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(
+        mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending")
+    )
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="feature-42",
+                pr_number=42,
+                is_draft=True,
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
+
+    rc = mc.main(_await_args(tmp_path))
+
+    assert rc == mc._AWAIT_UNBOUND
+    assert _waiter_mod._read_clean_exit_keys(SID) == set()
+
+
 def test_await_exit_10_clears_marker(tmp_path, monkeypatch):
     wt = _arm(tmp_path, 42)
     _wire_await(tmp_path, monkeypatch, wt)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 from agentic_pr_dash import github_api, session_ledger
 from agentic_pr_dash import maintenance_check as mc
@@ -98,7 +99,6 @@ def test_current_branch_resolution_rejects_closed_cached_pr_and_rebinds(
 def test_branch_resolution_rejects_ambiguous_same_branch_without_head_match(
     monkeypatch, tmp_path: Path
 ):
-    monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: None)
     monkeypatch.setattr(
         pr_state,
         "_gh_pr_list_json",
@@ -257,6 +257,64 @@ def test_cold_current_pr_resolution_shares_the_stop_gate_deadline(
     assert observed == [("list", deadline), ("rest", deadline)]
 
 
+def test_cold_ambiguous_current_pr_resolution_stays_unknown(
+    monkeypatch, tmp_path: Path
+):
+    """A cold strict-resolution failure must not fall back to stale ownership."""
+    owner = SimpleNamespace(pr_number=3017, owned_by=lambda session_id: True)
+    monkeypatch.setattr(
+        ownership_resolution, "resolve_worktree", lambda *args, **kwargs: owner
+    )
+    monkeypatch.setattr(_common, "_current_branch", lambda cwd: "shared")
+    monkeypatch.setattr(ownership_resolution, "_current_head", lambda cwd: "local")
+    monkeypatch.setattr(
+        pr_state,
+        "_resolve_pr_entry_for_branch",
+        lambda *args, **kwargs: pr_state._GH_UNAVAILABLE,
+    )
+
+    result = ownership_resolution.resolve_current_pr(
+        str(tmp_path), session_id="session-a"
+    )
+
+    assert result.branch == "shared"
+    assert result.pr_number is None
+    assert result.stale_pr_number == 3017
+    assert result.resolved is True
+    assert result.unknown is True
+
+
+def test_current_pr_resolution_preserves_local_checkout_sha(
+    monkeypatch, tmp_path: Path
+):
+    owner = SimpleNamespace(pr_number=3017, owned_by=lambda session_id: True)
+    monkeypatch.setattr(
+        ownership_resolution, "resolve_worktree", lambda *args, **kwargs: owner
+    )
+    monkeypatch.setattr(_common, "_current_branch", lambda cwd: "feature-b")
+    monkeypatch.setattr(
+        ownership_resolution, "_current_head", lambda cwd: "local-head"
+    )
+    monkeypatch.setattr(github_api, "peek_pr_snapshot", lambda cwd: None)
+    monkeypatch.setattr(
+        pr_state,
+        "_resolve_pr_entry_for_branch",
+        lambda *args, **kwargs: {
+            "number": 3062,
+            "headRefName": "feature-b",
+            "headRefOid": "remote-head",
+            "isDraft": False,
+        },
+    )
+
+    result = ownership_resolution.resolve_current_pr(
+        str(tmp_path), session_id="session-a"
+    )
+
+    assert result.pr_number == 3062
+    assert result.head_sha == "local-head"
+
+
 def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -279,6 +337,31 @@ def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Pat
     assert rebound[worktree].unknown is True
     assert rebound[worktree].pr_number is None
     assert rebound[worktree].stale_pr_number == 3017
+
+
+def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        is_draft=True,
+        resolved=True,
+        stale_pr_number=3017,
+    )
+    calls: list[tuple] = []
+
+    rebound, conflicts = _fence_current_pr_rebindings(
+        {worktree: binding},
+        session_id="session-a",
+        pid=123,
+        provenance_for={worktree: "armed"},
+        arm=lambda *args: calls.append(args) or True,
+    )
+
+    assert conflicts == []
+    assert calls == []
+    assert rebound[worktree] == binding
 
 
 def test_stop_gate_uses_durable_pid_when_cli_pid_is_absent(monkeypatch):

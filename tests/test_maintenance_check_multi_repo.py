@@ -11,10 +11,11 @@ import subprocess
 from pathlib import Path
 
 from agentic_pr_dash import maintenance_check as mc
-from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
+from agentic_pr_dash._maintenance import pr_state as _pr_state_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import stop_gate as _stop_gate_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 
 
 def _git(*args, cwd):
@@ -202,6 +203,15 @@ def test_stop_gate_does_not_adopt_or_inspect_unmarked_sibling_root_pr(
         _worktrees_mod,
         "_live_independent_owner_paths",
         lambda paths, session_id: set(),
+    )
+    monkeypatch.setattr(
+        _pr_state_mod,
+        "_resolve_pr_entry_for_branch",
+        lambda cwd, branch, **kwargs: {
+            "number": 100,
+            "headRefName": branch,
+            "isDraft": False,
+        },
     )
     monkeypatch.setattr(
         _reconcile_mod,
