@@ -101,6 +101,51 @@ def _local_head_sha(cwd: str) -> str:
         return ""
 
 
+def _probe_checkout_identity(worktree: str, timeout: float) -> list[str]:
+    """Read branch and HEAD in one subprocess bounded by the caller's budget."""
+    import subprocess  # noqa: PLC0415
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", worktree, "status", "--porcelain=v2", "--branch",
+                "--untracked-files=no",
+            ],
+            capture_output=True, text=True, timeout=max(0.001, timeout), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return [worktree, "", ""]
+    fields = {}
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("# branch."):
+                key, _, value = line[2:].partition(" ")
+                fields[key] = value
+    return [worktree, fields.get("branch.head", ""), fields.get("branch.oid", "")]
+
+
+def _bounded_checkout_identity(
+    worktrees: list[str], *, deadline: float | None, probe=_probe_checkout_identity
+) -> tuple[list[list[str]], bool]:
+    """Collect checkout identities without crossing the shared stop deadline."""
+    identities: list[list[str]] = []
+    for worktree in sorted(worktrees):
+        remaining = 5.0 if deadline is None else deadline - _time.monotonic()
+        if remaining <= 0:
+            return identities, False
+        identities.append(probe(worktree, min(5.0, remaining)))
+    return identities, True
+
+
+def _persist_unknown_binding_state(
+    cwd: str, *, now: float, worktrees: list[str]
+) -> None:
+    """Make an unobservable binding ineligible for the clean-stop shortcut."""
+    fingerprint = "current-pr-unknown:" + ",".join(sorted(worktrees))
+    state = _load_stop_state(cwd)
+    count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+    _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+
+
 def _cached_clean_binding_matches(
     cached_entry: dict | None,
     local_sha: str,
@@ -530,10 +575,21 @@ def _stop_gate_impl(args) -> int:
         and not last_pending
         and (now - float(state.get("ts", 0) or 0)) < interval
     )
-    checkout_identity = [
-        [worktree, _current_branch(worktree), _local_head_sha(worktree)]
-        for worktree in sorted(reconciled_owned)
-    ]
+    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
+    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
+    checkout_identity, identity_complete = _bounded_checkout_identity(
+        reconciled_owned, deadline=gate_deadline
+    )
+    if not identity_complete:
+        _persist_unknown_binding_state(
+            cwd, now=now, worktrees=list(reconciled_owned)
+        )
+        print(
+            "[pr-watch] BUDGET-UNKNOWN: checkout identity probes exceeded the "
+            "stop-gate budget; refusing to treat the owned PR set as clean.",
+            file=sys.stderr,
+        )
+        return 2
     if (
         rate_limited
         and not newly_adopted
@@ -574,8 +630,6 @@ def _stop_gate_impl(args) -> int:
     provenance_for = resolution.provenance_for if resolution is not None else {}
 
     from .ownership_resolution import resolve_current_prs  # noqa: PLC0415
-    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
-    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
     current_pr_bindings = resolve_current_prs(
         owned,
         session_id,
@@ -879,6 +933,9 @@ def _stop_gate_impl(args) -> int:
             file=sys.stderr,
         )
         if not pending:
+            _persist_unknown_binding_state(
+                cwd, now=now, worktrees=current_unknown_worktrees
+            )
             return 2
 
     if not pending and not unknown_worktrees:

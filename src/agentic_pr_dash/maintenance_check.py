@@ -2098,7 +2098,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     bindings=current_pr_bindings,
                 )
                 if (
-                    not watch_pending
+                    watch_pending is False
                     and not gh_unobservable
                     and not unknown_detached
                     and not warn_only_deferral

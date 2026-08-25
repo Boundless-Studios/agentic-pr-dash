@@ -3,16 +3,18 @@ from __future__ import annotations
 
 import os
 import sys
+from dataclasses import dataclass
 
 from agentic_pr_dash.config import load as load_config
+
 from ._common import (
     _PID_MAX_DIGITS,
+    _current_branch,
+    _fix_lease_seconds,
     _parse_iso,
     _pid_alive,
-    _fix_lease_seconds,
-    _resolve_owner_pid,
-    _current_branch,
     _repo_slug,
+    _resolve_owner_pid,
 )
 
 # How long an owner's loop heartbeat stays "fresh" (the ownership lease).
@@ -21,6 +23,17 @@ _DEFAULT_FIX_LEASE_SECONDS = 1800  # 30 min — covers a long fix phase; overrid
 
 # Heartbeat write coalescing window.
 _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class _ClaimWriteResult:
+    ok: bool
+    created: bool = False
+    claim_id: str | None = None
+    lease_epoch: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def _marker_path(cwd: str) -> str:
@@ -482,9 +495,15 @@ def _write_arm_marker(
         "pid": str(pid),
         "provenance": provenance,
     }
+    previous_marker: str | None = None
     if marker_writes_enabled():
         content = "".join(f"{k}={v}\n" for k, v in fields.items())
         target = os.path.join(state_dir, "pr-watch.armed")
+        try:
+            with open(target, encoding="utf-8") as fh:
+                previous_marker = fh.read()
+        except OSError:
+            pass
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
@@ -530,7 +549,7 @@ def _write_arm_marker(
     if not _checkout_matches_expected(
         cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
     ):
-        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        _rollback_arm_marker(cwd, session_id, pr_number, previous_marker)
         return False
 
     # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
@@ -538,19 +557,25 @@ def _write_arm_marker(
     # ownership rests entirely on the owner pid. The mirrored claim must start in
     # the same state, or a session that arms and then dies before its first
     # heartbeat would look owned on the claim side and unowned on the marker side.
-    claimed = _dual_write_ownership_claim(
+    claim_result = _dual_write_ownership_claim(
         cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
         pid_tier_only=True,
     )
     if not _checkout_matches_expected(
         cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
     ):
-        if claimed:
+        if isinstance(claim_result, _ClaimWriteResult) and claim_result.created:
+            _release_dual_write_claim(
+                repo, pr_number, session_id, reason="checkout_changed_during_arm",
+                claim_id=claim_result.claim_id, lease_epoch=claim_result.lease_epoch,
+            )
+        elif claim_result is True:  # compatibility for injected legacy writers
             _release_dual_write_claim(
                 repo, pr_number, session_id, reason="checkout_changed_during_arm"
             )
-        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        _rollback_arm_marker(cwd, session_id, pr_number, previous_marker)
         return False
+    claimed = bool(claim_result)
     marker_authoritative = marker_writes_enabled()
     if not claimed and not marker_authoritative:
         return False
@@ -645,8 +670,37 @@ def _discard_matching_arm_marker(cwd: str, session_id: str, pr_number: int) -> N
         pass
 
 
+def _rollback_arm_marker(
+    cwd: str, session_id: str, pr_number: int, previous_marker: str | None
+) -> None:
+    """Restore the marker replaced by this failed arm, or remove the new one."""
+    fields = _read_marker(cwd) or {}
+    if fields.get("session_id") != session_id or fields.get("pr") != str(pr_number):
+        return
+    if previous_marker is None:
+        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        return
+    target = _marker_path(cwd)
+    tmp: str | None = None
+    try:
+        import tempfile  # noqa: PLC0415
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(target), prefix=".pr-watch.armed."
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(previous_marker)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            if tmp is not None:
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
 def _release_dual_write_claim(
-    repo: str, pr_number: int, session_id: str, *, reason: str = "released"
+    repo: str, pr_number: int, session_id: str, *, reason: str = "released",
+    claim_id: str | None = None, lease_epoch: int | None = None,
 ) -> None:
     """Best-effort rollback for a claim acquired across a checkout race."""
     try:
@@ -657,6 +711,8 @@ def _release_dual_write_claim(
             pr_number=pr_number,
             session_id=session_id,
             reason=reason,
+            claim_id=claim_id,
+            lease_epoch=lease_epoch,
         )
     except Exception:  # noqa: BLE001 - rollback must not mask the fence
         pass
@@ -666,7 +722,7 @@ def _dual_write_ownership_claim(
     cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
     *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
     pid_tier_only: bool = False,
-) -> bool:
+) -> _ClaimWriteResult:
     """Record ownership as an agent-coordinator claim (BOU-2223).
 
     Stage 1 introduced this as a MIRROR of the authoritative marker write, so the
@@ -690,7 +746,11 @@ def _dual_write_ownership_claim(
     try:
         from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
         if not ownership.dual_write_enabled():
-            return False
+            return _ClaimWriteResult(False)
+        before = ownership.snapshot()
+        previous = before.claim_for(
+            _repo_slug(cwd) if repo is None else repo, pr_number
+        ) if before.known() else None
         outcome = ownership.record_ownership(
             lease_seconds=ownership.LEASE_PID_TIER_ONLY if pid_tier_only else None,
             repo=_repo_slug(cwd) if repo is None else repo,
@@ -714,9 +774,23 @@ def _dual_write_ownership_claim(
                     "conflict_session_id": outcome.conflict_session_id,
                 },
             )
-        return bool(outcome.ok)
+        created = bool(
+            before.known()
+            and outcome.ok
+            and outcome.claim_id
+            and not (
+                previous is not None
+                and previous.status == "active"
+                and previous.owner.session_id == session_id
+                and previous.claim_id == outcome.claim_id
+                and previous.lease_epoch == outcome.lease_epoch
+            )
+        )
+        return _ClaimWriteResult(
+            bool(outcome.ok), created, outcome.claim_id, outcome.lease_epoch
+        )
     except Exception:  # noqa: BLE001 — never break the caller
-        return False
+        return _ClaimWriteResult(False)
 
 
 def _marker_provenance(worktree_path: str) -> str:

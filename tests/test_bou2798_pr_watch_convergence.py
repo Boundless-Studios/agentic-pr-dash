@@ -20,10 +20,13 @@ from agentic_pr_dash._maintenance import (
 from agentic_pr_dash._maintenance.ownership_resolution import CurrentPRResolution
 from agentic_pr_dash._maintenance.stop_gate import (
     _binding_matches_live_checkout,
+    _bounded_checkout_identity,
     _cached_clean_binding_matches,
     _durable_stop_gate_pid,
     _effective_pr_pairs,
     _fence_current_pr_rebindings,
+    _load_stop_state,
+    _persist_unknown_binding_state,
     _prefetch_owned_pr_state,
     _unknown_binding_blocks_stop,
 )
@@ -628,6 +631,59 @@ def test_arm_releases_claim_when_checkout_changes_after_acquisition(
     ]
 
 
+def test_arm_does_not_release_preexisting_same_session_claim(
+    monkeypatch, tmp_path: Path
+):
+    checks = iter([True, True, False])
+    released: list[tuple] = []
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: False)
+    monkeypatch.setattr(
+        markers, "_checkout_matches_expected", lambda *args, **kwargs: next(checks)
+    )
+    monkeypatch.setattr(
+        markers,
+        "_dual_write_ownership_claim",
+        lambda *args, **kwargs: markers._ClaimWriteResult(
+            ok=True, created=False, claim_id="existing", lease_epoch=7
+        ),
+    )
+    monkeypatch.setattr(
+        markers,
+        "_release_dual_write_claim",
+        lambda *args, **kwargs: released.append((args, kwargs)),
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path), "session-a", 123, 3062,
+        expected_branch="feature-b", expected_head_sha="head-b",
+    )
+    assert released == []
+
+
+def test_arm_restores_previous_marker_when_checkout_changes_after_write(
+    monkeypatch, tmp_path: Path
+):
+    state_dir = tmp_path / ".agentic-pr-dash"
+    state_dir.mkdir()
+    marker_path = state_dir / "pr-watch.armed"
+    original = "pr=3017\narmed_at=old\nsession_id=session-a\npid=123\nprovenance=armed\n"
+    marker_path.write_text(original, encoding="utf-8")
+    checks = iter([True, True, False])
+    monkeypatch.setattr(markers, "marker_writes_enabled", lambda: True)
+    monkeypatch.setattr(
+        markers, "_checkout_matches_expected", lambda *args, **kwargs: next(checks)
+    )
+    monkeypatch.setattr(
+        markers, "_dual_write_ownership_claim", lambda *args, **kwargs: False
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path), "session-a", 123, 3062,
+        expected_branch="feature-b", expected_head_sha="head-b",
+    )
+    assert marker_path.read_text(encoding="utf-8") == original
+
+
 def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -730,6 +786,37 @@ def test_stop_prefetch_propagates_gate_deadline(monkeypatch):
             "deadline": deadline,
         }
     ]
+
+
+def test_checkout_identity_probe_stops_at_shared_gate_deadline(monkeypatch):
+    clock = {"now": 10.0}
+    calls: list[tuple[str, float]] = []
+    monkeypatch.setattr(time, "monotonic", lambda: clock["now"])
+
+    def probe(worktree, timeout):
+        calls.append((worktree, timeout))
+        clock["now"] += timeout
+        return [worktree, "branch", "head"]
+
+    identities, complete = _bounded_checkout_identity(
+        ["/one", "/two"], deadline=10.25, probe=probe
+    )
+
+    assert identities == [["/one", "branch", "head"]]
+    assert complete is False
+    assert calls == [("/one", 0.25)]
+
+
+def test_unknown_binding_persists_nonclean_fingerprint(tmp_path: Path):
+    _persist_unknown_binding_state(
+        str(tmp_path), now=123.0, worktrees=["/two", "/one"]
+    )
+
+    state = markers.load_config(str(tmp_path)).state_dir_for(str(tmp_path))
+    saved = _load_stop_state(str(tmp_path))
+    assert state.exists()
+    assert saved["ts"] == 123.0
+    assert saved["fingerprint"] == "current-pr-unknown:/one,/two"
 
 
 def test_pruning_stale_pr_preserves_replacement_marker(monkeypatch, tmp_path: Path):
