@@ -23,6 +23,7 @@ from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import worktree_check as _worktree_check_mod
+from agentic_pr_dash._maintenance import ownership_resolution as _ownership_resolution_mod
 from agentic_pr_dash._maintenance._common import _repo_slug
 
 SID = "sess-codex-pr75"
@@ -67,6 +68,28 @@ def _bind_pr(monkeypatch, pr: int = 42) -> None:
     """
     monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
     monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="test-branch",
+                pr_number=pr,
+                head_sha="test-head",
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "test-branch",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "test-head",
+    )
 
 
 def _wire_await(tmp_path, monkeypatch, wt):
@@ -101,7 +124,7 @@ def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
             raise AssertionError("await did not exit once the probe was observable")
         return 0, "nothing pending"
 
-    def fake_collect_watch_pending(owned, cwd, session_id):
+    def fake_required_checks_pending(pr, cwd):
         probe_calls[0] += 1
         if probe_calls[0] == 1:
             # Simulate required_checks_pending failing on a non-rate-limit gh
@@ -110,7 +133,9 @@ def test_await_probe_failure_suppresses_clean_exit(tmp_path, monkeypatch):
         return False
 
     monkeypatch.setattr(mc, "_check_worktree", fake_check)
-    monkeypatch.setattr(mc, "_collect_await_watch_pending", fake_collect_watch_pending)
+    monkeypatch.setattr(
+        github_api, "required_checks_pending", fake_required_checks_pending
+    )
     _bind_pr(monkeypatch)
 
     rc = mc.main(_await_args(tmp_path))
@@ -214,10 +239,72 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch, legacy_marker_wri
     # actually observed may be recorded verified-clean).
     monkeypatch.setattr(mc, "_current_branch", lambda cwd: "feature-42")
     monkeypatch.setattr(mc, "_resolve_open_pr_for_branch", lambda cwd, branch: (42, False))
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="feature-42",
+                pr_number=42,
+                head_sha="head-42",
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-42",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-42",
+    )
 
     rc = mc.main(_await_args(tmp_path))
     assert rc == 0
     assert _waiter_mod._read_clean_exit_keys(SID) == {_marker_key(wt, 42)}
+
+
+def test_await_clean_exit_excludes_draft_binding(
+    tmp_path, monkeypatch, legacy_marker_writes
+):
+    """Draft PRs are not waiter coverage and must not be recorded clean."""
+    wt = _arm(tmp_path, 42)
+    _wire_await(tmp_path, monkeypatch, wt)
+    monkeypatch.setattr(
+        mc, "_check_worktree", lambda path, sid, *, claim=True: (0, "nothing pending")
+    )
+    monkeypatch.setattr(mc, "_collect_await_watch_pending", lambda owned, cwd, sid: False)
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="feature-42",
+                pr_number=42,
+                head_sha="head-42",
+                is_draft=True,
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-42",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-42",
+    )
+
+    rc = mc.main(_await_args(tmp_path))
+
+    assert rc == mc._AWAIT_UNBOUND
+    assert _waiter_mod._read_clean_exit_keys(SID) == set()
 
 
 def test_await_exit_10_clears_marker(tmp_path, monkeypatch):

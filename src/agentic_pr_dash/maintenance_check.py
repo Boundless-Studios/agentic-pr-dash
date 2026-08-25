@@ -117,6 +117,8 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _record_has_blockers,
     _read_escalation_marker,
     _build_escalation_block,
+    _fence_current_pr_rebindings as _fence_waiter_rebindings,
+    _revalidate_current_pr_binding as _revalidate_waiter_binding,
 )
 
 # completion
@@ -680,7 +682,9 @@ def _await_watch_pending_this_tick(
     detached_records: list[dict],
     cwd: str,
     session_id: str,
-) -> bool:
+    *,
+    bindings: dict | None = None,
+) -> bool | None:
     """Watch-pending across BOTH live worktrees and detached (ledger-only) PRs.
 
     A session can own a PR solely through the ledger, so ``owned`` may be empty
@@ -693,12 +697,43 @@ def _await_watch_pending_this_tick(
         and r.get("state") not in ("merged", "closed", "draft", "unknown")
         for r in detached_records
     )
-    return detached_watch_pending or _collect_await_watch_pending(
-        owned, cwd, session_id
-    )
+    if detached_watch_pending:
+        return True
+    if bindings is None:
+        return _collect_await_watch_pending(owned, cwd, session_id)
+
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    unresolved: list[str] = []
+    unknown = False
+    for worktree in owned:
+        binding = bindings.get(worktree)
+        if binding is None or not binding.resolved:
+            unresolved.append(worktree)
+            continue
+        # The resolver snapshot was taken at the start of the waiter tick. A
+        # checkout can move while another worktree is doing GitHub I/O; never
+        # probe CI for the old PR in that race. Preserve unknown separately
+        # from CI-pending: it blocks a clean verdict, but only observed running
+        # CI (or an explicit rate limit) may extend a finite waiter deadline.
+        binding = _revalidate_waiter_binding(worktree, binding)
+        if binding.unknown:
+            unknown = True
+            continue
+        if binding.pr_number is None or binding.is_draft:
+            continue
+        if github_api.required_checks_pending(binding.pr_number, worktree):
+            return True
+    if unresolved and _collect_await_watch_pending(unresolved, cwd, session_id):
+        return True
+    return None if unknown else False
 
 
-def _owned_pr_pairs_for_await(owned: list[str]) -> list[tuple[str, int]]:
+def _owned_pr_pairs_for_await(
+    owned: list[str],
+    *,
+    bindings: dict | None = None,
+) -> list[tuple[str, int]]:
     """``(worktree, pr)`` pairs for the waiter, claim-first with marker fallback.
 
     ``_owned_open_pr_pairs`` reads ``pr-watch.armed`` and nothing else. Stage 4 of
@@ -712,19 +747,33 @@ def _owned_pr_pairs_for_await(owned: list[str]) -> list[tuple[str, int]]:
     left exactly as it is (several tests monkeypatch it directly and it is the
     specification) and the live claim is added alongside it.
     """
-    from ._maintenance.ownership_resolution import resolve_worktree  # noqa: PLC0415
-    from agentic_pr_dash import ownership  # noqa: PLC0415
+    from ._maintenance.ownership_resolution import resolve_current_prs  # noqa: PLC0415
 
     pairs = dict(_owned_open_pr_pairs(owned))
-    missing = [wt for wt in owned if wt not in pairs]
-    if missing:
-        # ONE store read for every worktree still unresolved, never one each.
-        snap = ownership.snapshot()
-        for wt in missing:
-            pr = resolve_worktree(wt, kind="waiter_divergence", snap=snap).pr_number
-            if pr is not None:
-                pairs[wt] = pr
-    return list(pairs.items())
+    current = bindings or resolve_current_prs(owned, kind="waiter_divergence")
+    for wt, binding in current.items():
+        if not binding.resolved:
+            # A detached/invalid branch has no current-branch evidence; retain
+            # the legacy marker fallback rather than inventing a rebind. A
+            # claim-only worktree has no marker to provide that fallback, so
+            # preserve its recorded PR only when the branch itself could not be
+            # established; a branch with an unknown GitHub lookup is marked
+            # resolved/unknown and must never fall back to stale ownership.
+            if (
+                wt not in pairs
+                and binding.branch is None
+                and binding.stale_pr_number is not None
+            ):
+                pairs[wt] = binding.stale_pr_number
+            continue
+        if binding.pr_number is None:
+            # The marker/claim may still name a closed PR A. Once the current
+            # branch was positively resolved to "no open PR", A is not a PR the
+            # waiter may watch or report as coverage.
+            pairs.pop(wt, None)
+        else:
+            pairs[wt] = binding.pr_number
+    return [(wt, pairs[wt]) for wt in owned if wt in pairs]
 
 
 def _marker_pr_still_current(worktree: str, pr_number: int) -> bool:
@@ -1848,6 +1897,19 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             else:
                 owned = [cwd]
 
+            # Resolve the current branch/PR once for this waiter tick. The same
+            # shared resolver is used by the stop gate, so a stale marker for PR
+            # A cannot make this waiter report A while the gate has already
+            # rebound the worktree to PR B.
+            from ._maintenance.ownership_resolution import (  # noqa: PLC0415
+                resolve_current_prs as _resolve_current_prs,
+            )
+            current_pr_bindings = _resolve_current_prs(
+                owned,
+                session_id,
+                kind="await_pr_watch_divergence",
+                snap=_await_snap,
+            )
             pending: list[tuple[str, str]] = []
             adopted_worktrees: set[str] = set()
             gh_unobservable = False
@@ -1879,7 +1941,32 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 is_adopted = provenance == "adopted"
                 if is_adopted:
                     adopted_worktrees.add(worktree)
-                code, text = _check_worktree(worktree, session_id, claim=False)
+                binding = current_pr_bindings.get(worktree)
+                binding = _revalidate_waiter_binding(worktree, binding)
+                if (
+                    session_id
+                    and binding is not None
+                    and not is_adopted
+                    and binding.stale_pr_number is not None
+                ):
+                    fenced, conflicts = _fence_waiter_rebindings(
+                        {worktree: binding},
+                        session_id=session_id,
+                        pid=owner_pid,
+                        provenance_for={worktree: provenance},
+                    )
+                    binding = fenced[worktree]
+                    if conflicts:
+                        gh_unobservable = True
+                if binding is not None:
+                    current_pr_bindings[worktree] = binding
+                if binding is not None and binding.unknown and not is_adopted:
+                    gh_unobservable = True
+                from ._maintenance.worktree_check import (  # noqa: PLC0415
+                    _use_current_pr_binding,
+                )
+                with _use_current_pr_binding(binding):
+                    code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
                     if is_adopted:
                         # Reported via the same adopted-work FYI as the stop
@@ -2020,10 +2107,14 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             watch_pending: bool | None = None
             if not getattr(args, "keep_alive_without_prs", False):
                 watch_pending = _await_watch_pending_this_tick(
-                    watched_owned, _detached_this_tick, cwd, session_id
+                    watched_owned,
+                    _detached_this_tick,
+                    cwd,
+                    session_id,
+                    bindings=current_pr_bindings,
                 )
                 if (
-                    not watch_pending
+                    watch_pending is False
                     and not gh_unobservable
                     and not unknown_detached
                     and not warn_only_deferral
@@ -2043,8 +2134,21 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # verified (round 5).
                     verified = {
                         _clean_exit_key(_repo_slug(wt), n)
-                        for wt, n in _owned_pr_pairs_for_await(watched_owned)
-                        if _marker_pr_still_current(wt, n)
+                        for wt, n in _owned_pr_pairs_for_await(
+                            watched_owned,
+                            bindings=current_pr_bindings,
+                        )
+                        if (
+                            (binding := current_pr_bindings.get(wt)) is not None
+                            and binding.resolved
+                            and not binding.unknown
+                            and not binding.is_draft
+                            and binding.pr_number == n
+                        )
+                        or (
+                            current_pr_bindings.get(wt) is None
+                            and _marker_pr_still_current(wt, n)
+                        )
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick
@@ -2072,7 +2176,11 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 # compute it here otherwise (keep_alive_without_prs sessions).
                 if watch_pending is None:
                     watch_pending = _await_watch_pending_this_tick(
-                        watched_owned, _detached_this_tick, cwd, session_id
+                        watched_owned,
+                        _detached_this_tick,
+                        cwd,
+                        session_id,
+                        bindings=current_pr_bindings,
                     )
                 # Read the flag AFTER the watch-pending probe so a quota wall hit
                 # by THAT call is captured too (a PR with running CI must not lose
@@ -2089,6 +2197,11 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                         file=sys.stderr,
                     )
                 elif not watch_pending:
+                    # Hard GitHub/ownership failures suppress the clean-state
+                    # verdict above, but they do not extend a finite waiter
+                    # deadline. Only a rate-limit (which has an explicit retry
+                    # policy) or running CI keeps this waiter alive past
+                    # max-wait.
                     print(
                         "[pr-watch] waiter max-wait reached with no feedback; "
                         "will re-arm on next stop."

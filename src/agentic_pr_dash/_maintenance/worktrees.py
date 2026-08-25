@@ -637,8 +637,14 @@ def _worktree_is_for_entry(path: str, entry, *, snap=None) -> bool:
     """
     from .ownership_resolution import resolve_worktree  # noqa: PLC0415
     owned = resolve_worktree(path, kind="ledger_entry_divergence", snap=snap)
-    if owned.pr_number is not None and str(owned.pr_number) == str(entry.pr):
-        return True
+    if owned.pr_number is not None:
+        if str(owned.pr_number) != str(entry.pr):
+            return False
+        branch = _current_branch(path)
+        # A stale marker/claim for PR A must not make a worktree that has moved
+        # to branch B hide A from detached-ledger reconciliation. When the local
+        # branch cannot be observed, retain the conservative ownership answer.
+        return not branch or not entry.branch or branch == entry.branch
     if owned.source == "none":
         return False
     branch = _current_branch(path)

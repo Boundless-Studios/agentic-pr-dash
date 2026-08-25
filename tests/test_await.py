@@ -24,6 +24,7 @@ from agentic_pr_dash._maintenance import waiter as _waiter_mod
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
 from agentic_pr_dash._maintenance import reconcile as _reconcile_mod
 from agentic_pr_dash._maintenance import markers as _markers_mod
+from agentic_pr_dash._maintenance import ownership_resolution as _ownership_resolution_mod
 
 
 SID = "sess-await-test"
@@ -52,6 +53,28 @@ def _bind_pr(monkeypatch, pr: int = 42) -> None:
     """
     monkeypatch.setattr(mc, "_owned_open_pr_pairs", lambda owned: [(w, pr) for w in owned])
     monkeypatch.setattr(mc, "_marker_pr_still_current", lambda wt, n: True)
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "test-branch",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "test-head",
+    )
+    monkeypatch.setattr(
+        _ownership_resolution_mod,
+        "resolve_current_prs",
+        lambda worktrees, session_id="", **kwargs: {
+            worktree: _ownership_resolution_mod.CurrentPRResolution(
+                worktree=worktree,
+                branch="test-branch",
+                pr_number=pr,
+                head_sha="test-head",
+                resolved=True,
+            )
+            for worktree in worktrees
+        },
+    )
 
 
 def _write_pidfile(

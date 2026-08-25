@@ -3,16 +3,19 @@ from __future__ import annotations
 
 import os
 import sys
+import time
+from dataclasses import dataclass
 
 from agentic_pr_dash.config import load as load_config
+
 from ._common import (
     _PID_MAX_DIGITS,
+    _current_branch,
+    _fix_lease_seconds,
     _parse_iso,
     _pid_alive,
-    _fix_lease_seconds,
-    _resolve_owner_pid,
-    _current_branch,
     _repo_slug,
+    _resolve_owner_pid,
 )
 
 # How long an owner's loop heartbeat stays "fresh" (the ownership lease).
@@ -21,6 +24,17 @@ _DEFAULT_FIX_LEASE_SECONDS = 1800  # 30 min — covers a long fix phase; overrid
 
 # Heartbeat write coalescing window.
 _DEFAULT_HEARTBEAT_MIN_INTERVAL_SECONDS = 60
+
+
+@dataclass(frozen=True)
+class _ClaimWriteResult:
+    ok: bool
+    created: bool = False
+    claim_id: str | None = None
+    lease_epoch: int | None = None
+
+    def __bool__(self) -> bool:
+        return self.ok
 
 
 def _marker_path(cwd: str) -> str:
@@ -441,6 +455,10 @@ def _write_arm_marker(
     pid: int,
     pr_number: int,
     provenance: str = "armed",
+    *,
+    expected_branch: str | None = None,
+    expected_head_sha: str | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Write the pr-watch.armed ownership marker (the single writer).
 
@@ -462,6 +480,16 @@ def _write_arm_marker(
     except OSError:
         return False
 
+    # A replacement binding was resolved before this writer ran. Re-read the
+    # checkout at the ownership boundary so a concurrent branch switch cannot
+    # stamp the new PR onto a different checkout. The caller supplies both
+    # identities; missing local evidence is unknown, not a match.
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
+    ):
+        return False
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     fields = {
         "pr": str(pr_number),
@@ -470,14 +498,28 @@ def _write_arm_marker(
         "pid": str(pid),
         "provenance": provenance,
     }
+    previous_marker: str | None = None
     if marker_writes_enabled():
         content = "".join(f"{k}={v}\n" for k, v in fields.items())
         target = os.path.join(state_dir, "pr-watch.armed")
+        try:
+            with open(target, encoding="utf-8") as fh:
+                previous_marker = fh.read()
+        except OSError:
+            pass
         tmp = None
         try:
             fd, tmp = tempfile.mkstemp(dir=state_dir, prefix=".pr-watch.armed.")
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(content)
+            if not _checkout_matches_expected(
+                cwd,
+                expected_branch=expected_branch,
+                expected_head_sha=expected_head_sha,
+                deadline=deadline,
+            ):
+                os.remove(tmp)
+                return False
             os.replace(tmp, target)
         except OSError:
             if tmp is not None:
@@ -486,12 +528,6 @@ def _write_arm_marker(
                 except OSError:
                     pass
             return False
-
-    try:
-        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
-            fh.write(session_id + "\n")
-    except OSError:
-        pass
 
     # Probed once and shared with the ownership dual-write below: both are `git`
     # subprocesses on the Stop-hook path, which has a hard deadline.
@@ -503,21 +539,74 @@ def _write_arm_marker(
     # ``subprocess.run(text=True)`` can also raise UnicodeDecodeError on a
     # non-UTF-8 ref name or git warning.
     try:
-        branch = _current_branch(cwd)
+        branch = _bounded_current_branch(cwd, deadline)
     except Exception:  # noqa: BLE001
         branch = ""
     try:
-        repo = _repo_slug(cwd)
+        repo = _bounded_repo_slug(cwd, deadline)
     except Exception:  # noqa: BLE001
         repo = ""
 
+    # The checkout can move while the branch/repository probes above run. Fence
+    # the claim itself, not just the marker write, so a replacement checkout
+    # cannot acquire durable ownership for the stale PR.
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
+    ):
+        _rollback_arm_marker(cwd, session_id, pr_number, previous_marker)
+        return False
+
+    # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
+    # ``fix_lease_until``, so it satisfies neither time-based liveness tier and its
+    # ownership rests entirely on the owner pid. The mirrored claim must start in
+    # the same state, or a session that arms and then dies before its first
+    # heartbeat would look owned on the claim side and unowned on the marker side.
+    claim_result = _dual_write_ownership_claim(
+        cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
+        pid_tier_only=True, track_creation=True,
+    )
+    if not _checkout_matches_expected(
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
+    ):
+        if isinstance(claim_result, _ClaimWriteResult) and claim_result.created:
+            _release_dual_write_claim(
+                repo, pr_number, session_id, reason="checkout_changed_during_arm",
+                claim_id=claim_result.claim_id, lease_epoch=claim_result.lease_epoch,
+            )
+        elif claim_result is True:  # compatibility for injected legacy writers
+            _release_dual_write_claim(
+                repo, pr_number, session_id, reason="checkout_changed_during_arm"
+            )
+        _rollback_arm_marker(cwd, session_id, pr_number, previous_marker)
+        return False
+    claimed = bool(claim_result)
+    marker_authoritative = marker_writes_enabled()
+    if not claimed and not marker_authoritative:
+        return False
+
+    try:
+        with open(os.path.join(state_dir, "pr-watch.session"), "w", encoding="utf-8") as fh:
+            fh.write(session_id + "\n")
+    except OSError:
+        pass
+
+    # The session ledger describes ownership that was actually acquired. Keep
+    # it behind the claim fence so a refused replacement cannot be attributed
+    # to the losing session.
     try:
         import subprocess  # noqa: PLC0415
+
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
         baseline = None
         try:
+            timeout = _remaining_timeout(deadline, 10)
+            if timeout is None:
+                raise subprocess.TimeoutExpired("git rev-parse HEAD", 0)
             rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                                 capture_output=True, text=True, timeout=10)
+                                 capture_output=True, text=True, timeout=timeout,
+                                 check=False)
             if rev.returncode == 0:
                 baseline = rev.stdout.strip() or None
         except (OSError, subprocess.TimeoutExpired):
@@ -526,16 +615,6 @@ def _write_arm_marker(
                               repo=repo)
     except Exception:  # noqa: BLE001
         pass
-
-    # An armed marker carries ``armed_at`` but NO ``heartbeat`` and no
-    # ``fix_lease_until``, so it satisfies neither time-based liveness tier and its
-    # ownership rests entirely on the owner pid. The mirrored claim must start in
-    # the same state, or a session that arms and then dies before its first
-    # heartbeat would look owned on the claim side and unowned on the marker side.
-    claimed = _dual_write_ownership_claim(
-        cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
-        pid_tier_only=True,
-    )
     # From Stage 4 the claim IS the ownership write, so its outcome is this
     # function's outcome. That makes arming genuinely fenced: when another LIVE
     # session already holds (repo, pr), `record_ownership` refuses and adoption
@@ -545,16 +624,176 @@ def _write_arm_marker(
     #
     # With marker writes still enabled the marker remains authoritative, so a
     # claim-store hiccup must not turn a successful arm into a failure.
-    if marker_writes_enabled():
+    if marker_authoritative:
         return True
     return claimed
+
+
+def _current_head_sha(cwd: str, *, timeout: float = 5) -> str:
+    """Return the checkout HEAD, or an empty string when git is unavailable."""
+    import subprocess  # noqa: PLC0415
+
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=max(0.001, timeout),
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _remaining_timeout(deadline: float | None, cap: float) -> float | None:
+    remaining = cap if deadline is None else deadline - time.monotonic()
+    return min(cap, remaining) if remaining > 0 else None
+
+
+def _bounded_current_branch(cwd: str, deadline: float | None) -> str:
+    import subprocess  # noqa: PLC0415
+
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
+    """Resolve the local origin without an unbounded gh fallback."""
+    import subprocess  # noqa: PLC0415
+    from urllib.parse import urlparse  # noqa: PLC0415
+
+    gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
+    if len(gh_repo_parts) >= 2:
+        return "/".join(gh_repo_parts[-2:]).removesuffix(".git")
+    if deadline is None:
+        return _repo_slug(cwd)
+    timeout = _remaining_timeout(deadline, 10)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    url = result.stdout.strip() if result.returncode == 0 else ""
+    if "://" in url:
+        tail = urlparse(url).path.lstrip("/")
+    elif url.startswith("git@") and ":" in url:
+        tail = url.split(":", 1)[1].lstrip("/")
+    else:
+        return ""
+    tail = tail.removesuffix(".git")
+    return tail if tail.count("/") == 1 else ""
+
+
+def _checkout_matches_expected(
+    cwd: str,
+    *,
+    expected_branch: str | None,
+    expected_head_sha: str | None,
+    deadline: float | None = None,
+) -> bool:
+    """Return whether the live checkout still matches an expected binding."""
+    if expected_branch is None and expected_head_sha is None:
+        return True
+    try:
+        if _remaining_timeout(deadline, 5) is None:
+            return False
+        branch = _bounded_current_branch(cwd, deadline)
+        timeout = _remaining_timeout(deadline, 5)
+        if timeout is None:
+            return False
+        head_sha = (
+            _current_head_sha(cwd)
+            if deadline is None
+            else _current_head_sha(cwd, timeout=timeout)
+        )
+    except Exception:  # noqa: BLE001 — fail closed at the arm boundary
+        return False
+    return bool(
+        branch
+        and head_sha
+        and (expected_branch is None or branch == expected_branch)
+        and (expected_head_sha is None or head_sha == expected_head_sha)
+    )
+
+
+def _discard_matching_arm_marker(cwd: str, session_id: str, pr_number: int) -> None:
+    """Remove only the marker this failed arm attempt wrote."""
+    fields = _read_marker(cwd) or {}
+    if fields.get("session_id") != session_id or fields.get("pr") != str(pr_number):
+        return
+    try:
+        os.remove(_marker_path(cwd))
+    except OSError:
+        pass
+
+
+def _rollback_arm_marker(
+    cwd: str, session_id: str, pr_number: int, previous_marker: str | None
+) -> None:
+    """Restore the marker replaced by this failed arm, or remove the new one."""
+    fields = _read_marker(cwd) or {}
+    if fields.get("session_id") != session_id or fields.get("pr") != str(pr_number):
+        return
+    if previous_marker is None:
+        _discard_matching_arm_marker(cwd, session_id, pr_number)
+        return
+    target = _marker_path(cwd)
+    tmp: str | None = None
+    try:
+        import tempfile  # noqa: PLC0415
+        fd, tmp = tempfile.mkstemp(
+            dir=os.path.dirname(target), prefix=".pr-watch.armed."
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(previous_marker)
+        os.replace(tmp, target)
+    except OSError:
+        try:
+            if tmp is not None:
+                os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _release_dual_write_claim(
+    repo: str, pr_number: int, session_id: str, *, reason: str = "released",
+    claim_id: str | None = None, lease_epoch: int | None = None,
+) -> None:
+    """Best-effort rollback for a claim acquired across a checkout race."""
+    try:
+        from agentic_pr_dash import ownership
+
+        ownership.release_ownership(
+            repo=repo,
+            pr_number=pr_number,
+            session_id=session_id,
+            reason=reason,
+            claim_id=claim_id,
+            lease_epoch=lease_epoch,
+        )
+    except Exception:  # noqa: BLE001 - rollback must not mask the fence
+        pass
 
 
 def _dual_write_ownership_claim(
     cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
     *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
-    pid_tier_only: bool = False,
-) -> bool:
+    pid_tier_only: bool = False, track_creation: bool = False,
+) -> _ClaimWriteResult:
     """Record ownership as an agent-coordinator claim (BOU-2223).
 
     Stage 1 introduced this as a MIRROR of the authoritative marker write, so the
@@ -578,7 +817,13 @@ def _dual_write_ownership_claim(
     try:
         from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
         if not ownership.dual_write_enabled():
-            return False
+            return _ClaimWriteResult(False)
+        before = ownership.snapshot() if track_creation else None
+        previous = (
+            before.claim_for(_repo_slug(cwd) if repo is None else repo, pr_number)
+            if before is not None and before.known()
+            else None
+        )
         outcome = ownership.record_ownership(
             lease_seconds=ownership.LEASE_PID_TIER_ONLY if pid_tier_only else None,
             repo=_repo_slug(cwd) if repo is None else repo,
@@ -602,9 +847,24 @@ def _dual_write_ownership_claim(
                     "conflict_session_id": outcome.conflict_session_id,
                 },
             )
-        return bool(outcome.ok)
+        created = bool(
+            before is not None
+            and before.known()
+            and outcome.ok
+            and outcome.claim_id
+            and not (
+                previous is not None
+                and previous.status == "active"
+                and previous.owner.session_id == session_id
+                and previous.claim_id == outcome.claim_id
+                and previous.lease_epoch == outcome.lease_epoch
+            )
+        )
+        return _ClaimWriteResult(
+            bool(outcome.ok), created, outcome.claim_id, outcome.lease_epoch
+        )
     except Exception:  # noqa: BLE001 — never break the caller
-        return False
+        return _ClaimWriteResult(False)
 
 
 def _marker_provenance(worktree_path: str) -> str:
@@ -672,10 +932,15 @@ def _prune_stale_marker(cwd: str, marker: dict, session_id: str) -> bool:
     if state not in ("merged", "closed"):
         return False
 
-    try:
-        os.remove(_marker_path(cwd))
-    except OSError:
-        pass
+    # The caller may hold a pre-rebind ownership snapshot for stale PR A while
+    # this same tick has already armed replacement PR B. Never delete B's
+    # marker while pruning A's ledger/claim artifacts.
+    current_marker = _read_marker(cwd) or {}
+    if current_marker.get("pr") == str(pr_number):
+        try:
+            os.remove(_marker_path(cwd))
+        except OSError:
+            pass
 
     try:
         os.remove(_stop_state_path(cwd))

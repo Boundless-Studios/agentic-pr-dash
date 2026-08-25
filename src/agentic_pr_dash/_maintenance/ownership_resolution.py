@@ -57,8 +57,9 @@ snapshot per worktree.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import os
+import time
+from dataclasses import dataclass, field
 
 
 def claim_reads_enabled() -> bool:
@@ -360,6 +361,206 @@ class WorktreeOwnership:
         if not session_id:
             return False
         return session_id == self.marker_session_id or session_id in self.claim_session_ids
+
+
+@dataclass(frozen=True)
+class CurrentPRResolution:
+    """The current branch/PR answer shared by the stop gate and waiter.
+
+    ``resolved`` means the worktree branch was known and GitHub returned a
+    definite open-PR answer (including "no open PR"). ``unknown`` is separate:
+    a stale cache or rate-limited lookup must not be mistaken for an unbound
+    worktree or a clean stop. ``stale_pr_number`` is retained only for pruning
+    and diagnostics; callers must never watch it after the branch moved on.
+    """
+
+    worktree: str
+    branch: str | None
+    pr_number: int | None
+    head_sha: str = ""
+    is_draft: bool = False
+    resolved: bool = False
+    unknown: bool = False
+    stale_pr_number: int | None = None
+
+
+def _remaining_timeout(deadline: float | None, cap: float) -> float | None:
+    remaining = cap if deadline is None else deadline - time.monotonic()
+    return min(cap, remaining) if remaining > 0 else None
+
+
+def _current_branch(worktree_path: str, *, deadline: float | None = None) -> str:
+    """Return a usable branch name within the caller's remaining budget."""
+    if deadline is None:
+        from ._common import _current_branch as current_branch  # noqa: PLC0415
+
+        branch = current_branch(worktree_path)
+        return "" if branch == "HEAD" else branch
+
+    import subprocess  # noqa: PLC0415
+
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return "" if branch == "HEAD" else branch
+
+
+def _current_head(worktree_path: str, *, deadline: float | None = None) -> str:
+    """Return the checked-out HEAD, or an empty string on local git failure."""
+    import subprocess  # noqa: PLC0415
+
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def resolve_current_pr(
+    worktree_path: str,
+    *,
+    session_id: str = "",
+    kind: str = "pr_watch_divergence",
+    owner: WorktreeOwnership | None = None,
+    snap=None,
+    deadline: float | None = None,
+) -> CurrentPRResolution:
+    """Resolve one owned worktree to its exact current branch/PR.
+
+    Ownership is established from the session/worktree claim first. Only then
+    is the checked-out branch (and local HEAD when available) used to select an
+    open PR. This prevents an author-wide PR list from binding a session to a
+    sibling worktree and lets the waiter follow a same-worktree PR replacement.
+    """
+    path = os.path.abspath(worktree_path)
+    resolved_owner = owner or resolve_worktree(path, kind=kind, snap=snap)
+    owns = getattr(resolved_owner, "owned_by", None)
+    if session_id and callable(owns) and not owns(session_id):
+        return CurrentPRResolution(path, None, None)
+
+    from .pr_state import _GH_UNAVAILABLE, _resolve_pr_entry_for_branch  # noqa: PLC0415
+
+    stale_pr = resolved_owner.pr_number
+    branch = _current_branch(path, deadline=deadline)
+    if not branch:
+        exhausted = deadline is not None and time.monotonic() >= deadline
+        return CurrentPRResolution(
+            path,
+            None,
+            None,
+            resolved=exhausted,
+            unknown=exhausted,
+            stale_pr_number=stale_pr,
+        )
+
+    head_sha = (
+        _current_head(path)
+        if deadline is None
+        else _current_head(path, deadline=deadline)
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            unknown=True,
+            stale_pr_number=stale_pr,
+        )
+    # A cold lookup failure is just as unobservable as a warm failure. In
+    # particular, an ambiguous same-branch result must not fall through to the
+    # legacy branch resolver, which may choose an arbitrary PR and then prune
+    # or watch stale ownership.
+    entry = _resolve_pr_entry_for_branch(
+        path,
+        branch,
+        head_oid=head_sha,
+        validate_snapshot_state=True,
+        deadline=deadline,
+    )
+    if entry is _GH_UNAVAILABLE:
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            unknown=True,
+            stale_pr_number=stale_pr,
+        )
+    if entry is None:
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            stale_pr_number=stale_pr,
+        )
+
+    number = int(entry["number"])
+    return CurrentPRResolution(
+        path,
+        branch,
+        number,
+        # Keep the local checkout identity separate from the remote PR head.
+        # A force-push or unpushed local commit is a checkout change, not a
+        # reason to rewrite the identity used by the stop-gate race check.
+        head_sha=head_sha,
+        is_draft=bool(entry.get("isDraft", False)),
+        resolved=True,
+        stale_pr_number=(stale_pr if stale_pr is not None and stale_pr != number else None),
+    )
+
+
+def resolve_current_prs(
+    worktrees: list[str],
+    session_id: str = "",
+    *,
+    kind: str = "pr_watch_divergence",
+    snap=None,
+    deadline: float | None = None,
+) -> dict[str, CurrentPRResolution]:
+    """Resolve all worktrees from one ownership snapshot and current PR pass."""
+    out: dict[str, CurrentPRResolution] = {}
+    for worktree in dict.fromkeys(os.path.abspath(path) for path in worktrees):
+        if deadline is not None and time.monotonic() >= deadline:
+            out[worktree] = CurrentPRResolution(
+                worktree, None, None, resolved=True, unknown=True
+            )
+            continue
+        owner = resolve_worktree(worktree, kind=kind, snap=snap)
+        owns = getattr(owner, "owned_by", None)
+        if session_id and callable(owns) and not owns(session_id):
+            continue
+        out[worktree] = resolve_current_pr(
+            worktree,
+            session_id=session_id,
+            kind=kind,
+            owner=owner,
+            snap=snap,
+            deadline=deadline,
+        )
+    return out
 
 
 def resolve_worktree(

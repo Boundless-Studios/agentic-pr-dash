@@ -8,8 +8,8 @@ import re
 import time as _time
 
 from agentic_pr_dash.config import load as load_config
-from ._common import _env_int
-from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance
+from ._common import _current_branch, _env_int
+from .markers import _read_marker, _prune_stale_marker, _read_session_marker, _marker_provenance, _write_arm_marker
 
 # BOU-2567 PR #122 review, P1 #3: `_check_worktree`'s clean-check text ends in
 # "(deferred: N)" (see worktree_check._check_worktree) whenever a PR has
@@ -41,6 +41,13 @@ def _load_stop_state(cwd: str) -> dict:
 
 def _save_stop_state(cwd: str, state: dict) -> None:
     try:
+        # Preserve the cheap branch/HEAD identity across later fingerprint
+        # updates in the same stop-gate tick. Without this, the clean-path
+        # writes below would erase it and force a full probe on every stop.
+        if "checkout_identity" not in state:
+            previous = _load_stop_state(cwd)
+            if "checkout_identity" in previous:
+                state = {**state, "checkout_identity": previous["checkout_identity"]}
         path = _stop_state_path(cwd)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
@@ -92,6 +99,199 @@ def _local_head_sha(cwd: str) -> str:
         return result.stdout.strip() if result.returncode == 0 else ""
     except (OSError, subprocess.TimeoutExpired):
         return ""
+
+
+def _probe_checkout_identity(worktree: str, timeout: float) -> list[str]:
+    """Read branch and HEAD in one subprocess bounded by the caller's budget."""
+    import subprocess  # noqa: PLC0415
+    try:
+        result = subprocess.run(
+            [
+                "git", "-C", worktree, "status", "--porcelain=v2", "--branch",
+                "--untracked-files=no",
+            ],
+            capture_output=True, text=True, timeout=max(0.001, timeout), check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return [worktree, "", ""]
+    fields = {}
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if line.startswith("# branch."):
+                key, _, value = line[2:].partition(" ")
+                fields[key] = value
+    return [worktree, fields.get("branch.head", ""), fields.get("branch.oid", "")]
+
+
+def _bounded_checkout_identity(
+    worktrees: list[str], *, deadline: float | None, probe=None
+) -> tuple[list[list[str]], bool]:
+    """Collect checkout identities without crossing the shared stop deadline."""
+    if probe is None:
+        probe = _probe_checkout_identity
+    identities: list[list[str]] = []
+    for worktree in sorted(worktrees):
+        remaining = 5.0 if deadline is None else deadline - _time.monotonic()
+        if remaining <= 0:
+            return identities, False
+        identities.append(probe(worktree, min(5.0, remaining)))
+    return identities, True
+
+
+def _persist_unknown_binding_state(
+    cwd: str, *, now: float, worktrees: list[str]
+) -> None:
+    """Make an unobservable binding ineligible for the clean-stop shortcut."""
+    fingerprint = "current-pr-unknown:" + ",".join(sorted(worktrees))
+    state = _load_stop_state(cwd)
+    count = int(state.get("count", 0)) + 1 if state.get("fingerprint") == fingerprint else 1
+    _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
+
+
+def _unknown_binding_fingerprint(worktrees: list[str]) -> str:
+    """Stable fingerprint component for current bindings that were unobservable."""
+    return "|current-pr-unknown:" + ",".join(sorted(worktrees))
+
+
+def _cached_clean_binding_matches(
+    cached_entry: dict | None,
+    local_sha: str,
+    binding,
+    *,
+    now: float,
+    interval: float,
+) -> bool:
+    """Return whether a clean cache entry belongs to this exact PR binding."""
+    return bool(
+        cached_entry
+        and binding is not None
+        and local_sha
+        and cached_entry.get("head_sha") == local_sha
+        and cached_entry.get("branch") == binding.branch
+        and cached_entry.get("pr_number") == binding.pr_number
+        # A draft verdict is not reusable after the same PR becomes ready (or
+        # the inverse transition). Older cache entries lack this field and
+        # therefore fail closed into a fresh check.
+        and cached_entry.get("is_draft") == bool(binding.is_draft)
+        and cached_entry.get("code") == 0
+        and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+    )
+
+
+def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
+    """Return whether a prefetched PR binding still names this checkout."""
+    def normalized(value: str) -> str:
+        return "HEAD" if value in {"HEAD", "(detached)"} else value
+
+    return bool(
+        binding is not None
+        and normalized(binding.branch) == normalized(branch)
+        and binding.head_sha == head_sha
+    )
+
+
+def _unknown_binding_blocks_stop(
+    worktree: str, provenance_for: dict[str, str]
+) -> bool:
+    """Return whether an unknown current binding belongs to this stop gate."""
+    return provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
+
+
+def _blocking_unknown_worktrees(
+    bindings: dict,
+    ownership_conflicts: list[str],
+    provenance_for: dict[str, str],
+) -> list[str]:
+    """Return unknown current bindings that belong to this stop gate."""
+    candidates = [
+        worktree for worktree, binding in bindings.items() if binding.unknown
+    ]
+    candidates.extend(
+        worktree for worktree in ownership_conflicts if worktree not in candidates
+    )
+    return [
+        worktree
+        for worktree in candidates
+        if _unknown_binding_blocks_stop(worktree, provenance_for)
+    ]
+
+
+def _revalidate_current_pr_binding(worktree: str, binding):
+    """Fail closed when a prefetched binding no longer names the checkout."""
+    if binding is None or not binding.resolved:
+        return binding
+
+    branch = _current_branch(worktree)
+    head_sha = _local_head_sha(worktree)
+    if _binding_matches_live_checkout(binding, branch, head_sha):
+        return binding
+
+    from dataclasses import replace  # noqa: PLC0415
+
+    return replace(
+        binding,
+        branch=branch,
+        pr_number=None,
+        head_sha=head_sha,
+        unknown=True,
+    )
+
+
+def _durable_stop_gate_pid(pid: int | None) -> int:
+    """Prefer an explicit owner pid; otherwise resolve the durable session pid."""
+    if pid is not None:
+        return int(pid)
+    from .worktrees import _resolve_owner_pid  # noqa: PLC0415
+
+    return _resolve_owner_pid()
+
+
+def _fence_current_pr_rebindings(
+    bindings: dict,
+    *,
+    session_id: str,
+    pid: int,
+    provenance_for: dict[str, str],
+    deadline: float | None = None,
+    arm=_write_arm_marker,
+) -> tuple[dict, list[str]]:
+    """Acquire replacement ownership before exposing a rebound PR in memory."""
+    from dataclasses import replace  # noqa: PLC0415
+
+    rebound = dict(bindings)
+    conflicts: list[str] = []
+    for worktree, binding in bindings.items():
+        if (
+            binding.pr_number is None
+            or binding.stale_pr_number is None
+            or binding.is_draft
+        ):
+            continue
+        binding = _revalidate_current_pr_binding(worktree, binding)
+        if binding.unknown:
+            conflicts.append(worktree)
+            rebound[worktree] = binding
+            continue
+        arm_kwargs = {
+            "expected_branch": binding.branch,
+            "expected_head_sha": binding.head_sha,
+        }
+        if deadline is not None:
+            arm_kwargs["deadline"] = deadline
+        if arm(
+            worktree,
+            session_id,
+            pid,
+            binding.pr_number,
+            provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
+            **arm_kwargs,
+        ):
+            continue
+        conflicts.append(worktree)
+        rebound[worktree] = replace(
+            binding, pr_number=None, resolved=True, unknown=True
+        )
+    return rebound, conflicts
 
 
 def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
@@ -223,7 +423,12 @@ def _owned_open_pr_pairs(owned: list[str]) -> list[tuple[str, int]]:
     return pairs
 
 
-def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[str, int]]:
+def _effective_pr_pairs(
+    owned: list[str],
+    pr_for: dict[str, int],
+    *,
+    current_resolved: set[str] | None = None,
+) -> list[tuple[str, int]]:
     """``(worktree, pr)`` pairs, preferring the claim-derived ``pr_for`` map
     (``ownership_resolution.resolve_owned``, BOU-2223 Stage 2) per worktree and
     falling back to the marker-derived :func:`_owned_open_pr_pairs` otherwise.
@@ -235,13 +440,21 @@ def _effective_pr_pairs(owned: list[str], pr_for: dict[str, int]) -> list[tuple[
     marker_by_wt = dict(_owned_open_pr_pairs(owned))
     pairs: list[tuple[str, int]] = []
     for wt in owned:
-        pr = pr_for.get(wt, marker_by_wt.get(wt))
+        if current_resolved is not None and wt in current_resolved:
+            # A positive current-branch lookup is authoritative, including a
+            # definite "no open PR" answer. Do not fall back to a closed marker
+            # or claim PR after a branch switch.
+            pr = pr_for.get(wt)
+        else:
+            pr = pr_for.get(wt, marker_by_wt.get(wt))
         if pr is not None:
             pairs.append((wt, pr))
     return pairs
 
 
-def _prefetch_owned_pr_state(pairs: list[tuple[str, int]]) -> None:
+def _prefetch_owned_pr_state(
+    pairs: list[tuple[str, int]], *, deadline: float | None = None
+) -> None:
     """Batch-fetch review-thread + CI-rollup data for every owned PR in as few
     GraphQL round trips as possible (BOU-2556), priming
     ``github_api``'s per-process cache before the per-worktree loop runs.
@@ -272,10 +485,13 @@ def _prefetch_owned_pr_state(pairs: list[tuple[str, int]]) -> None:
     for repo, pr_numbers in by_repo.items():
         if len(pr_numbers) < 2:
             continue  # no batching win for a single PR in this repo
+        if deadline is not None and _time.monotonic() >= deadline:
+            return
         try:
             owner, name = repo.split("/", 1)
             entries = github_api.batch_fetch_pr_review_and_ci(
                 owner, name, sorted(pr_numbers), cwd=repo_cwd[repo],
+                deadline=deadline,
             )
             if entries:
                 github_api.prime_pr_batch_cache(repo, entries)
@@ -339,7 +555,7 @@ RECONCILES_BEFORE_RATE_LIMIT = True
 
 def _stop_gate_impl(args) -> int:
     from agentic_pr_dash import github_api  # noqa: PLC0415
-    from .worktree_check import _check_worktree  # noqa: PLC0415
+    from .worktree_check import _check_worktree, _use_current_pr_binding  # noqa: PLC0415
     from .worktrees import _owned_worktrees_across_roots, _reconcile_owned_across_roots, _detached_records_across_roots  # noqa: PLC0415
     from .waiter import _detached_loop_alive, _await_alive, _detached_pending_entry, _read_clean_exit_keys, _clean_exit_key  # noqa: PLC0415
     import time  # noqa: PLC0415
@@ -358,6 +574,7 @@ def _stop_gate_impl(args) -> int:
     cwd = os.path.abspath(args.cwd)
 
     session_id = args.session_id or _read_session_marker(cwd)
+    owner_pid = _durable_stop_gate_pid(getattr(args, "pid", None))
 
     # Reconcile FIRST: run list-owned-equivalent adoption with the durable owner
     # pid, bounded by a short shared budget for Stop-hook deadline safety. A PR
@@ -372,9 +589,11 @@ def _stop_gate_impl(args) -> int:
     if session_id:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
-        _owned, newly_adopted = _reconcile_owned_across_roots(
-            session_id, cwd, getattr(args, "pid", None), deadline
+        reconciled_owned, newly_adopted = _reconcile_owned_across_roots(
+            session_id, cwd, owner_pid, deadline
         )
+    else:
+        reconciled_owned = [cwd]
 
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
@@ -391,9 +610,28 @@ def _stop_gate_impl(args) -> int:
         and not last_pending
         and (now - float(state.get("ts", 0) or 0)) < interval
     )
-    if rate_limited and not newly_adopted:
+    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
+    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
+    checkout_identity, identity_complete = _bounded_checkout_identity(
+        reconciled_owned, deadline=gate_deadline
+    )
+    if not identity_complete:
+        _persist_unknown_binding_state(
+            cwd, now=now, worktrees=list(reconciled_owned)
+        )
+        print(
+            "[pr-watch] BUDGET-UNKNOWN: checkout identity probes exceeded the "
+            "stop-gate budget; refusing to treat the owned PR set as clean.",
+            file=sys.stderr,
+        )
+        return 2
+    if (
+        rate_limited
+        and not newly_adopted
+        and state.get("checkout_identity") == checkout_identity
+    ):
         return 0
-    _save_stop_state(cwd, {**state, "ts": now})
+    _save_stop_state(cwd, {**state, "ts": now, "checkout_identity": checkout_identity})
 
     # BOU-2223 Stage 2: flip ownership reads onto the claim store, with the
     # marker as fallback whenever the two disagree. `resolve_owned` takes (or
@@ -426,6 +664,41 @@ def _stop_gate_impl(args) -> int:
     pr_for = resolution.pr_for if resolution is not None else {}
     provenance_for = resolution.provenance_for if resolution is not None else {}
 
+    from .ownership_resolution import resolve_current_prs  # noqa: PLC0415
+    current_pr_bindings = resolve_current_prs(
+        owned,
+        session_id,
+        kind="stop_gate_pr_watch_divergence",
+        snap=resolution_snapshot,
+        deadline=gate_deadline,
+    )
+    ownership_conflicts: list[str] = []
+    if session_id:
+        current_pr_bindings, ownership_conflicts = _fence_current_pr_rebindings(
+            current_pr_bindings,
+            session_id=session_id,
+            pid=owner_pid,
+            provenance_for=provenance_for,
+            deadline=gate_deadline,
+        )
+    current_pr_for = {
+        worktree: binding.pr_number
+        for worktree, binding in current_pr_bindings.items()
+        if binding.resolved and binding.pr_number is not None
+    }
+    current_resolved_worktrees = {
+        worktree
+        for worktree, binding in current_pr_bindings.items()
+        if binding.resolved
+    }
+    current_unknown_worktrees = _blocking_unknown_worktrees(
+        current_pr_bindings, ownership_conflicts, provenance_for
+    )
+    stale_current_pr_numbers = {
+        binding.stale_pr_number
+        for binding in current_pr_bindings.values()
+        if binding.resolved and binding.stale_pr_number is not None
+    }
     # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
     # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
     # Stop-hook timeout at seven (the incident this fixes). Prefetch all of
@@ -438,8 +711,12 @@ def _stop_gate_impl(args) -> int:
     # the loop falls back to its original per-PR calls (never a wrong answer,
     # only a slower one).
     github_api.clear_pr_batch_cache()
-    effective_pr_pairs = _effective_pr_pairs(owned, pr_for)
-    _prefetch_owned_pr_state(effective_pr_pairs)
+    effective_pr_pairs = _effective_pr_pairs(
+        owned,
+        {**pr_for, **current_pr_for},
+        current_resolved=current_resolved_worktrees,
+    )
+    _prefetch_owned_pr_state(effective_pr_pairs, deadline=gate_deadline)
 
     # BOU-2556: give the per-worktree loop below a wall-clock budget so a
     # session owning many PRs degrades gracefully instead of blowing the
@@ -452,8 +729,6 @@ def _stop_gate_impl(args) -> int:
     # package). Default (60s) is chosen with real headroom under the observed
     # ~108s external timeout so this budget — not that outer one — is what
     # actually governs completion.
-    gate_budget = _env_int("STOP_GATE_BUDGET", 60)
-    gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
     checked_count = 0
     unknown_worktrees: list[str] = []
 
@@ -500,14 +775,46 @@ def _stop_gate_impl(args) -> int:
     # the count must still be visible at this surface, not merely at `check`'s.
     total_deferred = 0
     for worktree in owned:
-        local_sha = _local_head_sha(worktree)
+        live_identity, identity_complete = _bounded_checkout_identity(
+            [worktree], deadline=gate_deadline
+        )
+        if not identity_complete:
+            unknown_worktrees.append(worktree)
+            continue
+        _, live_branch, local_sha = live_identity[0]
         cached_entry = pr_head_cache.get(worktree)
+        binding = current_pr_bindings.get(worktree)
         if (
-            cached_entry
-            and local_sha
-            and cached_entry.get("head_sha") == local_sha
-            and cached_entry.get("code") == 0
-            and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+            binding is not None
+            and binding.resolved
+            and not _binding_matches_live_checkout(binding, live_branch, local_sha)
+        ):
+            from dataclasses import replace  # noqa: PLC0415
+
+            binding = replace(
+                binding,
+                branch=live_branch,
+                pr_number=None,
+                head_sha=local_sha,
+                unknown=True,
+            )
+            current_pr_bindings[worktree] = binding
+            current_pr_for.pop(worktree, None)
+            is_adopted = not _unknown_binding_blocks_stop(worktree, provenance_for)
+            # A replacement binding that changed underneath an adopted
+            # worktree is informational maintenance-loop scope, not a blocker
+            # for this session. Drop the prefetched stale pair as well so the
+            # later waiter-coverage pass cannot resurrect the old PR.
+            if is_adopted:
+                effective_pr_pairs = [
+                    (path, pr)
+                    for path, pr in effective_pr_pairs
+                    if path != worktree
+                ]
+            if not is_adopted and worktree not in current_unknown_worktrees:
+                current_unknown_worktrees.append(worktree)
+        if _cached_clean_binding_matches(
+            cached_entry, local_sha, binding, now=now, interval=interval
         ):
             code, text = 0, cached_entry.get("text", "nothing pending")
             checked_count += 1
@@ -530,10 +837,17 @@ def _stop_gate_impl(args) -> int:
             unknown_worktrees.append(worktree)
             continue
         else:
-            code, text = _check_worktree(worktree, session_id, claim=False)
+            with _use_current_pr_binding(binding):
+                code, text = _check_worktree(worktree, session_id, claim=False)
             checked_count += 1
             pr_head_cache[worktree] = {
-                "head_sha": local_sha, "checked_at": now, "code": code, "text": text,
+                "head_sha": local_sha,
+                "branch": binding.branch if binding is not None else None,
+                "pr_number": binding.pr_number if binding is not None else None,
+                "is_draft": bool(binding.is_draft) if binding is not None else False,
+                "checked_at": now,
+                "code": code,
+                "text": text,
             }
             pr_head_cache_dirty = True
         # BOU-2567: accumulate from WHICHEVER branch above produced `text` —
@@ -644,6 +958,19 @@ def _stop_gate_impl(args) -> int:
             file=sys.stderr,
         )
 
+    if current_unknown_worktrees:
+        print(
+            "[pr-watch] current PR ownership could not be observed for "
+            f"{len(current_unknown_worktrees)} owned worktree(s); refusing to "
+            "treat stale PR state as clean. Retry when GitHub state is observable.",
+            file=sys.stderr,
+        )
+        _persist_unknown_binding_state(
+            cwd, now=now, worktrees=current_unknown_worktrees
+        )
+        if not pending:
+            return 2
+
     if not pending and not unknown_worktrees:
         # BOU-2567: surface the deferred count on every otherwise-clean path
         # through this branch (idle, escalation, waiter-demand, clean-exit) —
@@ -677,8 +1004,14 @@ def _stop_gate_impl(args) -> int:
             # alone, and a session owning a live open PR would never be told to
             # start a waiter — arriving review comments and red CI would stop
             # waking it. That is a fail-OPEN regression on a fail-closed path.
+            # Use the effective current/claim/marker pairs here rather than
+            # only ``current_pr_for``. A claim-only worktree without a usable
+            # local branch (for example a detached maintenance record) has no
+            # current binding, but it still needs coverage. When a branch was
+            # positively resolved, ``_effective_pr_pairs`` has already removed
+            # any stale PR and therefore remains safe for rebinds.
             claim_open_pr_numbers = {
-                pr for wt, pr in pr_for.items() if wt not in draft_worktrees
+                pr for wt, pr in effective_pr_pairs if wt not in draft_worktrees
             }
             draft_pr_numbers = {
                 pr for wt, pr in effective_pr_pairs if wt in draft_worktrees
@@ -688,7 +1021,9 @@ def _stop_gate_impl(args) -> int:
             }
             exclusively_draft_pr_numbers = draft_pr_numbers - non_draft_pr_numbers
             marker_open_pr_numbers = (
-                _owned_open_pr_numbers(owned) - exclusively_draft_pr_numbers
+                _owned_open_pr_numbers(owned)
+                - stale_current_pr_numbers
+                - exclusively_draft_pr_numbers
             )
             owned_pr_numbers = (
                 marker_open_pr_numbers | claim_open_pr_numbers
@@ -908,11 +1243,16 @@ def _stop_gate_impl(args) -> int:
         ).hexdigest()
     if unknown_worktrees:
         fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
+    if current_unknown_worktrees:
+        fingerprint += _unknown_binding_fingerprint(current_unknown_worktrees)
     released_until = float(state.get("released_until", 0) or 0)
     if (
         state.get("released_fingerprint") == fingerprint
         and state.get("released_session_id") == session_id
-        and (not unknown_worktrees or now < released_until)
+        and (
+            not unknown_worktrees and not current_unknown_worktrees
+            or now < released_until
+        )
     ):
         _save_stop_state(cwd, {**state, "ts": now})
         return 0
@@ -982,7 +1322,7 @@ def _stop_gate_impl(args) -> int:
             "released_fingerprint": fingerprint,
             "released_session_id": session_id,
         }
-        if unknown_worktrees:
+        if unknown_worktrees or current_unknown_worktrees:
             # Unknown is not an exact actionable observation. Suppress only for
             # one bounded cache window, then force another attempt so changed
             # review/CI state on an unchecked PR cannot remain hidden forever.

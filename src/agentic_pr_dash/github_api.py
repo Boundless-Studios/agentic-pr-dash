@@ -686,7 +686,10 @@ def _run(
             return timeout_s
         return max(0.0, min(timeout_s, deadline - time.monotonic()))
 
-    result = _run_once(cmd, timeout_s=timeout_s, cwd=cwd, env=env)
+    initial_timeout = remaining_timeout()
+    if initial_timeout <= 0:
+        return subprocess.CompletedProcess(cmd, 124, "", "deadline exceeded")
+    result = _run_once(cmd, timeout_s=initial_timeout, cwd=cwd, env=env)
     for attempt in range(1, _GH_RETRY_ATTEMPTS):
         if _is_transient_connectivity_failure(result):
             delay = _GH_RETRY_BASE_DELAY_S * (2 ** (attempt - 1))
@@ -719,6 +722,25 @@ def _run(
         _RATE_LIMIT_SEEN = True
         _RATE_LIMIT_EVENTS += 1
     return result
+
+
+def _run_with_optional_deadline(
+    cmd: list[str],
+    *,
+    cwd: str | None,
+    timeout_s: float,
+    deadline: float | None,
+) -> subprocess.CompletedProcess:
+    """Run a command while preserving the legacy no-deadline call shape.
+
+    A number of callers replace :func:`_run` with a small test double.  The
+    deadline is an opt-in budget threaded by maintenance callers, so omit the
+    keyword when no budget is active; this keeps those doubles compatible while
+    still enforcing a shared deadline whenever one was supplied.
+    """
+    if deadline is None:
+        return _run(cmd, cwd=cwd, timeout_s=timeout_s)
+    return _run(cmd, cwd=cwd, timeout_s=timeout_s, deadline=deadline)
 
 
 def _is_infra_check(name: str) -> bool:
@@ -819,6 +841,7 @@ class GhFailure:
 # can't bleed into a later healthy call.
 _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 
+
 # --------------------------------------------------------------------------- #
 # One PR-state resolution per repo, shared by every reader (BOU-2810)
 # --------------------------------------------------------------------------- #
@@ -859,16 +882,21 @@ _SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
 _GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
 
 
-def _repo_hostname(cwd: str | None = None) -> str:
+def _repo_hostname(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> str:
     """Return the current repository's GitHub host without an API call."""
 
     gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
     if len(gh_repo_parts) >= 3:
         return gh_repo_parts[0]
+    timeout = 10.0 if deadline is None else min(10.0, deadline - time.monotonic())
+    if timeout <= 0:
+        return os.environ.get("GH_HOST", "").strip() or "github.com"
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+            cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         remote = None
@@ -883,13 +911,24 @@ def _repo_hostname(cwd: str | None = None) -> str:
 
 
 def _viewer_login_result(
-    cwd: str | None = None, *, timeout_s: float = 15,
+    cwd: str | None = None,
+    *,
+    timeout_s: float = 15,
+    deadline: float | None = None,
 ) -> subprocess.CompletedProcess:
     """Resolve ``@me`` on the same GitHub host as the working repository."""
 
-    return _run(
-        ["gh", "api", "user", "--hostname", _repo_hostname(cwd), "--jq", ".login"],
-        cwd=cwd, timeout_s=timeout_s,
+    hostname = (
+        _repo_hostname(cwd)
+        if deadline is None
+        else _repo_hostname(cwd, deadline=deadline)
+    )
+    return _run_with_optional_deadline(
+        [
+            "gh", "api", "user", "--hostname",
+            hostname, "--jq", ".login",
+        ],
+        cwd=cwd, timeout_s=timeout_s, deadline=deadline,
     )
 
 
@@ -899,6 +938,30 @@ def last_list_open_prs_failure() -> GhFailure | None:
     ``None`` once a list has succeeded (or before any failure). Callers read
     this immediately after a ``None`` return from :func:`list_open_prs`."""
     return _LAST_LIST_OPEN_PRS_FAILURE
+
+
+def _record_list_open_prs_failure(
+    command: list[str],
+    result: subprocess.CompletedProcess,
+    *,
+    reason: str | None = None,
+) -> None:
+    """Classify a branch-list failure for the shared REST fallback gate."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    if reason is None:
+        reason = "rate-limit" if _is_rate_limit_failure(result) else "exit"
+    _LAST_LIST_OPEN_PRS_FAILURE = GhFailure(
+        command=command,
+        returncode=result.returncode,
+        stderr=result.stderr or "",
+        reason=reason,
+    )
+
+
+def _clear_list_open_prs_failure() -> None:
+    """Prevent a stale list failure from influencing a later healthy probe."""
+    global _LAST_LIST_OPEN_PRS_FAILURE
+    _LAST_LIST_OPEN_PRS_FAILURE = None
 
 
 def list_open_prs(cwd: str | None = None) -> list[dict] | None:
@@ -1640,7 +1703,8 @@ def find_pr_by_head(
 
 
 def _exact_head_pr_numbers(
-    owner: str, branch: str, rest_state: str, cwd: str | None = None
+    owner: str, branch: str, rest_state: str, cwd: str | None = None,
+    *, deadline: float | None = None,
 ) -> list[int] | None:
     """Return PR numbers whose head is *exactly* ``owner:branch`` via REST.
 
@@ -1653,7 +1717,7 @@ def _exact_head_pr_numbers(
     numbers: list[int] = []
     page = 1
     while True:
-        r = _run(
+        r = _run_with_optional_deadline(
             [
                 "gh", "api",
                 "-H", "Accept: application/vnd.github+json",
@@ -1666,6 +1730,7 @@ def _exact_head_pr_numbers(
             ],
             cwd=cwd,
             timeout_s=30,
+            deadline=deadline,
         )
         if r.returncode != 0:
             return None
@@ -1764,7 +1829,7 @@ def _pr_full_payload(number: int, cwd: str | None = None) -> dict | None:
     return pr if isinstance(pr, dict) else None
 
 
-def _rest_repo_owner(cwd: str | None = None) -> str:
+def _rest_repo_owner(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Base-repo owner login via the REST ``repos`` endpoint (quota fallback).
 
     :func:`get_repo_info` (``gh repo view``) resolves through GraphQL and
@@ -1774,17 +1839,17 @@ def _rest_repo_owner(cwd: str | None = None) -> str:
     remote — no API call is spent on the placeholder resolution itself.
     Returns ``""`` on any failure.
     """
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "repos/{owner}/{repo}", "--jq", ".owner.login"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return ""
     return (r.stdout or "").strip()
 
 
-def _rest_viewer_login(cwd: str | None = None) -> str:
+def _rest_viewer_login(cwd: str | None = None, *, deadline: float | None = None) -> str:
     """Authenticated identity's login via REST ``GET /user`` (quota fallback).
 
     Resolves the ``@me`` author sentinel without GraphQL — ``gh pr list
@@ -1793,10 +1858,10 @@ def _rest_viewer_login(cwd: str | None = None) -> str:
     (including a GitHub App installation token, which cannot call ``/user``) —
     the fallback caller must then fail closed rather than adopt a PR whose
     author it cannot verify (PR #77 review)."""
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          "user", "--jq", ".login"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return ""
@@ -1808,7 +1873,9 @@ def _rest_viewer_login(cwd: str | None = None) -> str:
 _REST_MERGEABLE_ENUM = {True: "MERGEABLE", False: "CONFLICTING", None: "UNKNOWN"}
 
 
-def _rest_pr_payload(number: int, cwd: str | None = None) -> dict | None:
+def _rest_pr_payload(
+    number: int, cwd: str | None = None, *, deadline: float | None = None
+) -> dict | None:
     """Full PR payload via REST ``pulls/{number}`` — the quota-safe twin of
     :func:`_pr_full_payload` (BOU-1966).
 
@@ -1820,10 +1887,10 @@ def _rest_pr_payload(number: int, cwd: str | None = None) -> dict | None:
     interchangeably. Returns ``None`` on any failure — the quota-fallback
     caller stays fail-closed.
     """
-    r = _run(
+    r = _run_with_optional_deadline(
         ["gh", "api", "-H", "Accept: application/vnd.github+json",
          f"repos/{{owner}}/{{repo}}/pulls/{number}"],
-        cwd=cwd, timeout_s=30,
+        cwd=cwd, timeout_s=30, deadline=deadline,
     )
     if r.returncode != 0:
         return None
@@ -3629,6 +3696,7 @@ def batch_fetch_pr_review_and_ci(
     quota_ledger: QuotaLedger | None = None,
     caller: QuotaCaller = QuotaCaller.DASHBOARD,
     work_class: QuotaWorkClass = QuotaWorkClass.BACKGROUND_OBSERVATION,
+    deadline: float | None = None,
 ) -> dict[int, dict]:
     """Fetch review threads + the required-checks rollup for MANY PRs in as few
     round trips as possible (BOU-2556).
@@ -3754,7 +3822,9 @@ def batch_fetch_pr_review_and_ci(
                 continue
 
         try:
-            r = _run(cmd, cwd=cwd, timeout_s=45)
+            r = _run_with_optional_deadline(
+                cmd, cwd=cwd, timeout_s=45, deadline=deadline
+            )
             if r.returncode != 0:
                 if quota_context is not None:
                     quota_context.ledger.record_failure(

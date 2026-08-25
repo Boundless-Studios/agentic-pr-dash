@@ -268,7 +268,7 @@ def test_stop_gate_prefetches_once_for_many_owned_worktrees_same_repo(
     )
     batch_calls: list[list[int]] = []
 
-    def _fake_batch(owner, repo, numbers, cwd=None):
+    def _fake_batch(owner, repo, numbers, cwd=None, *, deadline=None):
         batch_calls.append(list(numbers))
         return {n: {"threads": [], "required_pending": False} for n in numbers}
 

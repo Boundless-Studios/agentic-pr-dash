@@ -211,12 +211,11 @@ def test_stop_gate_uses_session_marker_fallback_for_reconciliation(
     assert rc == 2
 
 
-def test_stop_gate_still_idles_when_nothing_adopted_within_window(
+def test_stop_gate_refreshes_legacy_clean_state_without_checkout_identity(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Cost-preservation: a recent clean stop with NOTHING to adopt still
-    early-returns 0 (rate-limit intact) and never runs the per-worktree check."""
+    """A legacy clean state cannot hide a checkout change during its window."""
     monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "180")
     config.load.cache_clear()
 
@@ -252,7 +251,7 @@ def test_stop_gate_still_idles_when_nothing_adopted_within_window(
 
     assert rc == 0
     assert adopted == []
-    assert checked == [], "rate-limit must still short-circuit when nothing adopted"
+    assert checked == [str(worktree)]
 
 
 def test_collect_owned_skips_gh_probe_when_over_budget(
@@ -514,5 +513,5 @@ def test_stop_gate_keeps_fresh_marker_pr_untouched(
     )
 
     assert rewrites == [], "a current marker PR must not be rewritten"
-    assert checked == [], "no rewrite → rate-limit still short-circuits this tick"
+    assert checked == [str(worktree)], "legacy state is refreshed once with checkout identity"
     assert rc == 0

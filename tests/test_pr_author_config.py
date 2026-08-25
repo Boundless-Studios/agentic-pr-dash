@@ -13,6 +13,7 @@ the operator had open PRs, and ``await`` waiters exited ``{"outcome": "idle",
 from __future__ import annotations
 
 import subprocess
+import time
 
 import pytest
 
@@ -76,7 +77,9 @@ def test_list_open_prs_uses_configured_author(tmp_path, monkeypatch):
 
 def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     seen: list[list[str]] = []
-    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
+    monkeypatch.setattr(
+        github_api, "_repo_hostname", lambda cwd=None, deadline=None: "ghe.example"
+    )
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
@@ -103,6 +106,23 @@ def test_repo_hostname_prefers_host_qualified_gh_repo(monkeypatch):
     )
 
     assert github_api._repo_hostname("/repo") == "enterprise.example"
+
+
+def test_viewer_hostname_probe_uses_shared_deadline(monkeypatch):
+    now = [100.0]
+    seen: list[tuple[list[str], float]] = []
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def fake_run(command, **kwargs):
+        seen.append((command, kwargs["timeout"]))
+        return _cp(stdout="git@enterprise.example:owner/repo.git\n")
+
+    monkeypatch.setattr(github_api.subprocess, "run", fake_run)
+
+    github_api._viewer_login_result("/repo", deadline=102.5)
+
+    assert seen[0] == (["git", "remote", "get-url", "origin"], 2.5)
 
 
 def test_list_open_prs_rejects_non_list_before_author_filtering(tmp_path, monkeypatch):
@@ -149,7 +169,9 @@ def test_gh_pr_list_json_uses_configured_author(tmp_path, monkeypatch):
 
 def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatch):
     seen: list[list[str]] = []
-    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
+    monkeypatch.setattr(
+        github_api, "_repo_hostname", lambda cwd=None, deadline=None: "ghe.example"
+    )
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)
@@ -165,3 +187,48 @@ def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatc
     assert seen[0][seen[0].index("--json") + 1] == "number,author"
     assert seen[1][:3] == ["gh", "api", "user"]
     assert seen[1][seen[1].index("--hostname") + 1] == "ghe.example"
+
+
+def test_gh_pr_list_json_propagates_deadline_to_at_me_viewer_lookup(
+    tmp_path, monkeypatch
+):
+    seen: list[dict] = []
+    deadline = time.monotonic() + 30
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        if cmd[:3] == ["gh", "api", "user"]:
+            return _cp(stdout="viewer\n")
+        return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}]')
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+    assert pr_state._gh_pr_list_json(
+        str(tmp_path), [], "number", deadline=deadline
+    )
+    assert seen[0]["deadline"] == deadline
+    assert seen[1]["deadline"] == deadline
+
+
+def test_gh_pr_list_json_recomputes_viewer_timeout_from_shared_deadline(
+    tmp_path, monkeypatch
+):
+    now = [100.0]
+    seen: list[dict] = []
+
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def fake_run(cmd, **kwargs):
+        seen.append(kwargs)
+        if cmd[:3] == ["gh", "pr", "list"]:
+            now[0] = 108.0
+            return _cp(stdout='[{"number": 1, "author": {"login": "viewer"}}]')
+        return _cp(stdout="viewer\n")
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    assert pr_state._gh_pr_list_json(
+        str(tmp_path), [], "number", timeout=15, deadline=110.0
+    )
+    assert seen[0]["timeout_s"] == 10.0
+    assert seen[1]["timeout_s"] == 2.0
+    assert seen[1]["deadline"] == 110.0

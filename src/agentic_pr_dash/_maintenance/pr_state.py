@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 
 from ._common import _current_branch
 
@@ -80,7 +81,9 @@ def _payload_author_login(raw: dict) -> str:
     return str(author.get("login") or "") if isinstance(author, dict) else ""
 
 
-def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
+def _rest_payload_author_is_tracked(
+    raw: dict, cwd: str, *, deadline: float | None = None
+) -> bool:
     """True when a REST fallback payload's author is the configured ``pr_author``.
 
     The normal branch resolution only considers ``gh pr list --author
@@ -93,7 +96,13 @@ def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
     configured = _load_config(cwd).pr_author
-    expected = github_api._rest_viewer_login(cwd) if configured == "@me" else configured
+    expected = configured
+    if configured == "@me":
+        expected = (
+            github_api._rest_viewer_login(cwd, deadline=deadline)
+            if deadline is not None
+            else github_api._rest_viewer_login(cwd)
+        )
     author = raw.get("author")
     actual = str(author.get("login") or "") if isinstance(author, dict) else ""
     if not expected or not actual:
@@ -101,7 +110,14 @@ def _rest_payload_author_is_tracked(raw: dict, cwd: str) -> bool:
     return _login_key(actual) == _login_key(expected)
 
 
-def _rest_fallback_entry_for_branch(branch: str, cwd: str):
+def _rest_fallback_entry_for_branch(
+    branch: str,
+    cwd: str,
+    *,
+    force: bool = False,
+    deadline: float | None = None,
+    head_owner: str | None = None,
+):
     """Quota fallback (BOU-1966): raw PR entry for the current branch via REST.
 
     Resolves owner (REST) → exact owner-qualified head numbers (REST) → full
@@ -118,24 +134,187 @@ def _rest_fallback_entry_for_branch(branch: str, cwd: str):
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
-    if not _list_failure_is_rate_limited():
+    if not force and not _list_failure_is_rate_limited():
         return None
-    owner = github_api._rest_repo_owner(cwd)
+    owner = head_owner or (
+        github_api._rest_repo_owner(cwd, deadline=deadline)
+        if deadline is not None
+        else github_api._rest_repo_owner(cwd)
+    )
     if not owner:
         return None
-    numbers = github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    numbers = (
+        github_api._exact_head_pr_numbers(
+            owner, branch, "open", cwd=cwd, deadline=deadline
+        )
+        if deadline is not None
+        else github_api._exact_head_pr_numbers(owner, branch, "open", cwd=cwd)
+    )
     if not numbers:
         return None
+    matches = []
     for number in numbers:
-        raw = github_api._rest_pr_payload(number, cwd=cwd)
+        raw = (
+            github_api._rest_pr_payload(number, cwd=cwd, deadline=deadline)
+            if deadline is not None
+            else github_api._rest_pr_payload(number, cwd=cwd)
+        )
         if raw is None:
             return None  # REST failure mid-verification → fail closed
         if str(raw.get("headRefName") or "") != branch:
             continue
-        if not _rest_payload_author_is_tracked(raw, cwd):
+        if not _rest_payload_author_is_tracked(raw, cwd, deadline=deadline):
             continue
-        return raw
-    return None
+        matches.append(raw)
+    return matches[0] if len(matches) == 1 else None
+
+
+def _resolve_pr_entry_for_branch(
+    cwd: str,
+    branch: str,
+    *,
+    head_oid: str = "",
+    validate_snapshot_state: bool = False,
+    deadline: float | None = None,
+):
+    """Resolve one exact, tracked open-PR entry for ``branch``.
+
+    The ordinary branch helper intentionally serves the shared snapshot without
+    another network call. Ownership readers have a stricter contract: a cached
+    entry can be the PR that was closed immediately before a worktree switched
+    branches, so a snapshot candidate is revalidated through the REST resource
+    before it is used. If that candidate is stale, a forced REST head lookup gets
+    the replacement PR without trusting the author-wide GraphQL list.
+
+    ``None`` means a successful lookup found no open PR. ``_GH_UNAVAILABLE``
+    means the current branch could not be established with sufficient evidence.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    if not branch:
+        return None
+    if deadline is not None and time.monotonic() >= deadline:
+        return _GH_UNAVAILABLE
+
+    def _pick(entries: list[dict]):
+        exact = [
+            entry for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("headRefName") == branch
+            and isinstance(entry.get("number"), int)
+        ]
+        if not exact:
+            return None
+        if head_oid:
+            matching_head = [entry for entry in exact if entry.get("headRefOid") == head_oid]
+            if matching_head:
+                return matching_head[0] if len(matching_head) == 1 else _GH_UNAVAILABLE
+        if len(exact) > 1:
+            # A branch name is not an ownership proof: fork/base PRs can share
+            # it. If the local head cannot disambiguate them, fail closed
+            # instead of binding arbitrarily to ``exact[0]``.
+            return _GH_UNAVAILABLE
+        return exact[0]
+
+    snapshot = github_api.peek_pr_snapshot(cwd)
+    if snapshot is not None:
+        candidate = _pick(snapshot)
+        if candidate is _GH_UNAVAILABLE:
+            return _GH_UNAVAILABLE
+        if candidate is None:
+            if not validate_snapshot_state:
+                return None
+            replacement = (
+                _rest_fallback_entry_for_branch(
+                    branch, cwd, force=True, deadline=deadline
+                )
+                if deadline is not None
+                else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+            )
+            return replacement if replacement is not None else _GH_UNAVAILABLE
+        if not validate_snapshot_state:
+            return candidate
+
+        # A snapshot hit is not proof that the PR is still open. REST is the
+        # quota-safe, current-state check and also detects a reused branch whose
+        # open PR changed while the list snapshot was still warm.
+        live = (
+            github_api._rest_pr_payload(
+                int(candidate["number"]), cwd=cwd, deadline=deadline
+            )
+            if deadline is not None
+            else github_api._rest_pr_payload(int(candidate["number"]), cwd=cwd)
+        )
+        if (
+            live is not None
+            and str(live.get("state") or "").lower() == "open"
+            and live.get("headRefName") == branch
+        ):
+            # The resource proves this cached PR is still open, but not that it
+            # remains the only open PR for the exact head. A new PR can appear
+            # after the author-wide snapshot was cached.
+            live_head_owner = live.get("headRepositoryOwner")
+            if isinstance(live_head_owner, dict):
+                live_head_owner = live_head_owner.get("login")
+            if not isinstance(live_head_owner, str):
+                live_head_owner = None
+            unique = (
+                _rest_fallback_entry_for_branch(
+                    branch,
+                    cwd,
+                    force=True,
+                    deadline=deadline,
+                    head_owner=live_head_owner,
+                )
+                if deadline is not None
+                else _rest_fallback_entry_for_branch(
+                    branch, cwd, force=True, head_owner=live_head_owner
+                )
+            )
+            if unique is not None and unique.get("number") == live.get("number"):
+                return live
+            return _GH_UNAVAILABLE
+        # The cached candidate was closed, changed head, or could not be
+        # verified. Ask REST for the exact current head before declaring the
+        # worktree unbound. This path is deliberately not gated on a prior
+        # GraphQL error: the snapshot itself may be the stale source.
+        replacement = (
+            _rest_fallback_entry_for_branch(
+                branch, cwd, force=True, deadline=deadline
+            )
+            if deadline is not None
+            else _rest_fallback_entry_for_branch(branch, cwd, force=True)
+        )
+        if replacement is not None:
+            return replacement
+        # The owner-qualified REST head query cannot exclude a fork-backed
+        # replacement.  A miss is therefore unobservable even when the stale
+        # candidate itself was positively confirmed closed.
+        return _GH_UNAVAILABLE
+
+    data = (
+        _gh_pr_list_json(
+            cwd,
+            ["--head", branch],
+            "number,isDraft,headRefName,headRefOid",
+            deadline=deadline,
+        )
+        if deadline is not None
+        else _gh_pr_list_json(
+            cwd, ["--head", branch], "number,isDraft,headRefName,headRefOid"
+        )
+    )
+    if data is None:
+        # On a GraphQL/list failure, REST is the only authoritative fallback.
+        # A failed REST verification remains unknown rather than becoming a
+        # false "no PR" answer (the BOU-2798 waiter must stay fail-loud).
+        replacement = (
+            _rest_fallback_entry_for_branch(branch, cwd, deadline=deadline)
+            if deadline is not None
+            else _rest_fallback_entry_for_branch(branch, cwd)
+        )
+        return replacement if replacement is not None else _GH_UNAVAILABLE
+    return _pick(data)
 
 
 def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
@@ -458,7 +637,12 @@ def _pr_head_branch(cwd: str, pr_number: int):
 
 
 def _gh_pr_list_json(
-    cwd: str, extra_args: list[str], fields: str, timeout: float = 15
+    cwd: str,
+    extra_args: list[str],
+    fields: str,
+    timeout: float = 15,
+    *,
+    deadline: float | None = None,
 ) -> list | None:
     """Run `gh pr list --author <pr_author> --state open --json <fields> <extra>`.
 
@@ -490,38 +674,76 @@ def _gh_pr_list_json(
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.config import load as _load_config  # noqa: PLC0415
 
+    if deadline is not None:
+        timeout = min(timeout, max(0.0, deadline - time.monotonic()))
     if timeout <= 0:
         return None
-    deadline = time.monotonic() + timeout
+    call_deadline = deadline if deadline is not None else time.monotonic() + timeout
+    command = [
+        "gh", "pr", "list", "--state", "open", "--limit",
+        github_api._GH_COMPLETE_LIST_LIMIT, *extra_args, "--json",
+        ",".join(dict.fromkeys([*fields.split(","), "author"])),
+    ]
     result = github_api._run(
-        ["gh", "pr", "list", "--state", "open", "--limit",
-         github_api._GH_COMPLETE_LIST_LIMIT, *extra_args, "--json",
-         ",".join(dict.fromkeys([*fields.split(","), "author"]))],
-        timeout_s=timeout, deadline=deadline,
+        command,
+        timeout_s=timeout, deadline=call_deadline,
         cwd=cwd,
     )
     if result.returncode != 0:
+        github_api._record_list_open_prs_failure(command, result)
         return None
     try:
         data = json.loads(result.stdout or "[]")
     except ValueError:
+        github_api._record_list_open_prs_failure(
+            command, result, reason="invalid-json"
+        )
         return None
     if not isinstance(data, list):
+        github_api._record_list_open_prs_failure(
+            command, result, reason="not-a-list"
+        )
         return None
     author = _load_config(cwd).pr_author
     if author == "@me":
-        viewer = github_api._viewer_login_result(cwd, timeout_s=timeout)
+        viewer_timeout = timeout
+        if deadline is not None:
+            viewer_timeout = min(
+                viewer_timeout, max(0.0, deadline - time.monotonic())
+            )
+        if viewer_timeout <= 0:
+            return None
+        viewer = github_api._viewer_login_result(
+            cwd, timeout_s=viewer_timeout, deadline=deadline
+        )
         if viewer.returncode != 0:
+            viewer_command = (
+                viewer.args
+                if isinstance(viewer.args, list)
+                else ["gh", "api", "user"]
+            )
+            github_api._record_list_open_prs_failure(
+                viewer_command, viewer, reason="viewer-unavailable"
+            )
             return None
         author = viewer.stdout.strip()
         if not author:
+            github_api._record_list_open_prs_failure(
+                ["gh", "api", "user"],
+                subprocess.CompletedProcess(
+                    ["gh", "api", "user"], 1, "", "authenticated GitHub login is unavailable"
+                ),
+                reason="viewer-unavailable",
+            )
             return None
-    return [
+    filtered = [
         pr for pr in data
         if isinstance(pr, dict)
         and isinstance(pr.get("author"), dict)
         and pr["author"].get("login") == author
     ]
+    github_api._clear_list_open_prs_failure()
+    return filtered
 
 
 def _resolve_open_pr_for_branch(cwd: str, branch: str):
