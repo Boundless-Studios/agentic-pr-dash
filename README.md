@@ -148,6 +148,29 @@ back to GitHub's repository runner endpoint, which requires **Repository
 Administration: Read**; a missing permission is reported as an unauthorized
 probe rather than runner downtime.
 
+For a fleet spread across multiple Docker daemons, configure one
+`[[project.local_runner_hosts]]` table per host. Each table requires `prefix`;
+`docker_host` accepts a Docker endpoint such as `ssh://user@host`, and optional
+`name` controls the host label displayed on runner rows and probe errors.
+
+```toml
+[[project.local_runner_hosts]]
+name = "primary-ci"
+docker_host = "ssh://ci@example.com"
+prefix = "gha-runner-"
+
+[[project.local_runner_hosts]]
+name = "reserve"
+docker_host = "ssh://reserve@example.com"
+prefix = "gha-runner-"
+```
+
+`AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX` has highest precedence and
+temporarily selects the ambient Docker daemon. Without that environment
+override, `local_runner_hosts` takes precedence over the legacy
+`local_runner_container_prefix` TOML key. Invalid host entries are reported as
+degraded fleet configuration rather than omitted from the totals.
+
 If the fleet registers at the **organisation** level — a runner group rather than
 per-repository registration — the token additionally needs organisation
 **Self-hosted runners: Read**. The repository endpoint lists only repo-registered
