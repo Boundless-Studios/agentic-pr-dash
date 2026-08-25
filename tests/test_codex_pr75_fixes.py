@@ -247,10 +247,19 @@ def test_await_clean_exit_writes_marker(tmp_path, monkeypatch, legacy_marker_wri
                 worktree=worktree,
                 branch="feature-42",
                 pr_number=42,
+                head_sha="head-42",
                 resolved=True,
             )
             for worktree in worktrees
         },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-42",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-42",
     )
 
     rc = mc.main(_await_args(tmp_path))
@@ -276,11 +285,20 @@ def test_await_clean_exit_excludes_draft_binding(
                 worktree=worktree,
                 branch="feature-42",
                 pr_number=42,
+                head_sha="head-42",
                 is_draft=True,
                 resolved=True,
             )
             for worktree in worktrees
         },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-42",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-42",
     )
 
     rc = mc.main(_await_args(tmp_path))
