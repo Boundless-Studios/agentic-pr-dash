@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 from dataclasses import dataclass
 
 from agentic_pr_dash.config import load as load_config
@@ -457,6 +458,7 @@ def _write_arm_marker(
     *,
     expected_branch: str | None = None,
     expected_head_sha: str | None = None,
+    deadline: float | None = None,
 ) -> bool:
     """Write the pr-watch.armed ownership marker (the single writer).
 
@@ -483,7 +485,8 @@ def _write_arm_marker(
     # stamp the new PR onto a different checkout. The caller supplies both
     # identities; missing local evidence is unknown, not a match.
     if not _checkout_matches_expected(
-        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
     ):
         return False
 
@@ -513,6 +516,7 @@ def _write_arm_marker(
                 cwd,
                 expected_branch=expected_branch,
                 expected_head_sha=expected_head_sha,
+                deadline=deadline,
             ):
                 os.remove(tmp)
                 return False
@@ -535,11 +539,11 @@ def _write_arm_marker(
     # ``subprocess.run(text=True)`` can also raise UnicodeDecodeError on a
     # non-UTF-8 ref name or git warning.
     try:
-        branch = _current_branch(cwd)
+        branch = _bounded_current_branch(cwd, deadline)
     except Exception:  # noqa: BLE001
         branch = ""
     try:
-        repo = _repo_slug(cwd)
+        repo = _bounded_repo_slug(cwd, deadline)
     except Exception:  # noqa: BLE001
         repo = ""
 
@@ -547,7 +551,8 @@ def _write_arm_marker(
     # the claim itself, not just the marker write, so a replacement checkout
     # cannot acquire durable ownership for the stale PR.
     if not _checkout_matches_expected(
-        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
     ):
         _rollback_arm_marker(cwd, session_id, pr_number, previous_marker)
         return False
@@ -562,7 +567,8 @@ def _write_arm_marker(
         pid_tier_only=True, track_creation=True,
     )
     if not _checkout_matches_expected(
-        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
+        cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha,
+        deadline=deadline,
     ):
         if isinstance(claim_result, _ClaimWriteResult) and claim_result.created:
             _release_dual_write_claim(
@@ -595,8 +601,11 @@ def _write_arm_marker(
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
         baseline = None
         try:
+            timeout = _remaining_timeout(deadline, 10)
+            if timeout is None:
+                raise subprocess.TimeoutExpired("git rev-parse HEAD", 0)
             rev = subprocess.run(["git", "-C", cwd, "rev-parse", "HEAD"],
-                                 capture_output=True, text=True, timeout=10,
+                                 capture_output=True, text=True, timeout=timeout,
                                  check=False)
             if rev.returncode == 0:
                 baseline = rev.stdout.strip() or None
@@ -620,7 +629,7 @@ def _write_arm_marker(
     return claimed
 
 
-def _current_head_sha(cwd: str) -> str:
+def _current_head_sha(cwd: str, *, timeout: float = 5) -> str:
     """Return the checkout HEAD, or an empty string when git is unavailable."""
     import subprocess  # noqa: PLC0415
 
@@ -629,7 +638,7 @@ def _current_head_sha(cwd: str) -> str:
             ["git", "-C", cwd, "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=max(0.001, timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
@@ -637,18 +646,71 @@ def _current_head_sha(cwd: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
+def _remaining_timeout(deadline: float | None, cap: float) -> float | None:
+    remaining = cap if deadline is None else deadline - time.monotonic()
+    return min(cap, remaining) if remaining > 0 else None
+
+
+def _bounded_current_branch(cwd: str, deadline: float | None) -> str:
+    import subprocess  # noqa: PLC0415
+
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
+    """Resolve the local origin without an unbounded gh fallback."""
+    import subprocess  # noqa: PLC0415
+
+    if deadline is None:
+        return _repo_slug(cwd)
+    timeout = _remaining_timeout(deadline, 10)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
+        return ""
+    url = result.stdout.strip() if result.returncode == 0 else ""
+    tail = url.split("github.com", 1)[-1].lstrip(":/") if "github.com" in url else ""
+    tail = tail.removesuffix(".git")
+    return tail if tail.count("/") == 1 else ""
+
+
 def _checkout_matches_expected(
     cwd: str,
     *,
     expected_branch: str | None,
     expected_head_sha: str | None,
+    deadline: float | None = None,
 ) -> bool:
     """Return whether the live checkout still matches an expected binding."""
     if expected_branch is None and expected_head_sha is None:
         return True
     try:
-        branch = _current_branch(cwd)
-        head_sha = _current_head_sha(cwd)
+        if _remaining_timeout(deadline, 5) is None:
+            return False
+        branch = _bounded_current_branch(cwd, deadline)
+        timeout = _remaining_timeout(deadline, 5)
+        if timeout is None:
+            return False
+        head_sha = (
+            _current_head_sha(cwd)
+            if deadline is None
+            else _current_head_sha(cwd, timeout=timeout)
+        )
     except Exception:  # noqa: BLE001 — fail closed at the arm boundary
         return False
     return bool(

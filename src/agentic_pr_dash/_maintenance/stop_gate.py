@@ -180,9 +180,12 @@ def _cached_clean_binding_matches(
 
 def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
     """Return whether a prefetched PR binding still names this checkout."""
+    def normalized(value: str) -> str:
+        return "HEAD" if value in {"HEAD", "(detached)"} else value
+
     return bool(
         binding is not None
-        and binding.branch == branch
+        and normalized(binding.branch) == normalized(branch)
         and binding.head_sha == head_sha
     )
 
@@ -230,6 +233,7 @@ def _fence_current_pr_rebindings(
     session_id: str,
     pid: int,
     provenance_for: dict[str, str],
+    deadline: float | None = None,
     arm=_write_arm_marker,
 ) -> tuple[dict, list[str]]:
     """Acquire replacement ownership before exposing a rebound PR in memory."""
@@ -249,14 +253,19 @@ def _fence_current_pr_rebindings(
             conflicts.append(worktree)
             rebound[worktree] = binding
             continue
+        arm_kwargs = {
+            "expected_branch": binding.branch,
+            "expected_head_sha": binding.head_sha,
+        }
+        if deadline is not None:
+            arm_kwargs["deadline"] = deadline
         if arm(
             worktree,
             session_id,
             pid,
             binding.pr_number,
             provenance_for.get(worktree, _marker_provenance(worktree)) or "armed",
-            expected_branch=binding.branch,
-            expected_head_sha=binding.head_sha,
+            **arm_kwargs,
         ):
             continue
         conflicts.append(worktree)
@@ -651,6 +660,7 @@ def _stop_gate_impl(args) -> int:
             session_id=session_id,
             pid=owner_pid,
             provenance_for=provenance_for,
+            deadline=gate_deadline,
         )
     current_pr_for = {
         worktree: binding.pr_number

@@ -551,6 +551,73 @@ def test_fenced_rebind_passes_checkout_identity_to_arm(
     ]
 
 
+def test_fenced_rebind_passes_shared_deadline_to_arm(monkeypatch, tmp_path: Path):
+    worktree = str(tmp_path / "worktree")
+    binding = CurrentPRResolution(
+        worktree,
+        "feature-b",
+        3062,
+        head_sha="head-b",
+        resolved=True,
+        stale_pr_number=3017,
+    )
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "feature-b",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "head-b",
+    )
+
+    _fence_current_pr_rebindings(
+        {worktree: binding},
+        session_id="session-a",
+        pid=123,
+        provenance_for={worktree: "armed"},
+        deadline=42.0,
+        arm=lambda *args, **kwargs: calls.append(kwargs) or True,
+    )
+
+    assert calls == [{
+        "expected_branch": "feature-b",
+        "expected_head_sha": "head-b",
+        "deadline": 42.0,
+    }]
+
+
+def test_detached_checkout_identity_matches_head_binding():
+    binding = CurrentPRResolution(
+        "/worktree", "HEAD", 3062, head_sha="head-b", resolved=True
+    )
+
+    assert _binding_matches_live_checkout(binding, "(detached)", "head-b")
+
+
+def test_arm_marker_fails_closed_without_probing_after_deadline(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.setattr(markers.time, "monotonic", lambda: 50.0)
+    probes: list[str] = []
+    monkeypatch.setattr(
+        markers,
+        "_bounded_current_branch",
+        lambda cwd, deadline: probes.append(cwd) or "feature-b",
+    )
+
+    assert not markers._write_arm_marker(
+        str(tmp_path),
+        "session-a",
+        123,
+        3062,
+        expected_branch="feature-b",
+        expected_head_sha="head-b",
+        deadline=49.0,
+    )
+    assert probes == []
+
+
 def test_arm_rejects_mismatched_checkout_before_claim(
     monkeypatch, tmp_path: Path
 ):

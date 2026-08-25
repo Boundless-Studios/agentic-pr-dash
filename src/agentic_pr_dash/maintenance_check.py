@@ -117,6 +117,7 @@ from ._maintenance.stop_gate import (  # noqa: F401, E402
     _record_has_blockers,
     _read_escalation_marker,
     _build_escalation_block,
+    _fence_current_pr_rebindings as _fence_waiter_rebindings,
     _revalidate_current_pr_binding as _revalidate_waiter_binding,
 )
 
@@ -1942,6 +1943,21 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     adopted_worktrees.add(worktree)
                 binding = current_pr_bindings.get(worktree)
                 binding = _revalidate_waiter_binding(worktree, binding)
+                if (
+                    session_id
+                    and binding is not None
+                    and not is_adopted
+                    and binding.stale_pr_number is not None
+                ):
+                    fenced, conflicts = _fence_waiter_rebindings(
+                        {worktree: binding},
+                        session_id=session_id,
+                        pid=owner_pid,
+                        provenance_for={worktree: provenance},
+                    )
+                    binding = fenced[worktree]
+                    if conflicts:
+                        gh_unobservable = True
                 if binding is not None:
                     current_pr_bindings[worktree] = binding
                 if binding is not None and binding.unknown and not is_adopted:
