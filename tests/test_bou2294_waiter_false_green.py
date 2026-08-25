@@ -237,10 +237,19 @@ def test_claim_owned_waiter_records_its_clean_verdict(tmp_path, monkeypatch, cap
                 worktree=worktree,
                 branch="test-branch",
                 pr_number=2707,
+                head_sha="test-head",
                 resolved=True,
             )
             for worktree in worktrees
         },
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._current_branch",
+        lambda cwd: "test-branch",
+    )
+    monkeypatch.setattr(
+        "agentic_pr_dash._maintenance.stop_gate._local_head_sha",
+        lambda cwd: "test-head",
     )
     monkeypatch.setattr("time.sleep", lambda s: None)
 
