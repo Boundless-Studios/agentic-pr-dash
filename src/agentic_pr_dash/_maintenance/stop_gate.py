@@ -148,6 +148,11 @@ def _persist_unknown_binding_state(
     _save_stop_state(cwd, {"ts": now, "fingerprint": fingerprint, "count": count})
 
 
+def _unknown_binding_fingerprint(worktrees: list[str]) -> str:
+    """Stable fingerprint component for current bindings that were unobservable."""
+    return "|current-pr-unknown:" + ",".join(sorted(worktrees))
+
+
 def _cached_clean_binding_matches(
     cached_entry: dict | None,
     local_sha: str,
@@ -939,10 +944,10 @@ def _stop_gate_impl(args) -> int:
             "treat stale PR state as clean. Retry when GitHub state is observable.",
             file=sys.stderr,
         )
+        _persist_unknown_binding_state(
+            cwd, now=now, worktrees=current_unknown_worktrees
+        )
         if not pending:
-            _persist_unknown_binding_state(
-                cwd, now=now, worktrees=current_unknown_worktrees
-            )
             return 2
 
     if not pending and not unknown_worktrees:
@@ -1217,11 +1222,16 @@ def _stop_gate_impl(args) -> int:
         ).hexdigest()
     if unknown_worktrees:
         fingerprint += "|budget-unknown:" + ",".join(sorted(unknown_worktrees))
+    if current_unknown_worktrees:
+        fingerprint += _unknown_binding_fingerprint(current_unknown_worktrees)
     released_until = float(state.get("released_until", 0) or 0)
     if (
         state.get("released_fingerprint") == fingerprint
         and state.get("released_session_id") == session_id
-        and (not unknown_worktrees or now < released_until)
+        and (
+            not unknown_worktrees and not current_unknown_worktrees
+            or now < released_until
+        )
     ):
         _save_stop_state(cwd, {**state, "ts": now})
         return 0
@@ -1291,7 +1301,7 @@ def _stop_gate_impl(args) -> int:
             "released_fingerprint": fingerprint,
             "released_session_id": session_id,
         }
-        if unknown_worktrees:
+        if unknown_worktrees or current_unknown_worktrees:
             # Unknown is not an exact actionable observation. Suppress only for
             # one bounded cache window, then force another attempt so changed
             # review/CI state on an unchecked PR cannot remain hidden forever.

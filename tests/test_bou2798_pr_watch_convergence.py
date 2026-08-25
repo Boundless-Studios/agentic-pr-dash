@@ -29,6 +29,7 @@ from agentic_pr_dash._maintenance.stop_gate import (
     _persist_unknown_binding_state,
     _prefetch_owned_pr_state,
     _unknown_binding_blocks_stop,
+    _unknown_binding_fingerprint,
 )
 
 
@@ -846,6 +847,12 @@ def test_unknown_binding_persists_nonclean_fingerprint(tmp_path: Path):
     assert saved["fingerprint"] == "current-pr-unknown:/one,/two"
 
 
+def test_unknown_binding_fingerprint_is_stable_and_distinct():
+    assert _unknown_binding_fingerprint(["/two", "/one"]) == (
+        "|current-pr-unknown:/one,/two"
+    )
+
+
 def test_pruning_stale_pr_preserves_replacement_marker(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(pr_state, "_pr_open_state", lambda number, cwd: ("closed",))
     monkeypatch.setattr(markers, "release_ownership_claims", lambda *args: None)
@@ -1098,5 +1105,30 @@ def test_repointed_worktree_no_longer_hides_old_pr_from_detached_records(
     )
     monkeypatch.setattr(ownership_resolution, "resolve_worktree", lambda *a, **k: owner)
     monkeypatch.setattr(worktrees, "_current_branch", lambda path: "feature-b")
+
+    assert not worktrees._worktree_is_for_entry(str(tmp_path), entry)
+
+
+def test_reused_branch_does_not_hide_prior_pr_from_detached_records(
+    monkeypatch, tmp_path: Path
+):
+    entry = session_ledger.LedgerEntry(
+        pr=3017,
+        branch="feature-a",
+        worktree=str(tmp_path),
+        opened_at="",
+        baseline_sha=None,
+        repo="owner/repo",
+    )
+    owner = ownership_resolution.WorktreeOwnership(
+        worktree=str(tmp_path),
+        session_id="session-a",
+        pr_number=3062,
+        provenance="armed",
+        marker_session_id="session-a",
+        source="marker",
+    )
+    monkeypatch.setattr(ownership_resolution, "resolve_worktree", lambda *a, **k: owner)
+    monkeypatch.setattr(worktrees, "_current_branch", lambda path: "feature-a")
 
     assert not worktrees._worktree_is_for_entry(str(tmp_path), entry)
