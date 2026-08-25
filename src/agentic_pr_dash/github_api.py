@@ -882,16 +882,21 @@ _SNAPSHOT_SERVABLE_FIELDS = frozenset(PR_SNAPSHOT_FIELDS.split(","))
 _GH_COMPLETE_LIST_LIMIT = str(2**31 - 1)
 
 
-def _repo_hostname(cwd: str | None = None) -> str:
+def _repo_hostname(
+    cwd: str | None = None, *, deadline: float | None = None
+) -> str:
     """Return the current repository's GitHub host without an API call."""
 
     gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
     if len(gh_repo_parts) >= 3:
         return gh_repo_parts[0]
+    timeout = 10.0 if deadline is None else min(10.0, deadline - time.monotonic())
+    if timeout <= 0:
+        return os.environ.get("GH_HOST", "").strip() or "github.com"
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            cwd=cwd, capture_output=True, text=True, timeout=10, check=False,
+            cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         remote = None
@@ -913,8 +918,16 @@ def _viewer_login_result(
 ) -> subprocess.CompletedProcess:
     """Resolve ``@me`` on the same GitHub host as the working repository."""
 
+    hostname = (
+        _repo_hostname(cwd)
+        if deadline is None
+        else _repo_hostname(cwd, deadline=deadline)
+    )
     return _run_with_optional_deadline(
-        ["gh", "api", "user", "--hostname", _repo_hostname(cwd), "--jq", ".login"],
+        [
+            "gh", "api", "user", "--hostname",
+            hostname, "--jq", ".login",
+        ],
         cwd=cwd, timeout_s=timeout_s, deadline=deadline,
     )
 

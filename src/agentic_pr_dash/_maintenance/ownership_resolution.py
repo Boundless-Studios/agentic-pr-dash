@@ -384,16 +384,50 @@ class CurrentPRResolution:
     stale_pr_number: int | None = None
 
 
-def _current_head(worktree_path: str) -> str:
+def _remaining_timeout(deadline: float | None, cap: float) -> float | None:
+    remaining = cap if deadline is None else deadline - time.monotonic()
+    return min(cap, remaining) if remaining > 0 else None
+
+
+def _current_branch(worktree_path: str, *, deadline: float | None = None) -> str:
+    """Return a usable branch name within the caller's remaining budget."""
+    if deadline is None:
+        from ._common import _current_branch as current_branch  # noqa: PLC0415
+
+        branch = current_branch(worktree_path)
+        return "" if branch == "HEAD" else branch
+
+    import subprocess  # noqa: PLC0415
+
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    branch = result.stdout.strip() if result.returncode == 0 else ""
+    return "" if branch == "HEAD" else branch
+
+
+def _current_head(worktree_path: str, *, deadline: float | None = None) -> str:
     """Return the checked-out HEAD, or an empty string on local git failure."""
     import subprocess  # noqa: PLC0415
 
+    timeout = _remaining_timeout(deadline, 5)
+    if timeout is None:
+        return ""
     try:
         result = subprocess.run(
             ["git", "-C", worktree_path, "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired):
         return ""
@@ -422,15 +456,36 @@ def resolve_current_pr(
     if session_id and callable(owns) and not owns(session_id):
         return CurrentPRResolution(path, None, None)
 
-    from ._common import _current_branch  # noqa: PLC0415
     from .pr_state import _GH_UNAVAILABLE, _resolve_pr_entry_for_branch  # noqa: PLC0415
 
-    branch = _current_branch(path)
     stale_pr = resolved_owner.pr_number
+    branch = _current_branch(path, deadline=deadline)
     if not branch:
-        return CurrentPRResolution(path, None, None, stale_pr_number=stale_pr)
+        exhausted = deadline is not None and time.monotonic() >= deadline
+        return CurrentPRResolution(
+            path,
+            None,
+            None,
+            resolved=exhausted,
+            unknown=exhausted,
+            stale_pr_number=stale_pr,
+        )
 
-    head_sha = _current_head(path)
+    head_sha = (
+        _current_head(path)
+        if deadline is None
+        else _current_head(path, deadline=deadline)
+    )
+    if deadline is not None and time.monotonic() >= deadline:
+        return CurrentPRResolution(
+            path,
+            branch,
+            None,
+            head_sha=head_sha,
+            resolved=True,
+            unknown=True,
+            stale_pr_number=stale_pr,
+        )
     # A cold lookup failure is just as unobservable as a warm failure. In
     # particular, an ambiguous same-branch result must not fall through to the
     # legacy branch resolver, which may choose an arbitrary PR and then prune

@@ -77,7 +77,9 @@ def test_list_open_prs_uses_configured_author(tmp_path, monkeypatch):
 
 def test_list_open_prs_defaults_to_at_me(tmp_path, monkeypatch):
     seen: list[list[str]] = []
-    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
+    monkeypatch.setattr(
+        github_api, "_repo_hostname", lambda cwd=None, deadline=None: "ghe.example"
+    )
 
     def fake_run(cmd, timeout_s=20, cwd=None):
         seen.append(cmd)
@@ -104,6 +106,23 @@ def test_repo_hostname_prefers_host_qualified_gh_repo(monkeypatch):
     )
 
     assert github_api._repo_hostname("/repo") == "enterprise.example"
+
+
+def test_viewer_hostname_probe_uses_shared_deadline(monkeypatch):
+    now = [100.0]
+    seen: list[tuple[list[str], float]] = []
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def fake_run(command, **kwargs):
+        seen.append((command, kwargs["timeout"]))
+        return _cp(stdout="git@enterprise.example:owner/repo.git\n")
+
+    monkeypatch.setattr(github_api.subprocess, "run", fake_run)
+
+    github_api._viewer_login_result("/repo", deadline=102.5)
+
+    assert seen[0] == (["git", "remote", "get-url", "origin"], 2.5)
 
 
 def test_list_open_prs_rejects_non_list_before_author_filtering(tmp_path, monkeypatch):
@@ -150,7 +169,9 @@ def test_gh_pr_list_json_uses_configured_author(tmp_path, monkeypatch):
 
 def test_gh_pr_list_json_resolves_at_me_and_requests_author(tmp_path, monkeypatch):
     seen: list[list[str]] = []
-    monkeypatch.setattr(github_api, "_repo_hostname", lambda cwd=None: "ghe.example")
+    monkeypatch.setattr(
+        github_api, "_repo_hostname", lambda cwd=None, deadline=None: "ghe.example"
+    )
 
     def fake_run(cmd, **kwargs):
         seen.append(cmd)

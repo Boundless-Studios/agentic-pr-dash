@@ -452,6 +452,65 @@ def test_current_pr_resolution_preserves_local_checkout_sha(
     assert result.head_sha == "local-head"
 
 
+def test_current_pr_resolution_bounds_checkout_probes_by_deadline(
+    monkeypatch, tmp_path: Path
+):
+    owner = SimpleNamespace(pr_number=3017, owned_by=lambda session_id: True)
+    calls: list[tuple[list[str], float]] = []
+    now = [100.0]
+
+    monkeypatch.setattr(
+        ownership_resolution, "resolve_worktree", lambda *args, **kwargs: owner
+    )
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs["timeout"]))
+        now[0] = 102.0
+        return subprocess.CompletedProcess(command, 0, "feature-b\n", "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = ownership_resolution.resolve_current_pr(
+        str(tmp_path), session_id="session-a", deadline=101.0
+    )
+
+    assert calls == [
+        (["git", "-C", str(tmp_path), "rev-parse", "--abbrev-ref", "HEAD"], 1.0)
+    ]
+    assert result.unknown is True
+    assert result.stale_pr_number == 3017
+
+
+def test_current_pr_resolution_preserves_recorded_pr_for_detached_head(
+    monkeypatch, tmp_path: Path
+):
+    owner = SimpleNamespace(pr_number=3017, owned_by=lambda session_id: True)
+    monkeypatch.setattr(
+        ownership_resolution, "resolve_worktree", lambda *args, **kwargs: owner
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(command, 0, "HEAD\n", ""),
+    )
+    monkeypatch.setattr(
+        pr_state,
+        "_resolve_pr_entry_for_branch",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("detached HEAD must not be queried as a branch")
+        ),
+    )
+
+    result = ownership_resolution.resolve_current_pr(
+        str(tmp_path), session_id="session-a"
+    )
+
+    assert result.branch is None
+    assert result.pr_number is None
+    assert result.stale_pr_number == 3017
+
+
 def test_failed_fenced_rebind_is_reported_unknown_and_not_acquired(tmp_path: Path):
     worktree = str(tmp_path / "worktree")
     binding = CurrentPRResolution(
@@ -1014,6 +1073,19 @@ def test_bounded_repo_slug_accepts_enterprise_ssh_remote(monkeypatch):
     assert markers._bounded_repo_slug("/worktree", time.monotonic() + 10) == (
         "owner/repo"
     )
+
+
+def test_bounded_repo_slug_rejects_local_origin(monkeypatch):
+    monkeypatch.delenv("GH_REPO", raising=False)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "../mirror.git\n", ""
+        ),
+    )
+
+    assert markers._bounded_repo_slug("/worktree", time.monotonic() + 10) == ""
 
 
 def test_strict_binding_draft_state_overrides_stale_pr_snapshot(monkeypatch):

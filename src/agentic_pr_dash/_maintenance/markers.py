@@ -672,6 +672,9 @@ def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
     import subprocess  # noqa: PLC0415
     from urllib.parse import urlparse  # noqa: PLC0415
 
+    gh_repo_parts = [part for part in os.environ.get("GH_REPO", "").split("/") if part]
+    if len(gh_repo_parts) >= 2:
+        return "/".join(gh_repo_parts[-2:]).removesuffix(".git")
     if deadline is None:
         return _repo_slug(cwd)
     timeout = _remaining_timeout(deadline, 10)
@@ -687,10 +690,10 @@ def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
     url = result.stdout.strip() if result.returncode == 0 else ""
     if "://" in url:
         tail = urlparse(url).path.lstrip("/")
-    elif ":" in url:
+    elif url.startswith("git@") and ":" in url:
         tail = url.split(":", 1)[1].lstrip("/")
     else:
-        tail = url.lstrip("/")
+        return ""
     tail = tail.removesuffix(".git")
     return tail if tail.count("/") == 1 else ""
 
