@@ -559,7 +559,7 @@ def _write_arm_marker(
     # heartbeat would look owned on the claim side and unowned on the marker side.
     claim_result = _dual_write_ownership_claim(
         cwd, session_id, pid, pr_number, provenance, repo=repo, branch=branch,
-        pid_tier_only=True,
+        pid_tier_only=True, track_creation=True,
     )
     if not _checkout_matches_expected(
         cwd, expected_branch=expected_branch, expected_head_sha=expected_head_sha
@@ -721,7 +721,7 @@ def _release_dual_write_claim(
 def _dual_write_ownership_claim(
     cwd: str, session_id: str, pid: int | None, pr_number: int, provenance: str,
     *, work_found: bool = False, repo: str | None = None, branch: str | None = None,
-    pid_tier_only: bool = False,
+    pid_tier_only: bool = False, track_creation: bool = False,
 ) -> _ClaimWriteResult:
     """Record ownership as an agent-coordinator claim (BOU-2223).
 
@@ -747,10 +747,12 @@ def _dual_write_ownership_claim(
         from agentic_pr_dash import ownership, ownership_parity  # noqa: PLC0415
         if not ownership.dual_write_enabled():
             return _ClaimWriteResult(False)
-        before = ownership.snapshot()
-        previous = before.claim_for(
-            _repo_slug(cwd) if repo is None else repo, pr_number
-        ) if before.known() else None
+        before = ownership.snapshot() if track_creation else None
+        previous = (
+            before.claim_for(_repo_slug(cwd) if repo is None else repo, pr_number)
+            if before is not None and before.known()
+            else None
+        )
         outcome = ownership.record_ownership(
             lease_seconds=ownership.LEASE_PID_TIER_ONLY if pid_tier_only else None,
             repo=_repo_slug(cwd) if repo is None else repo,
@@ -775,7 +777,8 @@ def _dual_write_ownership_claim(
                 },
             )
         created = bool(
-            before.known()
+            before is not None
+            and before.known()
             and outcome.ok
             and outcome.claim_id
             and not (

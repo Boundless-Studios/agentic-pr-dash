@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
-from agentic_pr_dash import config, github_api, models, session_ledger
+from agentic_pr_dash import config, github_api, models, ownership, session_ledger
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash._maintenance import (
     _common,
@@ -682,6 +682,33 @@ def test_arm_restores_previous_marker_when_checkout_changes_after_write(
         expected_branch="feature-b", expected_head_sha="head-b",
     )
     assert marker_path.read_text(encoding="utf-8") == original
+
+
+def test_claim_heartbeat_does_not_replay_ownership_snapshot(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(ownership, "dual_write_enabled", lambda: True)
+    monkeypatch.setattr(
+        ownership,
+        "snapshot",
+        lambda: (_ for _ in ()).throw(AssertionError("heartbeat must not snapshot")),
+    )
+    monkeypatch.setattr(
+        ownership,
+        "record_ownership",
+        lambda **kwargs: SimpleNamespace(
+            ok=True,
+            claim_id="existing",
+            lease_epoch=7,
+            conflict_session_id=None,
+        ),
+    )
+
+    result = markers._dual_write_ownership_claim(
+        str(tmp_path), "session-a", 123, 3062, "armed",
+        repo="owner/repo", branch="feature-b", work_found=True,
+    )
+
+    assert result.ok is True
+    assert result.created is False
 
 
 def test_fenced_rebind_does_not_acquire_draft_replacement(tmp_path: Path):
