@@ -230,13 +230,34 @@ def _observe_finalization(args, policy, ledger, pr=None):
             "required CI status is unobservable; refusing to synthesize green"
         )
     github_api.clear_pr_batch_cache()
-    review_submissions = github_api.get_review_submissions(
-        pr.number,
-        pr.latest_commit_sha,
-        cwd,
-        excluded_authors={pr.author} if pr.author else set(),
-        strict=True,
-    )
+    excluded_authors = {pr.author} if pr.author else set()
+    if (
+        github_api.get_review_submissions_observation.__module__ == github_api.__name__
+        and github_api.get_review_submissions.__module__ == github_api.__name__
+    ):
+        review_observation = github_api.get_review_submissions_observation(
+            pr.number,
+            pr.latest_commit_sha,
+            cwd,
+            excluded_authors=excluded_authors,
+        )
+    else:
+        # Keep the historical adapter seam for downstream test/runtime wrappers
+        # that replace the list reader with a three-argument callable.
+        review_observation = github_api.ObservationReadResult.observed(
+            github_api.get_review_submissions(
+                pr.number,
+                pr.latest_commit_sha,
+                cwd,
+                excluded_authors=excluded_authors,
+                strict=True,
+            )
+        )
+    if not review_observation.observable:
+        raise RuntimeError(
+            review_observation.error
+            or f"review observation unavailable for PR #{pr.number}"
+        )
     threads = github_api.get_review_threads(pr.number, cwd, strict=True)
     deferrals = deferred_review.deferred_threads_for_pr(cwd, pr.number)
     return evaluate_pr_snapshot(
@@ -245,7 +266,7 @@ def _observe_finalization(args, policy, ledger, pr=None):
         ledger=ledger,
         threads=threads,
         deferrals=deferrals,
-        review_submissions=review_submissions,
+        review_observation=review_observation,
     )
 
 

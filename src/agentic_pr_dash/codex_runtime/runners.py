@@ -132,6 +132,16 @@ def run_shared_hook(
     the host's payload/env helpers.
     """
     normalized = normalize(payload)
+    raw_tool_name = payload.get("tool_name")
+    if raw_tool_name in {"exec_command", "functions.exec_command"}:
+        # Host normalizers translate Codex's shell tool to Claude's ``Bash``.
+        # Preserve the original runtime for downstream hooks that use session
+        # identity; otherwise an inherited Claude id can win after translation.
+        normalized = dict(normalized)
+        normalized["_gaia_hook_runtime"] = "codex"
+    elif raw_tool_name == "Bash":
+        normalized = dict(normalized)
+        normalized["_gaia_hook_runtime"] = "claude"
     apply_env(payload)
 
     if normalized.get("tool_name") != "Bash":

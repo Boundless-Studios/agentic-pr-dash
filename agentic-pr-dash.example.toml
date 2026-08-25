@@ -24,6 +24,19 @@ discovery_names = ["claude", "codex"]
 # Docker name prefix for a fleet hosted on this machine/configured Docker daemon.
 # When set, runner inventory is read locally without GitHub API credentials.
 # local_runner_container_prefix = "gha-runner-"
+# For a fleet on multiple Docker daemons, add one table per host. Each table
+# requires prefix; docker_host is optional (omit it for the ambient daemon), and
+# name is an optional display label. These tables override the legacy TOML key;
+# AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX overrides both TOML forms.
+# [[project.local_runner_hosts]]
+# name = "primary-ci"
+# docker_host = "ssh://ci@example.com"
+# prefix = "gha-runner-"
+#
+# [[project.local_runner_hosts]]
+# name = "reserve"
+# docker_host = "ssh://reserve@example.com"
+# prefix = "gha-runner-"
 
 # GitHub login whose open PRs the dashboard/maintenance tooling tracks.
 # Default "@me" is right when gh runs as the human operator. REQUIRED when

@@ -25,7 +25,12 @@ def _run_arm_hook(
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
     monkeypatch.setattr(os, "getppid", lambda: 4242)
     monkeypatch.delenv("CODEX_SESSION_ID", raising=False)
+    monkeypatch.delenv("CLAUDE_SESSION_ID", raising=False)
     monkeypatch.delenv("GAIA_SESSION_ID", raising=False)
+    monkeypatch.delenv("GAIA_SESSION_CLI", raising=False)
+    monkeypatch.delenv("GAIA_HOOK_RUNTIME", raising=False)
+    monkeypatch.delenv("GAIA_PROJECT_DIR", raising=False)
+    monkeypatch.delenv("CLAUDE_PROJECT_DIR", raising=False)
     monkeypatch.delenv("GAIA_PR_WATCH_AUTOLOOP", raising=False)
     monkeypatch.delenv("AGENTIC_PR_DASH_PR_WATCH_AUTOLOOP", raising=False)
     monkeypatch.delenv("WORKTREE_CONSOLE_CONFIG", raising=False)
@@ -127,6 +132,158 @@ def test_codex_session_id_beats_legacy_gaia_session_id(monkeypatch, tmp_path):
     )
 
     assert calls[0][calls[0].index("--session-id") + 1] == "codex-session"
+
+
+def test_codex_session_id_beats_inherited_claude_session_id(monkeypatch, tmp_path):
+    payload = {
+        "cwd": str(tmp_path),
+        "tool_name": "functions.exec_command",
+        "tool_input": {"cmd": "gh pr create --fill"},
+    }
+
+    calls = _run_arm_hook(
+        monkeypatch,
+        payload,
+        argv=["PostToolUse"],
+        env={
+            "CODEX_SESSION_ID": "codex-session",
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_SESSION_ID": "legacy-session",
+        },
+    )
+
+    assert calls[0][calls[0].index("--session-id") + 1] == "codex-session"
+
+
+def test_claude_session_id_beats_shared_gaia_session_id(monkeypatch, tmp_path):
+    """Claude's conversation id must not fall back to the shared launcher id."""
+    payload = {"cwd": str(tmp_path), "hook_event_name": "SessionStart"}
+
+    _run_arm_hook(
+        monkeypatch,
+        payload,
+        argv=["SessionStart"],
+        env={
+            "CLAUDE_SESSION_ID": "claude-conversation",
+            "GAIA_SESSION_ID": "shared-launcher-v7",
+            "GAIA_SESSION_CLI": "claude",
+        },
+    )
+
+    marker = run_arm_pr_watch.load_config(str(tmp_path)).session_marker_for(str(tmp_path))
+    assert marker.read_text(encoding="utf-8").strip() == "claude-conversation"
+
+
+def test_session_start_uses_project_dir_when_payload_omits_cwd(monkeypatch, tmp_path):
+    """A missing payload cwd must not redirect the marker to the hook process."""
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    hook_process_dir = tmp_path / "hook-process"
+    hook_process_dir.mkdir()
+    monkeypatch.chdir(hook_process_dir)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(project_dir))
+
+    _run_arm_hook(
+        monkeypatch,
+        {"hook_event_name": "SessionStart", "session_id": "session-in-project"},
+        argv=["SessionStart"],
+        env={"CLAUDE_PROJECT_DIR": str(project_dir)},
+    )
+
+    marker = run_arm_pr_watch.load_config(str(project_dir)).session_marker_for(str(project_dir))
+    assert marker.read_text(encoding="utf-8").strip() == "session-in-project"
+
+
+def test_session_start_prefers_explicit_project_dir_over_shared_process_checkout(
+    monkeypatch, tmp_path
+):
+    """Project-dir context wins when the hook runs from another checkout."""
+    shared_checkout = tmp_path / "shared-checkout"
+    shared_checkout.mkdir()
+    (shared_checkout / ".git").mkdir()
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+    monkeypatch.chdir(shared_checkout)
+
+    _run_arm_hook(
+        monkeypatch,
+        {"hook_event_name": "SessionStart"},
+        argv=["SessionStart"],
+        env={
+            "CODEX_SESSION_ID": "codex-session",
+            "GAIA_PROJECT_DIR": str(project_dir),
+            "GAIA_SESSION_CLI": "codex",
+        },
+    )
+
+    marker = run_arm_pr_watch.load_config(str(project_dir)).session_marker_for(str(project_dir))
+    assert marker.read_text(encoding="utf-8").strip() == "codex-session"
+    process_marker = run_arm_pr_watch.load_config(str(shared_checkout)).session_marker_for(
+        str(shared_checkout)
+    )
+    assert not process_marker.exists()
+
+
+def test_codex_payload_tool_identity_beats_inherited_claude_runtime(
+    monkeypatch, tmp_path
+):
+    """Codex payload identity wins over inherited Claude runtime hints."""
+    payload = {
+        "cwd": str(tmp_path),
+        "tool_name": "functions.exec_command",
+        "tool_input": {"cmd": "gh pr create --fill"},
+    }
+
+    assert _run_arm_hook(
+        monkeypatch,
+        payload,
+        argv=["PostToolUse"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_HOOK_RUNTIME": "claude",
+            "GAIA_SESSION_CLI": "claude",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+        },
+    ) == []
+
+
+def test_normalized_codex_runtime_marker_beats_bash_tool_name(
+    monkeypatch, tmp_path
+):
+    """The shared runner's runtime marker survives Bash normalization."""
+    _run_arm_hook(
+        monkeypatch,
+        {
+            "cwd": str(tmp_path),
+            "tool_name": "Bash",
+            "_gaia_hook_runtime": "codex",
+            "tool_input": {"command": "gh pr create --fill"},
+        },
+        argv=["PostToolUse"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+        },
+    )
+
+
+def test_codex_without_native_session_id_does_not_inherit_claude_id(
+    monkeypatch, tmp_path
+):
+    """Codex must leave ownership unbound when only a parent Claude id exists."""
+    _run_arm_hook(
+        monkeypatch,
+        {"hook_event_name": "SessionStart"},
+        argv=["SessionStart"],
+        env={
+            "CLAUDE_SESSION_ID": "inherited-claude-session",
+            "GAIA_SESSION_ID": "shared-launcher-id",
+            "GAIA_SESSION_CLI": "codex",
+        },
+    )
+
+    marker = run_arm_pr_watch.load_config(str(tmp_path)).session_marker_for(str(tmp_path))
+    assert not marker.exists()
 
 
 def test_pr_open_arms_without_autoloop_opt_in(monkeypatch, tmp_path):

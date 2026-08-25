@@ -59,14 +59,78 @@ def normalized_cwd(payload: dict) -> str:
     cwd = payload.get("cwd")
     if isinstance(cwd, str) and cwd:
         return os.path.abspath(cwd)
+    # SessionStart payloads from some hook hosts omit cwd. Project-dir values
+    # are supplied by the hook host and remain authoritative even when the
+    # hook process runs from a coordinator or shared-scripts checkout.
+    for env_name in ("CLAUDE_PROJECT_DIR", "GAIA_PROJECT_DIR"):
+        env_cwd = os.environ.get(env_name)
+        if env_cwd:
+            return os.path.abspath(env_cwd)
+    process_root = _git_worktree_root(os.getcwd())
+    if process_root is not None:
+        return process_root
     return os.getcwd()
+
+
+def _git_worktree_root(path: str) -> str | None:
+    candidate = Path(path).resolve()
+    for parent in (candidate, *candidate.parents):
+        if (parent / ".git").exists():
+            return str(parent)
+    return None
+
+
+def _hook_runtime(payload: dict) -> str:
+    """Return the hook host identity when the launcher exposes it."""
+    normalized_runtime = payload.get("_gaia_hook_runtime")
+    if normalized_runtime in {"claude", "codex"}:
+        return normalized_runtime
+
+    tool_name = payload.get("tool_name")
+    if tool_name in {"exec_command", "functions.exec_command"}:
+        return "codex"
+    if tool_name == "Bash":
+        return "claude"
+
+    for env_name in ("GAIA_HOOK_RUNTIME", "GAIA_SESSION_CLI"):
+        runtime = os.environ.get(env_name, "").strip().lower()
+        if runtime in {"claude", "codex"}:
+            return runtime
+    return ""
 
 
 def session_id_from_payload(payload: dict) -> str:
     raw = payload.get("session_id")
     if isinstance(raw, str) and raw:
         return raw
-    return os.environ.get("CODEX_SESSION_ID") or os.environ.get("GAIA_SESSION_ID") or ""
+    # Payload identity is authoritative. Native ids are runtime-scoped: a
+    # Codex hook must not inherit its parent Claude id, and neither runtime may
+    # claim a sibling via the shared launcher id when its native id is absent.
+    runtime = _hook_runtime(payload)
+    if runtime == "codex":
+        native_id = os.environ.get("CODEX_SESSION_ID", "")
+        if native_id:
+            return native_id
+        # Older Codex hosts only expose the Gaia launcher id. Preserve that
+        # compatibility fallback, but never use it when a Claude id leaked
+        # into the Codex environment: that would claim the parent session.
+        if os.environ.get("CLAUDE_SESSION_ID"):
+            return ""
+        return os.environ.get("GAIA_SESSION_ID", "")
+    if runtime == "claude":
+        return os.environ.get("CLAUDE_SESSION_ID") or os.environ.get(
+            "GAIA_SESSION_ID", ""
+        )
+    # A native Codex id is safe even when an older host does not expose its
+    # runtime name. Preserve the legacy launcher fallback only when no Claude
+    # id is present; an inherited Claude id is exactly the cross-runtime
+    # ownership collision this marker must avoid.
+    native_id = os.environ.get("CODEX_SESSION_ID", "")
+    if native_id:
+        return native_id
+    if os.environ.get("CLAUDE_SESSION_ID"):
+        return ""
+    return os.environ.get("GAIA_SESSION_ID", "")
 
 
 def _strip_optional_quotes(value: str) -> str:

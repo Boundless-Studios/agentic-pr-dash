@@ -207,6 +207,139 @@ def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:
     assert [h.docker_host for h in hosts] == ["ssh://ci", "ssh://wsl"]
 
 
+def test_configured_hosts_prefers_environment_prefix_over_multi_host_key(monkeypatch) -> None:
+    """The environment override selects the ambient daemon before TOML hosts."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": "gha-runner-", "docker_host": "ssh://ci", "name": "ci-box"},
+            ],
+        }
+
+    monkeypatch.setenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", "temporary-")
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    assert runner_monitor._configured_local_runner_hosts(None) == [
+        LocalRunnerHost(prefix="temporary-")
+    ]
+
+
+def test_malformed_configured_host_degrades_valid_fleet(monkeypatch) -> None:
+    """A malformed entry remains visible instead of making partial counts complete."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": "gha-runner-", "docker_host": "ssh://ci", "name": "ci-box"},
+                {"docker_host": "ssh://wsl", "name": "reserve"},
+            ],
+        }
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+
+    def run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
+        if _verb(cmd) == "ps":
+            return _completed(_container("gha-runner-1"))
+        return _completed(LISTENING)
+
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, run)
+
+    assert load is not None
+    assert load.online == 1
+    assert load.is_degraded
+    assert "reserve" in (load.error or "")
+    assert "prefix must be a non-empty string" in (load.error or "")
+
+
+def test_all_malformed_configured_hosts_return_configuration_failure(monkeypatch) -> None:
+    """Invalid local host configuration must not silently fall back to GitHub."""
+
+    class _Cfg:
+        extra = {"local_runner_hosts": [{"name": "reserve"}]}
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    load = runner_monitor._local_docker_runner_load(
+        runner_monitor._configured_local_runner_hosts(None), LABEL, None, lambda *_a: None
+    )
+
+    assert load is not None
+    assert load.is_degraded
+    assert "reserve" in (load.error or "")
+    assert "prefix must be a non-empty string" in (load.error or "")
+
+
+def test_non_list_configured_hosts_return_configuration_failure(monkeypatch) -> None:
+    """A table-shaped host setting must not silently fall back to GitHub."""
+
+    class _Cfg:
+        extra = {"local_runner_hosts": {"prefix": "gha-runner-"}}
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+    assert hosts[0].configuration_error == "must be a list of tables"
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "local_runner_hosts" in (load.error or "")
+
+
+def test_non_string_configured_host_prefix_returns_configuration_failure(monkeypatch) -> None:
+    """A typed-but-invalid prefix must remain visible as configuration error."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": ["gha-runner-"], "name": "list-prefix"},
+                {"prefix": 42, "name": "integer-prefix"},
+            ]
+        }
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+    assert all(
+        host.configuration_error == "prefix must be a non-empty string" for host in hosts
+    )
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "list-prefix" in (load.error or "")
+    assert "integer-prefix" in (load.error or "")
+
+
+def test_non_string_configured_docker_host_returns_configuration_failure(monkeypatch) -> None:
+    """A present non-string endpoint must not probe the ambient Docker daemon."""
+
+    class _Cfg:
+        extra = {
+            "local_runner_hosts": [
+                {"prefix": "gha-runner-", "docker_host": False, "name": "reserve"},
+            ]
+        }
+
+    monkeypatch.delenv("AGENTIC_PR_DASH_LOCAL_RUNNER_CONTAINER_PREFIX", raising=False)
+    monkeypatch.setattr(runner_monitor, "load_config", lambda *_a, **_k: _Cfg())
+    hosts = runner_monitor._configured_local_runner_hosts(None)
+
+    assert hosts[0].configuration_error == "docker_host must be a string"
+    load = runner_monitor._local_docker_runner_load(hosts, LABEL, None, lambda *_a: None)
+
+    assert load is not None
+    assert load.is_degraded
+    assert "reserve" in (load.error or "")
+    assert "docker_host must be a string" in (load.error or "")
+
+
 def test_configured_hosts_falls_back_to_legacy_prefix(monkeypatch) -> None:
     """Without the new key the ambient-daemon behaviour is unchanged."""
 
