@@ -124,9 +124,11 @@ def _probe_checkout_identity(worktree: str, timeout: float) -> list[str]:
 
 
 def _bounded_checkout_identity(
-    worktrees: list[str], *, deadline: float | None, probe=_probe_checkout_identity
+    worktrees: list[str], *, deadline: float | None, probe=None
 ) -> tuple[list[list[str]], bool]:
     """Collect checkout identities without crossing the shared stop deadline."""
+    if probe is None:
+        probe = _probe_checkout_identity
     identities: list[list[str]] = []
     for worktree in sorted(worktrees):
         remaining = 5.0 if deadline is None else deadline - _time.monotonic()
@@ -747,10 +749,15 @@ def _stop_gate_impl(args) -> int:
     # the count must still be visible at this surface, not merely at `check`'s.
     total_deferred = 0
     for worktree in owned:
-        local_sha = _local_head_sha(worktree)
+        live_identity, identity_complete = _bounded_checkout_identity(
+            [worktree], deadline=gate_deadline
+        )
+        if not identity_complete:
+            unknown_worktrees.append(worktree)
+            continue
+        _, live_branch, local_sha = live_identity[0]
         cached_entry = pr_head_cache.get(worktree)
         binding = current_pr_bindings.get(worktree)
-        live_branch = _current_branch(worktree)
         if (
             binding is not None
             and binding.resolved
