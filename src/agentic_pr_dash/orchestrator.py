@@ -1367,13 +1367,16 @@ class Orchestrator:
 
     async def _poll_loop(self) -> None:
         while True:
-            started = asyncio.get_running_loop().time()
             try:
                 await self.refresh_prs()
             except Exception as exc:
                 self.log(f"Poll error: {exc}", level="error")
-            elapsed = asyncio.get_running_loop().time() - started
-            await asyncio.sleep(max(0, POLL_INTERVAL_SECONDS - elapsed))
+            # Pace from completion, not from the start of the previous tick.
+            # A rate-limited refresh can itself exceed the nominal interval;
+            # subtracting that runtime produced a zero-second delay and turned
+            # the daemon into a permanent CPU/API retry loop exactly when
+            # GitHub needed it to back off.
+            await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def refresh_prs(self, force: bool = False) -> list[PRData]:
         """Refresh cached PR metadata and due review/CI observations.
