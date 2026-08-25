@@ -670,6 +670,7 @@ def _bounded_current_branch(cwd: str, deadline: float | None) -> str:
 def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
     """Resolve the local origin without an unbounded gh fallback."""
     import subprocess  # noqa: PLC0415
+    from urllib.parse import urlparse  # noqa: PLC0415
 
     if deadline is None:
         return _repo_slug(cwd)
@@ -684,7 +685,12 @@ def _bounded_repo_slug(cwd: str, deadline: float | None) -> str:
     except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError):
         return ""
     url = result.stdout.strip() if result.returncode == 0 else ""
-    tail = url.split("github.com", 1)[-1].lstrip(":/") if "github.com" in url else ""
+    if "://" in url:
+        tail = urlparse(url).path.lstrip("/")
+    elif ":" in url:
+        tail = url.split(":", 1)[1].lstrip("/")
+    else:
+        tail = url.lstrip("/")
     tail = tail.removesuffix(".git")
     return tail if tail.count("/") == 1 else ""
 

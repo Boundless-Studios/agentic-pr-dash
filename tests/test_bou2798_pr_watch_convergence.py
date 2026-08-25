@@ -14,6 +14,7 @@ from agentic_pr_dash._maintenance import (
     markers,
     ownership_resolution,
     pr_state,
+    stop_gate,
     worktree_check,
     worktrees,
 )
@@ -983,6 +984,35 @@ def test_revalidated_unknown_adopted_worktree_does_not_block_stop():
     )
     assert _unknown_binding_blocks_stop(
         "/armed-worktree", {"/armed-worktree": "armed"}
+    )
+
+
+def test_adopted_rebind_conflict_does_not_block_stop():
+    adopted = "/adopted-worktree"
+    armed = "/armed-worktree"
+    bindings = {
+        adopted: CurrentPRResolution(adopted, "feature-b", None, unknown=True),
+        armed: CurrentPRResolution(armed, "feature-c", None, unknown=True),
+    }
+
+    assert stop_gate._blocking_unknown_worktrees(
+        bindings,
+        [adopted, armed],
+        {adopted: "adopted", armed: "armed"},
+    ) == [armed]
+
+
+def test_bounded_repo_slug_accepts_enterprise_ssh_remote(monkeypatch):
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args[0], 0, "git@ghe.example:owner/repo.git\n", ""
+        ),
+    )
+
+    assert markers._bounded_repo_slug("/worktree", time.monotonic() + 10) == (
+        "owner/repo"
     )
 
 

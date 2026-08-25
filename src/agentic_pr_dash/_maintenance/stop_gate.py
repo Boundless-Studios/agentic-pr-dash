@@ -197,6 +197,25 @@ def _unknown_binding_blocks_stop(
     return provenance_for.get(worktree, _marker_provenance(worktree)) != "adopted"
 
 
+def _blocking_unknown_worktrees(
+    bindings: dict,
+    ownership_conflicts: list[str],
+    provenance_for: dict[str, str],
+) -> list[str]:
+    """Return unknown current bindings that belong to this stop gate."""
+    candidates = [
+        worktree for worktree, binding in bindings.items() if binding.unknown
+    ]
+    candidates.extend(
+        worktree for worktree in ownership_conflicts if worktree not in candidates
+    )
+    return [
+        worktree
+        for worktree in candidates
+        if _unknown_binding_blocks_stop(worktree, provenance_for)
+    ]
+
+
 def _revalidate_current_pr_binding(worktree: str, binding):
     """Fail closed when a prefetched binding no longer names the checkout."""
     if binding is None or not binding.resolved:
@@ -672,16 +691,8 @@ def _stop_gate_impl(args) -> int:
         for worktree, binding in current_pr_bindings.items()
         if binding.resolved
     }
-    current_unknown_worktrees = [
-        worktree
-        for worktree, binding in current_pr_bindings.items()
-        if binding.unknown
-        and _unknown_binding_blocks_stop(worktree, provenance_for)
-    ]
-    current_unknown_worktrees.extend(
-        worktree
-        for worktree in ownership_conflicts
-        if worktree not in current_unknown_worktrees
+    current_unknown_worktrees = _blocking_unknown_worktrees(
+        current_pr_bindings, ownership_conflicts, provenance_for
     )
     stale_current_pr_numbers = {
         binding.stale_pr_number
