@@ -264,8 +264,6 @@ def test_structured_dispatch_is_authoritative_over_raw_command(tmp_path: Path) -
         ("--disable", "responses_websockets"),
         ("--remote", "ws://localhost:4500"),
         ("--remote-auth-token-env", "CODEX_REMOTE_TOKEN"),
-        ("--image", "/private/image.png"),
-        ("-i", "/private/image.png"),
         ("-a", "never"),
     ],
 )
@@ -286,6 +284,26 @@ def test_structured_codex_dispatch_skips_value_taking_global_options(
 
     assert result.observation is not None
     assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("option", ["--image", "-i"])
+def test_structured_codex_dispatch_rejects_variadic_image_before_exec(
+    tmp_path: Path, option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", option, "/tmp/input.png", "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
 
 
 @pytest.mark.parametrize(

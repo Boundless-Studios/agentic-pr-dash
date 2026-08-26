@@ -572,6 +572,8 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
     index = 1
     while index < len(argv):
         token = argv[index]
+        if token in {"--image", "-i"} or token.startswith(("--image=", "-i=")):
+            return False
         if token in value_options:
             index += 2
             continue

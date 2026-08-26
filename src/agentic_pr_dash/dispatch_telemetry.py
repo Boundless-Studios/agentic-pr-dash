@@ -50,7 +50,7 @@ MAX_STRING_LENGTH = 1024
 
 _PROVIDER_NAMES = {
     DispatchProvider.CODEX: "openai",
-    DispatchProvider.OPENCODE: "opencode",
+    DispatchProvider.OPENCODE: None,
     DispatchProvider.CLAUDE: "anthropic",
 }
 _CODEX_VALUE_OPTIONS = {
@@ -168,9 +168,6 @@ class DispatchTelemetry:
         attributes: dict[str, OtelAttribute] = {
             "process.command": _executable_name(self.argv[0]),
             "process.command_args": self.sanitized_argv,
-            "gen_ai.provider.name": (
-                self.gen_ai_provider_name or _PROVIDER_NAMES[self.provider]
-            ),
             "gaia.dispatch.source": self.source.value,
             "gaia.dispatch.id": self.dispatch_id,
             "gaia.dispatch.task_type": self.task_type,
@@ -179,6 +176,9 @@ class DispatchTelemetry:
             "gaia.dispatch.ignore_user_config": self.ignore_user_config,
             "gaia.dispatch.resolution_source": self.resolution_source.value,
         }
+        provider_name = self.gen_ai_provider_name or _PROVIDER_NAMES[self.provider]
+        if provider_name:
+            attributes["gen_ai.provider.name"] = provider_name
         if self.parse_status is DispatchParseStatus.STRUCTURED:
             attributes["process.args_count"] = len(self.argv)
         if Path(self.argv[0]).is_absolute():
@@ -261,7 +261,7 @@ class DispatchTelemetry:
 @dataclass(frozen=True, slots=True)
 class _ParsedArgv:
     sanitized_argv: tuple[str, ...]
-    gen_ai_provider_name: str
+    gen_ai_provider_name: str | None
     model: str | None
     profile: str | None
     reasoning_effort: str | None
@@ -331,7 +331,7 @@ def _sanitize_and_resolve(
             break
         short_option = token[:2]
         if short_option in attached_short_options and len(token) > 2:
-            attached_value = token[2:]
+            attached_value = token[2:].removeprefix("=")
             safe_value = (
                 "<redacted:option>"
                 if provider is DispatchProvider.OPENCODE and short_option == "-s"
@@ -467,6 +467,8 @@ def _sanitize_and_resolve(
     bounded = sanitized[:MAX_ARG_COUNT]
     if len(sanitized) > MAX_ARG_COUNT:
         bounded.append(f"<truncated:{len(sanitized) - MAX_ARG_COUNT}-args>")
+    if provider is DispatchProvider.OPENCODE and model and "/" in model:
+        gen_ai_provider_name = _truncate(model.split("/", 1)[0])
     return _ParsedArgv(
         tuple(bounded),
         gen_ai_provider_name,
@@ -509,10 +511,9 @@ def _safe_option_value(option: str, value: str) -> str:
         return "<redacted:option>"
     if option not in {"--config", "-c"}:
         return value
-    key, _separator, _config_value = value.partition("=")
     assignment = _safe_config_assignment(value)
     if assignment is None:
-        return f"{key.strip()}=<redacted:config>"
+        return "<redacted:config>"
     normalized_key, parsed_value = assignment
     return f"{normalized_key}={parsed_value}"
 
@@ -567,7 +568,7 @@ def emit_dispatch_span(
     if effective_model:
         attributes["gaia.dispatch.effective_model"] = _truncate(effective_model)
     if error_type:
-        attributes["error.type"] = error_type
+        attributes["error.type"] = _truncate(error_type)
     dispatch_tracer = tracer or trace.get_tracer("agentic_pr_dash.dispatch")
     span = dispatch_tracer.start_span(
         "agent.dispatch",

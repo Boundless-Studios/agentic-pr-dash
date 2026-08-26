@@ -145,6 +145,34 @@ def test_toml_config_model_is_normalized() -> None:
     assert telemetry.requested_model == "gpt-5"
 
 
+def test_malformed_detached_config_value_is_fully_redacted() -> None:
+    secret = "PRIVATE_SENTINEL"
+    telemetry = _telemetry("codex", "exec", "-c", secret, "prompt")
+
+    serialized = json.dumps(telemetry.otel_attributes())
+
+    assert secret not in serialized
+    assert telemetry.sanitized_argv[3] == "<redacted:config>"
+
+
+@pytest.mark.parametrize(
+    ("option", "attribute", "expected"),
+    [
+        ("-m=gpt-5", "requested_model", "gpt-5"),
+        ("-s=workspace-write", "sandbox_mode", "workspace-write"),
+        ("-p=maintenance", "requested_profile", "maintenance"),
+        ("-C=/repo", "cwd", "/repo"),
+        ("-c=model=gpt-5", "requested_model", "gpt-5"),
+    ],
+)
+def test_short_equals_option_values_are_resolved_without_separator(
+    option: str, attribute: str, expected: str
+) -> None:
+    telemetry = _telemetry("codex", "exec", option, "prompt")
+
+    assert getattr(telemetry, attribute) == expected
+
+
 def test_toml_config_key_whitespace_and_comments_are_normalized() -> None:
     secret = "PRIVATE_SENTINEL"
     telemetry = _telemetry(
@@ -238,7 +266,7 @@ def test_sensitive_config_and_prompt_values_never_serialize() -> None:
     serialized = json.dumps(telemetry.otel_attributes())
 
     assert secret not in serialized
-    assert "openai_api_key=<redacted:config>" in serialized
+    assert "<redacted:config>" in serialized
     assert "<redacted:payload>" in serialized
 
 
@@ -407,6 +435,38 @@ def test_opencode_session_option_is_redacted_without_codex_sandbox_semantics() -
     )
 
 
+@pytest.mark.parametrize(
+    ("model", "expected_provider"),
+    [("openai/gpt-5", "openai"), ("anthropic/claude-sonnet", "anthropic")],
+)
+def test_opencode_provider_is_derived_from_qualified_model(
+    model: str, expected_provider: str
+) -> None:
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.OPENCODE,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("opencode", "run", "--model", model, "prompt"),
+        cwd="/repo/worktree",
+        task_type="review",
+        session_id="session-1",
+    )
+
+    assert telemetry.otel_attributes()["gen_ai.provider.name"] == expected_provider
+
+
+def test_opencode_omits_unknown_underlying_provider() -> None:
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.OPENCODE,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("opencode", "run", "--model", "custom-model", "prompt"),
+        cwd="/repo/worktree",
+        task_type="review",
+        session_id="session-1",
+    )
+
+    assert "gen_ai.provider.name" not in telemetry.otel_attributes()
+
+
 @pytest.mark.parametrize("option", ["-i/private/image.png", "-o/private/result.txt"])
 def test_attached_file_option_values_are_redacted(option: str) -> None:
     telemetry = _telemetry("codex", "exec", option, "prompt")
@@ -516,6 +576,25 @@ def test_completed_dispatch_emits_one_otel_span() -> None:
     assert spans[0].attributes["gaia.dispatch.effective_model"] == "gpt-5.6-sol"
     assert spans[0].start_time == 1_000_000_000
     assert spans[0].end_time == 2_000_000_000
+
+
+def test_completed_dispatch_bounds_generated_error_type() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry = _telemetry("codex", "exec", "prompt")
+
+    emit_dispatch_span(
+        telemetry,
+        outcome=DispatchOutcome.FAILURE,
+        effective_model=None,
+        error_type="process.exit_code." + "9" * (MAX_STRING_LENGTH + 10),
+        tracer=provider.get_tracer("test"),
+    )
+
+    error_type = exporter.get_finished_spans()[0].attributes["error.type"]
+    assert len(error_type) <= MAX_STRING_LENGTH
+    assert error_type.endswith("<truncated>")
 
 
 def test_relative_executable_omits_path_and_all_string_attributes_are_bounded() -> None:
