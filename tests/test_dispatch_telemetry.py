@@ -112,6 +112,13 @@ def test_config_model_has_distinct_resolution_source() -> None:
     ] == "config_override"
 
 
+def test_profile_is_preserved_as_resolution_source_for_adapter_model() -> None:
+    telemetry = _telemetry("codex", "exec", "--profile", "maintenance", "prompt")
+
+    assert telemetry.requested_model is None
+    assert telemetry.resolution_source is DispatchResolutionSource.PROFILE
+
+
 def test_missing_option_value_and_double_dash_do_not_change_routing() -> None:
     missing = _telemetry(
         "codex", "exec", "--model", "--profile", "maintenance", "prompt"
@@ -296,3 +303,24 @@ def test_dispatch_projects_to_existing_redacted_observation() -> None:
     assert observation.classification_framework == "coding-agent/v1"
     serialized = json.dumps(observation.to_persisted_dict())
     assert "private prompt" not in serialized
+
+
+def test_compatibility_projection_bounds_string_fields() -> None:
+    oversized = "x" * (MAX_STRING_LENGTH + 20)
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("codex", "exec", "prompt"),
+        cwd=oversized,
+        task_type=oversized,
+        session_id=oversized,
+    )
+
+    observation = telemetry.to_dispatch_observation(
+        outcome=DispatchOutcome.SUCCESS,
+        effective_model=oversized,
+    )
+
+    persisted = observation.to_persisted_dict()
+    for key in ("session_id", "worktree_root", "task_type", "resolved_model"):
+        assert len(persisted[key]) <= MAX_STRING_LENGTH

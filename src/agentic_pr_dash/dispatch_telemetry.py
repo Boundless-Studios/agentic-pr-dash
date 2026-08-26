@@ -184,11 +184,7 @@ class DispatchTelemetry:
             approval_mode=None,
             ignore_user_config=False,
             start_time_unix_nano=None,
-            resolution_source=(
-                DispatchResolutionSource.EXPLICIT_FLAG
-                if observation.requested_model
-                else DispatchResolutionSource.UNAVAILABLE
-            ),
+            resolution_source=DispatchResolutionSource.UNAVAILABLE,
             parse_status=parse_status,
             observed_at=observation.observed_at,
         )
@@ -205,12 +201,18 @@ class DispatchTelemetry:
         return DispatchObservation(
             provider=self.provider,
             source=self.source,
-            session_id=self.session_id,
-            worktree_root=self.cwd,
+            session_id=_truncate(self.session_id),
+            worktree_root=_truncate(self.cwd),
             command="<redacted>",
-            task_type=self.task_type,
-            requested_model=self.requested_model,
-            resolved_model=effective_model or self.requested_model,
+            task_type=_truncate(self.task_type),
+            requested_model=(
+                _truncate(self.requested_model) if self.requested_model else None
+            ),
+            resolved_model=(
+                _truncate(effective_model or self.requested_model)
+                if effective_model or self.requested_model
+                else None
+            ),
             outcome=outcome,
             review_verdict=review_verdict,
             classification_authority=ClassificationAuthority.DECLARED,
@@ -270,6 +272,8 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
             elif option == "--profile":
                 profile = _truncate(attached_value)
+                if resolution_source is DispatchResolutionSource.UNAVAILABLE:
+                    resolution_source = DispatchResolutionSource.PROFILE
             elif option == "--sandbox":
                 sandbox_mode = _truncate(attached_value)
             elif option == "--ask-for-approval":
@@ -299,6 +303,8 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
             elif token in {"--profile", "-p"}:
                 profile = _truncate(value)
+                if resolution_source is DispatchResolutionSource.UNAVAILABLE:
+                    resolution_source = DispatchResolutionSource.PROFILE
             elif token == "--sandbox":
                 sandbox_mode = _truncate(value)
             elif token == "--ask-for-approval":

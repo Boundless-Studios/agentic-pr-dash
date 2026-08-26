@@ -309,6 +309,26 @@ def test_legacy_dispatch_emits_typed_parse_status(
     assert emitted[0][0].parse_status.value == "legacy_parsed"
 
 
+def test_legacy_config_model_does_not_claim_explicit_flag_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+
+    run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="codex exec -c model=gpt-5.6-sol review",
+        )
+    )
+
+    assert emitted[0][0].resolution_source.value == "unavailable"
+
+
 def test_unavailable_span_has_low_cardinality_error_type(
     tmp_path: Path, monkeypatch
 ) -> None:
