@@ -507,6 +507,13 @@ async def test_dispatch_retries_after_coordinator_defers_same_facts(
     from agentic_pr_dash.coordinator import DispatchDecision
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
+    class Clock:
+        current = OBSERVED_AT
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    clock = Clock()
     store = LifecycleStore(tmp_path / "state")
     store.enqueue(_intent(pr_number=7))
     monkeypatch.setattr(
@@ -554,9 +561,15 @@ async def test_dispatch_retries_after_coordinator_defers_same_facts(
         policy=_policy(),
         ledger=_ledger(),
         orchestrator=dispatch,
+        now=clock,
     )
 
     await workflow.drain()
+    await workflow.drain()
+    assert dispatch.calls == 0
+    assert decision_calls == 1
+
+    clock.current += timedelta(seconds=30)
     await workflow.drain()
 
     assert dispatch.calls == 1
@@ -570,15 +583,16 @@ async def test_old_intent_head_drift_is_not_promoted_or_observed(
     store = LifecycleStore(tmp_path / "state")
     old_intent = _intent(pr_number=7, head_sha="b" * 40)
     store.enqueue(old_intent)
-    calls = {"batch": 0}
-    monkeypatch.setattr(
-        github_api,
-        "resolve_pr",
-        lambda number, fields, cwd=None, force=False: {
+    calls = {"batch": 0, "resolve": 0}
+
+    def resolve(number, fields, cwd=None, force=False):
+        calls["resolve"] += 1
+        return {
             **_pr_payload(),
             "headRefOid": HEAD,
-        },
-    )
+        }
+
+    monkeypatch.setattr(github_api, "resolve_pr", resolve)
 
     def collect(*args, **kwargs):
         calls["batch"] += 1
@@ -587,13 +601,22 @@ async def test_old_intent_head_drift_is_not_promoted_or_observed(
     monkeypatch.setattr(github_api, "collect_pr_maintenance_snapshots", collect)
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
-    workflow = LifecycleWorkflow(store, policy=_policy(), ledger=_ledger())
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+    )
     result = await workflow.drain()
+    repeated = await workflow.drain()
 
     record = store.list_intents()[0]
     assert result.deferred == 1
+    assert repeated.examined == 0
     assert record.state is IntentLifecycleStateV1.PENDING
     assert record.canonical_key is None
+    assert record.next_attempt_at == OBSERVED_AT + timedelta(seconds=30)
+    assert calls["resolve"] == 1
     assert calls["batch"] == 0
     drift = store.read_snapshot(
         MaintenanceTargetV1.exact(
@@ -875,6 +898,81 @@ async def test_drain_is_bounded_by_batch_size(
 
 
 @pytest.mark.asyncio
+async def test_promoted_batch_retry_backoff_allows_later_intent_to_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    ordered = [
+        intent.model_copy(update={"pr_number": 7 + index})
+        for index, intent in enumerate(_ordered_intents(count=3))
+    ]
+    store = LifecycleStore(tmp_path / "state")
+    for intent in ordered:
+        store.enqueue(intent)
+
+    monkeypatch.setattr(
+        github_api,
+        "resolve_pr",
+        lambda number, fields, cwd=None, force=False: {
+            **_pr_payload(),
+            "number": number,
+        },
+    )
+
+    def collect(owner, repo, pr_numbers, cwd=None):
+        baseline = _batch().observed[7]
+        return github_api.PrMaintenanceSnapshotBatch(
+            tuple(pr_numbers),
+            {
+                number: baseline.__class__(
+                    pr_number=number,
+                    head_sha=baseline.head_sha,
+                    head_committed_at=baseline.head_committed_at,
+                    ci_checks=baseline.ci_checks,
+                    required_pending=baseline.required_pending,
+                    unresolved_threads=baseline.unresolved_threads,
+                    merge_state=baseline.merge_state,
+                    mergeable=baseline.mergeable,
+                    review_decision=baseline.review_decision,
+                )
+                for number in pr_numbers
+            },
+            (),
+        )
+
+    monkeypatch.setattr(github_api, "collect_pr_maintenance_snapshots", collect)
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+        batch_size=2,
+    )
+
+    first = await workflow.drain()
+    second = await workflow.drain()
+
+    records = {record.intent.pushed_ref: record for record in store.list_intents()}
+    assert first.progressed == 2
+    assert second.progressed == 1
+    assert all(
+        records[intent.pushed_ref].state is IntentLifecycleStateV1.PROMOTED
+        for intent in ordered
+    )
+    assert all(
+        records[intent.pushed_ref].next_attempt_at
+        == OBSERVED_AT + timedelta(seconds=30)
+        for intent in ordered
+    )
+
+
+@pytest.mark.asyncio
 async def test_no_pr_retry_eligibility_is_durable_and_does_not_starve_later_intent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -939,6 +1037,13 @@ async def test_no_pr_retry_eligibility_is_durable_and_does_not_starve_later_inte
 async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
+    class Clock:
+        current = OBSERVED_AT
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    clock = Clock()
     first, later = _ordered_intents()
     store = LifecycleStore(tmp_path / "state")
     store.enqueue(first)
@@ -957,11 +1062,12 @@ async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
         store,
         policy=_policy(),
         ledger=_ledger(),
-        now=lambda: OBSERVED_AT,
+        now=clock,
         batch_size=1,
         stabilization_interval=timedelta(0),
     )
     await workflow.drain()
+    clock.current += timedelta(seconds=30)
     await workflow.drain()
 
     first_record = store.list_intents()[0]
@@ -972,7 +1078,7 @@ async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
         store,
         policy=_policy(),
         ledger=_ledger(),
-        now=lambda: OBSERVED_AT,
+        now=clock,
         batch_size=1,
     )
     result = await restarted.drain()

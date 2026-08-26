@@ -253,13 +253,7 @@ class LifecycleWorkflow:
             self._persist_unavailable(record, resolved.number)
             return "deferred"
         if resolved.head_sha != record.intent.head_sha:
-            drift_key = MaintenanceKeyV1(
-                repository=resolved.repository,
-                pr_number=resolved.number,
-                head_sha=record.intent.head_sha,
-                workflow_type=record.intent.workflow_type,
-            )
-            self.store.write_snapshot(_head_drift_snapshot(drift_key, self._now()))
+            self._persist_unavailable(record, resolved.number)
             return "deferred"
         return None
 
@@ -305,7 +299,11 @@ class LifecycleWorkflow:
         if snapshot.settled:
             self.store.settle_intent(record.intent, key)
         else:
-            self.store.promote_intent(record.intent, key)
+            self.store.promote_intent(
+                record.intent,
+                key,
+                next_attempt_at=self._now() + self.retry_interval,
+            )
         if (
             self.orchestrator is not None
             and _actionable(snapshot)

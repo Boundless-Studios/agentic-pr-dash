@@ -270,10 +270,10 @@ class LifecycleStore:
                     ingress_id=ingress_identity_hash(intent), intent=intent, state=state
                 )
                 status = EnqueueStatusV1.ENQUEUED
-            elif existing.state in {
-                IntentLifecycleStateV1.NO_PR,
-                IntentLifecycleStateV1.SETTLED,
-            }:
+            elif existing.state is IntentLifecycleStateV1.SETTLED or (
+                existing.state is IntentLifecycleStateV1.NO_PR
+                and intent.pr_number is not None
+            ):
                 state = (
                     IntentLifecycleStateV1.NO_PR
                     if intent.pr_number is None
@@ -301,6 +301,8 @@ class LifecycleStore:
         self,
         target: MaintenanceIntentV1 | MaintenanceTargetV1,
         key: MaintenanceKeyV1,
+        *,
+        next_attempt_at: datetime | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Link an ingress intent to the exact canonical job snapshot key."""
 
@@ -328,6 +330,7 @@ class LifecycleStore:
                 intent=promoted_intent,
                 state=IntentLifecycleStateV1.PROMOTED,
                 canonical_key=key,
+                next_attempt_at=next_attempt_at,
             )
             _write_json(path, record.model_dump(mode="json"))
         return record

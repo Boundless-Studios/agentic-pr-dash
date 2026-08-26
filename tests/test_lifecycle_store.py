@@ -264,7 +264,11 @@ def test_same_head_in_different_workflows_is_isolated(tmp_path: Path) -> None:
 
 def test_no_pr_intent_reactivates_when_pr_is_known(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "state")
-    first = enqueue_maintenance(_intent(pr_number=None), store=store)
+    unresolved = _intent(pr_number=None)
+    first = enqueue_maintenance(unresolved, store=store)
+    store.mark_no_pr(
+        unresolved, next_attempt_at=OBSERVED_AT + timedelta(minutes=5)
+    )
     second = enqueue_maintenance(
         _intent(
             pr_number=42,
@@ -279,6 +283,30 @@ def test_no_pr_intent_reactivates_when_pr_is_known(tmp_path: Path) -> None:
     assert second.intent.pr_number == 42
     assert second.intent.reason == "PR was created"
     assert second.state is IntentLifecycleStateV1.PENDING
+    assert store.list_intents()[0].next_attempt_at is None
+
+
+def test_duplicate_unresolved_enqueue_preserves_retry_backoff(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    enqueue_maintenance(unresolved, store=store)
+    retry_at = OBSERVED_AT + timedelta(minutes=5)
+    store.mark_no_pr(unresolved, next_attempt_at=retry_at)
+
+    duplicate = enqueue_maintenance(
+        unresolved.model_copy(
+            update={
+                "reason": "duplicate push",
+                "requested_at": OBSERVED_AT + timedelta(minutes=1),
+            }
+        ),
+        store=store,
+    )
+
+    record = store.list_intents()[0]
+    assert duplicate.status is EnqueueStatusV1.DUPLICATE
+    assert record.next_attempt_at == retry_at
+    assert record.intent.reason == unresolved.reason
 
 
 def test_list_intents_filters_typed_states_without_deleting_records(
