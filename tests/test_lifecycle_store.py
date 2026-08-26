@@ -314,6 +314,22 @@ def test_snapshot_is_fresh_at_ninety_seconds_and_stale_afterward(
     assert stale.status is SnapshotReadStatusV1.STALE
 
 
+@pytest.mark.parametrize(
+    "max_age_seconds",
+    [-1.0, math.nan, math.inf, -math.inf],
+)
+def test_snapshot_readers_reject_invalid_max_age(
+    tmp_path: Path, max_age_seconds: float
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    target = MaintenanceTargetV1(key=_key())
+
+    with pytest.raises(ValueError):
+        store.read_snapshot(target, max_age_seconds=max_age_seconds)
+    with pytest.raises(ValueError):
+        read_maintenance_snapshot(target, store=store, max_age_seconds=max_age_seconds)
+
+
 def test_corrupt_snapshot_returns_invalid(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "state")
     snapshot = _snapshot()
@@ -479,6 +495,64 @@ def test_unresolved_target_rejects_tampered_promoted_ingress_id(
         SnapshotReadStatusV1.MISSING,
     }
     assert result.snapshot is None
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "promote", "mark_no_pr"])
+def test_mutations_reject_tampered_intent_record_ingress_id(
+    tmp_path: Path, operation: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id="tampered-ingress-id",
+        intent=intent,
+        state=IntentLifecycleStateV1.PENDING,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        if operation == "enqueue":
+            enqueue_maintenance(intent, store=store)
+        elif operation == "promote":
+            store.promote_intent(intent, _key(head_sha=intent.head_sha))
+        else:
+            mark_maintenance_intent_no_pr(intent, store=store)
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "promote", "mark_no_pr"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "Other/Repo"),
+        ("pushed_ref", "refs/heads/other"),
+        ("head_sha", "b" * 40),
+        ("workflow_type", "other-workflow"),
+    ],
+)
+def test_mutations_reject_embedded_intent_identity_mismatch(
+    tmp_path: Path, operation: str, field: str, value: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    intent_data = intent.model_dump()
+    intent_data[field] = value
+    corrupted_intent = MaintenanceIntentV1(**intent_data)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(intent),
+        intent=corrupted_intent,
+        state=IntentLifecycleStateV1.PENDING,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        if operation == "enqueue":
+            enqueue_maintenance(intent, store=store)
+        elif operation == "promote":
+            store.promote_intent(intent, _key(head_sha=intent.head_sha))
+        else:
+            mark_maintenance_intent_no_pr(intent, store=store)
 
 
 @pytest.mark.parametrize(

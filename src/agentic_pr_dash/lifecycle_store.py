@@ -200,12 +200,26 @@ class LifecycleStore:
         except (ValidationError, TypeError) as exc:
             raise ValueError("invalid lifecycle intent record") from exc
 
+    def _load_validated_intent(
+        self, intent: MaintenanceIntentV1
+    ) -> MaintenanceIntentRecordV1 | None:
+        record = self._load_intent(intent)
+        if record is None:
+            return None
+        if (
+            record.ingress_id != ingress_identity_hash(intent)
+            or record.ingress_id != ingress_identity_hash(record.intent)
+            or not _same_ingress_identity(intent, record.intent)
+        ):
+            raise ValueError("invalid lifecycle intent record")
+        return record
+
     def enqueue(self, intent: MaintenanceIntentV1) -> EnqueueResultV1:
         """Enqueue an intent, deduplicating active records and reviving no-PR records."""
 
         path = self.intent_path(intent)
         with self._transaction_lock():
-            existing = self._load_intent(intent)
+            existing = self._load_validated_intent(intent)
             if existing is None:
                 state = (
                     IntentLifecycleStateV1.NO_PR
@@ -258,7 +272,7 @@ class LifecycleStore:
             )
         path = self.intent_path(intent)
         with self._transaction_lock():
-            record = self._load_intent(intent)
+            record = self._load_validated_intent(intent)
             if record is None:
                 raise KeyError("maintenance intent is not enqueued")
             if record.intent.pr_number not in (None, key.pr_number):
@@ -287,7 +301,7 @@ class LifecycleStore:
         )
         path = self.intent_path(intent)
         with self._transaction_lock():
-            existing = self._load_intent(intent)
+            existing = self._load_validated_intent(intent)
             if (
                 existing is not None
                 and existing.state is IntentLifecycleStateV1.PROMOTED
@@ -333,8 +347,8 @@ class LifecycleStore:
     ) -> MaintenanceSnapshotReadResultV1:
         """Read and validate an exact snapshot, classifying freshness."""
 
-        if max_age_seconds < 0:
-            raise ValueError("max_age_seconds must not be negative")
+        if not math.isfinite(max_age_seconds) or max_age_seconds < 0:
+            raise ValueError("max_age_seconds must be finite and nonnegative")
         try:
             expected = target.exact_key or self._promoted_key(target)
         except (OSError, ValueError):
