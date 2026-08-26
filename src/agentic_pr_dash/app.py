@@ -699,6 +699,7 @@ def _selected_worktree_cleanup_reason(
 
 
 def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[WorktreeCard], int, int]:
+    ownership_cache_generation = _dashboard_context_generation
     worktrees = discover_worktrees()
     main_repo_root = get_main_repo_root()
     active_agents_by_path = discover_active_agents([wt["path"] for wt in worktrees])
@@ -750,6 +751,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 _runtime_session_for_worktree(worktree["path"], runtime_summary),
                 main_repo_root=main_repo_root,
                 ownership_snapshot=ownership_snapshot,
+                ownership_cache_generation=ownership_cache_generation,
             )
         )
 
@@ -784,6 +786,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 session_worktree_path=resolved_worktree_path if branch_session else None,
                 main_repo_root=main_repo_root,
                 ownership_snapshot=ownership_snapshot,
+                ownership_cache_generation=ownership_cache_generation,
             )
         )
 
@@ -1047,9 +1050,12 @@ def _cached_ownership_for_card(
     repo_cwd: str,
     *,
     ownership_snapshot=None,
+    ownership_cache_generation: int | None = None,
 ) -> dict:
     """Share slow claim/event-store reads across dashboard view variants."""
     key = (worktree_path, pr_number, repo_cwd)
+    if ownership_cache_generation is None:
+        ownership_cache_generation = _dashboard_context_generation
     now = time.monotonic()
     with _ownership_card_cache_lock:
         expired = [
@@ -1062,14 +1068,16 @@ def _cached_ownership_for_card(
         cached = _ownership_card_cache.get(key)
         if cached and now - cached[0] <= _OWNERSHIP_CACHE_TTL_SECONDS:
             return cached[1]
-        ownership = _ownership_for_card(
-            worktree_path=worktree_path,
-            pr_number=pr_number,
-            repo_cwd=repo_cwd,
-            ownership_snapshot=ownership_snapshot,
-        )
-        _ownership_card_cache[key] = (time.monotonic(), ownership)
-        return ownership
+    ownership = _ownership_for_card(
+        worktree_path=worktree_path,
+        pr_number=pr_number,
+        repo_cwd=repo_cwd,
+        ownership_snapshot=ownership_snapshot,
+    )
+    with _ownership_card_cache_lock:
+        if ownership_cache_generation == _dashboard_context_generation:
+            _ownership_card_cache[key] = (time.monotonic(), ownership)
+    return ownership
 
 
 def _runtime_card_fields(
@@ -1113,6 +1121,7 @@ def _build_card_for_worktree(
     *,
     main_repo_root: str | None = None,
     ownership_snapshot=None,
+    ownership_cache_generation: int | None = None,
 ) -> WorktreeCard:
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
@@ -1160,6 +1169,7 @@ def _build_card_for_worktree(
         pr_number=pr.number if pr else None,
         repo_cwd=root,
         ownership_snapshot=ownership_snapshot,
+        ownership_cache_generation=ownership_cache_generation,
     )
 
     return WorktreeCard(
@@ -1221,6 +1231,7 @@ def _build_unassigned_pr_card(
     session_worktree_path: str | None = None,
     main_repo_root: str | None = None,
     ownership_snapshot=None,
+    ownership_cache_generation: int | None = None,
 ) -> WorktreeCard:
     # When a live branch-matched session attributes this PR to a worktree
     # (session_worktree_path), synthesize an agent from it so a PR worked from a
@@ -1268,6 +1279,7 @@ def _build_unassigned_pr_card(
         pr_number=pr.number,
         repo_cwd=main_repo_root or get_main_repo_root(),
         ownership_snapshot=ownership_snapshot,
+        ownership_cache_generation=ownership_cache_generation,
     )
 
     return WorktreeCard(

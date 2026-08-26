@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from unittest.mock import AsyncMock
 
 from agentic_pr_dash import app
@@ -65,6 +66,63 @@ def test_invalidation_clears_cached_card_details():
     app._invalidate_dashboard_context()
 
     assert app._ownership_card_cache == {}
+
+
+def test_invalidated_card_build_cannot_repopulate_ownership_cache(monkeypatch):
+    build_generation = app._dashboard_context_generation
+    monkeypatch.setattr(
+        app,
+        "_ownership_for_card",
+        lambda **_kwargs: {"owner_session_id": "stale"},
+    )
+
+    app._invalidate_dashboard_context()
+    ownership = app._cached_ownership_for_card(
+        worktree_path="/worktree",
+        pr_number=182,
+        repo_cwd="/repo",
+        ownership_cache_generation=build_generation,
+    )
+
+    assert ownership == {"owner_session_id": "stale"}
+    assert app._ownership_card_cache == {}
+
+
+def test_card_cache_miss_does_not_block_invalidation(monkeypatch):
+    load_started = threading.Event()
+    release_load = threading.Event()
+    invalidation_finished = threading.Event()
+
+    def slow_load(**_kwargs):
+        load_started.set()
+        assert release_load.wait(timeout=2)
+        return {"owner_session_id": "loaded"}
+
+    monkeypatch.setattr(app, "_ownership_for_card", slow_load)
+    worker = threading.Thread(
+        target=app._cached_ownership_for_card,
+        kwargs={
+            "worktree_path": "/worktree",
+            "pr_number": 182,
+            "repo_cwd": "/repo",
+        },
+    )
+    worker.start()
+    assert load_started.wait(timeout=2)
+
+    invalidator = threading.Thread(
+        target=lambda: (app._invalidate_dashboard_context(), invalidation_finished.set())
+    )
+    invalidator.start()
+    try:
+        assert invalidation_finished.wait(timeout=0.5)
+    finally:
+        release_load.set()
+        worker.join(timeout=2)
+        invalidator.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert not invalidator.is_alive()
 
 
 def test_force_refresh_does_not_duplicate_inflight_context_build(monkeypatch):
