@@ -120,6 +120,7 @@ class IntentLifecycleStateV1(StrEnum):
     PENDING = "pending"
     NO_PR = "no_pr"
     PROMOTED = "promoted"
+    SETTLED = "settled"
 
 
 class EnqueueStatusV1(StrEnum):
@@ -366,6 +367,7 @@ class MaintenanceIntentRecordV1(BaseModel):
     intent: MaintenanceIntentV1
     state: IntentLifecycleStateV1
     canonical_key: MaintenanceKeyV1 | None = None
+    next_attempt_at: datetime | None = None
 
 
 class EnqueueResultV1(BaseModel):

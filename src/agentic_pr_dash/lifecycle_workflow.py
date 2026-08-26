@@ -130,12 +130,18 @@ class LifecycleWorkflow:
         orchestrator: _DispatchTarget | None = None,
         now: Callable[[], datetime] | None = None,
         batch_size: int = 16,
+        resolution_concurrency: int = 4,
         stabilization_interval: timedelta = timedelta(seconds=30),
+        retry_interval: timedelta = timedelta(seconds=30),
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if resolution_concurrency <= 0:
+            raise ValueError("resolution_concurrency must be positive")
         if stabilization_interval < timedelta(0):
             raise ValueError("stabilization_interval must not be negative")
+        if retry_interval <= timedelta(0):
+            raise ValueError("retry_interval must be positive")
         if (policy is None) != (ledger is None):
             raise ValueError("policy and ledger must be provided together")
         if policy is None and context_loader is None:
@@ -147,7 +153,9 @@ class LifecycleWorkflow:
         self.orchestrator = orchestrator
         self._now = now or (lambda: datetime.now(UTC))
         self.batch_size = batch_size
+        self.retry_interval = retry_interval
         self.stabilization_interval = stabilization_interval
+        self._resolution_semaphore = asyncio.Semaphore(resolution_concurrency)
         self._drain_lock = asyncio.Lock()
 
     async def drain(self) -> LifecycleDrainResult:
@@ -161,16 +169,21 @@ class LifecycleWorkflow:
                 IntentLifecycleStateV1.PENDING,
                 IntentLifecycleStateV1.NO_PR,
                 IntentLifecycleStateV1.PROMOTED,
-            }
+            },
+            eligible_at=self._now(),
         )[: self.batch_size]
         result = LifecycleDrainResult()
         resolved_records: list[
             tuple[MaintenanceIntentRecordV1, _ResolvedPR]
         ] = []
-        for record in records:
-            try:
-                resolved = self._resolve(record)
-            except Exception:  # noqa: BLE001 - isolate one durable intent
+        resolutions = await asyncio.gather(
+            *(self._resolve_off_loop(record) for record in records),
+            return_exceptions=True,
+        )
+        for record, resolved in zip(records, resolutions, strict=True):
+            if isinstance(resolved, BaseException):
+                if not isinstance(resolved, Exception):
+                    raise resolved
                 self._persist_unavailable(record, record.intent.pr_number)
                 result = _count_outcome(result, "deferred")
                 continue
@@ -206,7 +219,7 @@ class LifecycleWorkflow:
 
     async def _consume(self, record: MaintenanceIntentRecordV1) -> str:
         try:
-            resolved = self._resolve(record)
+            resolved = await self._resolve_off_loop(record)
         except Exception:  # noqa: BLE001 - unavailable observations retry
             self._persist_unavailable(record, record.intent.pr_number)
             return "deferred"
@@ -223,9 +236,18 @@ class LifecycleWorkflow:
     ) -> str | None:
         if resolved is None:
             if record.intent.pr_number is None:
-                self.store.mark_no_pr(record.intent)
+                self.store.mark_no_pr(
+                    record.intent,
+                    next_attempt_at=self._now() + self.retry_interval,
+                )
                 return "no_pr"
             self._persist_unavailable(record, record.intent.pr_number)
+            return "deferred"
+        if (
+            resolved.payload.get("state") != "OPEN"
+            or resolved.payload.get("isDraft") is not False
+        ):
+            self._persist_unavailable(record, resolved.number)
             return "deferred"
         if resolved.repository.casefold() != record.intent.repository.casefold():
             self._persist_unavailable(record, resolved.number)
@@ -280,7 +302,10 @@ class LifecycleWorkflow:
         )
         snapshot = self._snapshot(key, observed)
         self.store.write_snapshot(snapshot)
-        self.store.promote_intent(record.intent, key)
+        if snapshot.settled:
+            self.store.settle_intent(record.intent, key)
+        else:
+            self.store.promote_intent(record.intent, key)
         if (
             self.orchestrator is not None
             and _actionable(snapshot)
@@ -300,6 +325,10 @@ class LifecycleWorkflow:
     def _persist_unavailable(
         self, record: MaintenanceIntentRecordV1, pr_number: int | None
     ) -> None:
+        self.store.schedule_retry(
+            record.intent,
+            next_attempt_at=self._now() + self.retry_interval,
+        )
         if pr_number is None:
             return
         key = MaintenanceKeyV1(
@@ -310,16 +339,24 @@ class LifecycleWorkflow:
         )
         self.store.write_snapshot(_head_drift_snapshot(key, self._now()))
 
+    async def _resolve_off_loop(
+        self, record: MaintenanceIntentRecordV1
+    ) -> _ResolvedPR | None:
+        async with self._resolution_semaphore:
+            return await asyncio.to_thread(self._resolve, record)
+
     def _resolve(self, record: MaintenanceIntentRecordV1) -> _ResolvedPR | None:
         intent = record.intent
         cwd = intent.worktree_path
         if intent.pr_number is None:
             branch = intent.pushed_ref.removeprefix("refs/heads/")
             payload = github_api.find_pr_by_head(branch, "open", cwd)
+            if isinstance(payload, dict):
+                payload = {**payload, "state": "OPEN"}
         else:
             payload = github_api.resolve_pr(
                 intent.pr_number,
-                "number,title,headRefName,headRefOid,baseRefName,url,isDraft,"
+                "number,title,headRefName,headRefOid,baseRefName,url,state,isDraft,"
                 "mergeStateStatus,mergeable,reviewDecision",
                 cwd,
                 force=True,

@@ -218,8 +218,9 @@ class LifecycleStore:
         self,
         *,
         states: set[IntentLifecycleStateV1] | None = None,
+        eligible_at: datetime | None = None,
     ) -> tuple[MaintenanceIntentRecordV1, ...]:
-        """List valid durable intent records, optionally restricted by state."""
+        """List valid records, optionally restricted by state and retry time."""
 
         if states is not None and not all(
             isinstance(state, IntentLifecycleStateV1) for state in states
@@ -244,7 +245,12 @@ class LifecycleStore:
                     continue
             except (ValidationError, TypeError):
                 continue
-            if states is None or record.state in states:
+            is_eligible = (
+                eligible_at is None
+                or record.next_attempt_at is None
+                or _utc(record.next_attempt_at) <= _utc(eligible_at)
+            )
+            if (states is None or record.state in states) and is_eligible:
                 records.append(record)
         return tuple(records)
 
@@ -264,7 +270,10 @@ class LifecycleStore:
                     ingress_id=ingress_identity_hash(intent), intent=intent, state=state
                 )
                 status = EnqueueStatusV1.ENQUEUED
-            elif existing.state is IntentLifecycleStateV1.NO_PR:
+            elif existing.state in {
+                IntentLifecycleStateV1.NO_PR,
+                IntentLifecycleStateV1.SETTLED,
+            }:
                 state = (
                     IntentLifecycleStateV1.NO_PR
                     if intent.pr_number is None
@@ -324,7 +333,10 @@ class LifecycleStore:
         return record
 
     def mark_no_pr(
-        self, target: MaintenanceIntentV1 | MaintenanceTargetV1
+        self,
+        target: MaintenanceIntentV1 | MaintenanceTargetV1,
+        *,
+        next_attempt_at: datetime | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Persist that an ingress event currently has no associated PR."""
 
@@ -350,6 +362,50 @@ class LifecycleStore:
                 ),
                 intent=marked_intent,
                 state=IntentLifecycleStateV1.NO_PR,
+                next_attempt_at=next_attempt_at,
+            )
+            _write_json(path, record.model_dump(mode="json"))
+        return record
+
+    def schedule_retry(
+        self,
+        target: MaintenanceIntentV1 | MaintenanceTargetV1,
+        *,
+        next_attempt_at: datetime,
+    ) -> MaintenanceIntentRecordV1:
+        """Persist the earliest time at which an existing intent may retry."""
+
+        intent = (
+            target
+            if isinstance(target, MaintenanceIntentV1)
+            else self._intent_for_target(target)
+        )
+        path = self.intent_path(intent)
+        with self._transaction_lock():
+            existing = self._load_validated_intent(intent)
+            if existing is None:
+                raise KeyError("maintenance intent is not enqueued")
+            record = existing.model_copy(
+                update={"next_attempt_at": _utc(next_attempt_at)}
+            )
+            _write_json(path, record.model_dump(mode="json"))
+        return record
+
+    def settle_intent(
+        self,
+        target: MaintenanceIntentV1 | MaintenanceTargetV1,
+        key: MaintenanceKeyV1,
+    ) -> MaintenanceIntentRecordV1:
+        """Mark a promoted exact-head job terminal until ingress reactivates it."""
+
+        promoted = self.promote_intent(target, key)
+        path = self.intent_path(promoted.intent)
+        with self._transaction_lock():
+            existing = self._load_validated_intent(promoted.intent)
+            if existing is None:
+                raise KeyError("maintenance intent is not enqueued")
+            record = existing.model_copy(
+                update={"state": IntentLifecycleStateV1.SETTLED}
             )
             _write_json(path, record.model_dump(mode="json"))
         return record
@@ -469,7 +525,8 @@ def _valid_promoted_record(
 ) -> bool:
     if (
         record is None
-        or record.state is not IntentLifecycleStateV1.PROMOTED
+        or record.state
+        not in {IntentLifecycleStateV1.PROMOTED, IntentLifecycleStateV1.SETTLED}
         or record.canonical_key is None
     ):
         return False

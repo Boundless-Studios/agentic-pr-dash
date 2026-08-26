@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import os
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -120,11 +123,28 @@ def _pr_payload() -> dict[str, object]:
         "headRefOid": HEAD,
         "baseRefName": "main",
         "url": "https://github.com/Acme/Widget/pull/7",
+        "state": "OPEN",
         "isDraft": False,
         "mergeStateStatus": "CLEAN",
         "mergeable": "MERGEABLE",
         "reviewDecision": "APPROVED",
     }
+
+
+def _ordered_intents(*, count: int = 2) -> list[MaintenanceIntentV1]:
+    intents = [
+        _intent(pr_number=7).model_copy(
+            update={
+                "pushed_ref": f"refs/heads/ordered-{index}",
+                "worktree_path": f"/tmp/ordered-{index}",
+            }
+        )
+        for index in range(count)
+    ]
+    return sorted(
+        intents,
+        key=lambda intent: LifecycleStore(Path("/tmp/unused")).intent_path(intent).name,
+    )
 
 
 def _batch(
@@ -198,6 +218,87 @@ async def test_push_before_pr_no_pr_then_reactivation_promotes(
         MaintenanceTargetV1.exact(record.canonical_key), now=OBSERVED_AT
     )
     assert result.status is SnapshotReadStatusV1.FRESH
+
+
+@pytest.mark.asyncio
+async def test_open_branch_lookup_without_state_field_can_promote(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent())
+    branch_payload = _pr_payload()
+    branch_payload.pop("state")
+    monkeypatch.setattr(
+        github_api,
+        "find_pr_by_head",
+        lambda branch, state="open", cwd=None: branch_payload,
+    )
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(
+        store, policy=_policy(), ledger=_ledger()
+    ).drain()
+
+    assert result.progressed == 1
+    assert store.list_intents()[0].state is IntentLifecycleStateV1.PROMOTED
+
+
+@pytest.mark.parametrize(
+    ("state", "is_draft"),
+    [("CLOSED", False), ("OPEN", True), (None, False)],
+)
+@pytest.mark.asyncio
+async def test_only_explicitly_open_nondraft_prs_are_observed_or_dispatched(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    state: str | None,
+    is_draft: bool,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=7)
+    store.enqueue(intent)
+    payload = {**_pr_payload(), "isDraft": is_draft}
+    if state is None:
+        payload.pop("state")
+    else:
+        payload["state"] = state
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *args, **kwargs: payload)
+    observation_calls = 0
+
+    def collect(*args, **kwargs):
+        nonlocal observation_calls
+        observation_calls += 1
+        return _batch()
+
+    monkeypatch.setattr(github_api, "collect_pr_maintenance_snapshots", collect)
+
+    class DispatchProbe:
+        calls = 0
+
+        async def dispatch_pr_maintenance(self, pr: PRData) -> None:
+            self.calls += 1
+
+    dispatch = DispatchProbe()
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store, policy=_policy(), ledger=_ledger(), orchestrator=dispatch
+    )
+
+    result = await workflow.drain()
+
+    assert result.deferred == 1
+    assert observation_calls == 0
+    assert dispatch.calls == 0
+    assert store.list_intents()[0].state is IntentLifecycleStateV1.PENDING
 
 
 @pytest.mark.asyncio
@@ -774,6 +875,152 @@ async def test_drain_is_bounded_by_batch_size(
 
 
 @pytest.mark.asyncio
+async def test_no_pr_retry_eligibility_is_durable_and_does_not_starve_later_intent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first, later = _ordered_intents()
+    first = first.model_copy(update={"pr_number": None})
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(first)
+    store.enqueue(later)
+    monkeypatch.setattr(github_api, "find_pr_by_head", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        github_api,
+        "resolve_pr",
+        lambda *args, **kwargs: _pr_payload(),
+    )
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+        batch_size=1,
+    )
+    first_result = await workflow.drain()
+
+    first_record = next(
+        record
+        for record in store.list_intents()
+        if record.intent.pushed_ref == first.pushed_ref
+    )
+    assert first_result.no_pr == 1
+    assert first_record.next_attempt_at is not None
+    assert first_record.next_attempt_at > OBSERVED_AT
+
+    restarted = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+        batch_size=1,
+    )
+    second_result = await restarted.drain()
+
+    assert second_result.progressed == 1
+    later_record = next(
+        record
+        for record in store.list_intents()
+        if record.intent.pushed_ref == later.pushed_ref
+    )
+    assert later_record.state is IntentLifecycleStateV1.PROMOTED
+
+
+@pytest.mark.asyncio
+async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    first, later = _ordered_intents()
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(first)
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *args, **kwargs: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+        batch_size=1,
+        stabilization_interval=timedelta(0),
+    )
+    await workflow.drain()
+    await workflow.drain()
+
+    first_record = store.list_intents()[0]
+    assert first_record.state.value == "settled"
+    store.enqueue(later)
+
+    restarted = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT,
+        batch_size=1,
+    )
+    result = await restarted.drain()
+
+    assert result.progressed == 1
+    reactivated = store.enqueue(first.model_copy(update={"reason": "new feedback"}))
+    assert reactivated.status.value == "reactivated"
+
+
+@pytest.mark.asyncio
+async def test_pr_resolution_runs_off_loop_with_bounded_concurrency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    for intent in _ordered_intents(count=4):
+        store.enqueue(intent)
+    counter_lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def blocking_resolution(*args, **kwargs):
+        nonlocal active, max_active
+        with counter_lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with counter_lock:
+            active -= 1
+
+    monkeypatch.setattr(github_api, "resolve_pr", blocking_resolution)
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        batch_size=4,
+        resolution_concurrency=2,
+    )
+    drain_task = asyncio.create_task(workflow.drain())
+    await asyncio.sleep(0.01)
+
+    assert not drain_task.done()
+    await drain_task
+    assert max_active == 2
+
+
+@pytest.mark.asyncio
 async def test_drain_batches_observations_for_same_repository(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1106,6 +1353,90 @@ async def test_live_owner_defers_existing_orchestrator_dispatch(
     assert record.canonical_key is not None
 
 
+@pytest.mark.parametrize(
+    ("claim_state", "expected_dispatches"),
+    [("active", 0), ("released", 1), ("stale", 1)],
+)
+@pytest.mark.asyncio
+async def test_lifecycle_dispatch_respects_claim_exclusion_and_adoption(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    claim_state: str,
+    expected_dispatches: int,
+) -> None:
+    from agentic_pr_dash import coordinator
+    from agentic_pr_dash.lifecycle_workflow import (
+        LifecycleWorkflow,
+        _pr_data,
+        _ResolvedPR,
+    )
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_COORDINATOR_STORE", str(tmp_path / "claims.jsonl")
+    )
+    monkeypatch.setattr(
+        coordinator, "worktree_has_dirty_or_unpushed_changes", lambda path: False
+    )
+    intent = _intent(pr_number=7).model_copy(
+        update={"worktree_path": str(worktree)}
+    )
+    observed = _batch(
+        ci_checks=(CICheck(name="tests", status="completed", conclusion="failure"),)
+    ).observed[7]
+    claimed_pr = _pr_data(
+        _ResolvedPR(_pr_payload(), REPOSITORY, 7, HEAD),
+        observed,
+        str(worktree),
+    )
+    claim = coordinator.claim_pr(
+        claimed_pr,
+        session_id="live-session",
+        pid=os.getpid(),
+        agent="codex",
+        lease_seconds=0 if claim_state == "stale" else 300,
+    )
+    if claim_state == "released":
+        coordinator.release_claim(claim, "live-session", "session_end")
+
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(intent)
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *args, **kwargs: _pr_payload())
+    monkeypatch.setattr(
+        github_api,
+        "collect_pr_maintenance_snapshots",
+        lambda *args, **kwargs: _batch(
+            ci_checks=(
+                CICheck(name="tests", status="completed", conclusion="failure"),
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+
+    class DispatchProbe:
+        calls = 0
+
+        async def dispatch_pr_maintenance(self, pr: PRData) -> None:
+            self.calls += 1
+
+    dispatch = DispatchProbe()
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        orchestrator=dispatch,
+    )
+
+    await workflow.drain()
+
+    assert dispatch.calls == expected_dispatches
+
+
 @pytest.mark.asyncio
 async def test_changed_observation_resets_stability(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1204,7 +1535,7 @@ async def test_same_pr_number_in_two_repositories_stays_isolated(
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_refresh_drains_lifecycle_under_refresh_lock(
+async def test_orchestrator_refresh_drains_lifecycle_after_releasing_refresh_lock(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from agentic_pr_dash.orchestrator import Orchestrator
@@ -1216,7 +1547,7 @@ async def test_orchestrator_refresh_drains_lifecycle_under_refresh_lock(
 
         async def drain(self) -> None:
             assert self.orchestrator is not None
-            assert self.orchestrator._refresh_lock.locked()
+            assert not self.orchestrator._refresh_lock.locked()
             self.calls += 1
 
     lifecycle = DrainProbe()

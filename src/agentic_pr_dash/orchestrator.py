@@ -1400,7 +1400,13 @@ class Orchestrator:
         and refreshes every observation slice immediately.
         """
         async with self._refresh_lock:
-            return await self._refresh_prs_locked(force=force)
+            prs = await self._refresh_prs_locked(force=force)
+        if self.lifecycle_workflow is not None:
+            try:
+                await self.lifecycle_workflow.drain()
+            except Exception as exc:  # noqa: BLE001 - lifecycle is best effort
+                self.log(f"Lifecycle drain error: {exc}", level="error")
+        return prs
 
     async def _refresh_prs_locked(self, *, force: bool = False) -> list[PRData]:
         """Run one refresh transaction while :attr:`_refresh_lock` is held."""
@@ -1450,12 +1456,6 @@ class Orchestrator:
         self._metadata_unconfirmed_keys.intersection_update(
             active_observation_keys
         )
-
-        if self.lifecycle_workflow is not None:
-            try:
-                await self.lifecycle_workflow.drain()
-            except Exception as exc:  # noqa: BLE001 - lifecycle is best effort
-                self.log(f"Lifecycle drain error: {exc}", level="error")
 
         return list(self.prs.values())
 
