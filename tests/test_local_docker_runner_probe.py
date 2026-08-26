@@ -18,7 +18,9 @@ stale offline rows.
 
 from __future__ import annotations
 
+import gc
 import subprocess
+import weakref
 
 from agentic_pr_dash import runner_monitor
 from agentic_pr_dash.runner_monitor import LocalRunnerHost
@@ -230,6 +232,28 @@ def test_dashboard_runner_probe_cache_is_scoped_to_repository(monkeypatch) -> No
     assert first.online == 1
     assert second.online == 2
     assert calls == ["/repo-a", "/repo-b"]
+
+
+def test_dashboard_runner_probe_cache_retains_probe_identity(monkeypatch) -> None:
+    class Probe:
+        def run(self, cmd, cwd, timeout):
+            raise AssertionError("the stubbed fleet loader should handle the probe")
+
+    monkeypatch.setattr(
+        runner_monitor,
+        "get_runner_fleet_load",
+        lambda *, cwd, run: runner_monitor.RunnerFleetLoad(online=1),
+    )
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+
+    run = Probe().run
+    cached_probe = weakref.ref(run)
+    runner_monitor.get_cached_runner_fleet_load(cwd="/repo", run=run)
+
+    del run
+    gc.collect()
+
+    assert cached_probe() is not None
 
 
 def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:
