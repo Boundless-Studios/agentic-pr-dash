@@ -20,11 +20,25 @@ or an explicit completion-marker reply on the thread. GitHub's "outdated" flag
 
 import argparse
 
+import pytest
+from agent_review_coordinator import (
+    ArchitectureDecision,
+    ArchitectureDecisionKind,
+    Disposition,
+    Finding,
+    FindingSettlementState,
+    Severity,
+)
+
 from agentic_pr_dash import github_api, maintenance
 from agentic_pr_dash import maintenance_check as mc
-from agentic_pr_dash.github_api import COMPLETE_MARKER, ReviewThread, ReviewThreadComment
+from agentic_pr_dash._maintenance import completion
+from agentic_pr_dash.github_api import (
+    COMPLETE_MARKER,
+    ReviewThread,
+    ReviewThreadComment,
+)
 from agentic_pr_dash.models import PRData, PRStatus
-
 
 ANCHOR = "backend/src/gaia/api/app.py"
 
@@ -125,6 +139,314 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
 
 def _args():
     return argparse.Namespace(cwd=".", pr=2139, baseline="basesha")
+
+
+def test_structured_fixed_reply_names_snapshot_fingerprint_and_evidence():
+    head_sha = "f" * 40
+    fixing_commit = "c0ffee" * 6 + "c0ff"
+    finding = Finding(
+        repository="Boundless-Studios/agentic-pr-dash",
+        head_sha=head_sha,
+        reviewer_execution_id="github-backstop",
+        reviewer_provider="rev",
+        severity=Severity.P1,
+        title="Preserve the lifecycle fence",
+        explanation="[P1] Preserve the lifecycle fence",
+        path=ANCHOR,
+        line=7,
+        invariant="A stale actor cannot mutate the active generation",
+        evidence="pytest: lifecycle fence regression passed",
+        disposition=Disposition.FIXED,
+        rationale="The fenced mutation now rejects stale generations.",
+        verification_passed=True,
+    )
+
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=finding,
+        head_sha=head_sha,
+        fixing_commit=fixing_commit,
+    )
+
+    assert body == "\n".join(
+        [
+            COMPLETE_MARKER,
+            "Review settlement:",
+            f"- Head SHA: `{head_sha}`",
+            f"- Finding fingerprint: `{finding.fingerprint}`",
+            "- Disposition: `fixed`",
+            "- Rationale: The fenced mutation now rejects stale generations.",
+            "- Evidence: pytest: lifecycle fence regression passed",
+            f"- Fixing commit: `{fixing_commit}`",
+        ]
+    )
+    parsed = completion.parse_structured_settlement_reply(body)
+    assert parsed is not None
+    assert parsed.head_sha == head_sha
+    assert parsed.finding_fingerprint == finding.fingerprint
+    assert parsed.disposition is Disposition.FIXED
+    assert parsed.rationale == finding.rationale
+    assert parsed.evidence == finding.evidence
+    assert parsed.fixing_commit == fixing_commit
+
+
+def _policy_closure(
+    disposition: Disposition,
+    state: FindingSettlementState,
+    *,
+    duplicate_of: str | None = None,
+    deferred_to_issue: str | None = None,
+    architecture_decision: ArchitectureDecision | None = None,
+):
+    finding = Finding(
+        repository="Boundless-Studios/agentic-pr-dash",
+        head_sha="f" * 40,
+        reviewer_execution_id="github-backstop",
+        reviewer_provider="rev",
+        severity=Severity.P1,
+        title="Preserve the lifecycle fence",
+        explanation="[P1] Preserve the lifecycle fence",
+        path=ANCHOR,
+        line=7,
+        invariant="A stale actor cannot mutate the active generation",
+        evidence="review evidence at the fenced mutation boundary",
+        duplicate_of=duplicate_of,
+        deferred_to_issue=deferred_to_issue,
+        disposition=disposition,
+        rationale="Evidence supports the recorded policy outcome.",
+        verification_passed=state is FindingSettlementState.FIXED,
+    )
+    return completion.PolicyFindingClosure(
+        finding=finding,
+        state=state,
+        architecture_decision=architecture_decision,
+    )
+
+
+def test_verified_fixed_publication_replies_before_resolving():
+    closure = _policy_closure(Disposition.FIXED, FindingSettlementState.FIXED)
+    thread = _thread("[P1] Preserve the lifecycle fence")
+    events: list[tuple[str, str]] = []
+
+    outcome = completion.apply_thread_settlement(
+        thread=thread,
+        closure=closure,
+        marker=COMPLETE_MARKER,
+        head_sha=closure.finding.head_sha,
+        fixing_commit="c" * 40,
+        reply=lambda body: events.append(("reply", body)) or True,
+        resolve=lambda: events.append(("resolve", thread.node_id)) or True,
+    )
+
+    assert [kind for kind, _ in events] == ["reply", "resolve"]
+    assert outcome.reply_visible
+    assert outcome.resolved
+    assert not outcome.actionable
+
+
+def test_failed_structured_reply_prevents_resolution_and_stays_actionable():
+    closure = _policy_closure(Disposition.FIXED, FindingSettlementState.FIXED)
+    thread = _thread("[P1] Preserve the lifecycle fence")
+    events: list[str] = []
+
+    outcome = completion.apply_thread_settlement(
+        thread=thread,
+        closure=closure,
+        marker=COMPLETE_MARKER,
+        head_sha=closure.finding.head_sha,
+        fixing_commit="c" * 40,
+        reply=lambda body: events.append("reply") and False,
+        resolve=lambda: events.append("resolve") or True,
+    )
+
+    assert events == ["reply"]
+    assert not outcome.reply_visible
+    assert not outcome.resolved
+    assert outcome.actionable
+
+
+@pytest.mark.parametrize(
+    ("disposition", "state", "duplicate_of", "deferred_to_issue", "expected"),
+    [
+        (Disposition.REJECT, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `reject`"),
+        (Disposition.STALE, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `stale`"),
+        (Disposition.DECLINED, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `declined`"),
+        (Disposition.WRONG_OWNER, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `wrong_owner`"),
+        (Disposition.DUPLICATE, FindingSettlementState.DECLINED_WITH_RATIONALE, "finding:prior", None, "- Duplicate of: `finding:prior`"),
+        (Disposition.DEFERRED_TO_EXISTING_ISSUE, FindingSettlementState.DEFERRED_TO_EXISTING_ISSUE, None, "BOU-918", "- Existing issue: `BOU-918`"),
+    ],
+)
+def test_non_code_policy_outcomes_reply_but_never_resolve(
+    disposition,
+    state,
+    duplicate_of,
+    deferred_to_issue,
+    expected,
+):
+    closure = _policy_closure(
+        disposition,
+        state,
+        duplicate_of=duplicate_of,
+        deferred_to_issue=deferred_to_issue,
+    )
+    thread = _thread("[P1] Preserve the lifecycle fence")
+    events: list[tuple[str, str]] = []
+
+    outcome = completion.apply_thread_settlement(
+        thread=thread,
+        closure=closure,
+        marker=COMPLETE_MARKER,
+        head_sha=closure.finding.head_sha,
+        fixing_commit=None,
+        reply=lambda body: events.append(("reply", body)) or True,
+        resolve=lambda: events.append(("resolve", thread.node_id)) or True,
+    )
+
+    assert [kind for kind, _ in events] == ["reply"]
+    assert expected in events[0][1]
+    assert outcome.reply_visible
+    assert not outcome.resolved
+    assert not outcome.actionable
+
+
+def test_architecture_publication_names_typed_decision_and_lineage():
+    base = _policy_closure(
+        Disposition.REJECT,
+        FindingSettlementState.DECLINED_WITH_RATIONALE,
+    )
+    decision = ArchitectureDecision(
+        repository=base.finding.repository,
+        delivery_id="delivery-pr-24",
+        review_charter_version="review-charter-v1",
+        lineage_id=base.finding.lineage_id,
+        decision=ArchitectureDecisionKind.CORE_FIX_PLANNED,
+        rationale="Rearchitect the scheduler in the next delivery.",
+        decided_by="architecture-owner",
+    )
+    closure = completion.PolicyFindingClosure(
+        finding=base.finding,
+        state=base.state,
+        architecture_decision=decision,
+    )
+
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+        architecture_decision=decision,
+    )
+
+    assert "- Architecture decision: `core_fix_planned`" in body
+    assert f"- Architecture lineage: `{base.finding.lineage_id}`" in body
+    assert "- Architecture decided by: `architecture-owner`" in body
+    assert "- Architecture rationale: Rearchitect the scheduler" in body
+
+
+def test_reviewer_followup_reopens_structured_non_code_reply():
+    closure = _policy_closure(
+        Disposition.WRONG_OWNER,
+        FindingSettlementState.DECLINED_WITH_RATIONALE,
+    )
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+    )
+    top = ReviewThreadComment(
+        database_id=42,
+        path=ANCHOR,
+        line=7,
+        body="[P1] Preserve the lifecycle fence",
+        author="rev",
+        created_at="2026-01-01T00:00:00Z",
+    )
+    thread = ReviewThread(
+        node_id="t1",
+        is_resolved=False,
+        is_outdated=False,
+        top=top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43,
+                path=ANCHOR,
+                line=7,
+                body=body,
+                author="bot",
+                created_at="2026-01-02T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="This still belongs to the current owner.",
+                author="rev",
+                created_at="2026-01-03T00:00:00Z",
+            ),
+        ],
+    )
+    events: list[str] = []
+
+    status = completion.settlement_reply_status(thread, closure)
+    outcome = completion.apply_thread_settlement(
+        thread=thread,
+        closure=closure,
+        marker=COMPLETE_MARKER,
+        head_sha=closure.finding.head_sha,
+        fixing_commit=None,
+        reply=lambda body: events.append("reply") or True,
+        resolve=lambda: events.append("resolve") or True,
+    )
+
+    assert status is completion.SettlementReplyStatus.REOPENED
+    assert events == []
+    assert not outcome.reply_visible
+    assert outcome.actionable
+
+
+def test_different_reviewer_followup_reopens_structured_non_code_reply():
+    closure = _policy_closure(
+        Disposition.WRONG_OWNER,
+        FindingSettlementState.DECLINED_WITH_RATIONALE,
+    )
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+    )
+    thread = _thread(
+        "[P1] Preserve the lifecycle fence",
+        created="2026-01-01T00:00:00Z",
+        replies=(),
+    )
+    thread = ReviewThread(
+        node_id=thread.node_id,
+        is_resolved=False,
+        is_outdated=False,
+        top=thread.top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43,
+                path=ANCHOR,
+                line=7,
+                body=body,
+                author="maintenance-bot",
+                created_at="2026-01-02T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="I am also reviewing this; the ownership concern remains.",
+                author="second-reviewer",
+                created_at="2026-01-03T00:00:00Z",
+            ),
+        ],
+    )
+
+    assert (
+        completion.settlement_reply_status(thread, closure)
+        is completion.SettlementReplyStatus.REOPENED
+    )
 
 
 # --- negative: anchor touched, body points elsewhere -> DO NOT resolve --------

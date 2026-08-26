@@ -1,15 +1,28 @@
+from dataclasses import replace
+
 import pytest
 from agent_review_coordinator import (
+    ArchitectureDecision,
+    ArchitectureDecisionKind,
+    Disposition,
+    Finding,
     FindingSettlementState,
+    FixCost,
     HeadAttestation,
     HeadAttestationKind,
+    Impact,
+    P2Evidence,
+    Reachability,
     ReviewLedger,
     ReviewPolicy,
     ReviewResult,
     ReviewStage,
+    Severity,
 )
 
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash._maintenance import completion
+from agentic_pr_dash._maintenance import review_settlement as settlement
 from agentic_pr_dash._maintenance.review_settlement import (
     combine_clean_observations,
     evaluate_pr_snapshot,
@@ -59,6 +72,73 @@ def _ledger() -> ReviewLedger:
     return ledger
 
 
+def _finding(
+    *,
+    head_sha: str = HEAD,
+    severity: Severity = Severity.P1,
+    p2_evidence: P2Evidence | None = None,
+    reviewer_execution_id: str = "local-review",
+) -> Finding:
+    return Finding(
+        repository=REPOSITORY,
+        head_sha=head_sha,
+        reviewer_execution_id=reviewer_execution_id,
+        reviewer_provider="reviewer",
+        severity=severity,
+        title="Preserve the lifecycle fence",
+        explanation="The active generation must reject stale writers.",
+        path="src/agentic_pr_dash/lifecycle_store.py",
+        line=17,
+        invariant="A stale actor cannot mutate the active generation",
+        evidence="review reproduction at the fenced mutation boundary",
+        p2_evidence=p2_evidence,
+    )
+
+
+def _declinable_p2_evidence() -> P2Evidence:
+    return P2Evidence(
+        reachability=Reachability.UNREACHABLE,
+        impact=Impact.LOW,
+        observed_recurrence=0,
+        interface_boundary_risk=False,
+        security_risk=False,
+        data_loss_risk=False,
+        durable_state_risk=False,
+        fix_cost=FixCost.ARCHITECTURAL,
+    )
+
+
+def _ledger_with_finding(finding: Finding) -> ReviewLedger:
+    ledger = ReviewLedger(
+        repository=REPOSITORY,
+        head_sha=finding.head_sha,
+        delivery_id=DELIVERY_ID,
+        review_charter_version=REVIEW_CHARTER_VERSION,
+    )
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=finding.head_sha,
+            stage=ReviewStage.LOCAL,
+            round_number=1,
+            slot_number=1,
+            reviewer_execution_id="local-review",
+            findings=[finding],
+        )
+    )
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=finding.head_sha,
+            stage=ReviewStage.BACKSTOP,
+            round_number=1,
+            slot_number=1,
+            reviewer_execution_id="backstop-review",
+        )
+    )
+    return ledger
+
+
 def _pr(**updates) -> PRData:
     values = {
         "number": 24,
@@ -93,6 +173,336 @@ def _observation(*, pr: PRData | None = None, ledger: ReviewLedger | None = None
         threads=[],
         deferrals={},
     )
+
+
+def test_policy_closure_requires_verified_fixed_disposition() -> None:
+    finding = _finding()
+    ledger = _ledger_with_finding(finding)
+    ledger.record_disposition(
+        fingerprint=finding.fingerprint,
+        disposition=Disposition.FIXED,
+        rationale="The fenced mutation now rejects stale generations.",
+    )
+
+    unverified = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=ledger,
+        fingerprint=finding.fingerprint,
+    )
+    ledger.record_verification(fingerprint=finding.fingerprint, passed=True)
+    verified = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=ledger,
+        fingerprint=finding.fingerprint,
+    )
+
+    assert unverified is not None
+    assert unverified.state is FindingSettlementState.UNRESOLVED
+    assert not unverified.addressed
+    assert verified is not None
+    assert verified.state is FindingSettlementState.FIXED
+    assert verified.addressed
+    assert verified.resolve_thread
+
+
+@pytest.mark.parametrize(
+    ("disposition", "severity", "record_kwargs", "expected_state"),
+    [
+        (
+            Disposition.REJECT,
+            Severity.P1,
+            {"evidence": "the reported path is unreachable"},
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+        ),
+        (
+            Disposition.STALE,
+            Severity.P1,
+            {"evidence": "the cited code was removed from this head"},
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+        ),
+        (
+            Disposition.DECLINED,
+            Severity.P2,
+            {},
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+        ),
+        (
+            Disposition.WRONG_OWNER,
+            Severity.P2,
+            {},
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+        ),
+        (
+            Disposition.DUPLICATE,
+            Severity.P1,
+            {"duplicate_of": "finding:existing-fingerprint"},
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+        ),
+        (
+            Disposition.DEFERRED_TO_EXISTING_ISSUE,
+            Severity.P2,
+            {"deferred_to_issue": "BOU-918"},
+            FindingSettlementState.DEFERRED_TO_EXISTING_ISSUE,
+        ),
+    ],
+)
+def test_policy_closure_uses_coordinator_finding_states(
+    disposition: Disposition,
+    severity: Severity,
+    record_kwargs: dict[str, str],
+    expected_state: FindingSettlementState,
+) -> None:
+    finding = _finding(
+        severity=severity,
+        p2_evidence=(
+            _declinable_p2_evidence() if severity is Severity.P2 else None
+        ),
+    )
+    ledger = _ledger_with_finding(finding)
+    ledger.record_disposition(
+        fingerprint=finding.fingerprint,
+        disposition=disposition,
+        rationale="Evidence shows this finding does not require a code change here.",
+        **record_kwargs,
+    )
+
+    closure = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=ledger,
+        fingerprint=finding.fingerprint,
+    )
+
+    assert closure is not None
+    assert closure.state is expected_state
+    assert closure.addressed
+    assert not closure.resolve_thread
+    assert closure.finding.disposition is disposition
+    assert closure.finding.duplicate_of == record_kwargs.get("duplicate_of")
+    assert closure.finding.deferred_to_issue == record_kwargs.get("deferred_to_issue")
+
+
+def test_policy_closure_carries_typed_architecture_decision_from_ledger() -> None:
+    previous_head = "b" * 40
+    previous = _finding(head_sha=previous_head)
+    ledger = _ledger_with_finding(previous)
+    ledger.advance_head(HEAD)
+    current = _finding(reviewer_execution_id="local-review-round-2")
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-review-round-2",
+            findings=[current],
+        )
+    )
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.BACKSTOP,
+            round_number=1,
+            slot_number=1,
+            reviewer_execution_id="backstop-review-current",
+        )
+    )
+    ledger.record_disposition(
+        fingerprint=current.fingerprint,
+        disposition=Disposition.REJECT,
+        rationale="The thin lifecycle boundary is the accepted ownership model.",
+        evidence="architecture review ADR-17",
+    )
+    decision = ArchitectureDecision(
+        repository=REPOSITORY,
+        delivery_id=DELIVERY_ID,
+        review_charter_version=REVIEW_CHARTER_VERSION,
+        lineage_id=current.lineage_id,
+        decision=ArchitectureDecisionKind.CORE_FIX_PLANNED,
+        rationale="Rearchitect the shared scheduler in the next delivery.",
+        decided_by="architecture-owner",
+    )
+    ledger.record_architecture_decision(decision)
+
+    closure = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=ledger,
+        fingerprint=current.fingerprint,
+    )
+
+    assert closure is not None
+    assert closure.architecture_decision == decision
+    assert closure.architecture_decision.decision is ArchitectureDecisionKind.CORE_FIX_PLANNED
+    assert closure.architecture_decision.lineage_id == current.lineage_id
+
+
+def _visibility_thread(*, replies=()):
+    from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
+
+    return ReviewThread(
+        node_id="PRRT_visibility",
+        is_resolved=False,
+        is_outdated=False,
+        top=ReviewThreadComment(
+            database_id=71,
+            path="src/agentic_pr_dash/lifecycle_store.py",
+            line=17,
+            body="[P1] Preserve the lifecycle fence",
+            author="reviewer",
+            created_at="2026-08-20T00:00:00Z",
+        ),
+        replies=list(replies),
+    )
+
+
+def _settled_visibility_ledger(thread, disposition: Disposition):
+    finding = settlement.finding_from_thread(
+        thread,
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="local-review",
+    )
+    ledger = _ledger_with_finding(finding)
+    ledger.record_disposition(
+        fingerprint=finding.fingerprint,
+        disposition=disposition,
+        rationale="The policy evidence supports this recorded outcome.",
+        evidence="targeted lifecycle boundary reproduction",
+    )
+    if disposition is Disposition.FIXED:
+        ledger.record_verification(fingerprint=finding.fingerprint, passed=True)
+    closure = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=ledger,
+        fingerprint=finding.fingerprint,
+    )
+    assert closure is not None
+    return ledger, closure
+
+
+def test_non_code_disposition_without_visible_reply_blocks_finalization() -> None:
+    thread = _visibility_thread()
+    ledger, _ = _settled_visibility_ledger(thread, Disposition.REJECT)
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert not observation.clean
+    assert "unaddressed_review_threads" in observation.blockers
+
+
+def test_fresh_structured_non_code_reply_is_visible_and_addressed() -> None:
+    from agentic_pr_dash.github_api import ReviewThreadComment
+
+    thread = _visibility_thread()
+    ledger, closure = _settled_visibility_ledger(thread, Disposition.REJECT)
+    body = completion.structured_settlement_reply_body(
+        marker="<!-- agentic-pr-dash:complete -->",
+        finding=closure.finding,
+        head_sha=HEAD,
+    )
+    thread = replace(thread, replies=[
+        ReviewThreadComment(
+            database_id=72,
+            path=thread.top.path,
+            line=thread.top.line,
+            body=body,
+            author="maintenance-bot",
+            created_at="2026-08-21T00:00:00Z",
+        )
+    ])
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert observation.clean
+    assert "unaddressed_review_threads" not in observation.blockers
+
+
+def test_reviewer_followup_after_structured_reply_reopens_finalization() -> None:
+    from agentic_pr_dash.github_api import ReviewThreadComment
+
+    thread = _visibility_thread()
+    ledger, closure = _settled_visibility_ledger(thread, Disposition.REJECT)
+    body = completion.structured_settlement_reply_body(
+        marker="<!-- agentic-pr-dash:complete -->",
+        finding=closure.finding,
+        head_sha=HEAD,
+    )
+    thread = replace(thread, replies=[
+        ReviewThreadComment(
+            database_id=72,
+            path=thread.top.path,
+            line=thread.top.line,
+            body=body,
+            author="maintenance-bot",
+            created_at="2026-08-21T00:00:00Z",
+        ),
+        ReviewThreadComment(
+            database_id=73,
+            path=thread.top.path,
+            line=thread.top.line,
+            body="This evidence does not address my concern.",
+            author="reviewer",
+            created_at="2026-08-22T00:00:00Z",
+        ),
+    ])
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert not observation.clean
+    assert "unaddressed_review_threads" in observation.blockers
+
+
+def test_verified_fixed_finding_stays_blocked_until_thread_is_resolved() -> None:
+    from agentic_pr_dash.github_api import ReviewThreadComment
+
+    thread = _visibility_thread()
+    ledger, closure = _settled_visibility_ledger(thread, Disposition.FIXED)
+    body = completion.structured_settlement_reply_body(
+        marker="<!-- agentic-pr-dash:complete -->",
+        finding=closure.finding,
+        head_sha=HEAD,
+        fixing_commit="c" * 40,
+    )
+    thread = replace(thread, replies=[
+        ReviewThreadComment(
+            database_id=72,
+            path=thread.top.path,
+            line=thread.top.line,
+            body=body,
+            author="maintenance-bot",
+            created_at="2026-08-21T00:00:00Z",
+        )
+    ])
+
+    observation = evaluate_pr_snapshot(
+        pr=_pr(),
+        policy=_policy(),
+        ledger=ledger,
+        threads=[thread],
+        deferrals={},
+    )
+
+    assert not observation.clean
+    assert "unresolved_fixed_review_threads" in observation.blockers
 
 
 def test_clean_snapshot_is_ready_but_not_final_until_reobserved() -> None:
@@ -393,6 +803,43 @@ def test_exhausted_p2_is_recorded_without_blocking_finalization() -> None:
             author="reviewer",
             created_at="2026-07-28T00:00:00Z",
         ),
+    )
+    projected = settlement.overlay_backstop_evidence(
+        ledger,
+        threads=[thread],
+        deferrals={},
+        reviews=[],
+        reviewer_count=1,
+    )
+    finding = settlement.finding_from_thread(
+        thread,
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="visibility-probe",
+    )
+    closure = settlement.classify_finding_closure(
+        policy=_policy(),
+        ledger=projected,
+        fingerprint=finding.fingerprint,
+    )
+    assert closure is not None
+    body = completion.structured_settlement_reply_body(
+        marker="<!-- agentic-pr-dash:complete -->",
+        finding=closure.finding,
+        head_sha=HEAD,
+    )
+    thread = replace(
+        thread,
+        replies=[
+            ReviewThreadComment(
+                database_id=31,
+                path=thread.top.path,
+                line=thread.top.line,
+                body=body,
+                author="maintenance-bot",
+                created_at="2026-07-29T00:00:00Z",
+            )
+        ],
     )
 
     observation = evaluate_pr_snapshot(
