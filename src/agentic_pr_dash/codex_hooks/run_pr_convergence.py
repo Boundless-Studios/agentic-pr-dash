@@ -27,6 +27,7 @@ _PUSH_UPDATE = re.compile(
     r"\[(?:new branch|new tag|deleted|up to date)\])\s+.+\s+->\s+.+$",
     re.IGNORECASE,
 )
+_IndexedTarget = tuple[int, str, str, str | None, str | None]
 
 
 class LocalGitIdentity:
@@ -111,6 +112,17 @@ def _packed_ref(common_dir: Path, ref_name: str) -> str:
     return ""
 
 
+def _read_ref(git_dir: Path, common_dir: Path, ref_name: str) -> str:
+    for base in (git_dir, common_dir):
+        try:
+            head_sha = (base / ref_name).read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if head_sha:
+            return head_sha
+    return _packed_ref(common_dir, ref_name)
+
+
 def _head_identity(git_dir: Path, common_dir: Path) -> tuple[str, str] | None:
     try:
         head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
@@ -121,16 +133,32 @@ def _head_identity(git_dir: Path, common_dir: Path) -> tuple[str, str] | None:
     pushed_ref = head.removeprefix("ref:").strip()
     if not pushed_ref:
         return None
-    head_sha = ""
-    for base in (git_dir, common_dir):
-        try:
-            head_sha = (base / pushed_ref).read_text(encoding="utf-8").strip()
-        except OSError:
-            continue
-        if head_sha:
-            break
-    head_sha = head_sha or _packed_ref(common_dir, pushed_ref)
+    head_sha = _read_ref(git_dir, common_dir, pushed_ref)
     return (head_sha, pushed_ref) if head_sha else None
+
+
+def _local_branch_ref(branch: str) -> str | None:
+    candidate = branch.strip()
+    if candidate.startswith("refs/heads/"):
+        candidate = candidate.removeprefix("refs/heads/")
+    elif candidate.startswith("refs/"):
+        return None
+    invalid = {" ", "~", "^", ":", "?", "*", "[", "\\"}
+    components = candidate.split("/")
+    if (
+        not candidate
+        or ".." in candidate
+        or "@{" in candidate
+        or any(character in candidate for character in invalid)
+        or any(
+            not component
+            or component.startswith(".")
+            or component.endswith((".", ".lock"))
+            for component in components
+        )
+    ):
+        return None
+    return f"refs/heads/{candidate}"
 
 
 def _origin_url(common_dir: Path) -> str:
@@ -154,7 +182,11 @@ def _origin_url(common_dir: Path) -> str:
     return ""
 
 
-def _filesystem_git_identity(cwd: str) -> LocalGitIdentity | None:
+def _filesystem_git_identity(
+    cwd: str,
+    *,
+    branch: str | None = None,
+) -> LocalGitIdentity | None:
     worktree = _worktree_root(cwd)
     if worktree is None:
         return None
@@ -162,7 +194,14 @@ def _filesystem_git_identity(cwd: str) -> LocalGitIdentity | None:
     if directories is None:
         return None
     git_dir, common_dir = directories
-    head = _head_identity(git_dir, common_dir)
+    if branch is None:
+        head = _head_identity(git_dir, common_dir)
+    else:
+        pushed_ref = _local_branch_ref(branch)
+        if pushed_ref is None:
+            return None
+        head_sha = _read_ref(git_dir, common_dir, pushed_ref)
+        head = (head_sha, pushed_ref) if head_sha else None
     if head is None:
         return None
     head_sha, pushed_ref = head
@@ -178,11 +217,31 @@ def _filesystem_git_identity(cwd: str) -> LocalGitIdentity | None:
     )
 
 
-def _subprocess_git_identity(cwd: str) -> LocalGitIdentity | None:
-    checkout = _git(cwd, "rev-parse", "--show-toplevel", "HEAD", "--symbolic-full-name", "HEAD")
-    if len(checkout) != 3:
-        return None
-    worktree_path, head_sha, pushed_ref = checkout
+def _subprocess_git_identity(
+    cwd: str,
+    *,
+    branch: str | None = None,
+) -> LocalGitIdentity | None:
+    if branch is None:
+        checkout = _git(
+            cwd,
+            "rev-parse",
+            "--show-toplevel",
+            "HEAD",
+            "--symbolic-full-name",
+            "HEAD",
+        )
+        if len(checkout) != 3:
+            return None
+        worktree_path, head_sha, pushed_ref = checkout
+    else:
+        pushed_ref = _local_branch_ref(branch)
+        if pushed_ref is None:
+            return None
+        checkout = _git(cwd, "rev-parse", "--show-toplevel", pushed_ref)
+        if len(checkout) != 2:
+            return None
+        worktree_path, head_sha = checkout
     remote = _git(worktree_path, "config", "--get", "remote.origin.url")
     if len(remote) != 1:
         return None
@@ -198,8 +257,15 @@ def _subprocess_git_identity(cwd: str) -> LocalGitIdentity | None:
     )
 
 
-def local_git_identity(cwd: str) -> LocalGitIdentity | None:
-    return _filesystem_git_identity(cwd) or _subprocess_git_identity(cwd)
+def local_git_identity(
+    cwd: str,
+    *,
+    branch: str | None = None,
+) -> LocalGitIdentity | None:
+    return _filesystem_git_identity(cwd, branch=branch) or _subprocess_git_identity(
+        cwd,
+        branch=branch,
+    )
 
 
 def _canonical_repository(value: str) -> str:
@@ -272,43 +338,116 @@ def _output_proves_push_succeeded(payload: dict) -> bool:
     return False
 
 
+def _merge_shell_state(
+    states: dict[
+        tuple[bool, str | None],
+        frozenset[_IndexedTarget],
+    ],
+    key: tuple[bool, str | None],
+    targets: frozenset[_IndexedTarget],
+) -> None:
+    if key in states:
+        states[key] &= targets
+    else:
+        states[key] = targets
+
+
+def _relocated_cwd(cwd: str | None, destination: str) -> str | None:
+    expanded = os.path.expanduser(destination)
+    if os.path.isabs(expanded):
+        return expanded
+    if cwd is None:
+        return None
+    return str((Path(cwd) / expanded).resolve())
+
+
 def _successful_targets(
     command: str,
     base_cwd: str,
     *,
     exit_code: int,
     payload: dict,
-) -> tuple[tuple[str, str, str | None], ...]:
+) -> tuple[tuple[str, str, str | None, str | None], ...]:
     segments = split_command_segments(command)
-    effective_cwd = base_cwd
-    targets: list[tuple[str, str, str | None]] = []
+    if any(operator in {"|", "&"} for operator, _segment in segments):
+        return ()
+    push_segments = sum(is_git_push(segment) for _operator, segment in segments)
+    output_proves_single_push = (
+        push_segments == 1 and _output_proves_push_succeeded(payload)
+    )
+    states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {
+        (True, base_cwd): frozenset()
+    }
     for index, (leading_op, segment) in enumerate(segments):
         destination = cd_target(segment)
-        if destination is not None:
-            destination = os.path.expanduser(destination)
-            effective_cwd = (
-                destination
-                if os.path.isabs(destination)
-                else str((Path(effective_cwd) / destination).resolve())
-            )
-            continue
-        if leading_op in {"||", "|", "&"}:
-            continue
-        later_segments = segments[index + 1 :]
-        if any(op != "&&" for op, _later in later_segments):
-            continue
-        if is_git_push(segment):
-            if exit_code != 0 and (
-                not later_segments or not _output_proves_push_succeeded(payload)
-            ):
-                continue
-            targets.append(("push", effective_git_cwd(segment, effective_cwd), None))
-            continue
+        push = is_git_push(segment)
         pr_target = parse_gh_pr_arm_target(segment)
-        if pr_target is not None and exit_code == 0:
-            pr_number, _branch = pr_target
-            targets.append(("pr", effective_cwd, pr_number))
-    return tuple(targets)
+        next_states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {}
+        for (previous_succeeded, cwd), proven_targets in states.items():
+            executes = (
+                leading_op in {"", ";"}
+                or (leading_op == "&&" and previous_succeeded)
+                or (leading_op == "||" and not previous_succeeded)
+            )
+            if not executes:
+                if push and output_proves_single_push:
+                    continue
+                _merge_shell_state(
+                    next_states,
+                    (previous_succeeded, cwd),
+                    proven_targets,
+                )
+                continue
+            if destination is not None:
+                _merge_shell_state(
+                    next_states,
+                    (True, _relocated_cwd(cwd, destination)),
+                    proven_targets,
+                )
+                _merge_shell_state(
+                    next_states,
+                    (False, cwd),
+                    proven_targets,
+                )
+                continue
+            outcomes = (True,) if push and output_proves_single_push else (True, False)
+            for succeeded in outcomes:
+                next_targets = proven_targets
+                if succeeded and cwd is not None:
+                    if push:
+                        next_targets |= {
+                            (
+                                index,
+                                "push",
+                                effective_git_cwd(segment, cwd),
+                                None,
+                                None,
+                            )
+                        }
+                    elif pr_target is not None:
+                        pr_number, branch = pr_target
+                        next_targets |= {
+                            (index, "pr", cwd, pr_number, branch)
+                        }
+                _merge_shell_state(
+                    next_states,
+                    (succeeded, cwd),
+                    next_targets,
+                )
+        states = next_states
+
+    expected_success = exit_code == 0
+    proven: frozenset[_IndexedTarget] | None = None
+    for (succeeded, _cwd), targets in states.items():
+        if succeeded != expected_success:
+            continue
+        proven = targets if proven is None else proven & targets
+    if not proven:
+        return ()
+    return tuple(
+        (kind, cwd, pr_number, branch)
+        for _index, kind, cwd, pr_number, branch in sorted(proven)
+    )
 
 
 def _enqueue_target(
@@ -316,11 +455,12 @@ def _enqueue_target(
     kind: str,
     cwd: str,
     explicit_pr_number: str | None,
+    target_branch: str | None,
     payload: dict,
     state_root: str | PathLike[str] | None,
     now: datetime | None,
 ) -> None:
-    identity = local_git_identity(cwd)
+    identity = local_git_identity(cwd, branch=target_branch)
     if identity is None:
         return
     pr_number = int(explicit_pr_number) if explicit_pr_number is not None else None
@@ -433,7 +573,7 @@ def _run_payload(
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return 0
-    for kind, cwd, pr_number in _successful_targets(
+    for kind, cwd, pr_number, branch in _successful_targets(
         command,
         str(normalized["cwd"]),
         exit_code=exit_code,
@@ -443,6 +583,7 @@ def _run_payload(
             kind=kind,
             cwd=cwd,
             explicit_pr_number=pr_number,
+            target_branch=branch,
             payload=payload,
             state_root=state_root,
             now=now,

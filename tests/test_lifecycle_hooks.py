@@ -44,13 +44,18 @@ def _git(repo: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def _repository(tmp_path: Path) -> tuple[Path, str]:
-    repo = tmp_path / "widget"
+def _repository(
+    tmp_path: Path,
+    *,
+    name: str = "widget",
+    remote: str = "git@github.com:Acme/Widget.git",
+) -> tuple[Path, str]:
+    repo = tmp_path / name
     repo.mkdir()
     _git(repo, "init", "-b", "feature/thin-hooks")
     _git(repo, "config", "user.email", "hooks@example.test")
     _git(repo, "config", "user.name", "Hook Tests")
-    _git(repo, "remote", "add", "origin", "git@github.com:Acme/Widget.git")
+    _git(repo, "remote", "add", "origin", remote)
     (repo / "README.md").write_text("hook fixture\n", encoding="utf-8")
     _git(repo, "add", "README.md")
     _git(repo, "commit", "-m", "fixture")
@@ -166,6 +171,67 @@ def test_compound_command_tracks_cd_relocation_before_push(tmp_path: Path) -> No
     assert len(records) == 1
     assert records[0].intent.worktree_path == str(repo)
     assert records[0].intent.head_sha == head
+
+
+@pytest.mark.parametrize("guard", ("true", "false"))
+def test_or_guarded_cd_never_retargets_push_to_the_other_repository(
+    tmp_path: Path,
+    guard: str,
+) -> None:
+    adapter = _adapter()
+    repo_a, _head_a = _repository(
+        tmp_path,
+        name="repo-a",
+        remote="git@github.com:Acme/RepoA.git",
+    )
+    _repository(
+        tmp_path,
+        name="repo-b",
+        remote="git@github.com:Acme/RepoB.git",
+    )
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": f"{guard} || cd ../repo-b && git push"},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(repo_a),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+    assert LifecycleStore(state_root).list_intents() == ()
+
+
+def test_sequential_cd_enqueues_the_relocated_repository(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo_a, _head_a = _repository(
+        tmp_path,
+        name="repo-a",
+        remote="git@github.com:Acme/RepoA.git",
+    )
+    repo_b, head_b = _repository(
+        tmp_path,
+        name="repo-b",
+        remote="git@github.com:Acme/RepoB.git",
+    )
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "true && cd ../repo-b && git push"},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(repo_a),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    records = LifecycleStore(state_root).list_intents()
+    assert len(records) == 1
+    assert records[0].intent.repository == "Acme/RepoB"
+    assert records[0].intent.worktree_path == str(repo_b)
+    assert records[0].intent.head_sha == head_b
 
 
 @pytest.mark.parametrize(
@@ -309,6 +375,78 @@ def test_pr_create_reactivates_a_push_that_previously_had_no_pr(
     assert reactivated.state is IntentLifecycleStateV1.PENDING
     assert reactivated.generation == 2
     assert reactivated.intent.pr_number == 42
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        "gh pr create --fill --head feature/pr-head",
+        "gh pr create --fill -Hfeature/pr-head",
+        "gh pr create --fill -H=feature/pr-head",
+        "gh pr ready feature/pr-head",
+    ),
+)
+def test_pr_branch_target_uses_the_exact_local_ref_identity(
+    tmp_path: Path,
+    command: str,
+) -> None:
+    adapter = _adapter()
+    repo, current_head = _repository(tmp_path)
+    _git(repo, "checkout", "-b", "feature/pr-head")
+    (repo / "branch.txt").write_text("branch head\n", encoding="utf-8")
+    _git(repo, "add", "branch.txt")
+    _git(repo, "commit", "-m", "branch head")
+    branch_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "feature/thin-hooks")
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": command, "workdir": str(repo)},
+        "tool_response": {
+            "exit_code": 0,
+            "stdout": "https://github.com/Acme/Widget/pull/42\n",
+        },
+        "cwd": str(tmp_path),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    records = LifecycleStore(state_root).list_intents()
+    assert len(records) == 1
+    intent = records[0].intent
+    assert intent.pushed_ref == "refs/heads/feature/pr-head"
+    assert intent.head_sha == branch_head
+    assert intent.head_sha != current_head
+    assert intent.pr_number == 42
+
+
+@pytest.mark.parametrize(
+    "head",
+    ("missing-branch", "someone:feature/pr-head"),
+)
+def test_pr_nonlocal_or_missing_branch_target_is_skipped(
+    tmp_path: Path,
+    head: str,
+) -> None:
+    adapter = _adapter()
+    repo, _current_head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": f"gh pr create --fill --head {head}"},
+        "tool_response": {
+            "exit_code": 0,
+            "stdout": "https://github.com/Acme/Widget/pull/42\n",
+        },
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+    assert LifecycleStore(state_root).list_intents() == ()
 
 
 def test_stop_reads_only_the_exact_head_snapshot_and_is_advisory_during_outage(
