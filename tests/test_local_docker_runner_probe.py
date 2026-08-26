@@ -180,13 +180,19 @@ def test_one_unreachable_host_degrades_but_still_reports() -> None:
     assert "reserve" in load.recommendation
 
 
-def test_all_hosts_unreachable_falls_back_to_github() -> None:
-    """Total loss of docker is unknown, not an authoritative zero."""
+def test_all_configured_hosts_unreachable_stays_local() -> None:
+    """Configured local infrastructure must never fall back to GitHub."""
 
     def run(cmd: list[str], cwd: str | None, timeout_s: int) -> subprocess.CompletedProcess[str]:
         return _completed("cannot connect", returncode=1)
 
-    assert runner_monitor._local_docker_runner_load([CI, RESERVE], LABEL, None, run) is None
+    load = runner_monitor._local_docker_runner_load([CI, RESERVE], LABEL, None, run)
+
+    assert load is not None
+    assert load.is_degraded
+    assert load.total == 0
+    assert "ci-box" in (load.error or "")
+    assert "reserve" in (load.error or "")
 
 
 def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:
