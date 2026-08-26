@@ -390,11 +390,14 @@ def _observation_from_request(
         effective_model = resolve_provider_model(
             structured.requested_model,
             resolution,
+            ignore_user_config=structured.ignore_user_config,
         )
         if structured.resolution_source is DispatchResolutionSource.UNAVAILABLE:
             structured = replace(
                 structured,
-                resolution_source=_adapter_resolution_source(resolution),
+                resolution_source=_adapter_resolution_source(
+                    resolution, ignore_user_config=structured.ignore_user_config
+                ),
             )
         verdict = response.get("review_verdict")
         if (
@@ -408,7 +411,7 @@ def _observation_from_request(
             outcome=outcome,
             effective_model=effective_model,
             error_type=(
-                f"process.exit_code.{response.get('exit_code')}"
+                f"process.exit_code.{_exit_code(response)}"
                 if outcome is DispatchOutcome.FAILURE
                 else (
                     "provider.unavailable"
@@ -541,6 +544,9 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
         return len(argv) >= 2 and argv[1] == "run"
     if provider is not DispatchProvider.CODEX:
         return False
+    option_tokens = argv[1 : argv.index("--")] if "--" in argv else argv[1:]
+    if any(token in {"-h", "--help", "-V", "--version"} for token in option_tokens):
+        return False
     value_options = {
         "--add-dir",
         "--ask-for-approval",
@@ -576,11 +582,13 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
     return False
 
 
-def _adapter_resolution_source(resolution: object) -> DispatchResolutionSource:
+def _adapter_resolution_source(
+    resolution: object, *, ignore_user_config: bool = False
+) -> DispatchResolutionSource:
     if not isinstance(resolution, dict):
         return DispatchResolutionSource.UNAVAILABLE
     configured = resolution.get("configured_model")
-    if isinstance(configured, str) and configured.strip():
+    if not ignore_user_config and isinstance(configured, str) and configured.strip():
         return DispatchResolutionSource.BASE_CONFIG
     default = resolution.get("default_model")
     if isinstance(default, str) and default.strip():
@@ -713,7 +721,10 @@ def _skip_timeout_prefix(tokens: list[str], index: int) -> int:
 
 
 def resolve_provider_model(
-    requested_model: str | None, resolution: object
+    requested_model: str | None,
+    resolution: object,
+    *,
+    ignore_user_config: bool = False,
 ) -> str | None:
     """Resolve model attribution supplied by a repository adapter.
 
@@ -725,7 +736,12 @@ def resolve_provider_model(
         return requested_model
     if not isinstance(resolution, dict):
         return None
-    for key in ("configured_model", "default_model"):
+    keys = (
+        ("default_model",)
+        if ignore_user_config
+        else ("configured_model", "default_model")
+    )
+    for key in keys:
         candidate = resolution.get(key)
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
@@ -765,12 +781,9 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
 
 def _exit_code(response: dict[object, object]) -> int | None:
     exit_code = response.get("exit_code", response.get("exitCode"))
-    if isinstance(exit_code, bool):
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
         return None
-    try:
-        return int(exit_code) if exit_code is not None else None
-    except (TypeError, ValueError):
-        return None
+    return exit_code
 
 
 def _valid_start_time(value: object) -> bool:

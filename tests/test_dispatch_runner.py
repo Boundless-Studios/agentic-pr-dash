@@ -24,6 +24,7 @@ from agentic_pr_dash.dispatch_observation import (
     DispatchProvider,
     DispatchSource,
 )
+from agentic_pr_dash.dispatch_telemetry import DispatchTelemetry
 
 
 def _request(
@@ -130,6 +131,27 @@ def test_flagless_dispatch_resolves_adapter_model_candidates(
     assert result.observation is not None
     assert result.observation.requested_model is None
     assert result.observation.resolved_model == expected
+
+
+def test_ignore_user_config_excludes_configured_model_candidate(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={
+            "configured_model": "user-model",
+            "default_model": "codex-default",
+        },
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "--ignore-user-config", "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.resolved_model == "codex-default"
 
 
 def test_explicit_model_wins_over_adapter_resolution(tmp_path: Path) -> None:
@@ -267,6 +289,30 @@ def test_structured_codex_dispatch_skips_value_taking_global_options(
 
 
 @pytest.mark.parametrize(
+    "argv",
+    [
+        ["codex", "exec", "--help"],
+        ["codex", "--version", "exec"],
+        ["codex", "-V", "exec"],
+        ["codex", "--help", "exec"],
+    ],
+)
+def test_structured_help_or_version_invocation_is_rejected(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {"argv": argv, "task_type": "review"}
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         {"argv": "codex exec review", "task_type": "review"},
@@ -315,7 +361,9 @@ def test_structured_metadata_rejects_implausible_start_time(
     assert not request.ledger_path.exists()
 
 
-@pytest.mark.parametrize("response", [{}, {"exit_code": "not-a-number"}])
+@pytest.mark.parametrize(
+    "response", [{}, {"exit_code": "not-a-number"}, {"exit_code": 0.5}]
+)
 def test_interactive_structured_dispatch_rejects_unknown_outcome(
     tmp_path: Path, response: dict[str, object]
 ) -> None:
@@ -331,11 +379,38 @@ def test_interactive_structured_dispatch_rejects_unknown_outcome(
         "task_type": "review",
     }
 
-    result = run_dispatch_hook(request, lambda observation: callbacks.append(observation))
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
 
     assert result.observation is None
     assert callbacks == []
     assert not request.ledger_path.exists()
+
+
+def test_camel_case_exit_code_is_used_in_error_attribute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        response={"exitCode": 1},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
 
 
 @pytest.mark.parametrize(
@@ -365,9 +440,7 @@ def test_structured_metadata_rejects_wrong_provider_or_subcommand(
     assert not request.ledger_path.exists()
 
 
-def test_legacy_dispatch_emits_typed_parse_status(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_legacy_dispatch_emits_typed_parse_status(tmp_path: Path, monkeypatch) -> None:
     emitted = []
     monkeypatch.setattr(
         "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
@@ -700,7 +773,7 @@ def test_canonical_multiline_review_with_stdin_redirect_keeps_classification(
         tmp_path,
         provider=DispatchProvider.CODEX,
         command=(
-            "codex exec --sandbox workspace-write \"Review this diff:\n"
+            'codex exec --sandbox workspace-write "Review this diff:\n'
             "+print('safe; quoted')\" </dev/null"
         ),
         classification={"task_type": "review", "framework": "coding-agent/v1"},
@@ -1047,9 +1120,7 @@ def test_structured_entrypoint_routes_default_paths_to_overridden_worktree(
     monkeypatch.setattr(
         sys,
         "stdin",
-        TextIOWrapper(
-            BytesIO(f"codex\0exec\0{option}\0{value}\0prompt\0".encode())
-        ),
+        TextIOWrapper(BytesIO(f"codex\0exec\0{option}\0{value}\0prompt\0".encode())),
     )
 
     result = run_codex_dispatch_logger.main(

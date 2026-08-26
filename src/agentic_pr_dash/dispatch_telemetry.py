@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -82,7 +83,13 @@ _REDACTED_VALUE_OPTIONS = {
     "-i",
     "-o",
 }
-_SAFE_CONFIG_KEYS = {"model", "model_reasoning_effort"}
+_SAFE_CONFIG_KEYS = {
+    "approval_policy",
+    "model",
+    "model_provider",
+    "model_reasoning_effort",
+    "sandbox_mode",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,8 +286,30 @@ def _sanitize_and_resolve(
     sandbox_mode = None
     approval_mode = None
     ignore_user_config = False
+    provider_explicit = False
+    sandbox_explicit = False
+    approval_explicit = False
+    bypass_policy = False
     working_root = None
     resolution_source = DispatchResolutionSource.UNAVAILABLE
+
+    def apply_config(value: str) -> None:
+        nonlocal model, reasoning_effort, resolution_source
+        nonlocal gen_ai_provider_name, sandbox_mode, approval_mode
+        model, reasoning_effort, resolution_source = _apply_config_value(
+            value, model, reasoning_effort, resolution_source
+        )
+        assignment = _safe_config_assignment(value)
+        if assignment is None:
+            return
+        key, parsed_value = assignment
+        if key == "model_provider" and not provider_explicit:
+            gen_ai_provider_name = _truncate(parsed_value)
+        elif key == "sandbox_mode" and not sandbox_explicit and not bypass_policy:
+            sandbox_mode = _truncate(parsed_value)
+        elif key == "approval_policy" and not approval_explicit and not bypass_policy:
+            approval_mode = _truncate(parsed_value)
+
     value_options = (
         _CODEX_VALUE_OPTIONS
         if provider is DispatchProvider.CODEX
@@ -293,9 +322,7 @@ def _sanitize_and_resolve(
     )
     index = 1
     subcommand_seen = False
-    subcommands = (
-        {"exec", "e"} if provider is DispatchProvider.CODEX else {"run"}
-    )
+    subcommands = {"exec", "e"} if provider is DispatchProvider.CODEX else {"run"}
     while index < len(argv):
         token = argv[index]
         if token == "--":
@@ -319,15 +346,17 @@ def _sanitize_and_resolve(
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
             elif short_option == "-s" and provider is DispatchProvider.CODEX:
-                sandbox_mode = _truncate(attached_value)
+                if not bypass_policy:
+                    sandbox_mode = _truncate(attached_value)
+                    sandbox_explicit = True
             elif short_option == "-a":
-                approval_mode = _truncate(attached_value)
+                if not bypass_policy:
+                    approval_mode = _truncate(attached_value)
+                    approval_explicit = True
             elif short_option == "-C":
                 working_root = attached_value
             else:
-                model, reasoning_effort, resolution_source = _apply_config_value(
-                    attached_value, model, reasoning_effort, resolution_source
-                )
+                apply_config(attached_value)
             index += 1
             continue
         option, separator, attached_value = token.partition("=")
@@ -355,15 +384,18 @@ def _sanitize_and_resolve(
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
             elif option == "--sandbox":
-                sandbox_mode = _truncate(attached_value)
+                if not bypass_policy:
+                    sandbox_mode = _truncate(attached_value)
+                    sandbox_explicit = True
             elif option == "--ask-for-approval":
-                approval_mode = _truncate(attached_value)
+                if not bypass_policy:
+                    approval_mode = _truncate(attached_value)
+                    approval_explicit = True
             elif option == "--config":
-                model, reasoning_effort, resolution_source = _apply_config_value(
-                    attached_value, model, reasoning_effort, resolution_source
-                )
+                apply_config(attached_value)
             elif option == "--local-provider":
                 gen_ai_provider_name = _truncate(attached_value)
+                provider_explicit = True
             elif option == "--cd":
                 working_root = attached_value
             index += 1
@@ -393,15 +425,18 @@ def _sanitize_and_resolve(
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
             elif token in {"--sandbox", "-s"} and provider is DispatchProvider.CODEX:
-                sandbox_mode = _truncate(value)
+                if not bypass_policy:
+                    sandbox_mode = _truncate(value)
+                    sandbox_explicit = True
             elif token in {"--ask-for-approval", "-a"}:
-                approval_mode = _truncate(value)
+                if not bypass_policy:
+                    approval_mode = _truncate(value)
+                    approval_explicit = True
             elif token in {"--config", "-c"}:
-                model, reasoning_effort, resolution_source = _apply_config_value(
-                    value, model, reasoning_effort, resolution_source
-                )
+                apply_config(value)
             elif token == "--local-provider":
                 gen_ai_provider_name = _truncate(value)
+                provider_explicit = True
             elif token in {"--cd", "-C"}:
                 working_root = value
             index += 2
@@ -411,6 +446,7 @@ def _sanitize_and_resolve(
             if token == "--ignore-user-config":
                 ignore_user_config = True
             elif token == "--dangerously-bypass-approvals-and-sandbox":
+                bypass_policy = True
                 sandbox_mode = "danger-full-access"
                 approval_mode = "never"
         elif token in subcommands and not subcommand_seen:
@@ -442,15 +478,10 @@ def _apply_config_value(
     reasoning_effort: str | None,
     resolution_source: DispatchResolutionSource,
 ) -> tuple[str | None, str | None, DispatchResolutionSource]:
-    key, found, raw_value = value.partition("=")
-    if not found or key not in _SAFE_CONFIG_KEYS:
+    assignment = _safe_config_assignment(value)
+    if assignment is None:
         return model, reasoning_effort, resolution_source
-    try:
-        parsed_value = tomllib.loads(f"value = {raw_value}")["value"]
-    except (tomllib.TOMLDecodeError, KeyError):
-        parsed_value = raw_value
-    if not isinstance(parsed_value, str):
-        return model, reasoning_effort, resolution_source
+    key, parsed_value = assignment
     if key == "model":
         if resolution_source is DispatchResolutionSource.EXPLICIT_FLAG:
             return model, reasoning_effort, resolution_source
@@ -467,10 +498,28 @@ def _safe_option_value(option: str, value: str) -> str:
         return "<redacted:option>"
     if option not in {"--config", "-c"}:
         return value
-    key, separator, config_value = value.partition("=")
+    key, _separator, _config_value = value.partition("=")
+    assignment = _safe_config_assignment(value)
+    if assignment is None:
+        return f"{key.strip()}=<redacted:config>"
+    normalized_key, parsed_value = assignment
+    return f"{normalized_key}={parsed_value}"
+
+
+def _safe_config_assignment(value: str) -> tuple[str, str] | None:
+    key, separator, raw_value = value.partition("=")
+    key = key.strip()
     if not separator or key not in _SAFE_CONFIG_KEYS:
-        return f"{key}=<redacted:config>"
-    return f"{key}={config_value}"
+        return None
+    try:
+        parsed_value = tomllib.loads(f"value = {raw_value}")["value"]
+    except (tomllib.TOMLDecodeError, KeyError):
+        parsed_value = raw_value.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.+/-]+", parsed_value):
+            return None
+    if not isinstance(parsed_value, str):
+        return None
+    return key, parsed_value
 
 
 def _truncate(value: str) -> str:

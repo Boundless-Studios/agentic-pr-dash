@@ -105,14 +105,13 @@ def test_model_option_forms_are_resolved_once(
 
 
 def test_config_model_has_distinct_resolution_source() -> None:
-    telemetry = _telemetry(
-        "codex", "exec", "--config", "model=gpt-5.6-sol", "prompt"
-    )
+    telemetry = _telemetry("codex", "exec", "--config", "model=gpt-5.6-sol", "prompt")
 
     assert telemetry.requested_model == "gpt-5.6-sol"
-    assert telemetry.otel_attributes()[
-        "gaia.dispatch.resolution_source"
-    ] == "config_override"
+    assert (
+        telemetry.otel_attributes()["gaia.dispatch.resolution_source"]
+        == "config_override"
+    )
 
 
 def test_explicit_model_takes_precedence_over_later_config_override() -> None:
@@ -146,6 +145,63 @@ def test_toml_config_model_is_normalized() -> None:
     assert telemetry.requested_model == "gpt-5"
 
 
+def test_toml_config_key_whitespace_and_comments_are_normalized() -> None:
+    secret = "PRIVATE_SENTINEL"
+    telemetry = _telemetry(
+        "codex", "exec", "-c", f'model = "gpt-5" # {secret}', "prompt"
+    )
+
+    assert telemetry.requested_model == "gpt-5"
+    serialized = json.dumps(telemetry.otel_attributes())
+    assert secret not in serialized
+    assert "model=gpt-5" in serialized
+
+
+@pytest.mark.parametrize(
+    ("override", "attribute", "expected"),
+    [
+        ('model_provider="ollama"', "gen_ai.provider.name", "ollama"),
+        ('approval_policy="never"', "gaia.dispatch.approval_mode", "never"),
+        (
+            'sandbox_mode="danger-full-access"',
+            "gaia.dispatch.sandbox_mode",
+            "danger-full-access",
+        ),
+    ],
+)
+def test_safe_policy_config_overrides_are_attributed(
+    override: str, attribute: str, expected: str
+) -> None:
+    attributes = _telemetry("codex", "exec", "-c", override, "prompt").otel_attributes()
+
+    assert attributes[attribute] == expected
+
+
+def test_explicit_policy_flags_take_precedence_over_config_overrides() -> None:
+    telemetry = _telemetry(
+        "codex",
+        "exec",
+        "--local-provider",
+        "lmstudio",
+        "--ask-for-approval",
+        "on-request",
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        'model_provider="ollama"',
+        "-c",
+        'approval_policy="never"',
+        "-c",
+        'sandbox_mode="danger-full-access"',
+        "prompt",
+    )
+
+    attributes = telemetry.otel_attributes()
+    assert attributes["gen_ai.provider.name"] == "lmstudio"
+    assert attributes["gaia.dispatch.approval_mode"] == "on-request"
+    assert attributes["gaia.dispatch.sandbox_mode"] == "workspace-write"
+
+
 def test_profile_is_preserved_as_resolution_source_for_adapter_model() -> None:
     telemetry = _telemetry("codex", "exec", "--profile", "maintenance", "prompt")
 
@@ -157,9 +213,7 @@ def test_missing_option_value_and_double_dash_do_not_change_routing() -> None:
     missing = _telemetry(
         "codex", "exec", "--model", "--profile", "maintenance", "prompt"
     )
-    terminated = _telemetry(
-        "codex", "exec", "--", "--model", "secret-payload-model"
-    )
+    terminated = _telemetry("codex", "exec", "--", "--model", "secret-payload-model")
 
     assert missing.requested_model is None
     assert missing.requested_profile == "maintenance"
@@ -216,9 +270,10 @@ def test_environment_is_allowlisted_instead_of_copied() -> None:
     serialized = json.dumps(telemetry.otel_attributes())
 
     assert telemetry.codex_home == "/safe/codex-home"
-    assert telemetry.otel_attributes()[
-        "process.environment_variable.CODEX_HOME"
-    ] == "/safe/codex-home"
+    assert (
+        telemetry.otel_attributes()["process.environment_variable.CODEX_HOME"]
+        == "/safe/codex-home"
+    )
     assert "sk-never-record" not in serialized
     assert "ARBITRARY" not in serialized
     assert "private" not in serialized
@@ -267,6 +322,21 @@ def test_dangerous_bypass_flag_sets_effective_policy_attributes() -> None:
 
     attributes = telemetry.otel_attributes()
 
+    assert attributes["gaia.dispatch.sandbox_mode"] == "danger-full-access"
+    assert attributes["gaia.dispatch.approval_mode"] == "never"
+
+
+def test_dangerous_bypass_policy_is_not_order_dependent() -> None:
+    telemetry = _telemetry(
+        "codex",
+        "exec",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-s",
+        "workspace-write",
+        "prompt",
+    )
+
+    attributes = telemetry.otel_attributes()
     assert attributes["gaia.dispatch.sandbox_mode"] == "danger-full-access"
     assert attributes["gaia.dispatch.approval_mode"] == "never"
 
@@ -441,9 +511,7 @@ def test_relative_executable_omits_path_and_all_string_attributes_are_bounded() 
 
 
 def test_dispatch_projects_to_existing_redacted_observation() -> None:
-    telemetry = _telemetry(
-        "codex", "exec", "--model", "gpt-5.6-sol", "private prompt"
-    )
+    telemetry = _telemetry("codex", "exec", "--model", "gpt-5.6-sol", "private prompt")
 
     observation = telemetry.to_dispatch_observation(
         outcome=DispatchOutcome.SUCCESS,
