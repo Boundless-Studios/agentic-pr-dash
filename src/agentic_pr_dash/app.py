@@ -70,6 +70,7 @@ _dashboard_context_generation = 0
 _OWNERSHIP_CACHE_TTL_SECONDS = 60.0
 _ownership_card_cache: dict[tuple[str | None, int | None, str], tuple[float, dict]] = {}
 _ownership_card_cache_lock = threading.Lock()
+_OWNERSHIP_SNAPSHOT_UNAVAILABLE = object()
 
 
 def _invalidate_dashboard_context() -> None:
@@ -712,6 +713,16 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
     }
     visible_worktrees = [wt for wt in worktrees if wt["path"] not in hidden_worktree_paths]
 
+    # Ownership resolution replays the full claim store. A cold card cache has
+    # one distinct key per worktree, so capture once for the entire board build
+    # instead of spending one bounded store read on every cache miss.
+    try:
+        from . import ownership  # noqa: PLC0415
+
+        ownership_snapshot = ownership.snapshot()
+    except Exception:  # noqa: BLE001
+        ownership_snapshot = _OWNERSHIP_SNAPSHOT_UNAVAILABLE
+
     cards: list[WorktreeCard] = []
     seen_pr_numbers: set[int] = set()
     prs_by_worktree = {
@@ -731,6 +742,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 active_agents_by_path.get(worktree["path"], []),
                 _runtime_session_for_worktree(worktree["path"], runtime_summary),
                 main_repo_root=main_repo_root,
+                ownership_snapshot=ownership_snapshot,
             )
         )
 
@@ -764,6 +776,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 runtime_session=runtime_session,
                 session_worktree_path=resolved_worktree_path if branch_session else None,
                 main_repo_root=main_repo_root,
+                ownership_snapshot=ownership_snapshot,
             )
         )
 
@@ -932,6 +945,8 @@ def _ownership_for_card(
     worktree_path: str | None,
     pr_number: int | None,
     repo_cwd: str,
+    *,
+    ownership_snapshot=None,
 ) -> dict:
     """Best-effort ownership/observability info for a WorktreeCard. Never raises.
 
@@ -950,12 +965,17 @@ def _ownership_for_card(
             # Claim-first for identity (BOU-2223 Stage 3); the marker still
             # supplies armed_at/heartbeat, which have no claim equivalent — the
             # claim's lease is a different quantity and must not be shown as one.
-            owned = resolve_worktree(worktree_path, kind="card_divergence")
-            if owned.session_id:
-                result["owner_session_id"] = owned.session_id
-            if owned.owner_pid is not None:
-                result["owner_pid"] = owned.owner_pid
-                result["owner_pid_alive"] = _pid_alive(str(owned.owner_pid))
+            if ownership_snapshot is not _OWNERSHIP_SNAPSHOT_UNAVAILABLE:
+                owned = resolve_worktree(
+                    worktree_path,
+                    kind="card_divergence",
+                    snap=ownership_snapshot,
+                )
+                if owned.session_id:
+                    result["owner_session_id"] = owned.session_id
+                if owned.owner_pid is not None:
+                    result["owner_pid"] = owned.owner_pid
+                    result["owner_pid_alive"] = _pid_alive(str(owned.owner_pid))
 
             marker = _read_marker(worktree_path)
             if marker:
@@ -1018,6 +1038,8 @@ def _cached_ownership_for_card(
     worktree_path: str | None,
     pr_number: int | None,
     repo_cwd: str,
+    *,
+    ownership_snapshot=None,
 ) -> dict:
     """Share slow claim/event-store reads across dashboard view variants."""
     key = (worktree_path, pr_number, repo_cwd)
@@ -1037,6 +1059,7 @@ def _cached_ownership_for_card(
             worktree_path=worktree_path,
             pr_number=pr_number,
             repo_cwd=repo_cwd,
+            ownership_snapshot=ownership_snapshot,
         )
         _ownership_card_cache[key] = (time.monotonic(), ownership)
         return ownership
@@ -1082,6 +1105,7 @@ def _build_card_for_worktree(
     runtime_session: session_registry.RuntimeSessionState | None = None,
     *,
     main_repo_root: str | None = None,
+    ownership_snapshot=None,
 ) -> WorktreeCard:
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
@@ -1128,6 +1152,7 @@ def _build_card_for_worktree(
         worktree_path=worktree.get("path"),
         pr_number=pr.number if pr else None,
         repo_cwd=root,
+        ownership_snapshot=ownership_snapshot,
     )
 
     return WorktreeCard(
@@ -1188,6 +1213,7 @@ def _build_unassigned_pr_card(
     runtime_session: session_registry.RuntimeSessionState | None = None,
     session_worktree_path: str | None = None,
     main_repo_root: str | None = None,
+    ownership_snapshot=None,
 ) -> WorktreeCard:
     # When a live branch-matched session attributes this PR to a worktree
     # (session_worktree_path), synthesize an agent from it so a PR worked from a
@@ -1234,6 +1260,7 @@ def _build_unassigned_pr_card(
         worktree_path=session_worktree_path or pr.worktree_path,
         pr_number=pr.number,
         repo_cwd=main_repo_root or get_main_repo_root(),
+        ownership_snapshot=ownership_snapshot,
     )
 
     return WorktreeCard(
