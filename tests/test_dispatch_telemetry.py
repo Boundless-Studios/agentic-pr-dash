@@ -175,6 +175,7 @@ def test_safe_policy_config_overrides_are_attributed(
     attributes = _telemetry("codex", "exec", "-c", override, "prompt").otel_attributes()
 
     assert attributes[attribute] == expected
+    assert "gaia.dispatch.reasoning_effort" not in attributes
 
 
 def test_explicit_policy_flags_take_precedence_over_config_overrides() -> None:
@@ -297,6 +298,16 @@ def test_unknown_attached_option_value_is_redacted() -> None:
     assert attributes["gaia.dispatch.reasoning_effort"] == "xhigh"
 
 
+def test_unknown_attached_short_option_value_is_redacted() -> None:
+    secret = "secret-attached-value"
+    telemetry = _telemetry("codex", "exec", f"-X{secret}", "prompt")
+
+    serialized = json.dumps(telemetry.otel_attributes())
+
+    assert secret not in serialized
+    assert "-X<redacted:option>" in serialized
+
+
 def test_execution_policy_options_are_structured_attributes() -> None:
     telemetry = _telemetry(
         "codex",
@@ -339,6 +350,12 @@ def test_dangerous_bypass_policy_is_not_order_dependent() -> None:
     attributes = telemetry.otel_attributes()
     assert attributes["gaia.dispatch.sandbox_mode"] == "danger-full-access"
     assert attributes["gaia.dispatch.approval_mode"] == "never"
+
+
+def test_full_auto_sets_compatible_sandbox_mode() -> None:
+    telemetry = _telemetry("codex", "exec", "--full-auto", "prompt")
+
+    assert telemetry.sandbox_mode == "workspace-write"
 
 
 @pytest.mark.parametrize("option", ["--local-provider", "--local-provider="])
@@ -396,6 +413,17 @@ def test_attached_file_option_values_are_redacted(option: str) -> None:
 
     serialized = json.dumps(telemetry.otel_attributes())
     assert "/private/" not in serialized
+    assert telemetry.sanitized_argv[2] in {
+        "-i<redacted:option>",
+        "-o<redacted:option>",
+    }
+
+
+@pytest.mark.parametrize("option", ["-imodel=gpt-5", "-omodel=gpt-5"])
+def test_attached_file_option_values_do_not_set_model(option: str) -> None:
+    telemetry = _telemetry("codex", "exec", option, "prompt")
+
+    assert telemetry.requested_model is None
     assert telemetry.sanitized_argv[2] in {
         "-i<redacted:option>",
         "-o<redacted:option>",

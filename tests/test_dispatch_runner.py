@@ -413,6 +413,27 @@ def test_camel_case_exit_code_is_used_in_error_attribute(
     assert captured[0][1]["error_type"] == "process.exit_code.1"
 
 
+def test_legacy_camel_case_exit_code_is_used_in_error_attribute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+        response={"exitCode": 1},
+    )
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
+
+
 @pytest.mark.parametrize(
     "argv",
     [

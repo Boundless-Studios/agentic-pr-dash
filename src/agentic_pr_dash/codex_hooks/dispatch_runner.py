@@ -489,7 +489,7 @@ def _observation_from_request(
         outcome=outcome,
         effective_model=resolved_model,
         error_type=(
-            f"process.exit_code.{response.get('exit_code')}"
+            f"process.exit_code.{_exit_code(response)}"
             if outcome is DispatchOutcome.FAILURE
             else (
                 "provider.unavailable"

@@ -355,7 +355,7 @@ def _sanitize_and_resolve(
                     approval_explicit = True
             elif short_option == "-C":
                 working_root = attached_value
-            else:
+            elif short_option == "-c":
                 apply_config(attached_value)
             index += 1
             continue
@@ -442,9 +442,18 @@ def _sanitize_and_resolve(
             index += 2
             continue
         if token.startswith("-"):
-            sanitized.append(_truncate(token))
+            sanitized.append(
+                _truncate(
+                    f"{short_option}<redacted:option>"
+                    if not token.startswith("--") and len(token) > 2
+                    else token
+                )
+            )
             if token == "--ignore-user-config":
                 ignore_user_config = True
+            elif token == "--full-auto" and not bypass_policy:
+                sandbox_mode = "workspace-write"
+                sandbox_explicit = True
             elif token == "--dangerously-bypass-approvals-and-sandbox":
                 bypass_policy = True
                 sandbox_mode = "danger-full-access"
@@ -490,7 +499,9 @@ def _apply_config_value(
             reasoning_effort,
             DispatchResolutionSource.CONFIG_OVERRIDE,
         )
-    return model, _truncate(parsed_value), resolution_source
+    if key == "model_reasoning_effort":
+        reasoning_effort = _truncate(parsed_value)
+    return model, reasoning_effort, resolution_source
 
 
 def _safe_option_value(option: str, value: str) -> str:
