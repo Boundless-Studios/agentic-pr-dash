@@ -4,6 +4,69 @@ from unittest.mock import AsyncMock
 from agentic_pr_dash import app
 
 
+def test_cold_context_rebuilds_during_first_ttl_of_host_uptime(monkeypatch):
+    async def scenario():
+        monkeypatch.setattr(app.time, "monotonic", lambda: 5.0)
+        monkeypatch.setattr(
+            app.asyncio,
+            "to_thread",
+            AsyncMock(return_value={"version": "fresh"}),
+        )
+        app._dashboard_context_cache.clear()
+        app._dashboard_context_tasks.clear()
+
+        context = await app._dashboard_context_async()
+
+        assert "columns" in context
+        task = app._dashboard_context_tasks[(False, "board")]
+        await task
+        assert await app._dashboard_context_async() == {"version": "fresh"}
+
+    asyncio.run(scenario())
+
+
+def test_invalidated_inflight_result_stays_stale_during_first_ttl(monkeypatch):
+    async def scenario():
+        started = asyncio.Event()
+        release = asyncio.Event()
+        builds = 0
+
+        async def fake_to_thread(func, **kwargs):
+            nonlocal builds
+            builds += 1
+            started.set()
+            await release.wait()
+            return {"version": builds}
+
+        monkeypatch.setattr(app.time, "monotonic", lambda: 5.0)
+        monkeypatch.setattr(app.asyncio, "to_thread", fake_to_thread)
+        app._dashboard_context_cache.clear()
+        app._dashboard_context_tasks.clear()
+
+        await app._dashboard_context_async()
+        await started.wait()
+        app._invalidate_dashboard_context()
+        release.set()
+        await app._dashboard_context_tasks[(False, "board")]
+
+        assert await app._dashboard_context_async() == {"version": 1}
+        await asyncio.sleep(0)
+        assert builds == 2
+
+    asyncio.run(scenario())
+
+
+def test_invalidation_clears_cached_card_details():
+    app._ownership_card_cache[("/worktree", 182, "/repo")] = (
+        1.0,
+        {"owner_session_id": "stale"},
+    )
+
+    app._invalidate_dashboard_context()
+
+    assert app._ownership_card_cache == {}
+
+
 def test_force_refresh_does_not_duplicate_inflight_context_build(monkeypatch):
     async def scenario():
         started = asyncio.Event()

@@ -67,6 +67,7 @@ CONTEXT_CACHE_TTL_SECONDS = 30.0
 _dashboard_context_cache: dict[tuple[bool, str], tuple[float, dict[str, object]]] = {}
 _dashboard_context_tasks: dict[tuple[bool, str], asyncio.Task[dict[str, object]]] = {}
 _dashboard_context_generation = 0
+_DASHBOARD_CONTEXT_STALE_AT = float("-inf")
 _OWNERSHIP_CACHE_TTL_SECONDS = 60.0
 _ownership_card_cache: dict[tuple[str | None, int | None, str], tuple[float, dict]] = {}
 _ownership_card_cache_lock = threading.Lock()
@@ -83,7 +84,9 @@ def _invalidate_dashboard_context() -> None:
     # both the displayable snapshot and the single in-flight worker; timestamp
     # entries as stale so one follow-up build runs after the worker settles.
     for key, (_timestamp, context) in list(_dashboard_context_cache.items()):
-        _dashboard_context_cache[key] = (float("-inf"), context)
+        _dashboard_context_cache[key] = (_DASHBOARD_CONTEXT_STALE_AT, context)
+    with _ownership_card_cache_lock:
+        _ownership_card_cache.clear()
 
 
 def _asset_version() -> str:
@@ -716,12 +719,16 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
     # Ownership resolution replays the full claim store. A cold card cache has
     # one distinct key per worktree, so capture once for the entire board build
     # instead of spending one bounded store read on every cache miss.
-    try:
-        from . import ownership  # noqa: PLC0415
+    from ._maintenance.ownership_resolution import claim_reads_enabled  # noqa: PLC0415
 
-        ownership_snapshot = ownership.snapshot()
-    except Exception:  # noqa: BLE001
-        ownership_snapshot = _OWNERSHIP_SNAPSHOT_UNAVAILABLE
+    ownership_snapshot = _OWNERSHIP_SNAPSHOT_UNAVAILABLE
+    if claim_reads_enabled():
+        try:
+            from . import ownership  # noqa: PLC0415
+
+            ownership_snapshot = ownership.snapshot()
+        except Exception:  # noqa: BLE001
+            pass
 
     cards: list[WorktreeCard] = []
     seen_pr_numbers: set[int] = set()
@@ -1576,7 +1583,7 @@ async def _dashboard_context_async(
         # refresh — which clears this cache — made the dashboard assert zero
         # PRs for as long as the rebuild took.
         cached = (
-            0.0,
+            _DASHBOARD_CONTEXT_STALE_AT,
             _dashboard_context_from_cards(
                 [],
                 0,
@@ -1622,7 +1629,7 @@ async def _dashboard_context_async(
                 timestamp = (
                     time.monotonic()
                     if build_generation == _dashboard_context_generation
-                    else 0.0
+                    else _DASHBOARD_CONTEXT_STALE_AT
                 )
                 _dashboard_context_cache[key] = (timestamp, context)
             return context
