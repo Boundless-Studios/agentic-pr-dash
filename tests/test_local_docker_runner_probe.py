@@ -195,6 +195,25 @@ def test_all_configured_hosts_unreachable_stays_local() -> None:
     assert "reserve" in (load.error or "")
 
 
+def test_dashboard_runner_probe_cache_reuses_one_local_snapshot(monkeypatch) -> None:
+    calls = 0
+
+    def load(*, cwd: str | None, run):
+        nonlocal calls
+        calls += 1
+        return runner_monitor.RunnerFleetLoad(online=calls)
+
+    monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", None)
+
+    first = runner_monitor.get_cached_runner_fleet_load(cwd="/repo")
+    second = runner_monitor.get_cached_runner_fleet_load(cwd="/repo")
+
+    assert first is second
+    assert first.online == 1
+    assert calls == 1
+
+
 def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:
     """local_runner_hosts wins over the legacy single-prefix key."""
 

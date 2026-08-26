@@ -37,7 +37,7 @@ from .models import (
 from . import orchestrator as _orchestrator_module
 from .orchestrator import Orchestrator
 from .quota import QuotaDecisionReason, QuotaTelemetry
-from .runner_monitor import get_runner_fleet_load
+from .runner_monitor import get_cached_runner_fleet_load
 from .webhook import MAX_WEBHOOK_BODY_BYTES, GithubWebhookIngress, WebhookRejected
 from . import session_registry
 from . import worktrees as _worktrees
@@ -1348,7 +1348,7 @@ def dashboard_context(show_agent_worktrees: bool = False, active_tab: str = "boa
 
 
 def runner_fleet_context() -> dict[str, object]:
-    return {"runner_fleet": get_runner_fleet_load(cwd=get_main_repo_root())}
+    return {"runner_fleet": get_cached_runner_fleet_load(cwd=get_main_repo_root())}
 
 
 def _runner_issues_from_prs(hidden_worktree_paths: set[str] | None = None) -> list[dict[str, object]]:

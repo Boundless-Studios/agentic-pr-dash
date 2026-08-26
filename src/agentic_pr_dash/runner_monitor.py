@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 import json
 import os
 import subprocess
+import threading
+import time
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
@@ -54,6 +56,10 @@ class RunnerFleetLoad:
 
 
 RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProcess[str]]
+
+_RUNNER_CACHE_TTL_SECONDS = 60.0
+_runner_cache_lock = threading.Lock()
+_runner_cache: tuple[float, RunnerFleetLoad] | None = None
 
 _INTEGRATION_PERMISSION_ERRORS = (
     "resource not accessible by integration",
@@ -486,6 +492,26 @@ def get_runner_fleet_load(
     # offline would fall back to the repo's empty or stale view and report zero
     # registered runners instead of N offline.
     return org_load if org_load.total else load
+
+
+def get_cached_runner_fleet_load(
+    *,
+    cwd: str | None = None,
+    run: RunCommand = _run,
+    ttl_seconds: float = _RUNNER_CACHE_TTL_SECONDS,
+) -> RunnerFleetLoad:
+    """Share one owned-host probe across all dashboard HTTP polls."""
+    global _runner_cache
+
+    now = time.monotonic()
+    with _runner_cache_lock:
+        if _runner_cache is not None:
+            fetched_at, load = _runner_cache
+            if now - fetched_at < ttl_seconds:
+                return load
+        load = get_runner_fleet_load(cwd=cwd, run=run)
+        _runner_cache = (time.monotonic(), load)
+        return load
 
 
 _GROUP_CACHE_TTL_SECONDS = 60.0
