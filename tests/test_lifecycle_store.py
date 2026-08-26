@@ -371,6 +371,43 @@ def test_unresolved_target_ignores_link_unless_intent_is_promoted(
     assert result.status is SnapshotReadStatusV1.MISSING
 
 
+@pytest.mark.parametrize("intent_pr_number", [None, 99])
+def test_unresolved_target_rejects_inconsistent_promoted_intent_pr(
+    tmp_path: Path, intent_pr_number: int | None
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=None)
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(pr_number=42, head_sha=intent.head_sha))
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(intent),
+        intent=_intent(pr_number=intent_pr_number),
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(
+        linked.model_dump_json(), encoding="utf-8"
+    )
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
 def test_corrupt_promotion_link_returns_invalid(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "state")
     intent = _intent(pr_number=None)

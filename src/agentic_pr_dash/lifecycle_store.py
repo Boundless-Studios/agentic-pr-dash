@@ -396,6 +396,7 @@ class LifecycleStore:
             record is None
             or record.state is not IntentLifecycleStateV1.PROMOTED
             or record.canonical_key is None
+            or record.intent.pr_number != record.canonical_key.pr_number
         ):
             return None
         if not _same_ingress_key(intent, record.canonical_key):
