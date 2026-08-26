@@ -234,6 +234,38 @@ def test_structured_dispatch_is_authoritative_over_raw_command(tmp_path: Path) -
 
 
 @pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--local-provider", "ollama"),
+        ("--enable", "responses_websockets"),
+        ("--disable", "responses_websockets"),
+        ("--remote", "ws://localhost:4500"),
+        ("--remote-auth-token-env", "CODEX_REMOTE_TOKEN"),
+        ("--image", "/private/image.png"),
+        ("-i", "/private/image.png"),
+        ("-a", "never"),
+    ],
+)
+def test_structured_codex_dispatch_skips_value_taking_global_options(
+    tmp_path: Path, option: str, value: str
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "--oss", option, value, "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
     "metadata",
     [
         {"argv": "codex exec review", "task_type": "review"},

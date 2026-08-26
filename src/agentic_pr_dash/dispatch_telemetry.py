@@ -52,19 +52,35 @@ _PROVIDER_NAMES = {
     DispatchProvider.OPENCODE: "opencode",
     DispatchProvider.CLAUDE: "anthropic",
 }
-_VALUE_OPTIONS = {
+_CODEX_VALUE_OPTIONS = {
     "--add-dir",
     "--ask-for-approval",
     "--config",
     "--cd",
+    "--disable",
+    "--enable",
+    "--image",
+    "--local-provider",
     "--model",
+    "--output-last-message",
     "--profile",
     "--sandbox",
+    "-a",
     "-C",
     "-c",
+    "-i",
     "-m",
+    "-o",
     "-p",
     "-s",
+}
+_OPENCODE_VALUE_OPTIONS = {"--model", "--session", "-m", "-s"}
+_REDACTED_VALUE_OPTIONS = {
+    "--image",
+    "--output-last-message",
+    "--session",
+    "-i",
+    "-o",
 }
 _SAFE_CONFIG_KEYS = {"model", "model_reasoning_effort"}
 
@@ -109,7 +125,7 @@ class DispatchTelemetry:
         """Build telemetry from an argv sequence without interpreting shell text."""
 
         exact_argv = tuple(argv)
-        parsed = _sanitize_and_resolve(exact_argv)
+        parsed = _sanitize_and_resolve(exact_argv, provider)
         return cls(
             provider=provider,
             source=source,
@@ -242,7 +258,9 @@ class _ParsedArgv:
     resolution_source: DispatchResolutionSource
 
 
-def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
+def _sanitize_and_resolve(
+    argv: tuple[str, ...], provider: DispatchProvider
+) -> _ParsedArgv:
     if not argv:
         raise ValueError("argv must contain an executable")
 
@@ -255,6 +273,16 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
     ignore_user_config = False
     working_root = None
     resolution_source = DispatchResolutionSource.UNAVAILABLE
+    value_options = (
+        _CODEX_VALUE_OPTIONS
+        if provider is DispatchProvider.CODEX
+        else _OPENCODE_VALUE_OPTIONS
+    )
+    attached_short_options = (
+        {"-C", "-a", "-c", "-i", "-m", "-o", "-p", "-s"}
+        if provider is DispatchProvider.CODEX
+        else {"-m", "-s"}
+    )
     index = 1
     while index < len(argv):
         token = argv[index]
@@ -263,13 +291,14 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
             sanitized.extend("<redacted:payload>" for _value in argv[index + 1 :])
             break
         short_option = token[:2]
-        if short_option in {"-C", "-c", "-m", "-p", "-s"} and len(token) > 2:
+        if short_option in attached_short_options and len(token) > 2:
             attached_value = token[2:]
-            sanitized.append(
-                _truncate(
-                    f"{short_option}{_safe_option_value(short_option, attached_value)}"
-                )
+            safe_value = (
+                "<redacted:option>"
+                if provider is DispatchProvider.OPENCODE and short_option == "-s"
+                else _safe_option_value(short_option, attached_value)
             )
+            sanitized.append(_truncate(f"{short_option}{safe_value}"))
             if short_option == "-m":
                 model = _truncate(attached_value)
                 resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
@@ -277,8 +306,10 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 profile = _truncate(attached_value)
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
-            elif short_option == "-s":
+            elif short_option == "-s" and provider is DispatchProvider.CODEX:
                 sandbox_mode = _truncate(attached_value)
+            elif short_option == "-a":
+                approval_mode = _truncate(attached_value)
             elif short_option == "-C":
                 working_root = attached_value
             else:
@@ -327,12 +358,18 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
             index += 1
             continue
         if (
-            token in _VALUE_OPTIONS
+            token in value_options
             and index + 1 < len(argv)
             and not argv[index + 1].startswith("-")
         ):
             value = argv[index + 1]
-            sanitized.extend((token, _truncate(_safe_option_value(token, value))))
+            safe_value = (
+                "<redacted:option>"
+                if provider is DispatchProvider.OPENCODE
+                and token in {"--session", "-s"}
+                else _safe_option_value(token, value)
+            )
+            sanitized.extend((token, _truncate(safe_value)))
             if token in {"--model", "-m"}:
                 model = _truncate(value)
                 resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
@@ -340,9 +377,9 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 profile = _truncate(value)
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
-            elif token in {"--sandbox", "-s"}:
+            elif token in {"--sandbox", "-s"} and provider is DispatchProvider.CODEX:
                 sandbox_mode = _truncate(value)
-            elif token == "--ask-for-approval":
+            elif token in {"--ask-for-approval", "-a"}:
                 approval_mode = _truncate(value)
             elif token in {"--config", "-c"}:
                 model, reasoning_effort, resolution_source = _apply_config_value(
@@ -402,6 +439,8 @@ def _apply_config_value(
 
 
 def _safe_option_value(option: str, value: str) -> str:
+    if option in _REDACTED_VALUE_OPTIONS:
+        return "<redacted:option>"
     if option not in {"--config", "-c"}:
         return value
     key, separator, config_value = value.partition("=")

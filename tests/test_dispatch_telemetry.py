@@ -244,6 +244,46 @@ def test_short_sandbox_option_is_structured() -> None:
     assert telemetry.sandbox_mode == "workspace-write"
 
 
+def test_short_approval_option_is_structured() -> None:
+    telemetry = _telemetry("codex", "exec", "-a", "never", "prompt")
+
+    assert telemetry.approval_mode == "never"
+
+
+def test_opencode_session_option_is_redacted_without_codex_sandbox_semantics() -> None:
+    session_id = "private-session-id"
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.OPENCODE,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("opencode", "run", "-s", session_id, "prompt"),
+        cwd="/repo",
+        task_type="exec",
+        session_id="session-1",
+    )
+
+    assert telemetry.sandbox_mode is None
+    assert session_id not in json.dumps(telemetry.otel_attributes())
+    assert telemetry.sanitized_argv == (
+        "opencode",
+        "run",
+        "-s",
+        "<redacted:option>",
+        "<redacted:payload>",
+    )
+
+
+@pytest.mark.parametrize("option", ["-i/private/image.png", "-o/private/result.txt"])
+def test_attached_file_option_values_are_redacted(option: str) -> None:
+    telemetry = _telemetry("codex", "exec", option, "prompt")
+
+    serialized = json.dumps(telemetry.otel_attributes())
+    assert "/private/" not in serialized
+    assert telemetry.sanitized_argv[2] in {
+        "-i<redacted:option>",
+        "-o<redacted:option>",
+    }
+
+
 @pytest.mark.parametrize(
     ("option", "value"),
     [("-C", "../other-repo"), ("--cd", "/other/repo")],
