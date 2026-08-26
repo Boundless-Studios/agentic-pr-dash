@@ -58,14 +58,27 @@ templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 # here: install-agent-ops-tools.sh already bounces the pr-dashboard daemon after
 # installing, which is what makes new templates live.
 templates.env.auto_reload = False
-CONTEXT_CACHE_TTL_SECONDS = 3.0
+# Local card discovery scans process cwd state plus session/ownership records.
+# It is deliberately decoupled from the 5s HTMX paint cadence: PR state is
+# refreshed by the orchestrator, while rebuilding this local snapshot on every
+# browser poll multiplies work by the number of open tabs.
+CONTEXT_CACHE_TTL_SECONDS = 30.0
 _dashboard_context_cache: dict[tuple[bool, str], tuple[float, dict[str, object]]] = {}
 _dashboard_context_tasks: dict[tuple[bool, str], asyncio.Task[dict[str, object]]] = {}
+_dashboard_context_generation = 0
 
 
 def _invalidate_dashboard_context() -> None:
-    _dashboard_context_cache.clear()
-    _dashboard_context_tasks.clear()
+    global _dashboard_context_generation
+    _dashboard_context_generation += 1
+    # A worker dispatched through ``asyncio.to_thread`` cannot be stopped by
+    # dropping its Task reference. Clearing the task map orphaned that scan and
+    # let every webhook start another one, keeping the board on its cold
+    # skeleton while duplicate process/session scans consumed CPU. Preserve
+    # both the displayable snapshot and the single in-flight worker; timestamp
+    # entries as stale so one follow-up build runs after the worker settles.
+    for key, (_timestamp, context) in list(_dashboard_context_cache.items()):
+        _dashboard_context_cache[key] = (0.0, context)
 
 
 def _asset_version() -> str:
@@ -679,6 +692,7 @@ def _selected_worktree_cleanup_reason(
 
 def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[WorktreeCard], int, int]:
     worktrees = discover_worktrees()
+    main_repo_root = get_main_repo_root()
     active_agents_by_path = discover_active_agents([wt["path"] for wt in worktrees])
     runtime_summary = session_registry.summarize_sessions()
     # Branch attribution (below) is scoped to THIS repo's worktrees and reads
@@ -712,6 +726,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 pr,
                 active_agents_by_path.get(worktree["path"], []),
                 _runtime_session_for_worktree(worktree["path"], runtime_summary),
+                main_repo_root=main_repo_root,
             )
         )
 
@@ -744,6 +759,7 @@ def build_worktree_cards(show_agent_worktrees: bool = False) -> tuple[list[Workt
                 worktree_hidden=worktree_hidden,
                 runtime_session=runtime_session,
                 session_worktree_path=resolved_worktree_path if branch_session else None,
+                main_repo_root=main_repo_root,
             )
         )
 
@@ -1032,6 +1048,8 @@ def _build_card_for_worktree(
     pr: PRData | None,
     active_agents: list[AgentProcess],
     runtime_session: session_registry.RuntimeSessionState | None = None,
+    *,
+    main_repo_root: str | None = None,
 ) -> WorktreeCard:
     fallback_agents = active_agents or _fallback_dashboard_agent(pr)
     # Prefer the turn-activity signal (real "in a turn" state) when the worktree
@@ -1051,7 +1069,7 @@ def _build_card_for_worktree(
     # Skipped entirely while the agent is working — nothing downstream consumes
     # it in that case, and the probe shells out to `gh` on every board poll.
     reclaimable = False
-    root = get_main_repo_root()
+    root = main_repo_root or get_main_repo_root()
     if (
         pr is None
         and activity != "working"
@@ -1074,10 +1092,17 @@ def _build_card_for_worktree(
         if _wt_dt is not None:
             _pr_created_at = _wt_dt.isoformat().replace("+00:00", "Z")
 
-    _ownership = _ownership_for_card(
-        worktree_path=worktree.get("path"),
-        pr_number=pr.number if pr else None,
-        repo_cwd=get_main_repo_root(),
+    # There is no ownership state to display or act on for an idle worktree
+    # with no PR and no live session. Resolving all of those dominated cold
+    # board builds in repositories with a large historical worktree pool.
+    _ownership = (
+        _ownership_for_card(
+            worktree_path=worktree.get("path"),
+            pr_number=pr.number if pr else None,
+            repo_cwd=root,
+        )
+        if pr is not None or fallback_agents or runtime_session is not None
+        else {}
     )
 
     return WorktreeCard(
@@ -1137,6 +1162,7 @@ def _build_unassigned_pr_card(
     worktree_hidden: bool = False,
     runtime_session: session_registry.RuntimeSessionState | None = None,
     session_worktree_path: str | None = None,
+    main_repo_root: str | None = None,
 ) -> WorktreeCard:
     # When a live branch-matched session attributes this PR to a worktree
     # (session_worktree_path), synthesize an agent from it so a PR worked from a
@@ -1182,7 +1208,7 @@ def _build_unassigned_pr_card(
     _ownership = _ownership_for_card(
         worktree_path=session_worktree_path or pr.worktree_path,
         pr_number=pr.number,
-        repo_cwd=get_main_repo_root(),
+        repo_cwd=main_repo_root or get_main_repo_root(),
     )
 
     return WorktreeCard(
@@ -1515,6 +1541,7 @@ async def _dashboard_context_async(
     task = _dashboard_context_tasks.get(key)
     if task is None or task.done():
         context_func = runner_dashboard_context if active_tab == "runner_issues" else dashboard_context
+        build_generation = _dashboard_context_generation
 
         async def rebuild() -> dict[str, object]:
             try:
@@ -1540,7 +1567,12 @@ async def _dashboard_context_async(
             current_task = asyncio.current_task()
             if _dashboard_context_tasks.get(key) is current_task:
                 _dashboard_context_tasks.pop(key, None)
-                _dashboard_context_cache[key] = (time.monotonic(), context)
+                timestamp = (
+                    time.monotonic()
+                    if build_generation == _dashboard_context_generation
+                    else 0.0
+                )
+                _dashboard_context_cache[key] = (timestamp, context)
             return context
 
         task = asyncio.create_task(rebuild())
