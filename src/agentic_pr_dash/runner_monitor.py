@@ -59,7 +59,9 @@ RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProce
 
 _RUNNER_CACHE_TTL_SECONDS = 60.0
 _runner_cache_lock = threading.Lock()
-_runner_cache: dict[tuple[str, int, int], tuple[float, RunnerFleetLoad, RunCommand]] = {}
+_runner_cache: dict[
+    tuple[str, int, int], tuple[float, float, RunnerFleetLoad, RunCommand]
+] = {}
 
 _INTEGRATION_PERMISSION_ERRORS = (
     "resource not accessible by integration",
@@ -512,7 +514,7 @@ def get_cached_runner_fleet_load(
     with _runner_cache_lock:
         expired_keys = [
             cached_key
-            for cached_key, (expires_at, _load, _run) in _runner_cache.items()
+            for cached_key, (_fetched_at, expires_at, _load, _run) in _runner_cache.items()
             if now >= expires_at
         ]
         for expired_key in expired_keys:
@@ -520,10 +522,12 @@ def get_cached_runner_fleet_load(
 
         cached = _runner_cache.get(key)
         if cached is not None:
-            _expires_at, load, _cached_run = cached
-            return load
+            fetched_at, _expires_at, load, _cached_run = cached
+            if now - fetched_at < ttl_seconds:
+                return load
         load = get_runner_fleet_load(cwd=cwd, run=run)
-        _runner_cache[key] = (time.monotonic() + ttl_seconds, load, run)
+        fetched_at = time.monotonic()
+        _runner_cache[key] = (fetched_at, fetched_at + ttl_seconds, load, run)
         return load
 
 

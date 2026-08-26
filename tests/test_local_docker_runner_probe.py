@@ -304,6 +304,31 @@ def test_dashboard_runner_probe_cache_uses_each_entry_ttl(monkeypatch) -> None:
     assert calls == ["/repo-long", "/repo-short"]
 
 
+def test_dashboard_runner_probe_cache_honors_current_call_ttl(monkeypatch) -> None:
+    calls = 0
+
+    def load(*, cwd: str | None, run):
+        nonlocal calls
+        calls += 1
+        return runner_monitor.RunnerFleetLoad(online=calls)
+
+    monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+    ticks = iter((0.0, 0.0, 3.0, 3.0))
+    monkeypatch.setattr(runner_monitor.time, "monotonic", lambda: next(ticks))
+
+    first = runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo", ttl_seconds=100.0
+    )
+    second = runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo", ttl_seconds=0.5
+    )
+
+    assert second is not first
+    assert second.online == 2
+    assert calls == 2
+
+
 def test_dashboard_runner_probe_cache_evicts_expired_probe_owners(monkeypatch) -> None:
     class Probe:
         def run(self, cmd, cwd, timeout):
