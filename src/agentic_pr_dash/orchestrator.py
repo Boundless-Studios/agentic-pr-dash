@@ -17,6 +17,8 @@ from enum import Enum
 
 from . import agents, coordinator, github_api, maintenance, session_registry
 from .config import load as load_config
+from .lifecycle_store import LifecycleStore
+from .lifecycle_workflow import LifecycleWorkflow, load_review_context
 from .maintenance_check import _resolve_maintenance_roots
 from .models import (
     CICheck,
@@ -337,8 +339,10 @@ class Orchestrator:
         *,
         observation_controller: ObservationController | None = None,
         quota_ledger: QuotaLedger | None = None,
+        lifecycle_workflow: LifecycleWorkflow | None = None,
     ):
         self.repo_cwd = repo_cwd
+        self.lifecycle_workflow = lifecycle_workflow
         self.observation_controller = (
             observation_controller or ObservationController()
         )
@@ -438,6 +442,12 @@ class Orchestrator:
         )
         self._poll_task: asyncio.Task | None = None
         self._max_events = 200
+        if self.lifecycle_workflow is None:
+            self.lifecycle_workflow = LifecycleWorkflow(
+                LifecycleStore(),
+                context_loader=load_review_context,
+                orchestrator=self,
+            )
 
     def _emit(
         self,
@@ -1440,6 +1450,12 @@ class Orchestrator:
         self._metadata_unconfirmed_keys.intersection_update(
             active_observation_keys
         )
+
+        if self.lifecycle_workflow is not None:
+            try:
+                await self.lifecycle_workflow.drain()
+            except Exception as exc:  # noqa: BLE001 - lifecycle is best effort
+                self.log(f"Lifecycle drain error: {exc}", level="error")
 
         return list(self.prs.values())
 

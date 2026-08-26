@@ -214,6 +214,40 @@ class LifecycleStore:
             raise ValueError("invalid lifecycle intent record")
         return record
 
+    def list_intents(
+        self,
+        *,
+        states: set[IntentLifecycleStateV1] | None = None,
+    ) -> tuple[MaintenanceIntentRecordV1, ...]:
+        """List valid durable intent records, optionally restricted by state."""
+
+        if states is not None and not all(
+            isinstance(state, IntentLifecycleStateV1) for state in states
+        ):
+            raise TypeError("intent states must use IntentLifecycleStateV1")
+        if not self._intent_dir.is_dir():
+            return ()
+        records: list[MaintenanceIntentRecordV1] = []
+        for path in sorted(self._intent_dir.glob("*.json")):
+            try:
+                raw = _read_json(path)
+            except (OSError, ValueError, TypeError):
+                continue
+            if raw is _MISSING:
+                continue
+            try:
+                record = MaintenanceIntentRecordV1.model_validate(raw)
+                if (
+                    record.ingress_id != ingress_identity_hash(record.intent)
+                    or path.stem != record.ingress_id
+                ):
+                    continue
+            except (ValidationError, TypeError):
+                continue
+            if states is None or record.state in states:
+                records.append(record)
+        return tuple(records)
+
     def enqueue(self, intent: MaintenanceIntentV1) -> EnqueueResultV1:
         """Enqueue an intent, deduplicating active records and reviving no-PR records."""
 

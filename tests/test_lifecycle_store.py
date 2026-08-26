@@ -281,6 +281,40 @@ def test_no_pr_intent_reactivates_when_pr_is_known(tmp_path: Path) -> None:
     assert second.state is IntentLifecycleStateV1.PENDING
 
 
+def test_list_intents_filters_typed_states_without_deleting_records(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    pending = _intent(head_sha="a" * 40, pr_number=42)
+    no_pr = _intent(head_sha="b" * 40, pr_number=None)
+    enqueue_maintenance(pending, store=store)
+    enqueue_maintenance(no_pr, store=store)
+
+    listed = store.list_intents(states={IntentLifecycleStateV1.PENDING})
+    all_records = store.list_intents()
+
+    assert [record.intent.head_sha for record in listed] == [pending.head_sha]
+    assert {record.state for record in all_records} == {
+        IntentLifecycleStateV1.PENDING,
+        IntentLifecycleStateV1.NO_PR,
+    }
+    assert store.intent_path(pending).is_file()
+    assert store.intent_path(no_pr).is_file()
+
+
+def test_list_intents_skips_unreadable_records(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(head_sha="a" * 40, pr_number=42)
+    enqueue_maintenance(intent, store=store)
+    corrupt = store.root / "intents" / "corrupt.json"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    listed = store.list_intents()
+
+    assert [record.intent.head_sha for record in listed] == [intent.head_sha]
+
+
 def test_mark_no_pr_exposes_unresolved_lookup_state(tmp_path: Path) -> None:
     store = LifecycleStore(tmp_path / "state")
     intent = _intent()
