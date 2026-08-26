@@ -256,6 +256,37 @@ def test_dashboard_runner_probe_cache_retains_probe_identity(monkeypatch) -> Non
     assert cached_probe() is not None
 
 
+def test_dashboard_runner_probe_cache_evicts_expired_probe_owners(monkeypatch) -> None:
+    class Probe:
+        def run(self, cmd, cwd, timeout):
+            raise AssertionError("the stubbed fleet loader should handle the probe")
+
+    monkeypatch.setattr(
+        runner_monitor,
+        "get_runner_fleet_load",
+        lambda *, cwd, run: runner_monitor.RunnerFleetLoad(online=1),
+    )
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+    ticks = iter((0.0, 0.0, 2.0, 2.0))
+    monkeypatch.setattr(runner_monitor.time, "monotonic", lambda: next(ticks))
+
+    expired_probe = Probe()
+    expired_owner = weakref.ref(expired_probe)
+    runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo", run=expired_probe.run, ttl_seconds=1.0
+    )
+    del expired_probe
+
+    current_probe = Probe()
+    runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo", run=current_probe.run, ttl_seconds=1.0
+    )
+    gc.collect()
+
+    assert expired_owner() is None
+    assert len(runner_monitor._runner_cache) == 1
+
+
 def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:
     """local_runner_hosts wins over the legacy single-prefix key."""
 

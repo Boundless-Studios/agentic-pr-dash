@@ -504,6 +504,14 @@ def get_cached_runner_fleet_load(
     now = time.monotonic()
     key = (cwd or "", id(run))
     with _runner_cache_lock:
+        expired_keys = [
+            cached_key
+            for cached_key, (fetched_at, _load, _run) in _runner_cache.items()
+            if now - fetched_at >= ttl_seconds
+        ]
+        for expired_key in expired_keys:
+            del _runner_cache[expired_key]
+
         cached = _runner_cache.get(key)
         if cached is not None:
             fetched_at, load, cached_run = cached
