@@ -327,6 +327,7 @@ def test_stale_mark_no_pr_cannot_overwrite_known_pr_reactivation(
             stale.intent,
             next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
             expected_generation=stale.generation,
+            expected_revision=stale.revision,
         )
 
     current = store.list_intents()[0]
@@ -343,7 +344,10 @@ def test_stale_settle_cannot_consume_settled_record_reactivation(
     store.enqueue(intent)
     initial = store.list_intents()[0]
     settled = store.settle_intent(
-        intent, _key(), expected_generation=initial.generation
+        intent,
+        _key(),
+        expected_generation=initial.generation,
+        expected_revision=initial.revision,
     )
     store.enqueue(intent.model_copy(update={"reason": "new reviewer feedback"}))
 
@@ -352,6 +356,7 @@ def test_stale_settle_cannot_consume_settled_record_reactivation(
             settled.intent,
             _key(),
             expected_generation=settled.generation,
+            expected_revision=settled.revision,
         )
 
     current = store.list_intents()[0]
@@ -373,18 +378,175 @@ def test_stale_retry_and_promotion_cannot_mutate_reactivated_generation(
             stale.intent,
             next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
             expected_generation=stale.generation,
+            expected_revision=stale.revision,
         )
     with pytest.raises(RuntimeError, match="generation"):
         store.promote_intent(
             stale.intent,
             _key(),
             expected_generation=stale.generation,
+            expected_revision=stale.revision,
         )
 
     current = store.list_intents()[0]
     assert current.generation == stale.generation + 1
     assert current.state is IntentLifecycleStateV1.PENDING
     assert current.next_attempt_at is None
+
+
+def test_same_generation_stale_mark_no_pr_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    newer = store.schedule_retry(
+        intent,
+        next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.mark_no_pr(
+            stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation
+    assert current.revision == newer.revision
+    assert current.state is IntentLifecycleStateV1.PENDING
+
+
+def test_same_generation_stale_retry_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    promoted = store.promote_intent(
+        intent,
+        _key(),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.revision == promoted.revision
+    assert current.state is IntentLifecycleStateV1.PROMOTED
+
+
+def test_same_generation_stale_promotion_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    no_pr = store.mark_no_pr(
+        intent,
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.revision == no_pr.revision
+    assert current.state is IntentLifecycleStateV1.NO_PR
+
+
+def test_settled_state_rejects_same_generation_stale_mutations(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    terminal_snapshot = _snapshot(settled=True)
+    settled = store.settle_intent(
+        intent,
+        _key(),
+        snapshot=terminal_snapshot,
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    stale_calls = (
+        lambda: store.mark_no_pr(
+            stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.settle_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+    )
+    for mutate in stale_calls:
+        with pytest.raises(RuntimeError, match="revision"):
+            mutate()
+
+    current = store.list_intents()[0]
+    assert current.state is IntentLifecycleStateV1.SETTLED
+    assert current.revision == settled.revision
+    assert store.read_snapshot(
+        MaintenanceTargetV1.exact(_key()), now=OBSERVED_AT
+    ).snapshot == terminal_snapshot
+
+
+def test_same_generation_stale_snapshot_write_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    store.schedule_retry(
+        intent,
+        next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.write_snapshot(
+            _snapshot(),
+            intent=stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    assert (
+        store.read_snapshot(
+            MaintenanceTargetV1.exact(_key()), now=OBSERVED_AT
+        ).status
+        is SnapshotReadStatusV1.MISSING
+    )
 
 
 def test_list_intents_filters_typed_states_without_deleting_records(

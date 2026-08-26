@@ -33,18 +33,25 @@ from .lifecycle_models import (
 _MISSING = object()
 
 
-class StaleIntentGenerationError(RuntimeError):
-    """Raised when a drain mutation targets an obsolete intent generation."""
+class StaleIntentVersionError(RuntimeError):
+    """Raised when a drain mutation targets an obsolete intent version."""
 
 
-def _require_generation(
+def _require_version(
     record: MaintenanceIntentRecordV1 | None,
     expected_generation: int | None,
+    expected_revision: int | None,
 ) -> None:
-    if expected_generation is not None and (
+    stale_generation = expected_generation is not None and (
         record is None or record.generation != expected_generation
-    ):
-        raise StaleIntentGenerationError("maintenance intent generation changed")
+    )
+    stale_revision = expected_revision is not None and (
+        record is None or record.revision != expected_revision
+    )
+    if stale_generation or stale_revision:
+        raise StaleIntentVersionError(
+            "maintenance intent generation or revision changed"
+        )
 
 
 def _utc(value: datetime) -> datetime:
@@ -298,13 +305,15 @@ class LifecycleStore:
                     intent=intent,
                     state=state,
                     generation=existing.generation + 1,
+                    revision=existing.revision + 1,
                     canonical_key=None,
                 )
                 status = EnqueueStatusV1.REACTIVATED
             else:
                 record = existing
                 status = EnqueueStatusV1.DUPLICATE
-            _write_json(path, record.model_dump(mode="json"))
+            if status is not EnqueueStatusV1.DUPLICATE:
+                _write_json(path, record.model_dump(mode="json"))
         return EnqueueResultV1(
             status=status,
             intent=record.intent,
@@ -319,6 +328,8 @@ class LifecycleStore:
         *,
         next_attempt_at: datetime | None = None,
         expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        snapshot: MaintenanceSnapshotV1 | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Link an ingress intent to the exact canonical job snapshot key."""
 
@@ -331,10 +342,12 @@ class LifecycleStore:
             raise ValueError(
                 "promotion key does not match ingress repository, head, or workflow"
             )
+        if snapshot is not None and not _same_job(snapshot.key, key):
+            raise ValueError("promotion snapshot key does not match promotion key")
         path = self.intent_path(intent)
         with self._transaction_lock():
             record = self._load_validated_intent(intent)
-            _require_generation(record, expected_generation)
+            _require_version(record, expected_generation, expected_revision)
             if record is None:
                 raise KeyError("maintenance intent is not enqueued")
             if record.intent.pr_number not in (None, key.pr_number):
@@ -347,9 +360,14 @@ class LifecycleStore:
                 intent=promoted_intent,
                 state=IntentLifecycleStateV1.PROMOTED,
                 generation=record.generation,
+                revision=record.revision + 1,
                 canonical_key=key,
                 next_attempt_at=next_attempt_at,
             )
+            if snapshot is not None:
+                _write_json(
+                    self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
+                )
             _write_json(path, record.model_dump(mode="json"))
         return record
 
@@ -359,6 +377,7 @@ class LifecycleStore:
         *,
         next_attempt_at: datetime | None = None,
         expected_generation: int | None = None,
+        expected_revision: int | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Persist that an ingress event currently has no associated PR."""
 
@@ -370,7 +389,7 @@ class LifecycleStore:
         path = self.intent_path(intent)
         with self._transaction_lock():
             existing = self._load_validated_intent(intent)
-            _require_generation(existing, expected_generation)
+            _require_version(existing, expected_generation, expected_revision)
             if (
                 existing is not None
                 and existing.state is IntentLifecycleStateV1.PROMOTED
@@ -386,6 +405,7 @@ class LifecycleStore:
                 intent=marked_intent,
                 state=IntentLifecycleStateV1.NO_PR,
                 generation=existing.generation if existing is not None else 1,
+                revision=existing.revision + 1 if existing is not None else 1,
                 next_attempt_at=next_attempt_at,
             )
             _write_json(path, record.model_dump(mode="json"))
@@ -397,6 +417,8 @@ class LifecycleStore:
         *,
         next_attempt_at: datetime,
         expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        snapshot: MaintenanceSnapshotV1 | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Persist the earliest time at which an existing intent may retry."""
 
@@ -408,12 +430,21 @@ class LifecycleStore:
         path = self.intent_path(intent)
         with self._transaction_lock():
             existing = self._load_validated_intent(intent)
-            _require_generation(existing, expected_generation)
+            _require_version(existing, expected_generation, expected_revision)
             if existing is None:
                 raise KeyError("maintenance intent is not enqueued")
+            if snapshot is not None and not _same_ingress_key(existing.intent, snapshot.key):
+                raise ValueError("retry snapshot key does not match maintenance intent")
             record = existing.model_copy(
-                update={"next_attempt_at": _utc(next_attempt_at)}
+                update={
+                    "next_attempt_at": _utc(next_attempt_at),
+                    "revision": existing.revision + 1,
+                }
             )
+            if snapshot is not None:
+                _write_json(
+                    self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
+                )
             _write_json(path, record.model_dump(mode="json"))
         return record
 
@@ -423,6 +454,8 @@ class LifecycleStore:
         key: MaintenanceKeyV1,
         *,
         expected_generation: int | None = None,
+        expected_revision: int | None = None,
+        snapshot: MaintenanceSnapshotV1 | None = None,
     ) -> MaintenanceIntentRecordV1:
         """Mark a promoted exact-head job terminal until ingress reactivates it."""
 
@@ -435,10 +468,12 @@ class LifecycleStore:
             raise ValueError(
                 "settlement key does not match ingress repository, head, or workflow"
             )
+        if snapshot is not None and not _same_job(snapshot.key, key):
+            raise ValueError("settlement snapshot key does not match settlement key")
         path = self.intent_path(intent)
         with self._transaction_lock():
             existing = self._load_validated_intent(intent)
-            _require_generation(existing, expected_generation)
+            _require_version(existing, expected_generation, expected_revision)
             if existing is None:
                 raise KeyError("maintenance intent is not enqueued")
             if existing.intent.pr_number not in (None, key.pr_number):
@@ -450,8 +485,13 @@ class LifecycleStore:
                 intent=MaintenanceIntentV1(**intent_data),
                 state=IntentLifecycleStateV1.SETTLED,
                 generation=existing.generation,
+                revision=existing.revision + 1,
                 canonical_key=key,
             )
+            if snapshot is not None:
+                _write_json(
+                    self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
+                )
             _write_json(path, record.model_dump(mode="json"))
         return record
 
@@ -475,21 +515,33 @@ class LifecycleStore:
         *,
         intent: MaintenanceIntentV1 | None = None,
         expected_generation: int | None = None,
-    ) -> None:
-        if expected_generation is None:
+        expected_revision: int | None = None,
+    ) -> MaintenanceIntentRecordV1 | None:
+        if expected_generation is None and expected_revision is None:
             _ensure_directory(self.root)
             _write_json(
                 self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
             )
-            return
+            return None
         if intent is None:
             raise ValueError("generation-checked snapshot writes require an intent")
         with self._transaction_lock():
             record = self._load_validated_intent(intent)
-            _require_generation(record, expected_generation)
+            _require_version(record, expected_generation, expected_revision)
+            if record is None:
+                raise KeyError("maintenance intent is not enqueued")
+            if not _same_ingress_key(record.intent, snapshot.key):
+                raise ValueError("snapshot key does not match maintenance intent")
+            updated = record.model_copy(
+                update={"revision": record.revision + 1}
+            )
             _write_json(
                 self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
             )
+            _write_json(
+                self.intent_path(record.intent), updated.model_dump(mode="json")
+            )
+        return updated
 
     def read_snapshot(
         self,

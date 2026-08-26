@@ -367,6 +367,7 @@ class MaintenanceIntentRecordV1(BaseModel):
     intent: MaintenanceIntentV1
     state: IntentLifecycleStateV1
     generation: int = Field(default=1, ge=1)
+    revision: int = Field(default=1, ge=1)
     canonical_key: MaintenanceKeyV1 | None = None
     next_attempt_at: datetime | None = None
 

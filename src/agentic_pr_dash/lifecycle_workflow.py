@@ -36,7 +36,7 @@ from .lifecycle_models import (
     RequiredCIStateV1,
     ReviewStateV1,
 )
-from .lifecycle_store import LifecycleStore, StaleIntentGenerationError
+from .lifecycle_store import LifecycleStore, StaleIntentVersionError
 from .models import PRData, ReviewComment
 
 ReviewContext: TypeAlias = tuple[ReviewPolicy, ReviewLedger]
@@ -189,7 +189,7 @@ class LifecycleWorkflow:
                 continue
             try:
                 outcome = self._resolution_outcome(record, resolved)
-            except StaleIntentGenerationError:
+            except StaleIntentVersionError:
                 result = _count_outcome(result, "deferred")
                 continue
             if outcome is not None:
@@ -229,7 +229,7 @@ class LifecycleWorkflow:
             return "deferred"
         try:
             outcome = self._resolution_outcome(record, resolved)
-        except StaleIntentGenerationError:
+        except StaleIntentVersionError:
             return "deferred"
         if outcome is not None:
             return outcome
@@ -247,6 +247,7 @@ class LifecycleWorkflow:
                     record.intent,
                     next_attempt_at=self._now() + self.retry_interval,
                     expected_generation=record.generation,
+                    expected_revision=record.revision,
                 )
                 return "no_pr"
             self._persist_unavailable(record, record.intent.pr_number)
@@ -304,16 +305,13 @@ class LifecycleWorkflow:
         )
         snapshot = self._snapshot(record, key, observed)
         try:
-            self.store.write_snapshot(
-                snapshot,
-                intent=record.intent,
-                expected_generation=record.generation,
-            )
             if snapshot.settled:
                 self.store.settle_intent(
                     record.intent,
                     key,
                     expected_generation=record.generation,
+                    expected_revision=record.revision,
+                    snapshot=snapshot,
                 )
             else:
                 self.store.promote_intent(
@@ -321,8 +319,10 @@ class LifecycleWorkflow:
                     key,
                     next_attempt_at=self._now() + self.retry_interval,
                     expected_generation=record.generation,
+                    expected_revision=record.revision,
+                    snapshot=snapshot,
                 )
-        except StaleIntentGenerationError:
+        except StaleIntentVersionError:
             return "deferred"
         if (
             self.orchestrator is not None
@@ -343,29 +343,24 @@ class LifecycleWorkflow:
     def _persist_unavailable(
         self, record: MaintenanceIntentRecordV1, pr_number: int | None
     ) -> None:
+        snapshot = None
+        if pr_number is not None:
+            key = MaintenanceKeyV1(
+                repository=record.intent.repository,
+                pr_number=pr_number,
+                head_sha=record.intent.head_sha,
+                workflow_type=record.intent.workflow_type,
+            )
+            snapshot = _head_drift_snapshot(key, self._now())
         try:
             self.store.schedule_retry(
                 record.intent,
                 next_attempt_at=self._now() + self.retry_interval,
                 expected_generation=record.generation,
+                expected_revision=record.revision,
+                snapshot=snapshot,
             )
-        except StaleIntentGenerationError:
-            return
-        if pr_number is None:
-            return
-        key = MaintenanceKeyV1(
-            repository=record.intent.repository,
-            pr_number=pr_number,
-            head_sha=record.intent.head_sha,
-            workflow_type=record.intent.workflow_type,
-        )
-        try:
-            self.store.write_snapshot(
-                _head_drift_snapshot(key, self._now()),
-                intent=record.intent,
-                expected_generation=record.generation,
-            )
-        except StaleIntentGenerationError:
+        except StaleIntentVersionError:
             return
 
     async def _resolve_off_loop(
