@@ -256,6 +256,54 @@ def test_dashboard_runner_probe_cache_retains_probe_identity(monkeypatch) -> Non
     assert cached_probe() is not None
 
 
+def test_dashboard_runner_probe_cache_reuses_recreated_bound_methods(monkeypatch) -> None:
+    calls = 0
+
+    class Probe:
+        def run(self, cmd, cwd, timeout):
+            raise AssertionError("the stubbed fleet loader should handle the probe")
+
+    def load(*, cwd: str | None, run):
+        nonlocal calls
+        calls += 1
+        return runner_monitor.RunnerFleetLoad(online=calls)
+
+    monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+
+    probe = Probe()
+    first = runner_monitor.get_cached_runner_fleet_load(cwd="/repo", run=probe.run)
+    second = runner_monitor.get_cached_runner_fleet_load(cwd="/repo", run=probe.run)
+
+    assert first is second
+    assert calls == 1
+    assert len(runner_monitor._runner_cache) == 1
+
+
+def test_dashboard_runner_probe_cache_uses_each_entry_ttl(monkeypatch) -> None:
+    calls: list[str | None] = []
+
+    def load(*, cwd: str | None, run):
+        calls.append(cwd)
+        return runner_monitor.RunnerFleetLoad(online=len(calls))
+
+    monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+    ticks = iter((0.0, 0.0, 1.0, 1.0, 3.0, 3.0))
+    monkeypatch.setattr(runner_monitor.time, "monotonic", lambda: next(ticks))
+
+    first = runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo-long", ttl_seconds=100.0
+    )
+    runner_monitor.get_cached_runner_fleet_load(cwd="/repo-short", ttl_seconds=0.5)
+    again = runner_monitor.get_cached_runner_fleet_load(
+        cwd="/repo-long", ttl_seconds=100.0
+    )
+
+    assert again is first
+    assert calls == ["/repo-long", "/repo-short"]
+
+
 def test_dashboard_runner_probe_cache_evicts_expired_probe_owners(monkeypatch) -> None:
     class Probe:
         def run(self, cmd, cwd, timeout):
