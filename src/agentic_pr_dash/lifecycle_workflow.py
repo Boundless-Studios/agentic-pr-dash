@@ -36,7 +36,7 @@ from .lifecycle_models import (
     RequiredCIStateV1,
     ReviewStateV1,
 )
-from .lifecycle_store import LifecycleStore
+from .lifecycle_store import LifecycleStore, StaleIntentGenerationError
 from .models import PRData, ReviewComment
 
 ReviewContext: TypeAlias = tuple[ReviewPolicy, ReviewLedger]
@@ -187,7 +187,11 @@ class LifecycleWorkflow:
                 self._persist_unavailable(record, record.intent.pr_number)
                 result = _count_outcome(result, "deferred")
                 continue
-            outcome = self._resolution_outcome(record, resolved)
+            try:
+                outcome = self._resolution_outcome(record, resolved)
+            except StaleIntentGenerationError:
+                result = _count_outcome(result, "deferred")
+                continue
             if outcome is not None:
                 result = _count_outcome(result, outcome)
                 continue
@@ -223,7 +227,10 @@ class LifecycleWorkflow:
         except Exception:  # noqa: BLE001 - unavailable observations retry
             self._persist_unavailable(record, record.intent.pr_number)
             return "deferred"
-        outcome = self._resolution_outcome(record, resolved)
+        try:
+            outcome = self._resolution_outcome(record, resolved)
+        except StaleIntentGenerationError:
+            return "deferred"
         if outcome is not None:
             return outcome
         assert resolved is not None
@@ -239,6 +246,7 @@ class LifecycleWorkflow:
                 self.store.mark_no_pr(
                     record.intent,
                     next_attempt_at=self._now() + self.retry_interval,
+                    expected_generation=record.generation,
                 )
                 return "no_pr"
             self._persist_unavailable(record, record.intent.pr_number)
@@ -294,16 +302,28 @@ class LifecycleWorkflow:
             head_sha=record.intent.head_sha,
             workflow_type=record.intent.workflow_type,
         )
-        snapshot = self._snapshot(key, observed)
-        self.store.write_snapshot(snapshot)
-        if snapshot.settled:
-            self.store.settle_intent(record.intent, key)
-        else:
-            self.store.promote_intent(
-                record.intent,
-                key,
-                next_attempt_at=self._now() + self.retry_interval,
+        snapshot = self._snapshot(record, key, observed)
+        try:
+            self.store.write_snapshot(
+                snapshot,
+                intent=record.intent,
+                expected_generation=record.generation,
             )
+            if snapshot.settled:
+                self.store.settle_intent(
+                    record.intent,
+                    key,
+                    expected_generation=record.generation,
+                )
+            else:
+                self.store.promote_intent(
+                    record.intent,
+                    key,
+                    next_attempt_at=self._now() + self.retry_interval,
+                    expected_generation=record.generation,
+                )
+        except StaleIntentGenerationError:
+            return "deferred"
         if (
             self.orchestrator is not None
             and _actionable(snapshot)
@@ -323,10 +343,14 @@ class LifecycleWorkflow:
     def _persist_unavailable(
         self, record: MaintenanceIntentRecordV1, pr_number: int | None
     ) -> None:
-        self.store.schedule_retry(
-            record.intent,
-            next_attempt_at=self._now() + self.retry_interval,
-        )
+        try:
+            self.store.schedule_retry(
+                record.intent,
+                next_attempt_at=self._now() + self.retry_interval,
+                expected_generation=record.generation,
+            )
+        except StaleIntentGenerationError:
+            return
         if pr_number is None:
             return
         key = MaintenanceKeyV1(
@@ -335,7 +359,14 @@ class LifecycleWorkflow:
             head_sha=record.intent.head_sha,
             workflow_type=record.intent.workflow_type,
         )
-        self.store.write_snapshot(_head_drift_snapshot(key, self._now()))
+        try:
+            self.store.write_snapshot(
+                _head_drift_snapshot(key, self._now()),
+                intent=record.intent,
+                expected_generation=record.generation,
+            )
+        except StaleIntentGenerationError:
+            return
 
     async def _resolve_off_loop(
         self, record: MaintenanceIntentRecordV1
@@ -434,7 +465,10 @@ class LifecycleWorkflow:
         return self.context_loader(record)
 
     def _snapshot(
-        self, key: MaintenanceKeyV1, observed: _ObservedPR
+        self,
+        record: MaintenanceIntentRecordV1,
+        key: MaintenanceKeyV1,
+        observed: _ObservedPR,
     ) -> MaintenanceSnapshotV1:
         now = _utc(self._now())
         observation = observed.observation
@@ -452,7 +486,13 @@ class LifecycleWorkflow:
         clean = _snapshot_is_clean(current, observation)
         if not clean:
             return current
-        return self._stabilize_clean(key, current, observation, now)
+        return self._stabilize_clean(
+            key,
+            current,
+            observation,
+            now,
+            reset=record.state is not IntentLifecycleStateV1.PROMOTED,
+        )
 
     def _stabilize_clean(
         self,
@@ -460,8 +500,10 @@ class LifecycleWorkflow:
         current: MaintenanceSnapshotV1,
         observation: FinalizationObservation,
         now: datetime,
+        *,
+        reset: bool = False,
     ) -> MaintenanceSnapshotV1:
-        previous = self._previous_snapshot(key)
+        previous = None if reset else self._previous_snapshot(key)
         if previous is None or not _same_snapshot_facts(previous, current):
             return _stabilization_pending(current, now)
         first_at = previous.stable_observation_first_at or previous.observed_at

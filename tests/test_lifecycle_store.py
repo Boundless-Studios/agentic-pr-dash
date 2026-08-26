@@ -309,6 +309,84 @@ def test_duplicate_unresolved_enqueue_preserves_retry_backoff(tmp_path: Path) ->
     assert record.intent.reason == unresolved.reason
 
 
+def test_stale_mark_no_pr_cannot_overwrite_known_pr_reactivation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    enqueue_maintenance(unresolved, store=store)
+    stale = store.list_intents()[0]
+    store.enqueue(
+        unresolved.model_copy(
+            update={"pr_number": 42, "reason": "PR created"}
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.mark_no_pr(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+    assert current.intent.pr_number == 42
+
+
+def test_stale_settle_cannot_consume_settled_record_reactivation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    initial = store.list_intents()[0]
+    settled = store.settle_intent(
+        intent, _key(), expected_generation=initial.generation
+    )
+    store.enqueue(intent.model_copy(update={"reason": "new reviewer feedback"}))
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.settle_intent(
+            settled.intent,
+            _key(),
+            expected_generation=settled.generation,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == settled.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+
+
+def test_stale_retry_and_promotion_cannot_mutate_reactivated_generation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    store.enqueue(unresolved)
+    stale = store.list_intents()[0]
+    store.enqueue(unresolved.model_copy(update={"pr_number": 42}))
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+        )
+    with pytest.raises(RuntimeError, match="generation"):
+        store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+    assert current.next_attempt_at is None
+
+
 def test_list_intents_filters_typed_states_without_deleting_records(
     tmp_path: Path,
 ) -> None:

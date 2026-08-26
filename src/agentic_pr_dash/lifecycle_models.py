@@ -366,6 +366,7 @@ class MaintenanceIntentRecordV1(BaseModel):
     ingress_id: str = Field(min_length=1)
     intent: MaintenanceIntentV1
     state: IntentLifecycleStateV1
+    generation: int = Field(default=1, ge=1)
     canonical_key: MaintenanceKeyV1 | None = None
     next_attempt_at: datetime | None = None
 

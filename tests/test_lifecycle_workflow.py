@@ -221,6 +221,35 @@ async def test_push_before_pr_no_pr_then_reactivation_promotes(
 
 
 @pytest.mark.asyncio
+async def test_stale_no_pr_resolution_cannot_overwrite_concurrent_reactivation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent()
+    store.enqueue(unresolved)
+
+    def resolve_then_reactivate(*args, **kwargs):
+        store.enqueue(
+            unresolved.model_copy(
+                update={"pr_number": 7, "reason": "PR created concurrently"}
+            )
+        )
+
+    monkeypatch.setattr(github_api, "find_pr_by_head", resolve_then_reactivate)
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(
+        store, policy=_policy(), ledger=_ledger()
+    ).drain()
+
+    current = store.list_intents()[0]
+    assert result.deferred == 1
+    assert current.generation == 2
+    assert current.state is IntentLifecycleStateV1.PENDING
+    assert current.intent.pr_number == 7
+
+
+@pytest.mark.asyncio
 async def test_open_branch_lookup_without_state_field_can_promote(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1086,6 +1115,62 @@ async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
     assert result.progressed == 1
     reactivated = store.enqueue(first.model_copy(update={"reason": "new feedback"}))
     assert reactivated.status.value == "reactivated"
+
+
+@pytest.mark.asyncio
+async def test_reactivated_generation_requires_two_fresh_clean_observations(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Clock:
+        current = OBSERVED_AT
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    clock = Clock()
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=7)
+    store.enqueue(intent)
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *args, **kwargs: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store, policy=_policy(), ledger=_ledger(), now=clock
+    )
+    await workflow.drain()
+    clock.current += timedelta(seconds=30)
+    await workflow.drain()
+    settled = store.list_intents()[0]
+    assert settled.state is IntentLifecycleStateV1.SETTLED
+
+    store.enqueue(intent.model_copy(update={"reason": "new reviewer feedback"}))
+    reactivated = store.list_intents()[0]
+    assert reactivated.generation == settled.generation + 1
+    await workflow.drain()
+
+    first_fresh = store.read_snapshot(
+        MaintenanceTargetV1.exact(settled.canonical_key), now=clock.current
+    ).snapshot
+    assert first_fresh is not None
+    assert first_fresh.stable_observation_count == 1
+    assert not first_fresh.settled
+
+    clock.current += timedelta(seconds=30)
+    await workflow.drain()
+    second_fresh = store.read_snapshot(
+        MaintenanceTargetV1.exact(settled.canonical_key), now=clock.current
+    ).snapshot
+    assert second_fresh is not None
+    assert second_fresh.stable_observation_count == 2
+    assert second_fresh.settled
 
 
 @pytest.mark.asyncio
