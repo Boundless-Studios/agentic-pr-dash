@@ -59,7 +59,9 @@ RunCommand = Callable[[list[str], Optional[str], int], subprocess.CompletedProce
 
 _RUNNER_CACHE_TTL_SECONDS = 60.0
 _runner_cache_lock = threading.Lock()
-_runner_cache: tuple[float, RunnerFleetLoad] | None = None
+_runner_cache: dict[
+    tuple[str, int, int], tuple[float, float, RunnerFleetLoad, RunCommand]
+] = {}
 
 _INTEGRATION_PERMISSION_ERRORS = (
     "resource not accessible by integration",
@@ -501,16 +503,31 @@ def get_cached_runner_fleet_load(
     ttl_seconds: float = _RUNNER_CACHE_TTL_SECONDS,
 ) -> RunnerFleetLoad:
     """Share one owned-host probe across all dashboard HTTP polls."""
-    global _runner_cache
-
     now = time.monotonic()
+    owner = getattr(run, "__self__", None)
+    function = getattr(run, "__func__", None)
+    key = (
+        (cwd or "", id(owner), id(function))
+        if owner is not None and function is not None
+        else (cwd or "", id(run), 0)
+    )
     with _runner_cache_lock:
-        if _runner_cache is not None:
-            fetched_at, load = _runner_cache
+        expired_keys = [
+            cached_key
+            for cached_key, (_fetched_at, expires_at, _load, _run) in _runner_cache.items()
+            if now >= expires_at
+        ]
+        for expired_key in expired_keys:
+            del _runner_cache[expired_key]
+
+        cached = _runner_cache.get(key)
+        if cached is not None:
+            fetched_at, _expires_at, load, _cached_run = cached
             if now - fetched_at < ttl_seconds:
                 return load
         load = get_runner_fleet_load(cwd=cwd, run=run)
-        _runner_cache = (time.monotonic(), load)
+        fetched_at = time.monotonic()
+        _runner_cache[key] = (fetched_at, fetched_at + ttl_seconds, load, run)
         return load
 
 
