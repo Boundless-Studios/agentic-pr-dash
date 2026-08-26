@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from agent_review_coordinator import (
+    Disposition,
     Finding,
     ReviewLedger,
     ReviewPolicy,
@@ -19,6 +20,7 @@ from agent_review_coordinator import (
 )
 
 from agentic_pr_dash import github_api
+from agentic_pr_dash._maintenance import completion, review_settlement
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 from agentic_pr_dash.lifecycle_models import (
     IntentLifecycleStateV1,
@@ -1397,6 +1399,123 @@ def _thread() -> ReviewThread:
             review_id=100,
         ),
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_non_code_reply_settles_with_thread_permitted_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class Clock:
+        current = OBSERVED_AT
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    thread = ReviewThread(
+        node_id="PRRT_visible",
+        is_resolved=False,
+        is_outdated=False,
+        top=ReviewThreadComment(
+            database_id=10,
+            path="src/feature.py",
+            line=10,
+            body="[P1] Preserve the lifecycle fence",
+            author="reviewer",
+            created_at=OBSERVED_AT.isoformat(),
+            review_id=100,
+        ),
+    )
+    finding = review_settlement.finding_from_thread(
+        thread,
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="local-visible-review",
+    )
+    ledger = _ledger()
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-visible-review",
+            findings=[finding],
+        )
+    )
+    ledger.record_disposition(
+        fingerprint=finding.fingerprint,
+        disposition=Disposition.REJECT,
+        rationale="The reported path cannot reach the lifecycle boundary.",
+        evidence="targeted lifecycle boundary reproduction",
+    )
+    closure = review_settlement.classify_thread_closure(
+        thread,
+        policy=_policy(),
+        ledger=ledger,
+    )
+    assert closure is not None
+    visible_reply = completion.structured_settlement_reply_body(
+        marker="<!-- agentic-pr-dash:completed -->",
+        finding=closure.finding,
+        head_sha=HEAD,
+    )
+    thread.replies.append(
+        ReviewThreadComment(
+            database_id=11,
+            path=thread.top.path,
+            line=thread.top.line,
+            body=visible_reply,
+            author="maintenance-bot",
+            created_at=(OBSERVED_AT + timedelta(seconds=1)).isoformat(),
+        )
+    )
+
+    clock = Clock()
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(
+        github_api,
+        "resolve_pr",
+        lambda number, fields, cwd=None, force=False: _pr_payload(),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "collect_pr_maintenance_snapshots",
+        lambda *args, **kwargs: _batch(unresolved_threads=(thread,)),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(store, policy=_policy(), ledger=ledger, now=clock)
+    await workflow.drain()
+    record = store.list_intents()[0]
+    assert record.canonical_key is not None
+    first = store.read_snapshot(
+        MaintenanceTargetV1.exact(record.canonical_key), now=clock.current
+    ).snapshot
+    assert first is not None
+    assert first.raw_unresolved_thread_count == 1
+    assert first.unaddressed_thread_count == 0
+    assert MaintenanceBlockerV1.REVIEW_FINDINGS not in first.blockers
+    assert first.stable_observation_count == 1
+    assert not first.settled
+
+    clock.current += timedelta(seconds=30)
+    await workflow.drain()
+    second = store.read_snapshot(
+        MaintenanceTargetV1.exact(record.canonical_key), now=clock.current
+    ).snapshot
+    assert second is not None
+    assert second.raw_unresolved_thread_count == 1
+    assert second.unaddressed_thread_count == 0
+    assert second.stable_observation_count == 2
+    assert second.settled
 
 
 @pytest.mark.asyncio

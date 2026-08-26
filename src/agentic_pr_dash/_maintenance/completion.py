@@ -235,7 +235,7 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
     if "Review settlement:" not in body.splitlines():
         return None
     try:
-        return SettlementReplyMetadata(
+        metadata = SettlementReplyMetadata(
             head_sha=_reply_field(body, "Head SHA", quoted=True) or "",
             finding_fingerprint=(
                 _reply_field(body, "Finding fingerprint", quoted=True) or ""
@@ -265,6 +265,9 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
             ),
             architecture_rationale=_reply_field(body, "Architecture rationale"),
         )
+        if metadata.disposition is Disposition.FIXED and not metadata.fixing_commit:
+            return None
+        return metadata
     except (ValidationError, ValueError):
         return None
 
@@ -272,15 +275,24 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
 def _reply_matches_closure(
     metadata: SettlementReplyMetadata,
     closure: PolicyFindingClosure,
+    *,
+    fixing_commit: str | None,
 ) -> bool:
     finding = closure.finding
     decision = closure.architecture_decision
+    expected_evidence = _settlement_evidence(
+        finding,
+        fixing_commit=fixing_commit,
+        architecture_decision=decision,
+    )
     return all(
         (
             metadata.head_sha == finding.head_sha,
             metadata.finding_fingerprint == finding.fingerprint,
             metadata.disposition is finding.disposition,
             metadata.rationale == _one_line(finding.rationale or ""),
+            metadata.evidence == expected_evidence,
+            metadata.fixing_commit == fixing_commit,
             metadata.duplicate_of == finding.duplicate_of,
             metadata.deferred_to_issue == finding.deferred_to_issue,
             metadata.architecture_decision
@@ -308,6 +320,8 @@ def _reply_timestamp(value: str) -> datetime | None:
 def settlement_reply_status(
     thread,  # type: ignore[no-untyped-def]
     closure: PolicyFindingClosure,
+    *,
+    fixing_commit: str | None = None,
 ) -> SettlementReplyStatus:
     """Return whether the exact current closure is visible after reviewer input."""
 
@@ -319,13 +333,16 @@ def settlement_reply_status(
         if (
             metadata is not None
             and timestamp is not None
-            and _reply_matches_closure(metadata, closure)
+            and _reply_matches_closure(
+                metadata,
+                closure,
+                fixing_commit=fixing_commit,
+            )
         ):
             matching_reply_times.append(timestamp)
-        elif metadata is None:
-            # Any later non-settlement response is new review input. The
-            # responder need not be the thread's original author: another
-            # reviewer can reopen a previously addressed finding.
+        else:
+            # Any later nonmatching response is new review input, including a
+            # structured reply for another head, finding, or evidence set.
             reviewer_times.append(timestamp)
     if not matching_reply_times:
         return SettlementReplyStatus.MISSING
@@ -355,7 +372,11 @@ def apply_thread_settlement(
     if not closure.addressed:
         return ThreadSettlementOutcome(False, False, False, True)
 
-    status = settlement_reply_status(thread, closure)
+    status = settlement_reply_status(
+        thread,
+        closure,
+        fixing_commit=fixing_commit,
+    )
     if status is SettlementReplyStatus.REOPENED:
         return ThreadSettlementOutcome(False, False, False, True)
 

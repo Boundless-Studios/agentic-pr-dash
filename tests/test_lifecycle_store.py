@@ -79,6 +79,7 @@ def _snapshot(
     health: ObservationHealthV1 = ObservationHealthV1.HEALTHY,
     settled: bool = False,
     raw_unresolved_thread_count: int = 0,
+    unaddressed_thread_count: int = 0,
 ) -> MaintenanceSnapshotV1:
     return MaintenanceSnapshotV1(
         key=key or _key(),
@@ -91,7 +92,7 @@ def _snapshot(
         review_state="clean",
         policy_unsettled_finding_count=0,
         raw_unresolved_thread_count=raw_unresolved_thread_count,
-        unaddressed_thread_count=0,
+        unaddressed_thread_count=unaddressed_thread_count,
         stable_observation_count=2,
         stable_observation_first_at=observed_at - timedelta(seconds=10),
         stable_observation_last_at=observed_at,
@@ -179,9 +180,16 @@ def test_settled_snapshot_rejects_unhealthy_or_unknown_facts() -> None:
         _snapshot(health=ObservationHealthV1.UNKNOWN, settled=True)
 
 
-def test_settled_snapshot_rejects_raw_unresolved_threads() -> None:
+def test_settled_snapshot_allows_visibly_addressed_open_threads() -> None:
+    snapshot = _snapshot(raw_unresolved_thread_count=1, settled=True)
+
+    assert snapshot.raw_unresolved_thread_count == 1
+    assert snapshot.unaddressed_thread_count == 0
+
+
+def test_settled_snapshot_rejects_unaddressed_threads() -> None:
     with pytest.raises(ValidationError):
-        _snapshot(raw_unresolved_thread_count=1, settled=True)
+        _snapshot(unaddressed_thread_count=1, settled=True)
 
 
 def test_snapshot_fact_collections_are_immutable() -> None:

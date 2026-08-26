@@ -1263,7 +1263,14 @@ def _cmd_complete_unleased(
         return _cmd_complete_sweep_p2(args)
 
     from . import github_api, maintenance  # noqa: PLC0415
+    from ._maintenance import completion
+    from ._maintenance.review_settlement import (
+        classify_thread_closure,
+    )
     from .github_api import COMPLETE_MARKER  # noqa: PLC0415
+    from .lifecycle_workflow import (
+        load_review_context_for_worktree,
+    )
     from .models import ReviewComment  # noqa: PLC0415
 
     cwd = os.path.abspath(args.cwd)
@@ -1353,7 +1360,25 @@ def _cmd_complete_unleased(
     left_unresolved: list[str] = []
 
     threads = github_api.get_review_threads(resolved_pr_number, cwd)
+    review_context = load_review_context_for_worktree(cwd)
+    policy = ledger = None
+    review_context_exact = False
+    if review_context is not None:
+        policy, ledger = review_context
+        repository = str(pr.repo or _repo_slug(cwd)).strip()
+        review_context_exact = (
+            ledger.repository.casefold() == repository.casefold()
+            and ledger.head_sha == head_sha
+        )
+        if not review_context_exact:
+            print(
+                "info: review policy context does not match the completing "
+                f"repository/head ({repository}@{head_sha}); policy-controlled "
+                "threads will remain open",
+                file=sys.stderr,
+            )
     deferred_count = 0
+    visibly_addressed_count = 0
     for thread in threads:
         if thread.is_resolved:
             continue
@@ -1366,6 +1391,83 @@ def _cmd_complete_unleased(
         # deferral is that this PR does not stay open waiting on it.
         if deferred_review.is_thread_deferred(cwd, resolved_pr_number, thread.node_id):
             deferred_count += 1
+            continue
+        if review_context is not None:
+            closure = (
+                classify_thread_closure(thread, policy=policy, ledger=ledger)
+                if review_context_exact and policy is not None and ledger is not None
+                else None
+            )
+            if closure is None or not closure.addressed:
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"info: leaving thread {thread.node_id} open — the exact-head "
+                    "review ledger has no settled policy disposition for it",
+                    file=sys.stderr,
+                )
+                continue
+
+            path = thread.top.path
+            fixing_commit = None
+            if closure.resolve_thread:
+                candidates = (
+                    commits_by_file.get(path, [])
+                    if path is not None
+                    else new_commits
+                )
+                if not candidates or head_date <= thread.top.created_at:
+                    left_unresolved.append(thread.node_id)
+                    print(
+                        f"info: leaving fixed thread {thread.node_id} open — no "
+                        "post-review fixing commit can be cited on the thread",
+                        file=sys.stderr,
+                    )
+                    continue
+                fixing_commit = candidates[-1][0]
+
+            stub = ReviewComment(
+                id=thread.top.database_id,
+                author=thread.top.author,
+                body=thread.top.body,
+                path=path,
+                line=thread.top.line,
+                created_at=thread.top.created_at,
+                is_inline=True,
+                thread_id=thread.node_id,
+            )
+            try:
+                outcome = completion.apply_thread_settlement(
+                    thread=thread,
+                    closure=closure,
+                    marker=COMPLETE_MARKER,
+                    head_sha=head_sha,
+                    fixing_commit=fixing_commit,
+                    reply=lambda body, comment=stub: (
+                        github_api.reply_to_review_comment(
+                            resolved_pr_number, comment, body, cwd
+                        )
+                    ),
+                    resolve=lambda node_id=thread.node_id: (
+                        github_api.resolve_review_thread(node_id, cwd)
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"warning: error publishing settlement for thread "
+                    f"{thread.node_id}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if outcome.actionable:
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"info: leaving thread {thread.node_id} open — its "
+                    "structured settlement is missing, failed, or was reopened",
+                    file=sys.stderr,
+                )
+            elif not outcome.resolved:
+                visibly_addressed_count += 1
             continue
         path = thread.top.path
         addressed = (
@@ -1534,6 +1636,8 @@ def _cmd_complete_unleased(
     _mark_maintenance_complete(maintenance, cwd, resolved_pr_number)
 
     deferred_suffix = f"; deferred: {deferred_count}" if deferred_count else ""
+    if visibly_addressed_count:
+        deferred_suffix += f"; visibly addressed: {visibly_addressed_count}"
 
     if remaining:
         print(

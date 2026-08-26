@@ -49,6 +49,8 @@ class FinalizationObservation(BaseModel):
     review: SettlementReport
     review_observation_state: ObservationState = ObservationState.OBSERVED
     diagnostics: list[str] = Field(default_factory=list)
+    addressed_thread_ids: list[str] = Field(default_factory=list)
+    unaddressed_thread_ids: list[str] = Field(default_factory=list)
     settlement_key: str = ""
 
 
@@ -457,6 +459,8 @@ def _settlement_state_key(
     blockers: Sequence[str],
     review: SettlementReport,
     review_observation_state: ObservationState,
+    addressed_thread_ids: Sequence[str],
+    unaddressed_thread_ids: Sequence[str],
 ) -> str:
     """Hash structured settlement state, excluding rendered guidance text."""
 
@@ -470,6 +474,8 @@ def _settlement_state_key(
         "blockers": sorted(blockers),
         "review": review_state,
         "review_observation_state": review_observation_state.value,
+        "addressed_thread_ids": sorted(addressed_thread_ids),
+        "unaddressed_thread_ids": sorted(unaddressed_thread_ids),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -549,6 +555,8 @@ def evaluate_pr_snapshot(
         reviewer_count=policy.review.backstop.reviewer_count,
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
+    addressed_thread_ids: list[str] = []
+    unaddressed_thread_ids: list[str] = []
     for thread in current_threads:
         finding = finding_from_thread(
             thread,
@@ -562,11 +570,16 @@ def evaluate_pr_snapshot(
             fingerprint=finding.fingerprint,
         )
         if closure is None or not closure.addressed:
+            unaddressed_thread_ids.append(thread.node_id)
             continue
         if closure.resolve_thread:
+            unaddressed_thread_ids.append(thread.node_id)
             _append_once(blockers, "unresolved_fixed_review_threads")
             continue
-        if settlement_reply_status(thread, closure) is not SettlementReplyStatus.FRESH:
+        if settlement_reply_status(thread, closure) is SettlementReplyStatus.FRESH:
+            addressed_thread_ids.append(thread.node_id)
+        else:
+            unaddressed_thread_ids.append(thread.node_id)
             _append_once(blockers, "unaddressed_review_threads")
     if review_observation_state is ObservationState.UNAVAILABLE:
         _append_once(blockers, "review_observation_unavailable")
@@ -606,6 +619,8 @@ def evaluate_pr_snapshot(
         blockers=blockers,
         review=review,
         review_observation_state=review_observation_state,
+        addressed_thread_ids=addressed_thread_ids,
+        unaddressed_thread_ids=unaddressed_thread_ids,
     )
     return FinalizationObservation(
         repository=final_repository,
@@ -615,6 +630,8 @@ def evaluate_pr_snapshot(
         review=review,
         review_observation_state=review_observation_state,
         diagnostics=diagnostics,
+        addressed_thread_ids=addressed_thread_ids,
+        unaddressed_thread_ids=unaddressed_thread_ids,
         settlement_key=settlement_key,
     )
 

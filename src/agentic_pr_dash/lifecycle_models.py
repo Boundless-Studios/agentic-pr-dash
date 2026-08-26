@@ -259,10 +259,9 @@ class MaintenanceSnapshotV1(BaseModel):
             raise ValueError("settled observations cannot have blockers or actions")
         if (
             self.policy_unsettled_finding_count
-            or self.raw_unresolved_thread_count
             or self.unaddressed_thread_count
         ):
-            raise ValueError("settled observations cannot have open findings")
+            raise ValueError("settled observations cannot have unaddressed findings")
         if self.stable_observation_count < 2:
             raise ValueError("settled observations require stable observations")
         if not self.stable_observation_first_at or not self.stable_observation_last_at:

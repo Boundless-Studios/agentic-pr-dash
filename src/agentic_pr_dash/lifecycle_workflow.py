@@ -48,7 +48,15 @@ ReviewContextLoader: TypeAlias = Callable[
 def load_review_context(record: MaintenanceIntentRecordV1) -> ReviewContext | None:
     """Load the worktree's review policy and ledger for one lifecycle intent."""
 
-    cwd = Path(record.intent.worktree_path)
+    return load_review_context_for_worktree(record.intent.worktree_path)
+
+
+def load_review_context_for_worktree(
+    worktree_path: str | Path,
+) -> ReviewContext | None:
+    """Load the review policy and ledger rooted at ``worktree_path``."""
+
+    cwd = Path(worktree_path)
     policy_path = _review_file(
         cwd,
         "AGENTIC_PR_DASH_REVIEW_POLICY",
@@ -444,10 +452,7 @@ class LifecycleWorkflow:
             observation,
             pr,
             len(observed.unresolved_threads),
-            sum(
-                thread.node_id not in deferrals
-                for thread in observed.unresolved_threads
-            ),
+            len(observation.unaddressed_thread_ids),
         )
 
     def _review_context(
@@ -556,7 +561,6 @@ def _build_snapshot(
         blockers,
         actions,
         policy_count,
-        observed.raw_unresolved_thread_count,
         observed.unaddressed_thread_count,
     )
     return MaintenanceSnapshotV1(
@@ -586,7 +590,6 @@ def _snapshot_is_clean(
         list(snapshot.blockers),
         list(snapshot.next_actions),
         snapshot.policy_unsettled_finding_count,
-        snapshot.raw_unresolved_thread_count,
         snapshot.unaddressed_thread_count,
     )
 
@@ -596,7 +599,6 @@ def _snapshot_is_clean_values(
     blockers: list[MaintenanceBlockerV1],
     actions: list[MaintenanceNextActionV1],
     policy_count: int,
-    raw_count: int,
     unaddressed_count: int,
 ) -> bool:
     return (
@@ -605,7 +607,6 @@ def _snapshot_is_clean_values(
         and not blockers
         and not actions
         and not policy_count
-        and not raw_count
         and not unaddressed_count
     )
 
