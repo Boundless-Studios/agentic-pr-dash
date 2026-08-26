@@ -22,6 +22,11 @@ WORKFLOW_TYPE = "pr-maintenance"
 _PR_URL = re.compile(
     r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<number>\d+)"
 )
+_PUSH_UPDATE = re.compile(
+    r"^(?:[0-9a-f]{4,}\.{2,3}[0-9a-f]{4,}|"
+    r"\[(?:new branch|new tag|deleted|up to date)\])\s+.+\s+->\s+.+$",
+    re.IGNORECASE,
+)
 
 
 class LocalGitIdentity:
@@ -235,7 +240,45 @@ def _output_pr_number(payload: dict, repository: str) -> int | None:
     return None
 
 
-def _successful_targets(command: str, base_cwd: str) -> tuple[tuple[str, str, str | None], ...]:
+def _tool_output(payload: dict) -> str:
+    response = payload.get("tool_response")
+    if not isinstance(response, dict):
+        return ""
+    return "\n".join(
+        value
+        for key in ("stdout", "stderr", "output", "text")
+        if isinstance((value := response.get(key)), str)
+    )
+
+
+def _output_proves_push_succeeded(payload: dict) -> bool:
+    output = _tool_output(payload)
+    lowered = output.casefold()
+    if (
+        "error: failed to push some refs" in lowered
+        or "fatal:" in lowered
+        or "[rejected]" in lowered
+        or "[remote rejected]" in lowered
+    ):
+        return False
+    for line in output.splitlines():
+        candidate = line.strip()
+        if candidate == "Everything up-to-date":
+            return True
+        if candidate[:1] in {"*", "+", "-", "="}:
+            candidate = candidate[1:].lstrip()
+        if _PUSH_UPDATE.fullmatch(candidate):
+            return True
+    return False
+
+
+def _successful_targets(
+    command: str,
+    base_cwd: str,
+    *,
+    exit_code: int,
+    payload: dict,
+) -> tuple[tuple[str, str, str | None], ...]:
     segments = split_command_segments(command)
     effective_cwd = base_cwd
     targets: list[tuple[str, str, str | None]] = []
@@ -251,13 +294,18 @@ def _successful_targets(command: str, base_cwd: str) -> tuple[tuple[str, str, st
             continue
         if leading_op in {"||", "|", "&"}:
             continue
-        if any(op != "&&" for op, _later in segments[index + 1 :]):
+        later_segments = segments[index + 1 :]
+        if any(op != "&&" for op, _later in later_segments):
             continue
         if is_git_push(segment):
+            if exit_code != 0 and (
+                not later_segments or not _output_proves_push_succeeded(payload)
+            ):
+                continue
             targets.append(("push", effective_git_cwd(segment, effective_cwd), None))
             continue
         pr_target = parse_gh_pr_arm_target(segment)
-        if pr_target is not None:
+        if pr_target is not None and exit_code == 0:
             pr_number, _branch = pr_target
             targets.append(("pr", effective_cwd, pr_number))
     return tuple(targets)
@@ -373,7 +421,10 @@ def _run_payload(
             ),
             now=now,
         )
-    if phase != "PostToolUse" or _exit_code(payload) != 0:
+    if phase != "PostToolUse":
+        return 0
+    exit_code = _exit_code(payload)
+    if exit_code is None:
         return 0
     normalized = normalized_payload(payload)
     if normalized.get("tool_name") != "Bash":
@@ -383,7 +434,10 @@ def _run_payload(
     if not isinstance(command, str):
         return 0
     for kind, cwd, pr_number in _successful_targets(
-        command, str(normalized["cwd"])
+        command,
+        str(normalized["cwd"]),
+        exit_code=exit_code,
+        payload=payload,
     ):
         _enqueue_target(
             kind=kind,

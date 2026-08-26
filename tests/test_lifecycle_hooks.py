@@ -191,6 +191,88 @@ def test_failed_or_failure_masked_push_does_not_enqueue(
     assert LifecycleStore(state_root).list_intents() == ()
 
 
+@pytest.mark.parametrize(
+    ("command", "stderr"),
+    (
+        (
+            "git push && gh pr create --fill",
+            "Everything up-to-date\nGraphQL: Base sha can't be blank\n",
+        ),
+        (
+            "make test && git push && notify",
+            (
+                "To github.com:Acme/Widget.git\n"
+                "   1234567..89abcde  feature/thin-hooks -> feature/thin-hooks\n"
+                "notify: delivery failed\n"
+            ),
+        ),
+    ),
+)
+def test_nonzero_compound_enqueues_push_when_output_proves_it_succeeded(
+    tmp_path: Path,
+    command: str,
+    stderr: str,
+) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": command, "workdir": str(repo)},
+        "tool_response": {"exit_code": 1, "stderr": stderr},
+        "cwd": str(tmp_path),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    records = LifecycleStore(state_root).list_intents()
+    assert len(records) == 1
+    assert records[0].intent.head_sha == head
+    assert records[0].intent.reason == "post-push maintenance"
+
+
+@pytest.mark.parametrize(
+    ("command", "exit_code", "stderr"),
+    (
+        ("git push", 1, "fatal: unable to access remote\n"),
+        (
+            "git push && gh pr create --fill",
+            1,
+            (
+                "To github.com:Acme/Widget.git\n"
+                " ! [rejected] feature/thin-hooks -> feature/thin-hooks\n"
+                "error: failed to push some refs\n"
+            ),
+        ),
+        ("git push || true", 0, "error: failed to push some refs\n"),
+        ("git push && gh pr create --fill", 1, "command exited with status 1\n"),
+        ("make build && git push", 1, "error: failed to push some refs\n"),
+    ),
+)
+def test_failed_or_ambiguous_nonzero_push_does_not_enqueue(
+    tmp_path: Path,
+    command: str,
+    exit_code: int,
+    stderr: str,
+) -> None:
+    adapter = _adapter()
+    repo, _head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": command, "workdir": str(repo)},
+        "tool_response": {"exit_code": exit_code, "stderr": stderr},
+        "cwd": str(tmp_path),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+    assert LifecycleStore(state_root).list_intents() == ()
+
+
 def test_pr_create_reactivates_a_push_that_previously_had_no_pr(
     tmp_path: Path,
 ) -> None:
