@@ -113,6 +113,15 @@ def test_config_model_has_distinct_resolution_source() -> None:
     ] == "config_override"
 
 
+def test_explicit_model_takes_precedence_over_later_config_override() -> None:
+    telemetry = _telemetry(
+        "codex", "exec", "--model", "gpt-5", "-c", 'model="o3"', "prompt"
+    )
+
+    assert telemetry.requested_model == "gpt-5"
+    assert telemetry.resolution_source is DispatchResolutionSource.EXPLICIT_FLAG
+
+
 @pytest.mark.parametrize(
     ("option", "expected"),
     [
@@ -236,6 +245,32 @@ def test_execution_policy_options_are_structured_attributes() -> None:
     assert attributes["gaia.dispatch.sandbox_mode"] == "workspace-write"
     assert attributes["gaia.dispatch.approval_mode"] == "on-request"
     assert attributes["gaia.dispatch.ignore_user_config"] is True
+
+
+def test_dangerous_bypass_flag_sets_effective_policy_attributes() -> None:
+    telemetry = _telemetry(
+        "codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "prompt"
+    )
+
+    attributes = telemetry.otel_attributes()
+
+    assert attributes["gaia.dispatch.sandbox_mode"] == "danger-full-access"
+    assert attributes["gaia.dispatch.approval_mode"] == "never"
+
+
+@pytest.mark.parametrize("option", ["--local-provider", "--local-provider="])
+def test_codex_oss_reports_selected_local_provider(option: str) -> None:
+    argv = (
+        ("codex", "exec", "--oss", option, "ollama", "prompt")
+        if option == "--local-provider"
+        else ("codex", "exec", "--oss", f"{option}lmstudio", "prompt")
+    )
+
+    attributes = _telemetry(*argv).otel_attributes()
+
+    assert attributes["gen_ai.provider.name"] == (
+        "ollama" if option == "--local-provider" else "lmstudio"
+    )
 
 
 def test_short_sandbox_option_is_structured() -> None:

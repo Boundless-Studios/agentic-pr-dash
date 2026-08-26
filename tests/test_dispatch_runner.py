@@ -985,6 +985,29 @@ def test_detached_entrypoint_accepts_nul_delimited_structured_argv(
     assert secret not in serialized
 
 
+@pytest.mark.parametrize(
+    "exit_code_args", [["--exit-code", "not-a-number"], ["--exit-code"]]
+)
+def test_structured_detached_entrypoint_rejects_malformed_exit_code(
+    tmp_path: Path, monkeypatch, exit_code_args: list[str]
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", *exit_code_args]
+    )
+
+    assert result == 0
+    assert not ledger.exists()
+
+
 def test_structured_detached_failure_preserves_unavailability_detection(
     tmp_path: Path, monkeypatch
 ) -> None:

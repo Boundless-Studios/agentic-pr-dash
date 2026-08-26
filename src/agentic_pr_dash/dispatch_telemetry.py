@@ -105,6 +105,7 @@ class DispatchTelemetry:
     ignore_user_config: bool
     start_time_unix_nano: int | None
     resolution_source: DispatchResolutionSource
+    gen_ai_provider_name: str | None = None
     parse_status: DispatchParseStatus = DispatchParseStatus.STRUCTURED
     dispatch_id: str = field(default_factory=lambda: str(uuid4()))
     observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -128,6 +129,7 @@ class DispatchTelemetry:
         parsed = _sanitize_and_resolve(exact_argv, provider)
         return cls(
             provider=provider,
+            gen_ai_provider_name=parsed.gen_ai_provider_name,
             source=source,
             argv=exact_argv,
             sanitized_argv=parsed.sanitized_argv,
@@ -160,7 +162,9 @@ class DispatchTelemetry:
             "process.command": _executable_name(self.argv[0]),
             "process.command_args": self.sanitized_argv,
             "process.args_count": len(self.argv),
-            "gen_ai.provider.name": _PROVIDER_NAMES[self.provider],
+            "gen_ai.provider.name": (
+                self.gen_ai_provider_name or _PROVIDER_NAMES[self.provider]
+            ),
             "gaia.dispatch.source": self.source.value,
             "gaia.dispatch.id": self.dispatch_id,
             "gaia.dispatch.task_type": self.task_type,
@@ -194,6 +198,7 @@ class DispatchTelemetry:
         executable = observation.provider.value
         return cls(
             provider=observation.provider,
+            gen_ai_provider_name=_PROVIDER_NAMES[observation.provider],
             source=observation.source,
             argv=(executable, "<legacy:redacted>"),
             sanitized_argv=(executable, "<legacy:redacted>"),
@@ -248,6 +253,7 @@ class DispatchTelemetry:
 @dataclass(frozen=True, slots=True)
 class _ParsedArgv:
     sanitized_argv: tuple[str, ...]
+    gen_ai_provider_name: str
     model: str | None
     profile: str | None
     reasoning_effort: str | None
@@ -265,6 +271,7 @@ def _sanitize_and_resolve(
         raise ValueError("argv must contain an executable")
 
     sanitized = [argv[0]]
+    gen_ai_provider_name = _PROVIDER_NAMES[provider]
     model = None
     profile = None
     reasoning_effort = None
@@ -323,6 +330,7 @@ def _sanitize_and_resolve(
             "--ask-for-approval",
             "--config",
             "--cd",
+            "--local-provider",
             "--model",
             "--profile",
             "--sandbox",
@@ -349,6 +357,8 @@ def _sanitize_and_resolve(
                 model, reasoning_effort, resolution_source = _apply_config_value(
                     attached_value, model, reasoning_effort, resolution_source
                 )
+            elif option == "--local-provider":
+                gen_ai_provider_name = _truncate(attached_value)
             elif option == "--cd":
                 working_root = attached_value
             index += 1
@@ -385,6 +395,8 @@ def _sanitize_and_resolve(
                 model, reasoning_effort, resolution_source = _apply_config_value(
                     value, model, reasoning_effort, resolution_source
                 )
+            elif token == "--local-provider":
+                gen_ai_provider_name = _truncate(value)
             elif token in {"--cd", "-C"}:
                 working_root = value
             index += 2
@@ -393,6 +405,9 @@ def _sanitize_and_resolve(
             sanitized.append(_truncate(token))
             if token == "--ignore-user-config":
                 ignore_user_config = True
+            elif token == "--dangerously-bypass-approvals-and-sandbox":
+                sandbox_mode = "danger-full-access"
+                approval_mode = "never"
         elif token in {"exec", "e", "run"}:
             sanitized.append(token)
         else:
@@ -403,6 +418,7 @@ def _sanitize_and_resolve(
         bounded.append(f"<truncated:{len(sanitized) - MAX_ARG_COUNT}-args>")
     return _ParsedArgv(
         tuple(bounded),
+        gen_ai_provider_name,
         model,
         profile,
         reasoning_effort,
@@ -430,6 +446,8 @@ def _apply_config_value(
     if not isinstance(parsed_value, str):
         return model, reasoning_effort, resolution_source
     if key == "model":
+        if resolution_source is DispatchResolutionSource.EXPLICIT_FLAG:
+            return model, reasoning_effort, resolution_source
         return (
             _truncate(parsed_value),
             reasoning_effort,

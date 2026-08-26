@@ -314,7 +314,13 @@ def _structured_stdin_payload(argv: list[str]) -> dict[str, object] | None:
     if not command_argv or any("\0" in value for value in command_argv):
         return None
 
-    exit_code = _option_value(argv, "--exit-code")
+    exit_code_raw = _option_value(argv, "--exit-code")
+    try:
+        exit_code = int(exit_code_raw) if exit_code_raw is not None else None
+    except ValueError:
+        return None
+    if exit_code is None:
+        return None
     stderr = ""
     error_file = _option_value(argv, "--error-file")
     if error_file:
