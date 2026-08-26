@@ -525,18 +525,21 @@ def _structured_telemetry(
         f"{request.provider.value}.exe",
     } or not _has_supported_subcommand(argv, request.provider):
         return None
-    return DispatchTelemetry.from_argv(
-        provider=request.provider,
-        source=request.source,
-        argv=argv,
-        cwd=str(request.payload.get("cwd") or os.getcwd()),
-        task_type=task_type.strip(),
-        session_id=str(request.payload.get("session_id") or ""),
-        environment={"CODEX_HOME": os.environ["CODEX_HOME"]}
-        if "CODEX_HOME" in os.environ
-        else None,
-        start_time_unix_nano=start_time_unix_nano,
-    )
+    try:
+        return DispatchTelemetry.from_argv(
+            provider=request.provider,
+            source=request.source,
+            argv=argv,
+            cwd=str(request.payload.get("cwd") or os.getcwd()),
+            task_type=task_type.strip(),
+            session_id=str(request.payload.get("session_id") or ""),
+            environment={"CODEX_HOME": os.environ["CODEX_HOME"]}
+            if "CODEX_HOME" in os.environ
+            else None,
+            start_time_unix_nano=start_time_unix_nano,
+        )
+    except (OSError, ValueError):
+        return None
 
 
 def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bool:
@@ -572,7 +575,7 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
     index = 1
     while index < len(argv):
         token = argv[index]
-        if token in {"--image", "-i"} or token.startswith(("--image=", "-i=")):
+        if token in {"--image", "-i"}:
             return False
         if token in value_options:
             index += 2

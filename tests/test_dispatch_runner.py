@@ -306,6 +306,42 @@ def test_structured_codex_dispatch_rejects_variadic_image_before_exec(
     assert not request.ledger_path.exists()
 
 
+@pytest.mark.parametrize("option", ["--image=/tmp/input.png", "-i=/tmp/input.png"])
+def test_structured_codex_dispatch_accepts_attached_image_before_exec(
+    tmp_path: Path, option: str
+) -> None:
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", option, "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("option", ["-C", "--cd"])
+def test_structured_codex_dispatch_rejects_nul_working_root(
+    tmp_path: Path, option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", option, "bad\0path", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
+
+
 @pytest.mark.parametrize(
     "argv",
     [

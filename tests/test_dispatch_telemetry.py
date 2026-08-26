@@ -401,6 +401,12 @@ def test_codex_oss_reports_selected_local_provider(option: str) -> None:
     )
 
 
+def test_codex_oss_omits_unknown_local_provider() -> None:
+    attributes = _telemetry("codex", "exec", "--oss", "prompt").otel_attributes()
+
+    assert "gen_ai.provider.name" not in attributes
+
+
 def test_short_sandbox_option_is_structured() -> None:
     telemetry = _telemetry("codex", "exec", "-s", "workspace-write", "prompt")
 

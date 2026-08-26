@@ -176,7 +176,7 @@ class DispatchTelemetry:
             "gaia.dispatch.ignore_user_config": self.ignore_user_config,
             "gaia.dispatch.resolution_source": self.resolution_source.value,
         }
-        provider_name = self.gen_ai_provider_name or _PROVIDER_NAMES[self.provider]
+        provider_name = self.gen_ai_provider_name
         if provider_name:
             attributes["gen_ai.provider.name"] = provider_name
         if self.parse_status is DispatchParseStatus.STRUCTURED:
@@ -451,6 +451,8 @@ def _sanitize_and_resolve(
             )
             if token == "--ignore-user-config":
                 ignore_user_config = True
+            elif token == "--oss" and not provider_explicit:
+                gen_ai_provider_name = None
             elif token == "--full-auto" and not bypass_policy:
                 sandbox_mode = "workspace-write"
                 sandbox_explicit = True
