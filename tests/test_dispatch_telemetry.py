@@ -18,6 +18,7 @@ from agentic_pr_dash.dispatch_observation import (
 from agentic_pr_dash.dispatch_telemetry import (
     MAX_ARG_COUNT,
     MAX_STRING_LENGTH,
+    DispatchResolutionSource,
     DispatchTelemetry,
     emit_dispatch_span,
 )
@@ -97,6 +98,35 @@ def test_model_option_forms_are_resolved_once(
     )
 
     assert telemetry.requested_model == expected_model
+    assert telemetry.resolution_source is DispatchResolutionSource.EXPLICIT_FLAG
+
+
+def test_config_model_has_distinct_resolution_source() -> None:
+    telemetry = _telemetry(
+        "codex", "exec", "--config", "model=gpt-5.6-sol", "prompt"
+    )
+
+    assert telemetry.requested_model == "gpt-5.6-sol"
+    assert telemetry.otel_attributes()[
+        "gaia.dispatch.resolution_source"
+    ] == "config_override"
+
+
+def test_missing_option_value_and_double_dash_do_not_change_routing() -> None:
+    missing = _telemetry(
+        "codex", "exec", "--model", "--profile", "maintenance", "prompt"
+    )
+    terminated = _telemetry(
+        "codex", "exec", "--", "--model", "secret-payload-model"
+    )
+
+    assert missing.requested_model is None
+    assert missing.requested_profile == "maintenance"
+    assert terminated.requested_model is None
+    assert terminated.sanitized_argv[-2:] == (
+        "<redacted:payload>",
+        "<redacted:payload>",
+    )
 
 
 def test_sensitive_config_and_prompt_values_never_serialize() -> None:
@@ -227,6 +257,26 @@ def test_completed_dispatch_emits_one_otel_span() -> None:
     assert spans[0].attributes["gaia.dispatch.effective_model"] == "gpt-5.6-sol"
     assert spans[0].start_time == 1_000_000_000
     assert spans[0].end_time == 2_000_000_000
+
+
+def test_relative_executable_omits_path_and_all_string_attributes_are_bounded() -> None:
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("codex", "exec", "prompt"),
+        cwd="w" * (MAX_STRING_LENGTH + 20),
+        task_type="t" * (MAX_STRING_LENGTH + 20),
+        session_id="session-1",
+    )
+
+    attributes = telemetry.otel_attributes()
+
+    assert "process.executable.path" not in attributes
+    assert all(
+        len(value) <= MAX_STRING_LENGTH
+        for value in attributes.values()
+        if isinstance(value, str)
+    )
 
 
 def test_dispatch_projects_to_existing_redacted_observation() -> None:

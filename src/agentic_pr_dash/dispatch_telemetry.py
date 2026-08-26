@@ -30,6 +30,17 @@ class DispatchParseStatus(str, Enum):
     UNKNOWN = "unknown"
 
 
+class DispatchResolutionSource(str, Enum):
+    """Authority that selected the attributed model."""
+
+    EXPLICIT_FLAG = "explicit_flag"
+    CONFIG_OVERRIDE = "config_override"
+    PROFILE = "profile"
+    TASK_ROUTING = "task_routing"
+    BASE_CONFIG = "base_config"
+    UNAVAILABLE = "unavailable"
+
+
 OtelAttribute = str | int | bool | tuple[str, ...]
 
 MAX_ARG_COUNT = 128
@@ -60,7 +71,7 @@ class DispatchTelemetry:
 
     provider: DispatchProvider
     source: DispatchSource
-    argv: tuple[str, ...]
+    argv: tuple[str, ...] = field(repr=False)
     sanitized_argv: tuple[str, ...]
     cwd: str
     task_type: str
@@ -73,6 +84,7 @@ class DispatchTelemetry:
     approval_mode: str | None
     ignore_user_config: bool
     start_time_unix_nano: int | None
+    resolution_source: DispatchResolutionSource
     parse_status: DispatchParseStatus = DispatchParseStatus.STRUCTURED
     dispatch_id: str = field(default_factory=lambda: str(uuid4()))
     observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -114,14 +126,14 @@ class DispatchTelemetry:
             approval_mode=parsed.approval_mode,
             ignore_user_config=parsed.ignore_user_config,
             start_time_unix_nano=start_time_unix_nano,
+            resolution_source=parsed.resolution_source,
         )
 
     def otel_attributes(self) -> dict[str, OtelAttribute]:
         """Return sanitized standard and Gaia-extension OTel attributes."""
 
         attributes: dict[str, OtelAttribute] = {
-            "process.command": Path(self.argv[0]).name,
-            "process.executable.path": self.argv[0],
+            "process.command": _executable_name(self.argv[0]),
             "process.command_args": self.sanitized_argv,
             "process.args_count": len(self.argv),
             "gen_ai.provider.name": _PROVIDER_NAMES[self.provider],
@@ -131,7 +143,10 @@ class DispatchTelemetry:
             "gaia.dispatch.worktree": self.cwd,
             "gaia.dispatch.parse_status": self.parse_status.value,
             "gaia.dispatch.ignore_user_config": self.ignore_user_config,
+            "gaia.dispatch.resolution_source": self.resolution_source.value,
         }
+        if Path(self.argv[0]).is_absolute():
+            attributes["process.executable.path"] = self.argv[0]
         optional = {
             "gen_ai.request.model": self.requested_model,
             "process.environment_variable.CODEX_HOME": self.codex_home,
@@ -141,7 +156,42 @@ class DispatchTelemetry:
             "gaia.dispatch.approval_mode": self.approval_mode,
         }
         attributes.update({key: value for key, value in optional.items() if value})
-        return attributes
+        return {key: _bound_attribute(value) for key, value in attributes.items()}
+
+    @classmethod
+    def from_legacy_observation(
+        cls,
+        observation: DispatchObservation,
+        *,
+        parse_status: DispatchParseStatus,
+    ) -> DispatchTelemetry:
+        """Represent one already-parsed legacy observation without raw text."""
+
+        executable = observation.provider.value
+        return cls(
+            provider=observation.provider,
+            source=observation.source,
+            argv=(executable, "<legacy:redacted>"),
+            sanitized_argv=(executable, "<legacy:redacted>"),
+            cwd=observation.worktree_root,
+            task_type=observation.task_type,
+            session_id=observation.session_id,
+            requested_model=observation.requested_model,
+            requested_profile=None,
+            reasoning_effort=None,
+            codex_home=None,
+            sandbox_mode=None,
+            approval_mode=None,
+            ignore_user_config=False,
+            start_time_unix_nano=None,
+            resolution_source=(
+                DispatchResolutionSource.EXPLICIT_FLAG
+                if observation.requested_model
+                else DispatchResolutionSource.UNAVAILABLE
+            ),
+            parse_status=parse_status,
+            observed_at=observation.observed_at,
+        )
 
     def to_dispatch_observation(
         self,
@@ -178,6 +228,7 @@ class _ParsedArgv:
     sandbox_mode: str | None
     approval_mode: str | None
     ignore_user_config: bool
+    resolution_source: DispatchResolutionSource
 
 
 def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
@@ -191,9 +242,14 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
     sandbox_mode = None
     approval_mode = None
     ignore_user_config = False
+    resolution_source = DispatchResolutionSource.UNAVAILABLE
     index = 2
     while index < len(argv):
         token = argv[index]
+        if token == "--":
+            sanitized.append(token)
+            sanitized.extend("<redacted:payload>" for _value in argv[index + 1 :])
+            break
         option, separator, attached_value = token.partition("=")
         if separator and option in {
             "--ask-for-approval",
@@ -211,6 +267,7 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
             )
             if option == "--model":
                 model = _truncate(attached_value)
+                resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
             elif option == "--profile":
                 profile = _truncate(attached_value)
             elif option == "--sandbox":
@@ -221,6 +278,7 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 key, found, config_value = attached_value.partition("=")
                 if found and key == "model":
                     model = _truncate(config_value)
+                    resolution_source = DispatchResolutionSource.CONFIG_OVERRIDE
                 elif found and key == "model_reasoning_effort":
                     reasoning_effort = _truncate(config_value)
             index += 1
@@ -229,11 +287,16 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
             sanitized.append(f"{option}=<redacted:option>")
             index += 1
             continue
-        if token in _VALUE_OPTIONS and index + 1 < len(argv):
+        if (
+            token in _VALUE_OPTIONS
+            and index + 1 < len(argv)
+            and not argv[index + 1].startswith("-")
+        ):
             value = argv[index + 1]
             sanitized.extend((token, _truncate(_safe_option_value(token, value))))
             if token in {"--model", "-m"}:
                 model = _truncate(value)
+                resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
             elif token in {"--profile", "-p"}:
                 profile = _truncate(value)
             elif token == "--sandbox":
@@ -244,6 +307,7 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 key, found, config_value = value.partition("=")
                 if found and key == "model":
                     model = _truncate(config_value)
+                    resolution_source = DispatchResolutionSource.CONFIG_OVERRIDE
                 elif found and key == "model_reasoning_effort":
                     reasoning_effort = _truncate(config_value)
             index += 2
@@ -266,6 +330,7 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
         sandbox_mode,
         approval_mode,
         ignore_user_config,
+        resolution_source,
     )
 
 
@@ -285,6 +350,18 @@ def _truncate(value: str) -> str:
     return value[: MAX_STRING_LENGTH - len(marker)] + marker
 
 
+def _executable_name(value: str) -> str:
+    return value.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def _bound_attribute(value: OtelAttribute) -> OtelAttribute:
+    if isinstance(value, str):
+        return _truncate(value)
+    if isinstance(value, tuple):
+        return tuple(_truncate(item) for item in value)
+    return value
+
+
 def emit_dispatch_span(
     telemetry: DispatchTelemetry,
     *,
@@ -298,7 +375,7 @@ def emit_dispatch_span(
 
     attributes = telemetry.otel_attributes()
     if effective_model:
-        attributes["gaia.dispatch.effective_model"] = effective_model
+        attributes["gaia.dispatch.effective_model"] = _truncate(effective_model)
     if error_type:
         attributes["error.type"] = error_type
     dispatch_tracer = tracer or trace.get_tracer("agentic_pr_dash.dispatch")

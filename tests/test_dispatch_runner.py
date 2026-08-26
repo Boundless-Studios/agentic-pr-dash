@@ -233,6 +233,106 @@ def test_structured_dispatch_is_authoritative_over_raw_command(tmp_path: Path) -
     assert "wrong-model" not in json.dumps(persisted)
 
 
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"argv": "codex exec review", "task_type": "review"},
+        {"argv": ["codex", "exec", "review"], "task_type": ""},
+        {
+            "argv": ["codex", "exec", "review"],
+            "task_type": "review",
+            "start_time_unix_nano": "invalid",
+        },
+    ],
+)
+def test_present_but_invalid_structured_metadata_fails_closed(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec --model wrong-model legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = metadata
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["git", "status"],
+        ["opencode", "run", "review"],
+        ["codex", "review"],
+    ],
+)
+def test_structured_metadata_rejects_wrong_provider_or_subcommand(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": argv,
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+def test_legacy_dispatch_emits_typed_parse_status(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+
+    result = run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="codex exec review",
+        )
+    )
+
+    assert result.observation is not None
+    assert emitted[0][0].parse_status.value == "legacy_parsed"
+
+
+def test_unavailable_span_has_low_cardinality_error_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+        response={"exit_code": 1, "stderr": "quota exhausted"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    run_dispatch_hook(request)
+
+    assert emitted[0][1]["error_type"] == "provider.unavailable"
+
+
 @pytest.mark.parametrize("provider", list(DispatchProvider))
 def test_unrelated_commands_are_ignored(
     tmp_path: Path, provider: DispatchProvider

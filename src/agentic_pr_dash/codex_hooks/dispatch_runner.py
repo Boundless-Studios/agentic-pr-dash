@@ -9,7 +9,7 @@ import shlex
 import sys
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agentic_pr_dash.dispatch_observation import (
@@ -20,6 +20,8 @@ from agentic_pr_dash.dispatch_observation import (
     DispatchSource,
 )
 from agentic_pr_dash.dispatch_telemetry import (
+    DispatchParseStatus,
+    DispatchResolutionSource,
     DispatchTelemetry,
     emit_dispatch_span,
 )
@@ -351,7 +353,9 @@ def _observation_from_request(
     request: DispatchHookRequest,
 ) -> DispatchObservation | None:
     structured = _structured_telemetry(request)
-    if structured is not None:
+    if "dispatch_telemetry" in request.payload:
+        if structured is None:
+            return None
         response = request.payload.get("tool_response")
         response = response if isinstance(response, dict) else {}
         outcome = _outcome(response)
@@ -360,6 +364,11 @@ def _observation_from_request(
             structured.requested_model,
             resolution,
         )
+        if structured.resolution_source is DispatchResolutionSource.UNAVAILABLE:
+            structured = replace(
+                structured,
+                resolution_source=_adapter_resolution_source(resolution),
+            )
         verdict = response.get("review_verdict")
         if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
             verdict = None
@@ -370,7 +379,11 @@ def _observation_from_request(
             error_type=(
                 f"process.exit_code.{response.get('exit_code')}"
                 if outcome is DispatchOutcome.FAILURE
-                else None
+                else (
+                    "provider.unavailable"
+                    if outcome is DispatchOutcome.UNAVAILABLE
+                    else None
+                )
             ),
         )
         return structured.to_dispatch_observation(
@@ -411,7 +424,7 @@ def _observation_from_request(
         request.payload.get("dispatch_model_resolution"),
     )
 
-    return DispatchObservation(
+    observation = DispatchObservation(
         provider=request.provider,
         source=request.source,
         session_id=str(request.payload.get("session_id") or ""),
@@ -429,6 +442,29 @@ def _observation_from_request(
         ),
         classification_framework=declared[1] if declared is not None else None,
     )
+    legacy_telemetry = DispatchTelemetry.from_legacy_observation(
+        observation,
+        parse_status=(
+            DispatchParseStatus.LEGACY_PARSED
+            if direct_invocation
+            else DispatchParseStatus.AMBIGUOUS
+        ),
+    )
+    emit_dispatch_span(
+        legacy_telemetry,
+        outcome=outcome,
+        effective_model=resolved_model,
+        error_type=(
+            f"process.exit_code.{response.get('exit_code')}"
+            if outcome is DispatchOutcome.FAILURE
+            else (
+                "provider.unavailable"
+                if outcome is DispatchOutcome.UNAVAILABLE
+                else None
+            )
+        ),
+    )
+    return observation
 
 
 def _structured_telemetry(
@@ -452,6 +488,18 @@ def _structured_telemetry(
         )
     ):
         return None
+    expected_subcommand = {
+        DispatchProvider.CODEX: "exec",
+        DispatchProvider.OPENCODE: "run",
+    }.get(request.provider)
+    executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
+    if (
+        expected_subcommand is None
+        or executable not in {request.provider.value, f"{request.provider.value}.exe"}
+        or len(argv) < 2
+        or argv[1] != expected_subcommand
+    ):
+        return None
     return DispatchTelemetry.from_argv(
         provider=request.provider,
         source=request.source,
@@ -461,6 +509,18 @@ def _structured_telemetry(
         session_id=str(request.payload.get("session_id") or ""),
         start_time_unix_nano=start_time_unix_nano,
     )
+
+
+def _adapter_resolution_source(resolution: object) -> DispatchResolutionSource:
+    if not isinstance(resolution, dict):
+        return DispatchResolutionSource.UNAVAILABLE
+    configured = resolution.get("configured_model")
+    if isinstance(configured, str) and configured.strip():
+        return DispatchResolutionSource.BASE_CONFIG
+    default = resolution.get("default_model")
+    if isinstance(default, str) and default.strip():
+        return DispatchResolutionSource.TASK_ROUTING
+    return DispatchResolutionSource.UNAVAILABLE
 
 
 def _declared_classification(payload: dict[str, object]) -> tuple[str, str] | None:
