@@ -286,7 +286,9 @@ def _sanitize_and_resolve(
     sandbox_mode = None
     approval_mode = None
     ignore_user_config = False
-    provider_explicit = False
+    local_provider_candidate = None
+    oss_mode = False
+    full_auto = False
     sandbox_explicit = False
     approval_explicit = False
     bypass_policy = False
@@ -303,7 +305,7 @@ def _sanitize_and_resolve(
         if assignment is None:
             return
         key, parsed_value = assignment
-        if key == "model_provider" and not provider_explicit:
+        if key == "model_provider":
             gen_ai_provider_name = _truncate(parsed_value)
         elif key == "sandbox_mode" and not sandbox_explicit and not bypass_policy:
             sandbox_mode = _truncate(parsed_value)
@@ -394,8 +396,7 @@ def _sanitize_and_resolve(
             elif option == "--config":
                 apply_config(attached_value)
             elif option == "--local-provider":
-                gen_ai_provider_name = _truncate(attached_value)
-                provider_explicit = True
+                local_provider_candidate = _truncate(attached_value)
             elif option == "--cd":
                 working_root = attached_value
             index += 1
@@ -435,8 +436,7 @@ def _sanitize_and_resolve(
             elif token in {"--config", "-c"}:
                 apply_config(value)
             elif token == "--local-provider":
-                gen_ai_provider_name = _truncate(value)
-                provider_explicit = True
+                local_provider_candidate = _truncate(value)
             elif token in {"--cd", "-C"}:
                 working_root = value
             index += 2
@@ -451,11 +451,10 @@ def _sanitize_and_resolve(
             )
             if token == "--ignore-user-config":
                 ignore_user_config = True
-            elif token == "--oss" and not provider_explicit:
-                gen_ai_provider_name = None
+            elif token == "--oss":
+                oss_mode = True
             elif token == "--full-auto" and not bypass_policy:
-                sandbox_mode = "workspace-write"
-                sandbox_explicit = True
+                full_auto = True
             elif token == "--dangerously-bypass-approvals-and-sandbox":
                 bypass_policy = True
                 sandbox_mode = "danger-full-access"
@@ -466,6 +465,14 @@ def _sanitize_and_resolve(
         else:
             sanitized.append("<redacted:payload>")
         index += 1
+    if provider is DispatchProvider.CODEX and oss_mode:
+        if local_provider_candidate:
+            gen_ai_provider_name = local_provider_candidate
+        elif gen_ai_provider_name == _PROVIDER_NAMES[provider]:
+            gen_ai_provider_name = None
+    if full_auto and not bypass_policy:
+        sandbox_mode = "workspace-write"
+        approval_mode = "never"
     bounded = sanitized[:MAX_ARG_COUNT]
     if len(sanitized) > MAX_ARG_COUNT:
         bounded.append(f"<truncated:{len(sanitized) - MAX_ARG_COUNT}-args>")

@@ -172,6 +172,32 @@ def test_explicit_model_wins_over_adapter_resolution(tmp_path: Path) -> None:
     assert result.observation.resolved_model == "explicit"
 
 
+def test_structured_opencode_provider_uses_adapter_resolved_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.OPENCODE,
+        command="<redacted>",
+        model_resolution={"configured_model": "openai/gpt-5"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["opencode", "run", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.resolved_model == "openai/gpt-5"
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "openai"
+
+
 @pytest.mark.parametrize(
     ("provider", "command", "model"),
     [
@@ -1231,6 +1257,35 @@ def test_structured_detached_entrypoint_rejects_malformed_exit_code(
 
     assert result == 0
     assert not ledger.exists()
+
+
+def test_interactive_structured_payload_rejects_nul_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(
+            json.dumps(
+                {
+                    "session_id": "session-1",
+                    "cwd": f"{tmp_path}\0invalid",
+                    "tool_input": {"command": "<redacted>"},
+                    "tool_response": {"exit_code": 0},
+                    "dispatch_telemetry": {
+                        "argv": ["codex", "exec", "private prompt"],
+                        "task_type": "exec",
+                    },
+                }
+            )
+        ),
+    )
+
+    result = run_codex_dispatch_logger.main([])
+
+    assert result == 0
+    assert not (tmp_path / ".beads" / "interactions.jsonl").exists()
 
 
 def test_structured_detached_failure_preserves_unavailability_detection(

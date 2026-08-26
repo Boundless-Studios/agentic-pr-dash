@@ -272,7 +272,10 @@ def run_provider_entrypoint(
             return 0
         payload = _normalize_hook_payload(raw)
 
-    root = Path(str(payload.get("cwd") or os.getcwd()))
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if "\0" in cwd:
+        return 0
+    root = Path(cwd)
     request = DispatchHookRequest(
         provider=provider,
         source=source,
@@ -392,6 +395,16 @@ def _observation_from_request(
             resolution,
             ignore_user_config=structured.ignore_user_config,
         )
+        if (
+            structured.provider is DispatchProvider.OPENCODE
+            and structured.gen_ai_provider_name is None
+            and effective_model
+            and "/" in effective_model
+        ):
+            structured = replace(
+                structured,
+                gen_ai_provider_name=effective_model.split("/", 1)[0],
+            )
         if structured.resolution_source is DispatchResolutionSource.UNAVAILABLE:
             structured = replace(
                 structured,

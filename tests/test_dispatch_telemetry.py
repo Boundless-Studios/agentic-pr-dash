@@ -210,6 +210,7 @@ def test_explicit_policy_flags_take_precedence_over_config_overrides() -> None:
     telemetry = _telemetry(
         "codex",
         "exec",
+        "--oss",
         "--local-provider",
         "lmstudio",
         "--ask-for-approval",
@@ -384,6 +385,23 @@ def test_full_auto_sets_compatible_sandbox_mode() -> None:
     telemetry = _telemetry("codex", "exec", "--full-auto", "prompt")
 
     assert telemetry.sandbox_mode == "workspace-write"
+    assert telemetry.approval_mode == "never"
+
+
+def test_full_auto_policy_is_not_order_dependent() -> None:
+    telemetry = _telemetry(
+        "codex",
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "read-only",
+        "--ask-for-approval",
+        "untrusted",
+        "prompt",
+    )
+
+    assert telemetry.sandbox_mode == "workspace-write"
+    assert telemetry.approval_mode == "never"
 
 
 @pytest.mark.parametrize("option", ["--local-provider", "--local-provider="])
@@ -405,6 +423,29 @@ def test_codex_oss_omits_unknown_local_provider() -> None:
     attributes = _telemetry("codex", "exec", "--oss", "prompt").otel_attributes()
 
     assert "gen_ai.provider.name" not in attributes
+
+
+def test_codex_local_provider_requires_oss_mode() -> None:
+    attributes = _telemetry(
+        "codex", "exec", "--local-provider", "ollama", "prompt"
+    ).otel_attributes()
+
+    assert attributes["gen_ai.provider.name"] == "openai"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ("codex", "exec", "-c", 'model_provider="ollama"', "--oss", "prompt"),
+        ("codex", "exec", "--oss", "-c", 'model_provider="ollama"', "prompt"),
+    ],
+)
+def test_codex_oss_preserves_configured_provider_regardless_of_order(
+    argv: tuple[str, ...],
+) -> None:
+    attributes = _telemetry(*argv).otel_attributes()
+
+    assert attributes["gen_ai.provider.name"] == "ollama"
 
 
 def test_short_sandbox_option_is_structured() -> None:
