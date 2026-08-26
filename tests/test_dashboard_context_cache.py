@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 from agentic_pr_dash import app
 
 
-def test_force_refresh_discards_inflight_context_result(monkeypatch):
+def test_force_refresh_does_not_duplicate_inflight_context_build(monkeypatch):
     async def scenario():
         started = asyncio.Event()
         release_stale = asyncio.Event()
@@ -32,6 +32,10 @@ def test_force_refresh_discards_inflight_context_result(monkeypatch):
 
         fresh_request = asyncio.create_task(app._dashboard_context_async())
         await asyncio.sleep(0)
+        # Invalidating a context cannot cancel the worker already running in a
+        # thread. Keep that build authoritative until it finishes instead of
+        # orphaning it and starting another expensive scan in parallel.
+        assert builds == 1
         release_stale.set()
 
         # Invalidation leaves no completed snapshot, so the request receives
@@ -39,9 +43,9 @@ def test_force_refresh_discards_inflight_context_result(monkeypatch):
         assert "columns" in await fresh_request
         assert "columns" in await stale_request
         assert await stale_build == {"version": "stale"}
-        fresh_build = app._dashboard_context_tasks.get((False, "board"))
-        if fresh_build:
-            await fresh_build
+        await app._dashboard_context_async()
+        fresh_build = app._dashboard_context_tasks[(False, "board")]
+        await fresh_build
         assert await app._dashboard_context_async() == {"version": "fresh"}
         assert builds == 2
 
