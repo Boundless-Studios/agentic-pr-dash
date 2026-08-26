@@ -295,9 +295,19 @@ def _local_docker_runner_load(
         rows.extend(host_rows)
 
     if len(unreachable) == len(hosts):
-        # Every declared daemon is unreadable: fall through to the GitHub
-        # endpoint rather than assert an authoritative zero.
-        return None
+        # Declaring local hosts makes them the authoritative inventory source.
+        # Falling back to GitHub here couples an owned-infrastructure health
+        # probe to API availability and rate limits, and can replace a precise
+        # connectivity failure with stale runner registrations.  Preserve the
+        # local failure instead; callers must not query GitHub for this fleet.
+        detail = ", ".join(sorted(unreachable))
+        return _degraded_load(
+            f"Runner probe could not reach: {detail}",
+            recommendation=(
+                "Configured desktop CI host(s) are unreachable; "
+                "runner health is unknown."
+            ),
+        )
 
     if len(configuration_errors) == len(hosts):
         return _degraded_load(
