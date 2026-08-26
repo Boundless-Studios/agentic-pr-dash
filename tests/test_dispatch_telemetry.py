@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
+    InMemorySpanExporter,
+)
 
-from agentic_pr_dash.dispatch_observation import DispatchProvider, DispatchSource
+from agentic_pr_dash.dispatch_observation import (
+    ClassificationAuthority,
+    DispatchOutcome,
+    DispatchProvider,
+    DispatchSource,
+)
 from agentic_pr_dash.dispatch_telemetry import (
     MAX_ARG_COUNT,
     MAX_STRING_LENGTH,
     DispatchTelemetry,
+    emit_dispatch_span,
 )
 
 
@@ -123,9 +134,30 @@ def test_environment_is_allowlisted_instead_of_copied() -> None:
     serialized = json.dumps(telemetry.otel_attributes())
 
     assert telemetry.codex_home == "/safe/codex-home"
+    assert telemetry.otel_attributes()[
+        "process.environment_variable.CODEX_HOME"
+    ] == "/safe/codex-home"
     assert "sk-never-record" not in serialized
     assert "ARBITRARY" not in serialized
     assert "private" not in serialized
+
+
+def test_unknown_attached_option_value_is_redacted() -> None:
+    secret = "secret-attached-value"
+    telemetry = _telemetry(
+        "codex",
+        "exec",
+        f"--api-key={secret}",
+        "--config=model_reasoning_effort=xhigh",
+        "prompt",
+    )
+
+    attributes = telemetry.otel_attributes()
+    serialized = json.dumps(attributes)
+
+    assert secret not in serialized
+    assert "--api-key=<redacted:option>" in serialized
+    assert attributes["gaia.dispatch.reasoning_effort"] == "xhigh"
 
 
 def test_execution_policy_options_are_structured_attributes() -> None:
@@ -161,3 +193,56 @@ def test_telemetry_bounds_argument_count_and_values_deterministically() -> None:
     assert command_args[-1] == f"<truncated:{len(argv) - MAX_ARG_COUNT}-args>"
     assert len(command_args[3]) <= MAX_STRING_LENGTH
     assert command_args[3].endswith("<truncated>")
+
+
+def test_completed_dispatch_emits_one_otel_span() -> None:
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    telemetry = DispatchTelemetry.from_argv(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.DETACHED_RUNNER,
+        argv=("codex", "exec", "--model", "gpt-5.6-sol", "private prompt"),
+        cwd="/repo",
+        task_type="review",
+        session_id="session-1",
+        start_time_unix_nano=1_000_000_000,
+    )
+
+    emit_dispatch_span(
+        telemetry,
+        outcome=DispatchOutcome.FAILURE,
+        effective_model="gpt-5.6-sol",
+        error_type="process.exit_code.1",
+        tracer=provider.get_tracer("test"),
+        end_time_unix_nano=2_000_000_000,
+    )
+
+    spans = exporter.get_finished_spans()
+    assert len(spans) == 1
+    assert spans[0].name == "agent.dispatch"
+    assert spans[0].status.status_code.name == "ERROR"
+    assert spans[0].attributes["error.type"] == "process.exit_code.1"
+    assert spans[0].attributes["gen_ai.request.model"] == "gpt-5.6-sol"
+    assert spans[0].attributes["gaia.dispatch.effective_model"] == "gpt-5.6-sol"
+    assert spans[0].start_time == 1_000_000_000
+    assert spans[0].end_time == 2_000_000_000
+
+
+def test_dispatch_projects_to_existing_redacted_observation() -> None:
+    telemetry = _telemetry(
+        "codex", "exec", "--model", "gpt-5.6-sol", "private prompt"
+    )
+
+    observation = telemetry.to_dispatch_observation(
+        outcome=DispatchOutcome.SUCCESS,
+        effective_model="gpt-5.6-sol",
+    )
+
+    assert observation.command == "<redacted>"
+    assert observation.requested_model == "gpt-5.6-sol"
+    assert observation.resolved_model == "gpt-5.6-sol"
+    assert observation.classification_authority is ClassificationAuthority.DECLARED
+    assert observation.classification_framework == "coding-agent/v1"
+    serialized = json.dumps(observation.to_persisted_dict())
+    assert "private prompt" not in serialized

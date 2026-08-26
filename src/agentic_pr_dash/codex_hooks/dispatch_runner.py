@@ -19,6 +19,10 @@ from agentic_pr_dash.dispatch_observation import (
     DispatchProvider,
     DispatchSource,
 )
+from agentic_pr_dash.dispatch_telemetry import (
+    DispatchTelemetry,
+    emit_dispatch_span,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,7 @@ _UNAVAILABLE_PATTERN = re.compile(
 )
 _ERROR_SCAN_CHUNK_SIZE = 64 * 1024
 _ERROR_SCAN_OVERLAP = 64
+_STRUCTURED_STDIN_LIMIT = 1024 * 1024
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
 AGENT_CLASSIFY_MAP = [
@@ -224,7 +229,12 @@ def run_provider_entrypoint(
     """Translate hook stdin or detached CLI arguments into a dispatch request."""
 
     source = DispatchSource.INTERACTIVE_HOOK
-    if "--command" in argv:
+    if "--structured-stdin" in argv:
+        source = DispatchSource.DETACHED_RUNNER
+        payload = _structured_stdin_payload(argv)
+        if payload is None:
+            return 0
+    elif "--command" in argv:
         source = DispatchSource.DETACHED_RUNNER
         command = _option_value(argv, "--command") or ""
         exit_code = _option_value(argv, "--exit-code")
@@ -288,9 +298,87 @@ def run_provider_entrypoint(
     return 0
 
 
+def _structured_stdin_payload(argv: list[str]) -> dict[str, object] | None:
+    task_type = _option_value(argv, "--task-type")
+    if not task_type:
+        return None
+    try:
+        raw = sys.stdin.buffer.read(_STRUCTURED_STDIN_LIMIT + 1)
+        if len(raw) > _STRUCTURED_STDIN_LIMIT or not raw.endswith(b"\0"):
+            return None
+        command_argv = [part.decode("utf-8") for part in raw[:-1].split(b"\0")]
+    except (AttributeError, UnicodeDecodeError, OSError):
+        return None
+    if not command_argv or any("\0" in value for value in command_argv):
+        return None
+
+    exit_code = _option_value(argv, "--exit-code")
+    stderr = ""
+    error_file = _option_value(argv, "--error-file")
+    if error_file:
+        try:
+            if _error_file_reports_unavailable(Path(error_file)):
+                stderr = "quota"
+        except OSError:
+            pass
+    started_at = _option_value(argv, "--started-at-unix-nano")
+    try:
+        start_time_unix_nano = int(started_at) if started_at is not None else None
+    except ValueError:
+        return None
+    payload: dict[str, object] = {
+        "session_id": os.environ.get("CLAUDE_SESSION_ID", ""),
+        "cwd": os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()),
+        "tool_input": {"command": "<redacted>"},
+        "tool_response": {"exit_code": exit_code, "stderr": stderr},
+        "dispatch_telemetry": {
+            "argv": command_argv,
+            "task_type": task_type,
+            "start_time_unix_nano": start_time_unix_nano,
+        },
+    }
+    configured_model = _option_value(argv, "--configured-model")
+    default_model = _option_value(argv, "--default-model")
+    if configured_model is not None or default_model is not None:
+        payload["dispatch_model_resolution"] = {
+            "configured_model": configured_model,
+            "default_model": default_model,
+        }
+    return payload
+
+
 def _observation_from_request(
     request: DispatchHookRequest,
 ) -> DispatchObservation | None:
+    structured = _structured_telemetry(request)
+    if structured is not None:
+        response = request.payload.get("tool_response")
+        response = response if isinstance(response, dict) else {}
+        outcome = _outcome(response)
+        resolution = request.payload.get("dispatch_model_resolution")
+        effective_model = resolve_provider_model(
+            structured.requested_model,
+            resolution,
+        )
+        verdict = response.get("review_verdict")
+        if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
+            verdict = None
+        emit_dispatch_span(
+            structured,
+            outcome=outcome,
+            effective_model=effective_model,
+            error_type=(
+                f"process.exit_code.{response.get('exit_code')}"
+                if outcome is DispatchOutcome.FAILURE
+                else None
+            ),
+        )
+        return structured.to_dispatch_observation(
+            outcome=outcome,
+            effective_model=effective_model,
+            review_verdict=dict(verdict) if verdict is not None else None,
+        )
+
     tool_input = request.payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
@@ -340,6 +428,38 @@ def _observation_from_request(
             else ClassificationAuthority.LEGACY_INFERRED
         ),
         classification_framework=declared[1] if declared is not None else None,
+    )
+
+
+def _structured_telemetry(
+    request: DispatchHookRequest,
+) -> DispatchTelemetry | None:
+    metadata = request.payload.get("dispatch_telemetry")
+    if not isinstance(metadata, dict):
+        return None
+    argv = metadata.get("argv")
+    task_type = metadata.get("task_type")
+    start_time_unix_nano = metadata.get("start_time_unix_nano")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(value, str) for value in argv)
+        or not isinstance(task_type, str)
+        or not task_type.strip()
+        or (
+            start_time_unix_nano is not None
+            and not isinstance(start_time_unix_nano, int)
+        )
+    ):
+        return None
+    return DispatchTelemetry.from_argv(
+        provider=request.provider,
+        source=request.source,
+        argv=argv,
+        cwd=str(request.payload.get("cwd") or os.getcwd()),
+        task_type=task_type.strip(),
+        session_id=str(request.payload.get("session_id") or ""),
+        start_time_unix_nano=start_time_unix_nano,
     )
 
 

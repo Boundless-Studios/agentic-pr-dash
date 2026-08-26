@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from io import StringIO
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 
 import pytest
@@ -202,6 +202,35 @@ def test_persisted_dispatch_omits_raw_command_content(tmp_path: Path) -> None:
     assert persisted["provider"] == "codex"
     assert persisted["task_type"] == "review"
     assert DispatchObservation.from_dict(persisted).command == "<redacted>"
+
+
+def test_structured_dispatch_is_authoritative_over_raw_command(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec --model wrong-model legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": [
+            "/usr/local/bin/codex",
+            "exec",
+            "--model",
+            "gpt-5.6-sol",
+            "private prompt",
+        ],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.command == "<redacted>"
+    assert result.observation.requested_model == "gpt-5.6-sol"
+    assert result.observation.resolved_model == "gpt-5.6-sol"
+    assert result.observation.classification_authority.value == "declared"
+    persisted = json.loads(request.ledger_path.read_text(encoding="utf-8"))
+    assert persisted["requested_model"] == "gpt-5.6-sol"
+    assert "wrong-model" not in json.dumps(persisted)
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))
@@ -715,6 +744,74 @@ def test_detached_entrypoint_accepts_adapter_model_resolution(
     persisted = json.loads(ledger.read_text(encoding="utf-8"))
     assert persisted["requested_model"] is None
     assert persisted["resolved_model"] == "kimi-for-coding/k3-256k"
+
+
+def test_detached_entrypoint_accepts_nul_delimited_structured_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    secret = "private prompt body"
+    argv = ("codex", "exec", "--model", "gpt-5.6-sol", secret)
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"\0".join(value.encode() for value in argv) + b"\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--structured-stdin",
+            "--task-type",
+            "review",
+            "--exit-code",
+            "0",
+        ]
+    )
+
+    assert result == 0
+    serialized = ledger.read_text(encoding="utf-8")
+    persisted = json.loads(serialized)
+    assert persisted["requested_model"] == "gpt-5.6-sol"
+    assert persisted["resolved_model"] == "gpt-5.6-sol"
+    assert persisted["classification_authority"] == "declared"
+    assert secret not in serialized
+
+
+def test_structured_detached_failure_preserves_unavailability_detection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    availability = tmp_path / "codex-availability.json"
+    error_file = tmp_path / "codex-error.txt"
+    error_file.write_text("usage quota exhausted", encoding="utf-8")
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("DISPATCH_AVAILABILITY_PATH", str(availability))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--structured-stdin",
+            "--task-type",
+            "exec",
+            "--exit-code",
+            "1",
+            "--error-file",
+            str(error_file),
+            "--started-at-unix-nano",
+            "1000000000",
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(ledger.read_text(encoding="utf-8"))["outcome"] == "unavailable"
+    assert json.loads(availability.read_text(encoding="utf-8"))["available"] is False
 
 
 def test_detached_failure_reads_error_file_for_unavailability(
