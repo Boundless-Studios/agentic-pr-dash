@@ -12,6 +12,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
 
 from agentic_pr_dash.dispatch_observation import (
     ClassificationAuthority,
+    DispatchObservation,
     DispatchOutcome,
     DispatchProvider,
     DispatchSource,
@@ -19,6 +20,7 @@ from agentic_pr_dash.dispatch_observation import (
 from agentic_pr_dash.dispatch_telemetry import (
     MAX_ARG_COUNT,
     MAX_STRING_LENGTH,
+    DispatchParseStatus,
     DispatchResolutionSource,
     DispatchTelemetry,
     emit_dispatch_span,
@@ -185,6 +187,17 @@ def test_sensitive_config_and_prompt_values_never_serialize() -> None:
     assert "<redacted:payload>" in serialized
 
 
+@pytest.mark.parametrize("prompt", ["exec", "e", "run"])
+def test_subcommand_shaped_prompt_is_redacted(prompt: str) -> None:
+    telemetry = _telemetry("codex", "exec", prompt)
+
+    assert telemetry.otel_attributes()["process.command_args"] == (
+        "codex",
+        "exec",
+        "<redacted:payload>",
+    )
+
+
 def test_environment_is_allowlisted_instead_of_copied() -> None:
     telemetry = DispatchTelemetry.from_argv(
         provider=DispatchProvider.CODEX,
@@ -332,6 +345,28 @@ def test_working_root_override_replaces_launch_cwd(option: str, value: str) -> N
         else value
     )
     assert telemetry.cwd == expected
+
+
+def test_legacy_telemetry_omits_fabricated_argument_count() -> None:
+    observation = DispatchObservation(
+        provider=DispatchProvider.CODEX,
+        source=DispatchSource.INTERACTIVE_HOOK,
+        session_id="session-1",
+        worktree_root="/repo/worktree",
+        command="<redacted>",
+        task_type="review",
+        requested_model=None,
+        resolved_model=None,
+        outcome=DispatchOutcome.SUCCESS,
+        classification_authority=ClassificationAuthority.LEGACY_INFERRED,
+    )
+
+    telemetry = DispatchTelemetry.from_legacy_observation(
+        observation,
+        parse_status=DispatchParseStatus.LEGACY_PARSED,
+    )
+
+    assert "process.args_count" not in telemetry.otel_attributes()
 
 
 def test_telemetry_bounds_argument_count_and_values_deterministically() -> None:

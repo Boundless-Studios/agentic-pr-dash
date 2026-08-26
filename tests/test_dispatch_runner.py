@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 
@@ -290,6 +291,50 @@ def test_present_but_invalid_structured_metadata_fails_closed(
     result = run_dispatch_hook(request)
 
     assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("start_time", [True, -1, 10**30])
+def test_structured_metadata_rejects_implausible_start_time(
+    tmp_path: Path, start_time: object
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+        "start_time_unix_nano": start_time,
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("response", [{}, {"exit_code": "not-a-number"}])
+def test_interactive_structured_dispatch_rejects_unknown_outcome(
+    tmp_path: Path, response: dict[str, object]
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+    )
+    request.payload["tool_response"] = response
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request, lambda observation: callbacks.append(observation))
+
+    assert result.observation is None
+    assert callbacks == []
     assert not request.ledger_path.exists()
 
 
@@ -986,6 +1031,40 @@ def test_detached_entrypoint_accepts_nul_delimited_structured_argv(
 
 
 @pytest.mark.parametrize(
+    ("option", "value"),
+    [("-C", "target"), ("--cd", "target")],
+)
+def test_structured_entrypoint_routes_default_paths_to_overridden_worktree(
+    tmp_path: Path, monkeypatch, option: str, value: str
+) -> None:
+    launch_root = tmp_path / "launch"
+    target_root = launch_root / value
+    launch_root.mkdir()
+    target_root.mkdir()
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.delenv("DISPATCH_AVAILABILITY_PATH", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(launch_root))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(
+            BytesIO(f"codex\0exec\0{option}\0{value}\0prompt\0".encode())
+        ),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", "--exit-code", "0"]
+    )
+
+    assert result == 0
+    ledger = target_root / ".beads" / "interactions.jsonl"
+    assert json.loads(ledger.read_text(encoding="utf-8"))["worktree_root"] == str(
+        target_root
+    )
+    assert not (launch_root / ".beads" / "interactions.jsonl").exists()
+
+
+@pytest.mark.parametrize(
     "exit_code_args", [["--exit-code", "not-a-number"], ["--exit-code"]]
 )
 def test_structured_detached_entrypoint_rejects_malformed_exit_code(
@@ -1034,7 +1113,7 @@ def test_structured_detached_failure_preserves_unavailability_detection(
             "--error-file",
             str(error_file),
             "--started-at-unix-nano",
-            "1000000000",
+            str(time.time_ns()),
         ]
     )
 

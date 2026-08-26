@@ -161,7 +161,6 @@ class DispatchTelemetry:
         attributes: dict[str, OtelAttribute] = {
             "process.command": _executable_name(self.argv[0]),
             "process.command_args": self.sanitized_argv,
-            "process.args_count": len(self.argv),
             "gen_ai.provider.name": (
                 self.gen_ai_provider_name or _PROVIDER_NAMES[self.provider]
             ),
@@ -173,6 +172,8 @@ class DispatchTelemetry:
             "gaia.dispatch.ignore_user_config": self.ignore_user_config,
             "gaia.dispatch.resolution_source": self.resolution_source.value,
         }
+        if self.parse_status is DispatchParseStatus.STRUCTURED:
+            attributes["process.args_count"] = len(self.argv)
         if Path(self.argv[0]).is_absolute():
             attributes["process.executable.path"] = self.argv[0]
         optional = {
@@ -291,6 +292,10 @@ def _sanitize_and_resolve(
         else {"-m", "-s"}
     )
     index = 1
+    subcommand_seen = False
+    subcommands = (
+        {"exec", "e"} if provider is DispatchProvider.CODEX else {"run"}
+    )
     while index < len(argv):
         token = argv[index]
         if token == "--":
@@ -408,8 +413,9 @@ def _sanitize_and_resolve(
             elif token == "--dangerously-bypass-approvals-and-sandbox":
                 sandbox_mode = "danger-full-access"
                 approval_mode = "never"
-        elif token in {"exec", "e", "run"}:
+        elif token in subcommands and not subcommand_seen:
             sanitized.append(token)
+            subcommand_seen = True
         else:
             sanitized.append("<redacted:payload>")
         index += 1

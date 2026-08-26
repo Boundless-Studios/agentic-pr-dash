@@ -8,6 +8,7 @@ import re
 import shlex
 import sys
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -55,6 +56,7 @@ _UNAVAILABLE_PATTERN = re.compile(
 _ERROR_SCAN_CHUNK_SIZE = 64 * 1024
 _ERROR_SCAN_OVERLAP = 64
 _STRUCTURED_STDIN_LIMIT = 1024 * 1024
+_MIN_PLAUSIBLE_UNIX_NANO = 946_684_800_000_000_000
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
 AGENT_CLASSIFY_MAP = [
@@ -285,6 +287,24 @@ def run_provider_entrypoint(
             )
         ),
     )
+    structured = _structured_telemetry(request)
+    if structured is not None:
+        effective_root = Path(structured.cwd)
+        request = replace(
+            request,
+            ledger_path=(
+                request.ledger_path
+                if "MODEL_DISPATCH_LOG" in os.environ
+                else effective_root / ".beads" / "interactions.jsonl"
+            ),
+            availability_path=(
+                request.availability_path
+                if "DISPATCH_AVAILABILITY_PATH" in os.environ
+                else effective_root
+                / ".agentic-pr-dash"
+                / f"{provider.value}-availability.json"
+            ),
+        )
     result = run_dispatch_hook(request, callback)
     if result.additional_context:
         print(
@@ -363,7 +383,8 @@ def _observation_from_request(
         if structured is None:
             return None
         response = request.payload.get("tool_response")
-        response = response if isinstance(response, dict) else {}
+        if not isinstance(response, dict) or _exit_code(response) is None:
+            return None
         outcome = _outcome(response)
         resolution = request.payload.get("dispatch_model_resolution")
         effective_model = resolve_provider_model(
@@ -492,10 +513,7 @@ def _structured_telemetry(
         or not all(isinstance(value, str) for value in argv)
         or not isinstance(task_type, str)
         or not task_type.strip()
-        or (
-            start_time_unix_nano is not None
-            and not isinstance(start_time_unix_nano, int)
-        )
+        or not _valid_start_time(start_time_unix_nano)
     ):
         return None
     executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
@@ -743,6 +761,24 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
     if isinstance(stderr, str) and _UNAVAILABLE_PATTERN.search(stderr):
         return DispatchOutcome.UNAVAILABLE
     return DispatchOutcome.FAILURE
+
+
+def _exit_code(response: dict[object, object]) -> int | None:
+    exit_code = response.get("exit_code", response.get("exitCode"))
+    if isinstance(exit_code, bool):
+        return None
+    try:
+        return int(exit_code) if exit_code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _valid_start_time(value: object) -> bool:
+    return value is None or (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and _MIN_PLAUSIBLE_UNIX_NANO <= value <= time.time_ns()
+    )
 
 
 def _error_file_reports_unavailable(path: Path) -> bool:
