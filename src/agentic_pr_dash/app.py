@@ -82,7 +82,7 @@ def _invalidate_dashboard_context() -> None:
     # both the displayable snapshot and the single in-flight worker; timestamp
     # entries as stale so one follow-up build runs after the worker settles.
     for key, (_timestamp, context) in list(_dashboard_context_cache.items()):
-        _dashboard_context_cache[key] = (0.0, context)
+        _dashboard_context_cache[key] = (float("-inf"), context)
 
 
 def _asset_version() -> str:
@@ -1023,10 +1023,21 @@ def _cached_ownership_for_card(
     key = (worktree_path, pr_number, repo_cwd)
     now = time.monotonic()
     with _ownership_card_cache_lock:
+        expired = [
+            cached_key
+            for cached_key, (timestamp, _value) in _ownership_card_cache.items()
+            if now - timestamp > _OWNERSHIP_CACHE_TTL_SECONDS
+        ]
+        for expired_key in expired:
+            _ownership_card_cache.pop(expired_key, None)
         cached = _ownership_card_cache.get(key)
         if cached and now - cached[0] <= _OWNERSHIP_CACHE_TTL_SECONDS:
             return cached[1]
-        ownership = _ownership_for_card(worktree_path, pr_number, repo_cwd)
+        ownership = _ownership_for_card(
+            worktree_path=worktree_path,
+            pr_number=pr_number,
+            repo_cwd=repo_cwd,
+        )
         _ownership_card_cache[key] = (time.monotonic(), ownership)
         return ownership
 
