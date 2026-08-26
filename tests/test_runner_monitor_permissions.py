@@ -120,16 +120,15 @@ def test_scaled_down_local_fleet_reports_zero_without_github() -> None:
     assert [cmd[:3] for cmd in calls] == [["docker", "ps", "-a"]]
 
 
-def test_unreadable_local_probe_still_falls_back_to_github() -> None:
-    """A docker failure is genuinely unavailable, so the fallback must remain.
+def test_unreadable_configured_local_probe_does_not_call_github() -> None:
+    """Configured local infrastructure stays independent of GitHub."""
 
-    This pins the boundary against the scaled-down case above: only a
-    *successful* empty listing is an authoritative zero.
-    """
+    calls: list[list[str]] = []
 
     def docker_unavailable(
         cmd: list[str], cwd: str | None, timeout_s: int
     ) -> subprocess.CompletedProcess[str]:
+        calls.append(cmd)
         if cmd[:3] == ["docker", "ps", "-a"]:
             return subprocess.CompletedProcess(
                 cmd, 1, stdout="", stderr="docker: command not found"
@@ -149,4 +148,5 @@ def test_unreadable_local_probe_still_falls_back_to_github() -> None:
     )
 
     assert load.is_degraded is True
-    assert "Administration: Read" in (load.error or "")
+    assert "Runner probe could not reach: local" in (load.error or "")
+    assert [cmd[:3] for cmd in calls] == [["docker", "ps", "-a"]]
