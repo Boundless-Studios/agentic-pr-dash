@@ -23,6 +23,7 @@ from ._maintenance.review_settlement import (
     combine_clean_observations,
     evaluate_pr_snapshot,
 )
+from .config import load as load_config
 from .lifecycle_models import (
     IntentLifecycleStateV1,
     MaintenanceBlockerV1,
@@ -136,6 +137,7 @@ class LifecycleWorkflow:
         ledger: ReviewLedger | None = None,
         context_loader: ReviewContextLoader | None = None,
         orchestrator: _DispatchTarget | None = None,
+        maintenance_author: str | None = None,
         now: Callable[[], datetime] | None = None,
         batch_size: int = 16,
         resolution_concurrency: int = 4,
@@ -159,6 +161,7 @@ class LifecycleWorkflow:
         self.ledger = ledger
         self.context_loader = context_loader
         self.orchestrator = orchestrator
+        self.maintenance_author = maintenance_author
         self._now = now or (lambda: datetime.now(UTC))
         self.batch_size = batch_size
         self.retry_interval = retry_interval
@@ -446,6 +449,13 @@ class LifecycleWorkflow:
             threads=observed.unresolved_threads,
             deferrals=deferrals,
             review_observation=review_observation,
+            maintenance_author=(
+                self.maintenance_author
+                if self.maintenance_author is not None
+                else load_config(
+                    record.intent.worktree_path
+                ).maintenance_mutation_identity
+            ),
         )
         pr.review_comments.extend(_policy_review_comments(observation))
         return _ObservedPR(

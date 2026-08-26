@@ -3169,6 +3169,38 @@ def edit_review_comment(comment_id: int, body: str, cwd: str | None = None) -> b
     return r.returncode == 0
 
 
+def get_commit_date(sha: str, cwd: str | None = None) -> str:
+    """Return a commit's committer timestamp, preferring the local object."""
+
+    try:
+        local = subprocess.run(
+            ["git", "-C", cwd or ".", "show", "-s", "--format=%cI", sha],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if local.returncode == 0 and local.stdout.strip():
+            return local.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    remote = _run(
+        [
+            "gh",
+            "api",
+            f"repos/{{owner}}/{{repo}}/commits/{sha}",
+            "--jq",
+            ".commit.committer.date",
+        ],
+        cwd=cwd,
+        timeout_s=20,
+    )
+    if remote.returncode != 0:
+        return ""
+    return remote.stdout.strip()
+
+
 def get_commit_changed_files(sha: str, cwd: str | None = None) -> list[str]:
     """Return list of filenames changed by a commit.
 

@@ -39,6 +39,27 @@ _MODULE_REF_STOPWORDS = frozenset({"e.g", "i.e", "etc"})
 # lines matches the diff context GitHub shows around an inline comment.
 _ANCHOR_CONTEXT_LINES = 3
 
+_SETTLEMENT_MARKER_RE = re.compile(
+    r"^<!-- agentic-pr-dash:[a-z0-9-]+ -->$"
+)
+_SETTLEMENT_FIELDS: tuple[tuple[str, bool], ...] = (
+    ("Head SHA", True),
+    ("Finding fingerprint", True),
+    ("Disposition", True),
+    ("Rationale", False),
+    ("Evidence", False),
+    ("Fixing commit", True),
+    ("Duplicate of", True),
+    ("Existing issue", True),
+    ("Architecture decision", True),
+    ("Architecture lineage", True),
+    ("Architecture decided by", True),
+    ("Architecture rationale", False),
+)
+_REQUIRED_SETTLEMENT_FIELDS = frozenset(
+    label for label, _quoted in _SETTLEMENT_FIELDS[:5]
+)
+
 
 class SettlementReplyMetadata(BaseModel):
     """Machine-readable fields carried by one visible settlement reply."""
@@ -214,56 +235,87 @@ def structured_settlement_reply_body(
     return "\n".join(lines)
 
 
-def _reply_field(body: str, label: str, *, quoted: bool = False) -> str | None:
-    prefix = f"- {label}: "
-    value = next(
-        (line[len(prefix):] for line in body.splitlines() if line.startswith(prefix)),
-        None,
-    )
+def _canonical_reply_fields(body: str) -> dict[str, str] | None:
+    """Return canonical settlement fields, rejecting any surrounding prose."""
+
+    lines = body.splitlines()
+    if (
+        len(lines) < 7
+        or body != "\n".join(lines)
+        or _SETTLEMENT_MARKER_RE.fullmatch(lines[0]) is None
+        or lines[1] != "Review settlement:"
+    ):
+        return None
+
+    field_specs = {
+        label: (index, quoted)
+        for index, (label, quoted) in enumerate(_SETTLEMENT_FIELDS)
+    }
+    fields: dict[str, str] = {}
+    previous_index = -1
+    for line in lines[2:]:
+        if not line.startswith("- ") or ": " not in line:
+            return None
+        label, value = line[2:].split(": ", 1)
+        spec = field_specs.get(label)
+        if spec is None or label in fields:
+            return None
+        index, quoted = spec
+        if index <= previous_index:
+            return None
+        previous_index = index
+        if quoted:
+            if len(value) < 2 or not (
+                value.startswith("`") and value.endswith("`")
+            ):
+                return None
+            value = value[1:-1]
+        value = value.strip()
+        if not value:
+            return None
+        fields[label] = value
+    if not _REQUIRED_SETTLEMENT_FIELDS.issubset(fields):
+        return None
+    return fields
+
+
+def _reply_field(fields: dict[str, str], label: str) -> str | None:
+    value = fields.get(label)
     if value is None:
         return None
-    if quoted:
-        if len(value) < 2 or not (value.startswith("`") and value.endswith("`")):
-            return None
-        value = value[1:-1]
     return value.strip() or None
 
 
 def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | None:
     """Parse a reply rendered by :func:`structured_settlement_reply_body`."""
 
-    if "Review settlement:" not in body.splitlines():
+    fields = _canonical_reply_fields(body)
+    if fields is None:
         return None
     try:
         metadata = SettlementReplyMetadata(
-            head_sha=_reply_field(body, "Head SHA", quoted=True) or "",
+            head_sha=_reply_field(fields, "Head SHA") or "",
             finding_fingerprint=(
-                _reply_field(body, "Finding fingerprint", quoted=True) or ""
+                _reply_field(fields, "Finding fingerprint") or ""
             ),
             disposition=Disposition(
-                _reply_field(body, "Disposition", quoted=True) or ""
+                _reply_field(fields, "Disposition") or ""
             ),
-            rationale=_reply_field(body, "Rationale") or "",
-            evidence=_reply_field(body, "Evidence") or "",
-            fixing_commit=_reply_field(body, "Fixing commit", quoted=True),
-            duplicate_of=_reply_field(body, "Duplicate of", quoted=True),
-            deferred_to_issue=_reply_field(body, "Existing issue", quoted=True),
+            rationale=_reply_field(fields, "Rationale") or "",
+            evidence=_reply_field(fields, "Evidence") or "",
+            fixing_commit=_reply_field(fields, "Fixing commit"),
+            duplicate_of=_reply_field(fields, "Duplicate of"),
+            deferred_to_issue=_reply_field(fields, "Existing issue"),
             architecture_decision=(
                 ArchitectureDecisionKind(value)
                 if (
-                    value := _reply_field(
-                        body, "Architecture decision", quoted=True
-                    )
+                    value := _reply_field(fields, "Architecture decision")
                 )
                 else None
             ),
-            architecture_lineage_id=_reply_field(
-                body, "Architecture lineage", quoted=True
-            ),
-            architecture_decided_by=_reply_field(
-                body, "Architecture decided by", quoted=True
-            ),
-            architecture_rationale=_reply_field(body, "Architecture rationale"),
+            architecture_lineage_id=_reply_field(fields, "Architecture lineage"),
+            architecture_decided_by=_reply_field(fields, "Architecture decided by"),
+            architecture_rationale=_reply_field(fields, "Architecture rationale"),
         )
         if metadata.disposition is Disposition.FIXED and not metadata.fixing_commit:
             return None
@@ -273,9 +325,11 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
 
 
 def _reply_matches_closure(
+    body: str,
     metadata: SettlementReplyMetadata,
     closure: PolicyFindingClosure,
     *,
+    marker: str,
     fixing_commit: str | None,
 ) -> bool:
     finding = closure.finding
@@ -287,6 +341,14 @@ def _reply_matches_closure(
     )
     return all(
         (
+            body
+            == structured_settlement_reply_body(
+                marker=marker,
+                finding=finding,
+                head_sha=finding.head_sha,
+                fixing_commit=fixing_commit,
+                architecture_decision=decision,
+            ),
             metadata.head_sha == finding.head_sha,
             metadata.finding_fingerprint == finding.fingerprint,
             metadata.disposition is finding.disposition,
@@ -321,6 +383,8 @@ def settlement_reply_status(
     thread,  # type: ignore[no-untyped-def]
     closure: PolicyFindingClosure,
     *,
+    marker: str,
+    maintenance_author: str,
     fixing_commit: str | None = None,
 ) -> SettlementReplyStatus:
     """Return whether the exact current closure is visible after reviewer input."""
@@ -331,11 +395,15 @@ def settlement_reply_status(
         metadata = parse_structured_settlement_reply(reply.body)
         timestamp = _reply_timestamp(reply.created_at)
         if (
-            metadata is not None
+            maintenance_author
+            and reply.author.casefold() == maintenance_author.casefold()
+            and metadata is not None
             and timestamp is not None
             and _reply_matches_closure(
+                reply.body,
                 metadata,
                 closure,
+                marker=marker,
                 fixing_commit=fixing_commit,
             )
         ):
@@ -364,17 +432,23 @@ def apply_thread_settlement(
     marker: str,
     head_sha: str,
     fixing_commit: str | None,
+    maintenance_author: str,
     reply: Callable[[str], bool],
+    refetch: Callable[[], object | None],
     resolve: Callable[[], bool],
 ) -> ThreadSettlementOutcome:
     """Publish a coordinator closure, resolving only a verified fixed finding."""
 
     if not closure.addressed:
         return ThreadSettlementOutcome(False, False, False, True)
+    if not maintenance_author.strip():
+        return ThreadSettlementOutcome(False, False, False, True)
 
     status = settlement_reply_status(
         thread,
         closure,
+        marker=marker,
+        maintenance_author=maintenance_author,
         fixing_commit=fixing_commit,
     )
     if status is SettlementReplyStatus.REOPENED:
@@ -396,6 +470,23 @@ def apply_thread_settlement(
         if not reply_visible:
             return ThreadSettlementOutcome(False, False, False, True)
         reply_posted = True
+
+    if reply_posted or closure.resolve_thread:
+        try:
+            refreshed_thread = refetch()
+        except Exception:  # noqa: BLE001
+            refreshed_thread = None
+        if refreshed_thread is None:
+            return ThreadSettlementOutcome(False, reply_posted, False, True)
+        status = settlement_reply_status(
+            refreshed_thread,
+            closure,
+            marker=marker,
+            maintenance_author=maintenance_author,
+            fixing_commit=fixing_commit,
+        )
+        if status is not SettlementReplyStatus.FRESH:
+            return ThreadSettlementOutcome(False, reply_posted, False, True)
 
     if not closure.resolve_thread:
         return ThreadSettlementOutcome(True, reply_posted, False, False)

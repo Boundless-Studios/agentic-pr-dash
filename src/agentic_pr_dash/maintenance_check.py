@@ -268,6 +268,7 @@ def _observe_finalization(args, policy, ledger, pr=None):
         threads=threads,
         deferrals=deferrals,
         review_observation=review_observation,
+        maintenance_author=load_config(cwd).maintenance_mutation_identity,
     )
 
 
@@ -1361,6 +1362,7 @@ def _cmd_complete_unleased(
 
     threads = github_api.get_review_threads(resolved_pr_number, cwd)
     review_context = load_review_context_for_worktree(cwd)
+    maintenance_author = load_config(cwd).maintenance_mutation_identity.strip()
     policy = ledger = None
     review_context_exact = False
     if review_context is not None:
@@ -1415,7 +1417,22 @@ def _cmd_complete_unleased(
                     if path is not None
                     else new_commits
                 )
-                if not candidates or head_date <= thread.top.created_at:
+                thread_created_at = _parse_iso(thread.top.created_at)
+                newer_candidates: list[tuple[str, str]] = []
+                if thread_created_at is not None:
+                    for sha, message in candidates:
+                        try:
+                            commit_created_at = _parse_iso(
+                                github_api.get_commit_date(sha, cwd)
+                            )
+                        except Exception:  # noqa: BLE001
+                            commit_created_at = None
+                        if (
+                            commit_created_at is not None
+                            and commit_created_at > thread_created_at
+                        ):
+                            newer_candidates.append((sha, message))
+                if not newer_candidates:
                     left_unresolved.append(thread.node_id)
                     print(
                         f"info: leaving fixed thread {thread.node_id} open — no "
@@ -1423,7 +1440,7 @@ def _cmd_complete_unleased(
                         file=sys.stderr,
                     )
                     continue
-                fixing_commit = candidates[-1][0]
+                fixing_commit = newer_candidates[-1][0]
 
             stub = ReviewComment(
                 id=thread.top.database_id,
@@ -1442,10 +1459,21 @@ def _cmd_complete_unleased(
                     marker=COMPLETE_MARKER,
                     head_sha=head_sha,
                     fixing_commit=fixing_commit,
+                    maintenance_author=maintenance_author,
                     reply=lambda body, comment=stub: (
                         github_api.reply_to_review_comment(
                             resolved_pr_number, comment, body, cwd
                         )
+                    ),
+                    refetch=lambda node_id=thread.node_id: next(
+                        (
+                            current
+                            for current in github_api.get_review_threads(
+                                resolved_pr_number, cwd, strict=True
+                            )
+                            if current.node_id == node_id
+                        ),
+                        None,
                     ),
                     resolve=lambda node_id=thread.node_id: (
                         github_api.resolve_review_thread(node_id, cwd)

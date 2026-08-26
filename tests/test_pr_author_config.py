@@ -56,6 +56,23 @@ def test_pr_author_env_wins_over_toml(tmp_path, monkeypatch):
     assert config.load(str(tmp_path)).pr_author == "from-env"
 
 
+def test_maintenance_mutation_identity_defaults_to_unconfigured(tmp_path):
+    assert config.load(str(tmp_path)).maintenance_mutation_identity == ""
+
+
+def test_maintenance_mutation_identity_env_wins_over_toml(tmp_path, monkeypatch):
+    (tmp_path / "agentic-pr-dash.toml").write_text(
+        'maintenance_mutation_identity = "from-toml"\n', encoding="utf-8"
+    )
+    monkeypatch.setenv(
+        "AGENTIC_PR_DASH_MAINTENANCE_MUTATION_IDENTITY",
+        "from-env",
+    )
+    config.load.cache_clear()
+
+    assert config.load(str(tmp_path)).maintenance_mutation_identity == "from-env"
+
+
 # --------------------------------------------------------------------------- #
 # list_open_prs (dashboard board / snapshot cache)
 # --------------------------------------------------------------------------- #

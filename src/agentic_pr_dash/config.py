@@ -157,6 +157,13 @@ class Config:
     ``agentic-pr-dash.toml`` (or ``AGENTIC_PR_DASH_PR_AUTHOR``) whenever the
     automation identity differs from the PR author."""
 
+    maintenance_mutation_identity: str = ""
+    """GitHub login used for maintenance review-comment mutations.
+
+    Structured settlement replies count as visible closure only when GitHub
+    reports this exact author login. Empty (the default) disables automated
+    settlement visibility rather than trusting an unconfigured identity."""
+
     fallback_executor: str = ""
     """Shell command template the loop runs when the primary :attr:`executor`
     fails for a PR (non-zero exit or a failed spawn); ``{prompt}`` is substituted.
@@ -490,6 +497,11 @@ def load(cwd: str | None = None) -> Config:
         fallback_executor=_env("FALLBACK_EXECUTOR") or proj.get("fallback_executor") or "",
         await_command=await_command,
         pr_author=_env("PR_AUTHOR") or proj.get("pr_author") or "@me",
+        maintenance_mutation_identity=(
+            _env("MAINTENANCE_MUTATION_IDENTITY")
+            or proj.get("maintenance_mutation_identity")
+            or ""
+        ),
         maintenance_loop_pidfile=loop_pidfile,
         maintenance_loop_machine_wide=machine_wide,
         maintenance_repo_roots=tuple(maintenance_repo_roots),

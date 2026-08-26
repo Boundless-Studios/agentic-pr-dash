@@ -27,7 +27,11 @@ from agentic_pr_dash._maintenance.completion import (
     SettlementReplyStatus,
     settlement_reply_status,
 )
-from agentic_pr_dash.github_api import ObservationReadResult, ObservationState
+from agentic_pr_dash.github_api import (
+    COMPLETE_MARKER,
+    ObservationReadResult,
+    ObservationState,
+)
 from agentic_pr_dash.maintenance import terminal_clean_blockers
 from agentic_pr_dash.models import PRData
 
@@ -491,6 +495,7 @@ def evaluate_pr_snapshot(
     deferrals: Mapping[str, Mapping[str, object]],
     review_submissions: Sequence = (),
     review_observation: ObservationReadResult[Sequence] | None = None,
+    maintenance_author: str = "",
 ) -> FinalizationObservation:
     """Combine one live PR snapshot with provider-neutral review settlement."""
 
@@ -576,7 +581,15 @@ def evaluate_pr_snapshot(
             unaddressed_thread_ids.append(thread.node_id)
             _append_once(blockers, "unresolved_fixed_review_threads")
             continue
-        if settlement_reply_status(thread, closure) is SettlementReplyStatus.FRESH:
+        if (
+            settlement_reply_status(
+                thread,
+                closure,
+                marker=COMPLETE_MARKER,
+                maintenance_author=maintenance_author,
+            )
+            is SettlementReplyStatus.FRESH
+        ):
             addressed_thread_ids.append(thread.node_id)
         else:
             unaddressed_thread_ids.append(thread.node_id)

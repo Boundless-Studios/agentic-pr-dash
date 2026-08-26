@@ -1492,7 +1492,13 @@ async def test_fresh_non_code_reply_settles_with_thread_permitted_open(
     )
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
-    workflow = LifecycleWorkflow(store, policy=_policy(), ledger=ledger, now=clock)
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=ledger,
+        maintenance_author="maintenance-bot",
+        now=clock,
+    )
     await workflow.drain()
     record = store.list_intents()[0]
     assert record.canonical_key is not None

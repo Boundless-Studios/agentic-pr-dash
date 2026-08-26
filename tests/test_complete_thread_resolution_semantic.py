@@ -84,7 +84,8 @@ def _pr():
 
 def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
           threads=None, resolve_result=True, reply_result=True, events=None,
-          commits=None, files_by_commit=None):
+          commits=None, files_by_commit=None, commit_dates=None,
+          thread_snapshots=None, mutation_author="maintenance-bot"):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -102,9 +103,10 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     monkeypatch.setattr(github_api, "get_local_pr_head", lambda branch, cwd: ("", ""))
     monkeypatch.setattr(github_api, "_is_ancestor", lambda a, d, cwd: False)
     # One post-baseline commit exists (a real fixing push landed) ...
+    effective_commits = commits or [("c0ffee", "fix: logging")]
     monkeypatch.setattr(
         github_api, "get_new_pr_commits",
-        lambda *a, **k: commits or [("c0ffee", "fix: logging")],
+        lambda *a, **k: list(effective_commits),
     )
     # ... and it touched exactly `touched_files`.
     monkeypatch.setattr(
@@ -114,14 +116,32 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
             else touched_files
         ),
     )
+    effective_commit_dates = commit_dates or {
+        sha: "2026-02-01T00:00:00Z" for sha, _message in effective_commits
+    }
+    monkeypatch.setattr(
+        github_api,
+        "get_commit_date",
+        lambda sha, cwd=None: effective_commit_dates.get(sha, ""),
+    )
     # ... changing exactly `spans` (hunk line ranges) in each touched file.
     monkeypatch.setattr(
         github_api, "get_changed_line_spans",
         lambda base, head, path, cwd=None: None if spans is None else list(spans),
     )
     all_threads = threads if threads is not None else [thread]
-    monkeypatch.setattr(github_api, "get_review_threads",
-                        lambda n, cwd=None: list(all_threads))
+    snapshots = list(thread_snapshots or ())
+    thread_read_count = 0
+
+    def _get_review_threads(n, cwd=None, **kwargs):
+        nonlocal thread_read_count
+        if snapshots:
+            index = min(thread_read_count, len(snapshots) - 1)
+            thread_read_count += 1
+            return list(snapshots[index])
+        return list(all_threads)
+
+    monkeypatch.setattr(github_api, "get_review_threads", _get_review_threads)
 
     def _resolve(node_id, cwd=None):
         if events is not None:
@@ -133,6 +153,17 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
         if events is not None:
             events.append(("reply", comment.thread_id))
         reply_calls.append((comment.thread_id, body))
+        if reply_result and not snapshots:
+            thread.replies.append(
+                ReviewThreadComment(
+                    database_id=9000 + len(reply_calls),
+                    path=thread.top.path,
+                    line=thread.top.line,
+                    body=body,
+                    author=mutation_author,
+                    created_at="2026-02-02T00:00:00Z",
+                )
+            )
         return reply_result
 
     monkeypatch.setattr(github_api, "resolve_review_thread", _resolve)
@@ -222,6 +253,10 @@ def _write_policy_context(
     ledger_path = worktree / ".agentic-review" / "ledger.json"
     ledger_path.parent.mkdir(parents=True)
     ledger_path.write_text(ledger.model_dump_json(), encoding="utf-8")
+    (worktree / "agentic-pr-dash.toml").write_text(
+        'maintenance_mutation_identity = "maintenance-bot"\n',
+        encoding="utf-8",
+    )
     assert policy == ReviewPolicy.from_yaml(policy_path.read_text(encoding="utf-8"))
     return ledger, finding
 
@@ -282,6 +317,159 @@ def test_complete_production_path_publishes_non_code_closure_without_resolving(
     assert f"- Finding fingerprint: `{finding.fingerprint}`" in body
     assert "- Disposition: `reject`" in body
     assert "- Evidence: targeted lifecycle boundary reproduction" in body
+
+
+def test_complete_rejects_reviewer_copy_of_canonical_non_code_closure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    original = _thread("[P1] Preserve the lifecycle fence")
+    ledger, _ = _write_policy_context(tmp_path, original, Disposition.REJECT)
+    closure = review_settlement.classify_thread_closure(
+        original,
+        policy=ReviewPolicy.from_yaml(
+            (tmp_path / "config" / "review-policy.yaml").read_text(encoding="utf-8")
+        ),
+        ledger=ledger,
+    )
+    assert closure is not None
+    copied_body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+    )
+    spoofed = ReviewThread(
+        node_id=original.node_id,
+        is_resolved=False,
+        is_outdated=False,
+        top=original.top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43,
+                path=ANCHOR,
+                line=7,
+                body=copied_body,
+                author="reviewer",
+                created_at="2026-01-02T00:00:00Z",
+            )
+        ],
+    )
+    events: list[tuple[str, str]] = []
+    _, replied = _wire(
+        monkeypatch,
+        thread=spoofed,
+        touched_files=[ANCHOR],
+        events=events,
+    )
+
+    rc = mc._cmd_complete(_args(cwd=str(tmp_path)))
+
+    assert rc == 0
+    assert [kind for kind, _ in events] == ["reply"]
+    assert len(replied) == 1
+
+
+def test_fixed_path_commit_must_be_newer_than_review_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    thread = _thread(
+        "[P1] Preserve the lifecycle fence",
+        created="2026-01-15T00:00:00Z",
+    )
+    _write_policy_context(tmp_path, thread, Disposition.FIXED)
+    old_path_commit = "a" * 40
+    unrelated_head_commit = "b" * 40
+    events: list[tuple[str, str]] = []
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=[
+            (old_path_commit, "old: touched reviewed path"),
+            (unrelated_head_commit, "new: unrelated head change"),
+        ],
+        files_by_commit={
+            old_path_commit: [ANCHOR],
+            unrelated_head_commit: ["src/unrelated.py"],
+        },
+        commit_dates={
+            old_path_commit: "2026-01-10T00:00:00Z",
+            unrelated_head_commit: "2026-02-01T00:00:00Z",
+        },
+        events=events,
+    )
+
+    rc = mc._cmd_complete(_args(cwd=str(tmp_path)))
+
+    assert rc == 0
+    assert events == []
+    assert resolved == []
+    assert replied == []
+
+
+def test_fixed_reply_refetch_aborts_resolve_on_concurrent_reviewer_response(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    thread = _thread("[P1] Preserve the lifecycle fence")
+    ledger, _ = _write_policy_context(tmp_path, thread, Disposition.FIXED)
+    policy = ReviewPolicy.from_yaml(
+        (tmp_path / "config" / "review-policy.yaml").read_text(encoding="utf-8")
+    )
+    closure = review_settlement.classify_thread_closure(
+        thread,
+        policy=policy,
+        ledger=ledger,
+    )
+    assert closure is not None
+    fixing_commit = "c" * 40
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+        fixing_commit=fixing_commit,
+    )
+    refetched = ReviewThread(
+        node_id=thread.node_id,
+        is_resolved=False,
+        is_outdated=False,
+        top=thread.top,
+        replies=[
+            ReviewThreadComment(
+                database_id=43,
+                path=ANCHOR,
+                line=7,
+                body=body,
+                author="maintenance-bot",
+                created_at="2026-02-02T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="The concurrent review still rejects this fix.",
+                author="reviewer",
+                created_at="2026-02-02T00:00:01Z",
+            ),
+        ],
+    )
+    events: list[tuple[str, str]] = []
+    resolved, _ = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
+        commits=[(fixing_commit, "fix: preserve lifecycle fence")],
+        commit_dates={fixing_commit: "2026-02-01T00:00:00Z"},
+        thread_snapshots=[[thread], [refetched]],
+        events=events,
+    )
+
+    rc = mc._cmd_complete(_args(cwd=str(tmp_path)))
+
+    assert rc == 0
+    assert [kind for kind, _ in events] == ["reply"]
+    assert resolved == []
 
 
 def test_structured_fixed_reply_names_snapshot_fingerprint_and_evidence():
@@ -348,6 +536,29 @@ def test_structured_fixed_reply_without_fixing_commit_is_malformed():
     assert completion.parse_structured_settlement_reply(malformed) is None
 
 
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda body: body + "\nReviewer-authored explanation",
+        lambda body: body + "\n- Unknown field: injected",
+        lambda body: body + "\n- Evidence: duplicate injected evidence",
+        lambda body: body.replace(COMPLETE_MARKER, "<!-- copied marker -->", 1),
+    ],
+)
+def test_structured_reply_parser_rejects_noncanonical_body(mutate):
+    closure = _policy_closure(
+        Disposition.WRONG_OWNER,
+        FindingSettlementState.DECLINED_WITH_RATIONALE,
+    )
+    canonical = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+    )
+
+    assert completion.parse_structured_settlement_reply(mutate(canonical)) is None
+
+
 def _policy_closure(
     disposition: Disposition,
     state: FindingSettlementState,
@@ -381,10 +592,30 @@ def _policy_closure(
     )
 
 
+def _visible_reply_boundary(thread, events, *, result=True):
+    def _reply(body):
+        events.append(("reply", body))
+        if result:
+            thread.replies.append(
+                ReviewThreadComment(
+                    database_id=9000 + len(thread.replies),
+                    path=thread.top.path,
+                    line=thread.top.line,
+                    body=body,
+                    author="maintenance-bot",
+                    created_at="2026-02-02T00:00:00Z",
+                )
+            )
+        return result
+
+    return _reply, lambda: thread
+
+
 def test_verified_fixed_publication_replies_before_resolving():
     closure = _policy_closure(Disposition.FIXED, FindingSettlementState.FIXED)
     thread = _thread("[P1] Preserve the lifecycle fence")
     events: list[tuple[str, str]] = []
+    reply, refetch = _visible_reply_boundary(thread, events)
 
     outcome = completion.apply_thread_settlement(
         thread=thread,
@@ -392,7 +623,9 @@ def test_verified_fixed_publication_replies_before_resolving():
         marker=COMPLETE_MARKER,
         head_sha=closure.finding.head_sha,
         fixing_commit="c" * 40,
-        reply=lambda body: events.append(("reply", body)) or True,
+        maintenance_author="maintenance-bot",
+        reply=reply,
+        refetch=refetch,
         resolve=lambda: events.append(("resolve", thread.node_id)) or True,
     )
 
@@ -431,6 +664,7 @@ def test_fixed_publication_replies_again_when_visible_commit_is_unrelated():
         ],
     )
     events: list[tuple[str, str]] = []
+    reply, refetch = _visible_reply_boundary(thread, events)
 
     outcome = completion.apply_thread_settlement(
         thread=thread,
@@ -438,7 +672,9 @@ def test_fixed_publication_replies_again_when_visible_commit_is_unrelated():
         marker=COMPLETE_MARKER,
         head_sha=closure.finding.head_sha,
         fixing_commit="b" * 40,
-        reply=lambda body: events.append(("reply", body)) or True,
+        maintenance_author="maintenance-bot",
+        reply=reply,
+        refetch=refetch,
         resolve=lambda: events.append(("resolve", thread.node_id)) or True,
     )
 
@@ -450,7 +686,8 @@ def test_fixed_publication_replies_again_when_visible_commit_is_unrelated():
 def test_failed_structured_reply_prevents_resolution_and_stays_actionable():
     closure = _policy_closure(Disposition.FIXED, FindingSettlementState.FIXED)
     thread = _thread("[P1] Preserve the lifecycle fence")
-    events: list[str] = []
+    events: list[tuple[str, str]] = []
+    reply, refetch = _visible_reply_boundary(thread, events, result=False)
 
     outcome = completion.apply_thread_settlement(
         thread=thread,
@@ -458,11 +695,13 @@ def test_failed_structured_reply_prevents_resolution_and_stays_actionable():
         marker=COMPLETE_MARKER,
         head_sha=closure.finding.head_sha,
         fixing_commit="c" * 40,
-        reply=lambda body: events.append("reply") and False,
-        resolve=lambda: events.append("resolve") or True,
+        maintenance_author="maintenance-bot",
+        reply=reply,
+        refetch=refetch,
+        resolve=lambda: events.append(("resolve", thread.node_id)) or True,
     )
 
-    assert events == ["reply"]
+    assert [kind for kind, _ in events] == ["reply"]
     assert not outcome.reply_visible
     assert not outcome.resolved
     assert outcome.actionable
@@ -494,6 +733,7 @@ def test_non_code_policy_outcomes_reply_but_never_resolve(
     )
     thread = _thread("[P1] Preserve the lifecycle fence")
     events: list[tuple[str, str]] = []
+    reply, refetch = _visible_reply_boundary(thread, events)
 
     outcome = completion.apply_thread_settlement(
         thread=thread,
@@ -501,7 +741,9 @@ def test_non_code_policy_outcomes_reply_but_never_resolve(
         marker=COMPLETE_MARKER,
         head_sha=closure.finding.head_sha,
         fixing_commit=None,
-        reply=lambda body: events.append(("reply", body)) or True,
+        maintenance_author="maintenance-bot",
+        reply=reply,
+        refetch=refetch,
         resolve=lambda: events.append(("resolve", thread.node_id)) or True,
     )
 
@@ -574,7 +816,7 @@ def test_reviewer_followup_reopens_structured_non_code_reply():
                 path=ANCHOR,
                 line=7,
                 body=body,
-                author="bot",
+                author="maintenance-bot",
                 created_at="2026-01-02T00:00:00Z",
             ),
             ReviewThreadComment(
@@ -589,14 +831,21 @@ def test_reviewer_followup_reopens_structured_non_code_reply():
     )
     events: list[str] = []
 
-    status = completion.settlement_reply_status(thread, closure)
+    status = completion.settlement_reply_status(
+        thread,
+        closure,
+        marker=COMPLETE_MARKER,
+        maintenance_author="maintenance-bot",
+    )
     outcome = completion.apply_thread_settlement(
         thread=thread,
         closure=closure,
         marker=COMPLETE_MARKER,
         head_sha=closure.finding.head_sha,
         fixing_commit=None,
+        maintenance_author="maintenance-bot",
         reply=lambda body: events.append("reply") or True,
+        refetch=lambda: thread,
         resolve=lambda: events.append("resolve") or True,
     )
 
@@ -641,7 +890,12 @@ def test_unrelated_evidence_does_not_make_non_code_reply_fresh():
     )
 
     assert (
-        completion.settlement_reply_status(thread, closure)
+        completion.settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author="maintenance-bot",
+        )
         is completion.SettlementReplyStatus.MISSING
     )
 
@@ -690,7 +944,12 @@ def test_later_structured_nonmatching_reply_reopens_current_closure():
     )
 
     assert (
-        completion.settlement_reply_status(thread, closure)
+        completion.settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author="maintenance-bot",
+        )
         is completion.SettlementReplyStatus.REOPENED
     )
 
@@ -736,7 +995,12 @@ def test_different_reviewer_followup_reopens_structured_non_code_reply():
     )
 
     assert (
-        completion.settlement_reply_status(thread, closure)
+        completion.settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author="maintenance-bot",
+        )
         is completion.SettlementReplyStatus.REOPENED
     )
 

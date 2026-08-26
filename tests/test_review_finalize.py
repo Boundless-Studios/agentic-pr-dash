@@ -27,7 +27,7 @@ from agentic_pr_dash._maintenance.review_settlement import (
     combine_clean_observations,
     evaluate_pr_snapshot,
 )
-from agentic_pr_dash.github_api import ReviewSubmission
+from agentic_pr_dash.github_api import COMPLETE_MARKER, ReviewSubmission
 from agentic_pr_dash.models import CICheck, PRData
 
 REPOSITORY = "Boundless-Studios/agentic-pr-dash"
@@ -403,7 +403,7 @@ def test_fresh_structured_non_code_reply_is_visible_and_addressed() -> None:
     thread = _visibility_thread()
     ledger, closure = _settled_visibility_ledger(thread, Disposition.REJECT)
     body = completion.structured_settlement_reply_body(
-        marker="<!-- agentic-pr-dash:complete -->",
+        marker=COMPLETE_MARKER,
         finding=closure.finding,
         head_sha=HEAD,
     )
@@ -424,6 +424,7 @@ def test_fresh_structured_non_code_reply_is_visible_and_addressed() -> None:
         ledger=ledger,
         threads=[thread],
         deferrals={},
+        maintenance_author="maintenance-bot",
     )
 
     assert observation.clean
@@ -436,7 +437,7 @@ def test_reviewer_followup_after_structured_reply_reopens_finalization() -> None
     thread = _visibility_thread()
     ledger, closure = _settled_visibility_ledger(thread, Disposition.REJECT)
     body = completion.structured_settlement_reply_body(
-        marker="<!-- agentic-pr-dash:complete -->",
+        marker=COMPLETE_MARKER,
         finding=closure.finding,
         head_sha=HEAD,
     )
@@ -465,6 +466,7 @@ def test_reviewer_followup_after_structured_reply_reopens_finalization() -> None
         ledger=ledger,
         threads=[thread],
         deferrals={},
+        maintenance_author="maintenance-bot",
     )
 
     assert not observation.clean
@@ -477,7 +479,7 @@ def test_verified_fixed_finding_stays_blocked_until_thread_is_resolved() -> None
     thread = _visibility_thread()
     ledger, closure = _settled_visibility_ledger(thread, Disposition.FIXED)
     body = completion.structured_settlement_reply_body(
-        marker="<!-- agentic-pr-dash:complete -->",
+        marker=COMPLETE_MARKER,
         finding=closure.finding,
         head_sha=HEAD,
         fixing_commit="c" * 40,
@@ -499,6 +501,7 @@ def test_verified_fixed_finding_stays_blocked_until_thread_is_resolved() -> None
         ledger=ledger,
         threads=[thread],
         deferrals={},
+        maintenance_author="maintenance-bot",
     )
 
     assert not observation.clean
@@ -824,7 +827,7 @@ def test_exhausted_p2_is_recorded_without_blocking_finalization() -> None:
     )
     assert closure is not None
     body = completion.structured_settlement_reply_body(
-        marker="<!-- agentic-pr-dash:complete -->",
+        marker=COMPLETE_MARKER,
         finding=closure.finding,
         head_sha=HEAD,
     )
@@ -848,6 +851,7 @@ def test_exhausted_p2_is_recorded_without_blocking_finalization() -> None:
         ledger=ledger,
         threads=[thread],
         deferrals={},
+        maintenance_author="maintenance-bot",
     )
 
     assert observation.clean
