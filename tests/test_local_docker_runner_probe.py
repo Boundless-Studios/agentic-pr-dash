@@ -204,7 +204,7 @@ def test_dashboard_runner_probe_cache_reuses_one_local_snapshot(monkeypatch) -> 
         return runner_monitor.RunnerFleetLoad(online=calls)
 
     monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
-    monkeypatch.setattr(runner_monitor, "_runner_cache", None)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
 
     first = runner_monitor.get_cached_runner_fleet_load(cwd="/repo")
     second = runner_monitor.get_cached_runner_fleet_load(cwd="/repo")
@@ -212,6 +212,24 @@ def test_dashboard_runner_probe_cache_reuses_one_local_snapshot(monkeypatch) -> 
     assert first is second
     assert first.online == 1
     assert calls == 1
+
+
+def test_dashboard_runner_probe_cache_is_scoped_to_repository(monkeypatch) -> None:
+    calls: list[str | None] = []
+
+    def load(*, cwd: str | None, run):
+        calls.append(cwd)
+        return runner_monitor.RunnerFleetLoad(online=len(calls))
+
+    monkeypatch.setattr(runner_monitor, "get_runner_fleet_load", load)
+    monkeypatch.setattr(runner_monitor, "_runner_cache", {})
+
+    first = runner_monitor.get_cached_runner_fleet_load(cwd="/repo-a")
+    second = runner_monitor.get_cached_runner_fleet_load(cwd="/repo-b")
+
+    assert first.online == 1
+    assert second.online == 2
+    assert calls == ["/repo-a", "/repo-b"]
 
 
 def test_configured_hosts_prefers_multi_host_key(monkeypatch) -> None:

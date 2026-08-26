@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 
 from fastapi import FastAPI, Form, Request, Response
@@ -66,6 +67,9 @@ CONTEXT_CACHE_TTL_SECONDS = 30.0
 _dashboard_context_cache: dict[tuple[bool, str], tuple[float, dict[str, object]]] = {}
 _dashboard_context_tasks: dict[tuple[bool, str], asyncio.Task[dict[str, object]]] = {}
 _dashboard_context_generation = 0
+_OWNERSHIP_CACHE_TTL_SECONDS = 60.0
+_ownership_card_cache: dict[tuple[str | None, int | None, str], tuple[float, dict]] = {}
+_ownership_card_cache_lock = threading.Lock()
 
 
 def _invalidate_dashboard_context() -> None:
@@ -1010,6 +1014,23 @@ def _ownership_for_card(
     return result
 
 
+def _cached_ownership_for_card(
+    worktree_path: str | None,
+    pr_number: int | None,
+    repo_cwd: str,
+) -> dict:
+    """Share slow claim/event-store reads across dashboard view variants."""
+    key = (worktree_path, pr_number, repo_cwd)
+    now = time.monotonic()
+    with _ownership_card_cache_lock:
+        cached = _ownership_card_cache.get(key)
+        if cached and now - cached[0] <= _OWNERSHIP_CACHE_TTL_SECONDS:
+            return cached[1]
+        ownership = _ownership_for_card(worktree_path, pr_number, repo_cwd)
+        _ownership_card_cache[key] = (time.monotonic(), ownership)
+        return ownership
+
+
 def _runtime_card_fields(
     runtime_session: session_registry.RuntimeSessionState | None,
 ) -> dict[str, object]:
@@ -1092,17 +1113,10 @@ def _build_card_for_worktree(
         if _wt_dt is not None:
             _pr_created_at = _wt_dt.isoformat().replace("+00:00", "Z")
 
-    # There is no ownership state to display or act on for an idle worktree
-    # with no PR and no live session. Resolving all of those dominated cold
-    # board builds in repositories with a large historical worktree pool.
-    _ownership = (
-        _ownership_for_card(
-            worktree_path=worktree.get("path"),
-            pr_number=pr.number if pr else None,
-            repo_cwd=root,
-        )
-        if pr is not None or fallback_agents or runtime_session is not None
-        else {}
+    _ownership = _cached_ownership_for_card(
+        worktree_path=worktree.get("path"),
+        pr_number=pr.number if pr else None,
+        repo_cwd=root,
     )
 
     return WorktreeCard(
@@ -1205,7 +1219,7 @@ def _build_unassigned_pr_card(
     # is still used above (activity_worktree_path) for the working/idle signal.
     card_worktree_path = None if worktree_hidden else session_worktree_path
 
-    _ownership = _ownership_for_card(
+    _ownership = _cached_ownership_for_card(
         worktree_path=session_worktree_path or pr.worktree_path,
         pr_number=pr.number,
         repo_cwd=main_repo_root or get_main_repo_root(),
@@ -2236,6 +2250,7 @@ async def cleanup_worktree(request: Request, path: str = Form(...)):
         orchestrator.log(f"Cleanup failed for {Path(path).name}: {detail}", level="error")
         return _cleanup_response(request, '<span class="card-warning">Cleanup failed</span>', 500)
 
+    _invalidate_dashboard_context()
     orchestrator.log(f"Cleanup requested for {Path(path).name}: {reason}")
     return _cleanup_response(request, '<span class="card-clean-status">Cleanup requested</span>', 200)
 
