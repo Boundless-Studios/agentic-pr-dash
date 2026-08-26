@@ -6,14 +6,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
 
-from pydantic import (
-    AliasChoices,
-    BaseModel,
-    ConfigDict,
-    Field,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def _required_text(value: Any) -> str:
@@ -47,26 +40,15 @@ def canonical_repository(value: str) -> str:
     return _required_text(candidate)
 
 
-class _LifecycleEnum(StrEnum):
-    @classmethod
-    def _missing_(cls, value: object) -> StrEnum | None:
-        if isinstance(value, str):
-            folded = value.casefold()
-            return next((member for member in cls if member.value == folded), None)
-        return None
-
-
-class ObservationHealthV1(_LifecycleEnum):
+class ObservationHealthV1(StrEnum):
     HEALTHY = "healthy"
     UNHEALTHY = "unhealthy"
     PARTIAL = "partial"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
 
-    OBSERVED = "healthy"
 
-
-class MaintenanceBlockerV1(_LifecycleEnum):
+class MaintenanceBlockerV1(StrEnum):
     REQUIRED_CI_FAILED = "required_ci_failed"
     REQUIRED_CI_PENDING = "required_ci_pending"
     MERGE_CONFLICT = "merge_conflict"
@@ -75,15 +57,8 @@ class MaintenanceBlockerV1(_LifecycleEnum):
     NO_PR = "no_pr"
     UNKNOWN = "unknown"
 
-    CI_FAILED = "required_ci_failed"
-    CI_PENDING = "required_ci_pending"
-    CONFLICT = "merge_conflict"
-    REVIEW = "review_findings"
-    REVIEW_UNSETTLED = "review_unsettled"
-    POLICY_UNSETTLED = "policy_unsettled"
 
-
-class MaintenanceNextActionV1(_LifecycleEnum):
+class MaintenanceNextActionV1(StrEnum):
     WAIT_FOR_CI = "wait_for_ci"
     FIX_CI = "fix_ci"
     ADDRESS_REVIEW = "address_review"
@@ -92,10 +67,8 @@ class MaintenanceNextActionV1(_LifecycleEnum):
     CREATE_PR = "create_pr"
     NONE = "none"
 
-    WAIT_FOR_OBSERVATION = "retry_observation"
 
-
-class RequiredCIStateV1(_LifecycleEnum):
+class RequiredCIStateV1(StrEnum):
     PASSING = "passing"
     PENDING = "pending"
     FAILING = "failing"
@@ -103,46 +76,35 @@ class RequiredCIStateV1(_LifecycleEnum):
     UNAVAILABLE = "unavailable"
     NOT_REQUIRED = "not_required"
 
-    PASSED = "passing"
-    FAILED = "failing"
-    PASS = "passing"
-    FAIL = "failing"
-    SUCCESS = "passing"
 
-
-class MergeabilityStateV1(_LifecycleEnum):
+class MergeabilityStateV1(StrEnum):
     MERGEABLE = "mergeable"
     CONFLICTING = "conflicting"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
 
-    CONFLICTED = "conflicting"
 
-
-class ReviewStateV1(_LifecycleEnum):
+class ReviewStateV1(StrEnum):
     CLEAN = "clean"
     CHANGES_REQUESTED = "changes_requested"
     PENDING = "pending"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
 
-    APPROVED = "clean"
-    NONE = "clean"
 
-
-class IntentLifecycleStateV1(_LifecycleEnum):
+class IntentLifecycleStateV1(StrEnum):
     PENDING = "pending"
     NO_PR = "no_pr"
     PROMOTED = "promoted"
 
 
-class EnqueueStatusV1(_LifecycleEnum):
+class EnqueueStatusV1(StrEnum):
     ENQUEUED = "enqueued"
     DUPLICATE = "duplicate"
     REACTIVATED = "reactivated"
 
 
-class SnapshotReadStatusV1(_LifecycleEnum):
+class SnapshotReadStatusV1(StrEnum):
     FRESH = "fresh"
     STALE = "stale"
     MISSING = "missing"
@@ -155,7 +117,7 @@ class MaintenanceIntentV1(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     repository: str
-    pushed_ref: str = Field(validation_alias=AliasChoices("pushed_ref", "ref"))
+    pushed_ref: str
     head_sha: str
     workflow_type: str
     reason: str
@@ -224,59 +186,19 @@ class MaintenanceSnapshotV1(BaseModel):
 
     key: MaintenanceKeyV1
     observed_at: datetime
-    observation_health: ObservationHealthV1 = Field(
-        default=ObservationHealthV1.UNKNOWN,
-        validation_alias=AliasChoices("observation_health", "health"),
-    )
-    blockers: list[MaintenanceBlockerV1] = Field(default_factory=list)
-    next_actions: list[MaintenanceNextActionV1] = Field(default_factory=list)
-    required_ci_state: RequiredCIStateV1 = Field(
-        default=RequiredCIStateV1.UNKNOWN,
-        validation_alias=AliasChoices(
-            "required_ci_state", "required_ci", "ci_state"
-        ),
-    )
-    mergeability: MergeabilityStateV1 = Field(
-        default=MergeabilityStateV1.UNKNOWN,
-        validation_alias=AliasChoices(
-            "mergeability", "mergeability_state", "merge_state"
-        ),
-    )
-    review_state: ReviewStateV1 = Field(
-        default=ReviewStateV1.UNKNOWN,
-        validation_alias=AliasChoices(
-            "review_state", "review", "review_decision"
-        ),
-    )
-    policy_unsettled_finding_count: int = Field(
-        default=0, ge=0, validation_alias=AliasChoices(
-            "policy_unsettled_finding_count", "policy_unsettled_findings"
-        )
-    )
-    raw_unresolved_thread_count: int = Field(
-        default=0, ge=0, validation_alias=AliasChoices(
-            "raw_unresolved_thread_count", "raw_unresolved_threads"
-        )
-    )
-    unaddressed_thread_count: int = Field(
-        default=0, ge=0, validation_alias=AliasChoices(
-            "unaddressed_thread_count", "unaddressed_threads"
-        )
-    )
-    stable_observation_count: int = Field(default=0, ge=0)
-    stable_observation_first_at: datetime | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "stable_observation_first_at", "stable_first_observed_at"
-        ),
-    )
-    stable_observation_last_at: datetime | None = Field(
-        default=None,
-        validation_alias=AliasChoices(
-            "stable_observation_last_at", "stable_last_observed_at"
-        ),
-    )
-    settled: bool = False
+    observation_health: ObservationHealthV1
+    blockers: list[MaintenanceBlockerV1]
+    next_actions: list[MaintenanceNextActionV1]
+    required_ci_state: RequiredCIStateV1
+    mergeability: MergeabilityStateV1
+    review_state: ReviewStateV1
+    policy_unsettled_finding_count: int = Field(ge=0)
+    raw_unresolved_thread_count: int = Field(ge=0)
+    unaddressed_thread_count: int = Field(ge=0)
+    stable_observation_count: int = Field(ge=0)
+    stable_observation_first_at: datetime | None
+    stable_observation_last_at: datetime | None
+    settled: bool
 
     @field_validator("observed_at", mode="after")
     @classmethod
@@ -310,7 +232,11 @@ class MaintenanceSnapshotV1(BaseModel):
             raise ValueError("settled observations require clean review state")
         if self.blockers or self.next_actions:
             raise ValueError("settled observations cannot have blockers or actions")
-        if self.policy_unsettled_finding_count or self.unaddressed_thread_count:
+        if (
+            self.policy_unsettled_finding_count
+            or self.raw_unresolved_thread_count
+            or self.unaddressed_thread_count
+        ):
             raise ValueError("settled observations cannot have open findings")
         if self.stable_observation_count < 2:
             raise ValueError("settled observations require stable observations")
@@ -326,9 +252,7 @@ class MaintenanceTargetV1(BaseModel):
 
     key: MaintenanceKeyV1 | None = None
     repository: str | None = None
-    pushed_ref: str | None = Field(
-        default=None, validation_alias=AliasChoices("pushed_ref", "ref")
-    )
+    pushed_ref: str | None = None
     head_sha: str | None = None
     workflow_type: str | None = None
     pr_number: int | None = Field(default=None, gt=0)
@@ -442,35 +366,3 @@ class MaintenanceSnapshotReadResultV1(BaseModel):
     snapshot: MaintenanceSnapshotV1 | None = None
     age_seconds: float | None = None
     reason: str = ""
-
-    @property
-    def fresh(self) -> bool:
-        return self.status is SnapshotReadStatusV1.FRESH
-
-    @property
-    def stale(self) -> bool:
-        return self.status is SnapshotReadStatusV1.STALE
-
-
-# Short aliases make the v1 contracts convenient without weakening their names.
-EnqueueStatus = EnqueueStatusV1
-SnapshotReadStatus = SnapshotReadStatusV1
-MaintenanceBlocker = MaintenanceBlockerV1
-MaintenanceNextAction = MaintenanceNextActionV1
-RequiredCIState = RequiredCIStateV1
-MergeabilityState = MergeabilityStateV1
-ReviewState = ReviewStateV1
-ObservationHealth = ObservationHealthV1
-IntentLifecycleState = IntentLifecycleStateV1
-MaintenanceTarget = MaintenanceTargetV1
-Blocker = MaintenanceBlockerV1
-NextAction = MaintenanceNextActionV1
-CIState = RequiredCIStateV1
-Mergeability = MergeabilityStateV1
-Enqueued = EnqueueStatusV1.ENQUEUED
-Duplicate = EnqueueStatusV1.DUPLICATE
-Reactivated = EnqueueStatusV1.REACTIVATED
-Fresh = SnapshotReadStatusV1.FRESH
-Stale = SnapshotReadStatusV1.STALE
-Missing = SnapshotReadStatusV1.MISSING
-Invalid = SnapshotReadStatusV1.INVALID

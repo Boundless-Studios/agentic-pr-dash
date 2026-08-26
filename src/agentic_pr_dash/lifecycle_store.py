@@ -30,6 +30,9 @@ from .lifecycle_models import (
 )
 
 
+_MISSING = object()
+
+
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -112,12 +115,30 @@ def _write_json(path: Path, payload: object) -> None:
             pass
 
 
-def _read_json(path: Path) -> object | None:
+def _read_json(path: Path) -> object:
     try:
         with path.open(encoding="utf-8") as handle:
             return json.load(handle)
     except FileNotFoundError:
-        return None
+        return _MISSING
+
+
+def _freshness(
+    snapshot: MaintenanceSnapshotV1,
+    *,
+    max_age_seconds: float,
+    now: datetime | None,
+) -> MaintenanceSnapshotReadResultV1:
+    current = _utc(now or datetime.now(timezone.utc))
+    age = max(0.0, (current - snapshot.observed_at).total_seconds())
+    status = (
+        SnapshotReadStatusV1.FRESH
+        if age <= max_age_seconds
+        else SnapshotReadStatusV1.STALE
+    )
+    return MaintenanceSnapshotReadResultV1(
+        status=status, snapshot=snapshot, age_seconds=age
+    )
 
 
 class LifecycleStore:
@@ -172,7 +193,7 @@ class LifecycleStore:
         self, intent: MaintenanceIntentV1
     ) -> MaintenanceIntentRecordV1 | None:
         raw = _read_json(self.intent_path(intent))
-        if raw is None:
+        if raw is _MISSING:
             return None
         try:
             return MaintenanceIntentRecordV1.model_validate(raw)
@@ -326,59 +347,36 @@ class LifecycleStore:
             return MaintenanceSnapshotReadResultV1(
                 status=SnapshotReadStatusV1.MISSING, reason="target has no promoted key"
             )
-        try:
-            raw = _read_json(self.snapshot_path(expected))
-        except (OSError, ValueError):
-            return MaintenanceSnapshotReadResultV1(
-                status=SnapshotReadStatusV1.INVALID,
-                reason="snapshot could not be decoded",
-            )
-        if raw is None:
-            return MaintenanceSnapshotReadResultV1(status=SnapshotReadStatusV1.MISSING)
-        try:
-            snapshot = MaintenanceSnapshotV1.model_validate(raw)
-        except (ValidationError, TypeError):
-            return MaintenanceSnapshotReadResultV1(
-                status=SnapshotReadStatusV1.INVALID,
-                reason="snapshot is not valid JSON contract",
-            )
+        loaded = self._load_snapshot(expected)
+        if isinstance(loaded, MaintenanceSnapshotReadResultV1):
+            return loaded
+        snapshot = loaded
         if not _same_job(snapshot.key, expected):
             return MaintenanceSnapshotReadResultV1(
                 status=SnapshotReadStatusV1.MISSING,
                 reason="snapshot identity does not match target",
             )
-        current = _utc(now or datetime.now(timezone.utc))
-        age = max(0.0, (current - snapshot.observed_at).total_seconds())
-        status = (
-            SnapshotReadStatusV1.FRESH
-            if age <= max_age_seconds
-            else SnapshotReadStatusV1.STALE
-        )
-        return MaintenanceSnapshotReadResultV1(
-            status=status, snapshot=snapshot, age_seconds=age
-        )
+        return _freshness(snapshot, max_age_seconds=max_age_seconds, now=now)
 
-    def enqueue_maintenance(self, intent: MaintenanceIntentV1) -> EnqueueResultV1:
-        return self.enqueue(intent)
-
-    def write_maintenance_snapshot(self, snapshot: MaintenanceSnapshotV1) -> None:
-        self.write_snapshot(snapshot)
-
-    def read_maintenance_snapshot(
-        self,
-        target: MaintenanceTargetV1,
-        *,
-        max_age_seconds: float = 90.0,
-        now: datetime | None = None,
-    ) -> MaintenanceSnapshotReadResultV1:
-        return self.read_snapshot(target, max_age_seconds=max_age_seconds, now=now)
-
-    def link_intent(
-        self,
-        target: MaintenanceIntentV1 | MaintenanceTargetV1,
-        key: MaintenanceKeyV1,
-    ) -> MaintenanceIntentRecordV1:
-        return self.promote_intent(target, key)
+    def _load_snapshot(
+        self, key: MaintenanceKeyV1
+    ) -> MaintenanceSnapshotV1 | MaintenanceSnapshotReadResultV1:
+        try:
+            raw = _read_json(self.snapshot_path(key))
+        except (OSError, ValueError):
+            return MaintenanceSnapshotReadResultV1(
+                status=SnapshotReadStatusV1.INVALID,
+                reason="snapshot could not be decoded",
+            )
+        if raw is _MISSING:
+            return MaintenanceSnapshotReadResultV1(status=SnapshotReadStatusV1.MISSING)
+        try:
+            return MaintenanceSnapshotV1.model_validate(raw)
+        except (ValidationError, TypeError):
+            return MaintenanceSnapshotReadResultV1(
+                status=SnapshotReadStatusV1.INVALID,
+                reason="snapshot is not valid JSON contract",
+            )
 
     def _promoted_key(self, target: MaintenanceTargetV1) -> MaintenanceKeyV1 | None:
         if target.repository is None:
@@ -394,7 +392,11 @@ class LifecycleStore:
             requested_at=datetime.now(timezone.utc),
         )
         record = self._load_intent(intent)
-        if record is None or record.canonical_key is None:
+        if (
+            record is None
+            or record.state is not IntentLifecycleStateV1.PROMOTED
+            or record.canonical_key is None
+        ):
             return None
         if not _same_ingress_key(intent, record.canonical_key):
             return None
@@ -459,33 +461,6 @@ def mark_maintenance_intent_no_pr(
     return _store_for(store, root).mark_no_pr(target)
 
 
-def mark_no_pr(
-    target: MaintenanceIntentV1 | MaintenanceTargetV1,
-    store: LifecycleStore | PathLike[str] | None = None,
-    *,
-    root: PathLike[str] | None = None,
-) -> MaintenanceIntentRecordV1:
-    return mark_maintenance_intent_no_pr(target, store, root=root)
-
-
-def link_maintenance_intent(
-    target: MaintenanceIntentV1 | MaintenanceTargetV1,
-    key: MaintenanceKeyV1,
-    store: LifecycleStore | PathLike[str] | None = None,
-    *,
-    root: PathLike[str] | None = None,
-) -> MaintenanceIntentRecordV1:
-    return promote_maintenance_intent(target, key, store, root=root)
-
-
-def promote_intent(
-    target: MaintenanceIntentV1 | MaintenanceTargetV1,
-    key: MaintenanceKeyV1,
-    store: LifecycleStore | PathLike[str] | None = None,
-    *,
-    root: PathLike[str] | None = None,
-) -> MaintenanceIntentRecordV1:
-    return promote_maintenance_intent(target, key, store, root=root)
 
 
 def write_maintenance_snapshot(
