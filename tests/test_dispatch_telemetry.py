@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from opentelemetry.sdk.trace import TracerProvider
@@ -112,6 +113,28 @@ def test_config_model_has_distinct_resolution_source() -> None:
     ] == "config_override"
 
 
+@pytest.mark.parametrize(
+    ("option", "expected"),
+    [
+        ("-mgpt-5", ("requested_model", "gpt-5")),
+        ("-pmaintenance", ("requested_profile", "maintenance")),
+        ("-cmodel=gpt-5", ("requested_model", "gpt-5")),
+    ],
+)
+def test_attached_short_option_values_are_resolved(
+    option: str, expected: tuple[str, str]
+) -> None:
+    telemetry = _telemetry("codex", "exec", option, "prompt")
+
+    assert getattr(telemetry, expected[0]) == expected[1]
+
+
+def test_toml_config_model_is_normalized() -> None:
+    telemetry = _telemetry("codex", "exec", "-c", 'model="gpt-5"', "prompt")
+
+    assert telemetry.requested_model == "gpt-5"
+
+
 def test_profile_is_preserved_as_resolution_source_for_adapter_model() -> None:
     telemetry = _telemetry("codex", "exec", "--profile", "maintenance", "prompt")
 
@@ -213,6 +236,27 @@ def test_execution_policy_options_are_structured_attributes() -> None:
     assert attributes["gaia.dispatch.sandbox_mode"] == "workspace-write"
     assert attributes["gaia.dispatch.approval_mode"] == "on-request"
     assert attributes["gaia.dispatch.ignore_user_config"] is True
+
+
+def test_short_sandbox_option_is_structured() -> None:
+    telemetry = _telemetry("codex", "exec", "-s", "workspace-write", "prompt")
+
+    assert telemetry.sandbox_mode == "workspace-write"
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("-C", "../other-repo"), ("--cd", "/other/repo")],
+)
+def test_working_root_override_replaces_launch_cwd(option: str, value: str) -> None:
+    telemetry = _telemetry("codex", "exec", option, value, "prompt")
+
+    expected = (
+        str(Path("/repo/worktree", value).resolve())
+        if not value.startswith("/")
+        else value
+    )
+    assert telemetry.cwd == expected
 
 
 def test_telemetry_bounds_argument_count_and_values_deterministically() -> None:

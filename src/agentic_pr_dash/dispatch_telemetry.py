@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import tomllib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -55,12 +56,15 @@ _VALUE_OPTIONS = {
     "--add-dir",
     "--ask-for-approval",
     "--config",
+    "--cd",
     "--model",
     "--profile",
     "--sandbox",
+    "-C",
     "-c",
     "-m",
     "-p",
+    "-s",
 }
 _SAFE_CONFIG_KEYS = {"model", "model_reasoning_effort"}
 
@@ -111,7 +115,11 @@ class DispatchTelemetry:
             source=source,
             argv=exact_argv,
             sanitized_argv=parsed.sanitized_argv,
-            cwd=cwd,
+            cwd=(
+                str(Path(cwd, parsed.working_root).resolve())
+                if parsed.working_root is not None
+                else cwd
+            ),
             task_type=task_type,
             session_id=session_id,
             requested_model=parsed.model,
@@ -230,6 +238,7 @@ class _ParsedArgv:
     sandbox_mode: str | None
     approval_mode: str | None
     ignore_user_config: bool
+    working_root: str | None
     resolution_source: DispatchResolutionSource
 
 
@@ -237,25 +246,52 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
     if not argv:
         raise ValueError("argv must contain an executable")
 
-    sanitized = list(argv[:2])
+    sanitized = [argv[0]]
     model = None
     profile = None
     reasoning_effort = None
     sandbox_mode = None
     approval_mode = None
     ignore_user_config = False
+    working_root = None
     resolution_source = DispatchResolutionSource.UNAVAILABLE
-    index = 2
+    index = 1
     while index < len(argv):
         token = argv[index]
         if token == "--":
             sanitized.append(token)
             sanitized.extend("<redacted:payload>" for _value in argv[index + 1 :])
             break
+        short_option = token[:2]
+        if short_option in {"-C", "-c", "-m", "-p", "-s"} and len(token) > 2:
+            attached_value = token[2:]
+            sanitized.append(
+                _truncate(
+                    f"{short_option}{_safe_option_value(short_option, attached_value)}"
+                )
+            )
+            if short_option == "-m":
+                model = _truncate(attached_value)
+                resolution_source = DispatchResolutionSource.EXPLICIT_FLAG
+            elif short_option == "-p":
+                profile = _truncate(attached_value)
+                if resolution_source is DispatchResolutionSource.UNAVAILABLE:
+                    resolution_source = DispatchResolutionSource.PROFILE
+            elif short_option == "-s":
+                sandbox_mode = _truncate(attached_value)
+            elif short_option == "-C":
+                working_root = attached_value
+            else:
+                model, reasoning_effort, resolution_source = _apply_config_value(
+                    attached_value, model, reasoning_effort, resolution_source
+                )
+            index += 1
+            continue
         option, separator, attached_value = token.partition("=")
         if separator and option in {
             "--ask-for-approval",
             "--config",
+            "--cd",
             "--model",
             "--profile",
             "--sandbox",
@@ -279,12 +315,11 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
             elif option == "--ask-for-approval":
                 approval_mode = _truncate(attached_value)
             elif option == "--config":
-                key, found, config_value = attached_value.partition("=")
-                if found and key == "model":
-                    model = _truncate(config_value)
-                    resolution_source = DispatchResolutionSource.CONFIG_OVERRIDE
-                elif found and key == "model_reasoning_effort":
-                    reasoning_effort = _truncate(config_value)
+                model, reasoning_effort, resolution_source = _apply_config_value(
+                    attached_value, model, reasoning_effort, resolution_source
+                )
+            elif option == "--cd":
+                working_root = attached_value
             index += 1
             continue
         if separator and token.startswith("-"):
@@ -305,23 +340,24 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
                 profile = _truncate(value)
                 if resolution_source is DispatchResolutionSource.UNAVAILABLE:
                     resolution_source = DispatchResolutionSource.PROFILE
-            elif token == "--sandbox":
+            elif token in {"--sandbox", "-s"}:
                 sandbox_mode = _truncate(value)
             elif token == "--ask-for-approval":
                 approval_mode = _truncate(value)
             elif token in {"--config", "-c"}:
-                key, found, config_value = value.partition("=")
-                if found and key == "model":
-                    model = _truncate(config_value)
-                    resolution_source = DispatchResolutionSource.CONFIG_OVERRIDE
-                elif found and key == "model_reasoning_effort":
-                    reasoning_effort = _truncate(config_value)
+                model, reasoning_effort, resolution_source = _apply_config_value(
+                    value, model, reasoning_effort, resolution_source
+                )
+            elif token in {"--cd", "-C"}:
+                working_root = value
             index += 2
             continue
         if token.startswith("-"):
             sanitized.append(_truncate(token))
             if token == "--ignore-user-config":
                 ignore_user_config = True
+        elif token in {"exec", "e", "run"}:
+            sanitized.append(token)
         else:
             sanitized.append("<redacted:payload>")
         index += 1
@@ -336,8 +372,33 @@ def _sanitize_and_resolve(argv: tuple[str, ...]) -> _ParsedArgv:
         sandbox_mode,
         approval_mode,
         ignore_user_config,
+        working_root,
         resolution_source,
     )
+
+
+def _apply_config_value(
+    value: str,
+    model: str | None,
+    reasoning_effort: str | None,
+    resolution_source: DispatchResolutionSource,
+) -> tuple[str | None, str | None, DispatchResolutionSource]:
+    key, found, raw_value = value.partition("=")
+    if not found or key not in _SAFE_CONFIG_KEYS:
+        return model, reasoning_effort, resolution_source
+    try:
+        parsed_value = tomllib.loads(f"value = {raw_value}")["value"]
+    except (tomllib.TOMLDecodeError, KeyError):
+        parsed_value = raw_value
+    if not isinstance(parsed_value, str):
+        return model, reasoning_effort, resolution_source
+    if key == "model":
+        return (
+            _truncate(parsed_value),
+            reasoning_effort,
+            DispatchResolutionSource.CONFIG_OVERRIDE,
+        )
+    return model, _truncate(parsed_value), resolution_source
 
 
 def _safe_option_value(option: str, value: str) -> str:

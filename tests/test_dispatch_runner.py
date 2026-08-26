@@ -353,6 +353,60 @@ def test_unavailable_span_has_low_cardinality_error_type(
     assert emitted[0][1]["error_type"] == "provider.unavailable"
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["codex", "--model", "gpt-5", "exec", "prompt"],
+        ["codex", "e", "prompt"],
+    ],
+)
+def test_structured_codex_accepts_global_options_and_exec_alias(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {"argv": argv, "task_type": "exec"}
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+
+
+def test_structured_telemetry_forwards_codex_home(tmp_path: Path, monkeypatch) -> None:
+    emitted = []
+    monkeypatch.setenv("CODEX_HOME", "/safe/codex-home")
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append(telemetry),
+    )
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "prompt"],
+        "task_type": "exec",
+    }
+
+    run_dispatch_hook(request)
+
+    assert emitted[0].codex_home == "/safe/codex-home"
+
+
+def test_non_review_structured_dispatch_drops_review_verdict(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        response={"exit_code": 0, "review_verdict": {"findings": []}},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.review_verdict is None
+
+
 @pytest.mark.parametrize("provider", list(DispatchProvider))
 def test_unrelated_commands_are_ignored(
     tmp_path: Path, provider: DispatchProvider

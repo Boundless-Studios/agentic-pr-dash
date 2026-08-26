@@ -370,7 +370,11 @@ def _observation_from_request(
                 resolution_source=_adapter_resolution_source(resolution),
             )
         verdict = response.get("review_verdict")
-        if not isinstance(verdict, dict) or outcome is not DispatchOutcome.SUCCESS:
+        if (
+            not isinstance(verdict, dict)
+            or outcome is not DispatchOutcome.SUCCESS
+            or structured.task_type != "review"
+        ):
             verdict = None
         emit_dispatch_span(
             structured,
@@ -488,17 +492,11 @@ def _structured_telemetry(
         )
     ):
         return None
-    expected_subcommand = {
-        DispatchProvider.CODEX: "exec",
-        DispatchProvider.OPENCODE: "run",
-    }.get(request.provider)
     executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
-    if (
-        expected_subcommand is None
-        or executable not in {request.provider.value, f"{request.provider.value}.exe"}
-        or len(argv) < 2
-        or argv[1] != expected_subcommand
-    ):
+    if executable not in {
+        request.provider.value,
+        f"{request.provider.value}.exe",
+    } or not _has_supported_subcommand(argv, request.provider):
         return None
     return DispatchTelemetry.from_argv(
         provider=request.provider,
@@ -507,8 +505,43 @@ def _structured_telemetry(
         cwd=str(request.payload.get("cwd") or os.getcwd()),
         task_type=task_type.strip(),
         session_id=str(request.payload.get("session_id") or ""),
+        environment={"CODEX_HOME": os.environ["CODEX_HOME"]}
+        if "CODEX_HOME" in os.environ
+        else None,
         start_time_unix_nano=start_time_unix_nano,
     )
+
+
+def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bool:
+    if provider is DispatchProvider.OPENCODE:
+        return len(argv) >= 2 and argv[1] == "run"
+    if provider is not DispatchProvider.CODEX:
+        return False
+    value_options = {
+        "--add-dir",
+        "--ask-for-approval",
+        "--cd",
+        "--config",
+        "--model",
+        "--profile",
+        "--sandbox",
+        "-C",
+        "-c",
+        "-m",
+        "-p",
+        "-s",
+    }
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token in value_options:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token in {"exec", "e"}
+    return False
 
 
 def _adapter_resolution_source(resolution: object) -> DispatchResolutionSource:
