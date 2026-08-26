@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -23,21 +24,44 @@ def _optional_text(value: Any) -> str | None:
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def canonical_repository(value: str) -> str:
-    """Return a trimmed owner/name identity while retaining its casing."""
+    """Return a trimmed GitHub owner/name identity while retaining casing."""
 
-    candidate = _required_text(value).strip("/")
-    if "://" in candidate:
-        candidate = candidate.split("//", 1)[1].split("/", 1)[-1]
-    candidate = candidate.removesuffix("/").removesuffix(".git")
-    pieces = [piece for piece in candidate.split("/") if piece]
-    if len(pieces) >= 2:
-        candidate = "/".join(pieces[-2:])
-    return _required_text(candidate)
+    candidate = _required_text(value)
+    if candidate.casefold().startswith("git@") and ":" in candidate:
+        host, candidate = candidate.split(":", 1)
+        if host.casefold() != "git@github.com":
+            raise ValueError("repository URL must use github.com")
+    elif "://" in candidate:
+        parsed = urlsplit(candidate)
+        try:
+            hostname = parsed.hostname
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("repository URL is malformed") from exc
+        if (
+            parsed.scheme.casefold() not in {"http", "https", "ssh"}
+            or hostname is None
+            or hostname.casefold() != "github.com"
+            or parsed.query
+            or parsed.fragment
+            or port is not None
+            and port not in {22, 80, 443}
+            or parsed.username not in (None, "git")
+        ):
+            raise ValueError("repository URL must use github.com")
+        candidate = parsed.path
+    candidate = candidate.strip("/")
+    if candidate.casefold().endswith(".git"):
+        candidate = candidate[:-4]
+    pieces = candidate.split("/")
+    if len(pieces) != 2 or any(not piece.strip() for piece in pieces):
+        raise ValueError("repository must be an owner/name identity")
+    return "/".join(_required_text(piece) for piece in pieces)
 
 
 class ObservationHealthV1(StrEnum):
@@ -187,8 +211,8 @@ class MaintenanceSnapshotV1(BaseModel):
     key: MaintenanceKeyV1
     observed_at: datetime
     observation_health: ObservationHealthV1
-    blockers: list[MaintenanceBlockerV1]
-    next_actions: list[MaintenanceNextActionV1]
+    blockers: tuple[MaintenanceBlockerV1, ...]
+    next_actions: tuple[MaintenanceNextActionV1, ...]
     required_ci_state: RequiredCIStateV1
     mergeability: MergeabilityStateV1
     review_state: ReviewStateV1
@@ -262,9 +286,7 @@ class MaintenanceTargetV1(BaseModel):
     def _repository(cls, value: str | None) -> str | None:
         return canonical_repository(value) if value is not None else None
 
-    @field_validator(
-        "pushed_ref", "head_sha", "workflow_type", mode="before"
-    )
+    @field_validator("pushed_ref", "head_sha", "workflow_type", mode="before")
     @classmethod
     def _optional_text(cls, value: Any) -> str | None:
         return _optional_text(value)

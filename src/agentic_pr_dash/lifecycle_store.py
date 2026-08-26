@@ -5,12 +5,13 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from os import PathLike
 from pathlib import Path
 
@@ -29,14 +30,13 @@ from .lifecycle_models import (
     SnapshotReadStatusV1,
 )
 
-
 _MISSING = object()
 
 
 def _utc(value: datetime) -> datetime:
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
 def lifecycle_state_root(root: PathLike[str] | None = None) -> Path:
@@ -129,7 +129,7 @@ def _freshness(
     max_age_seconds: float,
     now: datetime | None,
 ) -> MaintenanceSnapshotReadResultV1:
-    current = _utc(now or datetime.now(timezone.utc))
+    current = _utc(now or datetime.now(UTC))
     age = max(0.0, (current - snapshot.observed_at).total_seconds())
     status = (
         SnapshotReadStatusV1.FRESH
@@ -150,8 +150,8 @@ class LifecycleStore:
         *,
         lock_timeout_seconds: float = 2.0,
     ) -> None:
-        if lock_timeout_seconds <= 0:
-            raise ValueError("lock_timeout_seconds must be positive")
+        if not math.isfinite(lock_timeout_seconds) or lock_timeout_seconds <= 0:
+            raise ValueError("lock_timeout_seconds must be finite and positive")
         self.root = lifecycle_state_root(root)
         self.lock_timeout_seconds = lock_timeout_seconds
         self._intent_dir = self.root / "intents"
@@ -288,16 +288,17 @@ class LifecycleStore:
         path = self.intent_path(intent)
         with self._transaction_lock():
             existing = self._load_intent(intent)
-            if existing is not None and existing.state is IntentLifecycleStateV1.PROMOTED:
+            if (
+                existing is not None
+                and existing.state is IntentLifecycleStateV1.PROMOTED
+            ):
                 raise ValueError("a promoted intent cannot be marked no_pr")
             data = (existing.intent if existing else intent).model_dump()
             data["pr_number"] = None
             marked_intent = MaintenanceIntentV1(**data)
             record = MaintenanceIntentRecordV1(
                 ingress_id=(
-                    existing.ingress_id
-                    if existing
-                    else ingress_identity_hash(intent)
+                    existing.ingress_id if existing else ingress_identity_hash(intent)
                 ),
                 intent=marked_intent,
                 state=IntentLifecycleStateV1.NO_PR,
@@ -316,14 +317,12 @@ class LifecycleStore:
             reason="promotion",
             worktree_path="promotion",
             session_id="promotion",
-            requested_at=datetime.now(timezone.utc),
+            requested_at=datetime.now(UTC),
         )
 
     def write_snapshot(self, snapshot: MaintenanceSnapshotV1) -> None:
         _ensure_directory(self.root)
-        _write_json(
-            self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json")
-        )
+        _write_json(self.snapshot_path(snapshot.key), snapshot.model_dump(mode="json"))
 
     def read_snapshot(
         self,
@@ -389,17 +388,10 @@ class LifecycleStore:
             reason="lookup",
             worktree_path="lookup",
             session_id="lookup",
-            requested_at=datetime.now(timezone.utc),
+            requested_at=datetime.now(UTC),
         )
         record = self._load_intent(intent)
-        if (
-            record is None
-            or record.state is not IntentLifecycleStateV1.PROMOTED
-            or record.canonical_key is None
-            or record.intent.pr_number != record.canonical_key.pr_number
-        ):
-            return None
-        if not _same_ingress_key(intent, record.canonical_key):
+        if not _valid_promoted_record(intent, record):
             return None
         return record.canonical_key
 
@@ -409,6 +401,39 @@ def _same_ingress_key(intent: MaintenanceIntentV1, key: MaintenanceKeyV1) -> boo
         intent.normalized_repository == key.normalized_repository
         and intent.head_sha == key.head_sha
         and intent.workflow_type == key.workflow_type
+    )
+
+
+def _same_ingress_identity(
+    left: MaintenanceIntentV1, right: MaintenanceIntentV1
+) -> bool:
+    return (
+        left.normalized_repository == right.normalized_repository
+        and left.pushed_ref == right.pushed_ref
+        and left.head_sha == right.head_sha
+        and left.workflow_type == right.workflow_type
+    )
+
+
+def _valid_promoted_record(
+    requested: MaintenanceIntentV1,
+    record: MaintenanceIntentRecordV1 | None,
+) -> bool:
+    if (
+        record is None
+        or record.state is not IntentLifecycleStateV1.PROMOTED
+        or record.canonical_key is None
+    ):
+        return False
+    if record.ingress_id != ingress_identity_hash(record.intent):
+        return False
+    if record.ingress_id != ingress_identity_hash(requested):
+        return False
+    if not _same_ingress_identity(requested, record.intent):
+        return False
+    return (
+        record.intent.pr_number == record.canonical_key.pr_number
+        and _same_ingress_key(requested, record.canonical_key)
     )
 
 
@@ -460,8 +485,6 @@ def mark_maintenance_intent_no_pr(
     root: PathLike[str] | None = None,
 ) -> MaintenanceIntentRecordV1:
     return _store_for(store, root).mark_no_pr(target)
-
-
 
 
 def write_maintenance_snapshot(

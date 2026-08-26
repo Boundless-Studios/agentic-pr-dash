@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import math
 import os
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from stat import S_IMODE
 
@@ -31,8 +32,6 @@ from agentic_pr_dash.lifecycle_store import (
     write_maintenance_snapshot,
 )
 
-
-UTC = timezone.utc
 OBSERVED_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
 
 
@@ -109,6 +108,35 @@ def test_repository_is_trimmed_for_display_and_casefolded_for_identity() -> None
     assert ingress_identity_hash(intent) == ingress_identity_hash(equivalent)
 
 
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "Acme/Widget",
+        "git@github.com:Acme/Widget.git",
+        "ssh://git@github.com/Acme/Widget.git",
+        "https://github.com/Acme/Widget.git",
+    ],
+)
+def test_repository_clone_urls_share_owner_name_identity(repository: str) -> None:
+    intent = _intent(repository=repository)
+
+    assert intent.repository == "Acme/Widget"
+    assert intent.normalized_repository == "acme/widget"
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://gitlab.com/Acme/Widget.git",
+        "git@gitlab.com:Acme/Widget.git",
+        "ssh://git@evil.example/Acme/Widget.git",
+    ],
+)
+def test_repository_clone_urls_reject_malformed_hosts(repository: str) -> None:
+    with pytest.raises(ValidationError):
+        _intent(repository=repository)
+
+
 def test_models_reject_blank_fields_and_nonpositive_pr() -> None:
     for field in (
         "repository",
@@ -156,6 +184,19 @@ def test_settled_snapshot_rejects_raw_unresolved_threads() -> None:
         _snapshot(raw_unresolved_thread_count=1, settled=True)
 
 
+def test_snapshot_fact_collections_are_immutable() -> None:
+    snapshot = _snapshot()
+
+    assert isinstance(snapshot.blockers, tuple)
+    assert isinstance(snapshot.next_actions, tuple)
+    with pytest.raises(AttributeError):
+        snapshot.blockers.append("required_ci_failed")  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        snapshot.next_actions.append("fix_ci")  # type: ignore[attr-defined]
+    assert snapshot.model_dump(mode="json")["blockers"] == []
+    assert snapshot.model_dump(mode="json")["next_actions"] == []
+
+
 def test_snapshot_requires_explicit_settlement_evidence_fields() -> None:
     complete = _snapshot().model_dump()
     for field in (
@@ -180,7 +221,9 @@ def test_snapshot_requires_explicit_settlement_evidence_fields() -> None:
 
 def test_v1_contract_exposes_only_canonical_fields_and_enum_members() -> None:
     assert MaintenanceIntentV1.model_fields["pushed_ref"].validation_alias is None
-    assert MaintenanceSnapshotV1.model_fields["required_ci_state"].validation_alias is None
+    assert (
+        MaintenanceSnapshotV1.model_fields["required_ci_state"].validation_alias is None
+    )
     assert tuple(ObservationHealthV1.__members__) == (
         "HEALTHY",
         "UNHEALTHY",
@@ -352,9 +395,7 @@ def test_unresolved_target_ignores_link_unless_intent_is_promoted(
         state=state,
         canonical_key=snapshot.key,
     )
-    store.intent_path(intent).write_text(
-        linked.model_dump_json(), encoding="utf-8"
-    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
     write_maintenance_snapshot(snapshot, store=store)
 
     result = read_maintenance_snapshot(
@@ -385,9 +426,87 @@ def test_unresolved_target_rejects_inconsistent_promoted_intent_pr(
         state=IntentLifecycleStateV1.PROMOTED,
         canonical_key=snapshot.key,
     )
-    store.intent_path(intent).write_text(
-        linked.model_dump_json(), encoding="utf-8"
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
     )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
+def test_unresolved_target_rejects_tampered_promoted_ingress_id(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    linked = MaintenanceIntentRecordV1(
+        ingress_id="tampered-ingress-id",
+        intent=intent,
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "Other/Repo"),
+        ("pushed_ref", "refs/heads/other"),
+        ("head_sha", "b" * 40),
+        ("workflow_type", "other-workflow"),
+    ],
+)
+def test_unresolved_target_rejects_cross_identity_promoted_record(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    intent_data = intent.model_dump()
+    intent_data[field] = value
+    corrupted_intent = MaintenanceIntentV1(**intent_data)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(corrupted_intent),
+        intent=corrupted_intent,
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
     write_maintenance_snapshot(snapshot, store=store)
 
     result = read_maintenance_snapshot(
@@ -456,7 +575,10 @@ def test_default_root_falls_back_to_home(
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
 
-    assert LifecycleStore().root == home / ".local" / "state" / "agentic-pr-dash" / "lifecycle"
+    assert (
+        LifecycleStore().root
+        == home / ".local" / "state" / "agentic-pr-dash" / "lifecycle"
+    )
 
 
 def test_atomic_snapshot_replacement_never_exposes_partial_json(tmp_path: Path) -> None:
@@ -517,16 +639,29 @@ def test_lock_timeout_is_bounded_for_read_modify_write(tmp_path: Path) -> None:
     fd = os.open(store.root / ".lifecycle.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        started = datetime.now().timestamp()
+        started = datetime.now(UTC).timestamp()
         with pytest.raises(TimeoutError):
             enqueue_maintenance(_intent(), store=store)
-        assert datetime.now().timestamp() - started < 1
+        assert datetime.now(UTC).timestamp() - started < 1
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
-def test_read_modify_write_lock_deduplicates_concurrent_enqueues(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "lock_timeout_seconds",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_lock_timeout_must_be_finite_and_positive(
+    tmp_path: Path, lock_timeout_seconds: float
+) -> None:
+    with pytest.raises(ValueError):
+        LifecycleStore(tmp_path / "state", lock_timeout_seconds=lock_timeout_seconds)
+
+
+def test_read_modify_write_lock_deduplicates_concurrent_enqueues(
+    tmp_path: Path,
+) -> None:
     store = LifecycleStore(tmp_path / "state")
     barrier = threading.Barrier(8)
     statuses: list[EnqueueStatusV1] = []
