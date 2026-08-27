@@ -15,35 +15,51 @@ This file was run against pre-fix code to confirm RED (deferred threads were
 resolved/replied-to exactly like any other addressed thread) before the skip
 was added to ``_cmd_complete``'s per-thread loop.
 """
+
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 from agentic_pr_dash import github_api, maintenance
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash._maintenance import deferred_review as dr
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 from agentic_pr_dash.models import PRData, PRStatus
-from agentic_pr_dash._maintenance import deferred_review as dr
 
 ANCHOR = "backend/src/gaia/api/app.py"
 SPANS_AT_ANCHOR = [(6, 8, 6, 9)]
 PR_NUMBER = 2139
 
 
-def _thread(body: str = "Guard against a None campaign here.", node_id: str = "t1") -> ReviewThread:
+def _thread(
+    body: str = "Guard against a None campaign here.", node_id: str = "t1"
+) -> ReviewThread:
     c = ReviewThreadComment(
-        database_id=42, path=ANCHOR, line=7, body=body,
-        author="rev", created_at="2026-01-01T00:00:00Z",
+        database_id=42,
+        path=ANCHOR,
+        line=7,
+        body=body,
+        author="rev",
+        created_at="2026-01-01T00:00:00Z",
     )
     return ReviewThread(node_id=node_id, is_resolved=False, is_outdated=False, top=c)
 
 
 def _pr() -> PRData:
     return PRData(
-        number=PR_NUMBER, repo="boundless/test", title="t", branch="b", url=f"https://x/pull/{PR_NUMBER}",
-        failing_checks=[], review_comments=[], merge_state="CLEAN",
-        latest_commit_sha="headsha", latest_commit_date="2026-02-01T00:00:00Z",
-        worktree_path="/wt", status=PRStatus.CLEAN,
+        number=PR_NUMBER,
+        repo="boundless/test",
+        title="t",
+        branch="b",
+        url=f"https://x/pull/{PR_NUMBER}",
+        failing_checks=[],
+        review_comments=[],
+        merge_state="CLEAN",
+        latest_commit_sha="headsha",
+        latest_commit_date="2026-02-01T00:00:00Z",
+        worktree_path="/wt",
+        status=PRStatus.CLEAN,
     )
 
 
@@ -52,6 +68,11 @@ def _wire(monkeypatch, *, thread: ReviewThread):
     reply_calls: list[object] = []
 
     monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: _pr())
+    monkeypatch.setattr(
+        mc,
+        "load_config",
+        lambda cwd: SimpleNamespace(maintenance_mutation_identity="maintenance-bot"),
+    )
     monkeypatch.setattr(github_api, "get_local_pr_head", lambda branch, cwd: ("", ""))
     monkeypatch.setattr(github_api, "_is_ancestor", lambda a, d, cwd: False)
     monkeypatch.setattr(
@@ -61,11 +82,12 @@ def _wire(monkeypatch, *, thread: ReviewThread):
         github_api, "get_commit_changed_files", lambda sha, cwd=None: [ANCHOR]
     )
     monkeypatch.setattr(
-        github_api, "get_changed_line_spans",
+        github_api,
+        "get_changed_line_spans",
         lambda base, head, path, cwd=None: list(SPANS_AT_ANCHOR),
     )
     monkeypatch.setattr(
-        github_api, "get_review_threads", lambda n, cwd=None: [thread]
+        github_api, "get_review_threads", lambda n, cwd=None, **kwargs: [thread]
     )
 
     def _resolve(node_id, cwd=None):
@@ -74,6 +96,16 @@ def _wire(monkeypatch, *, thread: ReviewThread):
 
     def _reply(pr_number, comment, body, cwd=None):
         reply_calls.append((comment.thread_id, body))
+        thread.replies.append(
+            ReviewThreadComment(
+                database_id=9000 + len(reply_calls),
+                path=thread.top.path,
+                line=thread.top.line,
+                body=body,
+                author="maintenance-bot",
+                created_at="2026-02-02T00:00:00Z",
+            )
+        )
         return True
 
     monkeypatch.setattr(github_api, "resolve_review_thread", _resolve)
@@ -101,25 +133,30 @@ def test_control_fully_addressed_thread_still_auto_resolves(monkeypatch) -> None
     assert [t for t, _ in replied] == ["t1"]
 
 
-def test_deferred_thread_is_never_auto_resolved_even_with_full_evidence(
+def test_deferred_thread_gets_canonical_reply_without_resolution(
     tmp_path, monkeypatch
 ) -> None:
-    """The fix: deferral outranks the evidence gate entirely — a deferred
-    thread is never resolved or replied to by `complete`, regardless of
-    whether the fixing commits would otherwise satisfy the evidence bar."""
+    """A deferred thread remains open but receives structured disposition."""
     thread = _thread()
     cwd = str(tmp_path)
     resolved, replied = _wire(monkeypatch, thread=thread)
     dr.defer_thread(
-        cwd, PR_NUMBER, thread_id="t1", comment_id=42, severity="P1",
-        ticket="BOU-2559", reason="out of scope: requires files this PR does not own",
+        cwd,
+        PR_NUMBER,
+        thread_id="t1",
+        comment_id=42,
+        severity="P1",
+        ticket="BOU-2559",
+        reason="out of scope: requires files this PR does not own",
     )
 
     rc = mc._cmd_complete(_args(cwd=cwd))
 
     assert rc == 0
     assert resolved == [], "a deferred thread must never be auto-resolved by complete"
-    assert replied == [], "complete must not post its own completion reply over a deferral"
+    assert len(replied) == 1
+    assert "<!-- agentic-pr-dash:completed -->" in replied[0][1]
+    assert "- Disposition: `defer`" in replied[0][1]
 
 
 def test_deferred_thread_does_not_count_as_a_remaining_blocker(
@@ -133,7 +170,12 @@ def test_deferred_thread_does_not_count_as_a_remaining_blocker(
     cwd = str(tmp_path)
     _wire(monkeypatch, thread=thread)
     dr.defer_thread(
-        cwd, PR_NUMBER, thread_id="t1", comment_id=42, severity="P2", ticket="BOU-1000",
+        cwd,
+        PR_NUMBER,
+        thread_id="t1",
+        comment_id=42,
+        severity="P2",
+        ticket="BOU-1000",
     )
 
     rc = mc._cmd_complete(_args(cwd=cwd))
@@ -144,3 +186,50 @@ def test_deferred_thread_does_not_count_as_a_remaining_blocker(
         f"a deferred-only PR must not be kept open on the review_comments "
         f"blocker; got: {out!r}"
     )
+
+
+def test_ticketless_deferred_thread_remains_a_blocker(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    thread = _thread()
+    cwd = str(tmp_path)
+    _wire(monkeypatch, thread=thread)
+    dr.defer_thread(
+        cwd,
+        PR_NUMBER,
+        thread_id="t1",
+        comment_id=42,
+        severity="P1",
+        ticket="",
+        reason="temporarily deferred without a tracking issue",
+    )
+
+    rc = mc._cmd_complete(_args(cwd=cwd))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "review_comments" in captured.out
+    assert "tracking issue" in captured.err
+
+
+def test_failed_deferred_reply_remains_a_blocker(tmp_path, monkeypatch, capsys) -> None:
+    thread = _thread()
+    cwd = str(tmp_path)
+    _wire(monkeypatch, thread=thread)
+    monkeypatch.setattr(github_api, "reply_to_review_comment", lambda *a, **k: False)
+    dr.defer_thread(
+        cwd,
+        PR_NUMBER,
+        thread_id="t1",
+        comment_id=42,
+        severity="P1",
+        ticket="BOU-2559",
+        reason="tracked outside this PR",
+    )
+
+    rc = mc._cmd_complete(_args(cwd=cwd))
+
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "review_comments" in captured.out
+    assert "missing, failed, or was reopened" in captured.err

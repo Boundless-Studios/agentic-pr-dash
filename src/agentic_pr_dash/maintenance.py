@@ -20,7 +20,10 @@ def now_utc() -> datetime:
 
 
 def state_path(worktree_path: str, pr_number: int) -> Path:
-    return load_config(worktree_path).maintenance_dir_for(worktree_path) / f"pr-{pr_number}.json"
+    return (
+        load_config(worktree_path).maintenance_dir_for(worktree_path)
+        / f"pr-{pr_number}.json"
+    )
 
 
 def handoff_path(worktree_path: str) -> Path:
@@ -35,10 +38,16 @@ def handoff_path(worktree_path: str) -> Path:
     return load_config(worktree_path).state_dir_for(worktree_path) / HANDOFF_FILENAME
 
 
-def pr_url(pr_number: int | str, fallback_url: str | None = None, *, cwd: str | None = None) -> str:
+def pr_url(
+    pr_number: int | str, fallback_url: str | None = None, *, cwd: str | None = None
+) -> str:
     if fallback_url:
         return fallback_url
-    repo = load_config(cwd).resolved_repo(Path(cwd) if cwd else None) if cwd else load_config().resolved_repo()
+    repo = (
+        load_config(cwd).resolved_repo(Path(cwd) if cwd else None)
+        if cwd
+        else load_config().resolved_repo()
+    )
     return f"https://github.com/{repo}/pull/{pr_number}" if repo else f"#{pr_number}"
 
 
@@ -54,12 +63,18 @@ def blockers_for_pr(pr: PRData) -> list[str]:
     :func:`terminal_clean_blockers` to decide whether work may be declared done.
     """
     blockers: list[str] = []
-    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
+    if (
+        pr.merge_state == "DIRTY"
+        or pr.mergeable == "CONFLICTING"
+        or pr.status.value == "merge_conflict"
+    ):
         blockers.append("merge_conflict")
     if pr.failing_checks:
         blockers.append("ci_failure")
     if pr.review_comments:
         blockers.append("review_comments")
+    if pr.review_decision.strip().upper() == "CHANGES_REQUESTED":
+        blockers.append("changes_requested")
     return blockers
 
 
@@ -233,8 +248,9 @@ def mark_state(
     return state
 
 
-
-def discover_active_primary_feature_pipeline_agents(worktree_path: str) -> list[AgentProcess]:
+def discover_active_primary_feature_pipeline_agents(
+    worktree_path: str,
+) -> list[AgentProcess]:
     """Live, independent sessions that own a worktree — so the dashboard defers
     to them instead of spawning a competing maintenance agent.
 
@@ -252,7 +268,9 @@ def discover_active_primary_feature_pipeline_agents(worktree_path: str) -> list[
     """
     by_pid: dict[int, AgentProcess] = {
         agent.pid: agent
-        for agent in discover_primary_feature_pipeline_agents([worktree_path]).get(worktree_path, [])
+        for agent in discover_primary_feature_pipeline_agents([worktree_path]).get(
+            worktree_path, []
+        )
     }
     discovery_names = set(load_config(worktree_path).discovery_names)
     for state in session_registry.active_sessions_for_worktree(worktree_path):
@@ -288,7 +306,11 @@ def build_maintenance_summary(pr: PRData, *, deferred_count: int = 0) -> str:
         parts.append(f"{len(pr.failing_checks)} failing CI check(s)")
     else:
         parts.append("CI green")
-    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
+    if (
+        pr.merge_state == "DIRTY"
+        or pr.mergeable == "CONFLICTING"
+        or pr.status.value == "merge_conflict"
+    ):
         parts.append("merge conflict")
     if str(pr.review_decision).upper() == "CHANGES_REQUESTED":
         parts.append("changes requested")
@@ -312,60 +334,88 @@ def build_maintenance_prompt(
         "Do NOT create a new branch or PR. Commit and push to the existing branch.",
     ]
 
-    if pr.merge_state == "DIRTY" or pr.mergeable == "CONFLICTING" or pr.status.value == "merge_conflict":
+    if (
+        pr.merge_state == "DIRTY"
+        or pr.mergeable == "CONFLICTING"
+        or pr.status.value == "merge_conflict"
+    ):
         base_branch = pr.base_branch or "main"
-        sections.extend([
-            "",
-            f"## Merge Conflicts",
-            f"This PR has merge conflicts against `{base_branch}`.",
-            f"Fetch `origin/{base_branch}`, merge it into the current branch, resolve conflicts, test, commit, and push.",
-            "Do not use `git reset --hard` and do not discard unrelated local changes.",
-            "Never use bare `git stash push`/`git stash pop` — the stash stack is shared "
-            "across all worktrees of this repo and indexes shift under concurrent agents. "
-            "Prefer stash-free flows; if you must stash, use "
-            "`agentic-pr-dash stash push -m \"<branch>: <purpose>\"`, then restore with "
-            "`agentic-pr-dash stash apply \"<label>\"` or discard with "
-            "`agentic-pr-dash stash drop \"<label>\"`.",
-        ])
+        sections.extend(
+            [
+                "",
+                f"## Merge Conflicts",
+                f"This PR has merge conflicts against `{base_branch}`.",
+                f"Fetch `origin/{base_branch}`, merge it into the current branch, resolve conflicts, test, commit, and push.",
+                "Do not use `git reset --hard` and do not discard unrelated local changes.",
+                "Never use bare `git stash push`/`git stash pop` — the stash stack is shared "
+                "across all worktrees of this repo and indexes shift under concurrent agents. "
+                "Prefer stash-free flows; if you must stash, use "
+                '`agentic-pr-dash stash push -m "<branch>: <purpose>"`, then restore with '
+                '`agentic-pr-dash stash apply "<label>"` or discard with '
+                '`agentic-pr-dash stash drop "<label>"`.',
+            ]
+        )
 
     if pr.failing_checks:
         failing = ", ".join(pr.failing_checks)
-        sections.extend([
-            "",
-            "## CI Failures",
-            f"This PR has {len(pr.failing_checks)} failing CI check(s): {failing}.",
-            "Fix the failures and run the narrowest relevant local tests before pushing.",
-        ])
-        for check_name, log_tail in (failed_logs or {}).items():
-            sections.extend([
+        sections.extend(
+            [
                 "",
-                f"--- Failed CI log: {check_name} ---",
-                log_tail,
-                "--- End ---",
-            ])
+                "## CI Failures",
+                f"This PR has {len(pr.failing_checks)} failing CI check(s): {failing}.",
+                "Fix the failures and run the narrowest relevant local tests before pushing.",
+            ]
+        )
+        for check_name, log_tail in (failed_logs or {}).items():
+            sections.extend(
+                [
+                    "",
+                    f"--- Failed CI log: {check_name} ---",
+                    log_tail,
+                    "--- End ---",
+                ]
+            )
 
     if pr.review_comments:
-        sections.extend([
-            "",
-            "## Review Comments",
-            "Address each review comment below, commit, and push.",
-            "After pushing, run `agentic-pr-dash complete` "
-            "to post completion replies and resolve the threads.",
-        ])
+        sections.extend(
+            [
+                "",
+                "## Review Comments",
+                "Address each review comment below, commit, and push.",
+                "After pushing, run `agentic-pr-dash complete` "
+                "to post completion replies and resolve the threads.",
+            ]
+        )
         for comment in pr.review_comments:
             loc = f" on `{comment.path}:{comment.line}`" if comment.path else ""
-            sections.extend([
+            sections.extend(
+                [
+                    "",
+                    f"### Comment {comment.id} by @{comment.author}{loc}",
+                    comment.body,
+                ]
+            )
+
+    if pr.review_decision.strip().upper() == "CHANGES_REQUESTED":
+        sections.extend(
+            [
                 "",
-                f"### Comment {comment.id} by @{comment.author}{loc}",
-                comment.body,
-            ])
+                "## Changes Requested",
+                (
+                    "A top-level review requested changes. Fetch the review body and "
+                    "address each requested change before completing maintenance."
+                ),
+            ]
+        )
 
     if guidance:
-        sections.extend([
-            "",
-            "## Additional Guidance From Developer",
-            guidance,
-        ])
+        sections.extend(
+            [
+                "",
+                "## Additional Guidance From Developer",
+                guidance,
+            ]
+        )
 
     return "\n".join(sections).strip() + "\n"
 
@@ -392,7 +442,9 @@ def _conventions_preamble(cwd: str | None = None) -> str:
     )
 
 
-def ensure_maintenance_bead(state: MaintenanceState, pr: PRData, prompt: str) -> str | None:
+def ensure_maintenance_bead(
+    state: MaintenanceState, pr: PRData, prompt: str
+) -> str | None:
     """Open (or find) a tracked task for this PR via the configured tracker.
 
     With the default ``none`` tracker this is a no-op and returns ``None`` — the
@@ -415,12 +467,14 @@ def ensure_maintenance_bead(state: MaintenanceState, pr: PRData, prompt: str) ->
         f"Latest commit: {pr.latest_commit_sha or 'unknown'}\n\n"
         f"{prompt}"
     )
-    return tracker.open_task(pr=pr.number, branch=pr.branch, title=title, body=body, cwd=state.worktree_path)
+    return tracker.open_task(
+        pr=pr.number, branch=pr.branch, title=title, body=body, cwd=state.worktree_path
+    )
 
 
 def _branch_label(branch: str) -> str:
     for prefix in ("feature/", "fix/", "chore/", "hotfix/", "release/"):
         if branch.startswith(prefix):
-            branch = branch[len(prefix):]
+            branch = branch[len(prefix) :]
             break
     return branch.replace("/", "-")

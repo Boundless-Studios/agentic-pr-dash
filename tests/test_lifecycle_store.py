@@ -1,0 +1,1092 @@
+from __future__ import annotations
+
+import math
+import os
+import threading
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from stat import S_IMODE
+
+import pytest
+from pydantic import ValidationError
+
+from agentic_pr_dash.lifecycle_models import (
+    EnqueueStatusV1,
+    IntentLifecycleStateV1,
+    MaintenanceIntentRecordV1,
+    MaintenanceIntentV1,
+    MaintenanceKeyV1,
+    MaintenanceSnapshotV1,
+    MaintenanceTargetV1,
+    ObservationHealthV1,
+    RequiredCIStateV1,
+    SnapshotReadStatusV1,
+)
+from agentic_pr_dash.lifecycle_store import (
+    LifecycleStore,
+    canonical_job_hash,
+    enqueue_maintenance,
+    ingress_identity_hash,
+    mark_maintenance_intent_no_pr,
+    read_maintenance_snapshot,
+    write_maintenance_snapshot,
+)
+
+OBSERVED_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
+
+
+def _intent(
+    *,
+    repository: str = "Acme/Widget",
+    head_sha: str = "a" * 40,
+    workflow_type: str = "pr-maintenance",
+    reason: str = "post-push maintenance",
+    requested_at: datetime = OBSERVED_AT,
+    pr_number: int | None = 42,
+) -> MaintenanceIntentV1:
+    return MaintenanceIntentV1(
+        repository=repository,
+        pushed_ref="refs/heads/feature/thing",
+        head_sha=head_sha,
+        workflow_type=workflow_type,
+        reason=reason,
+        worktree_path="/tmp/worktree",
+        session_id="session-1",
+        requested_at=requested_at,
+        pr_number=pr_number,
+    )
+
+
+def _key(
+    *,
+    repository: str = "Acme/Widget",
+    head_sha: str = "a" * 40,
+    workflow_type: str = "pr-maintenance",
+    pr_number: int = 42,
+) -> MaintenanceKeyV1:
+    return MaintenanceKeyV1(
+        repository=repository,
+        pr_number=pr_number,
+        head_sha=head_sha,
+        workflow_type=workflow_type,
+    )
+
+
+def _snapshot(
+    key: MaintenanceKeyV1 | None = None,
+    *,
+    observed_at: datetime = OBSERVED_AT,
+    health: ObservationHealthV1 = ObservationHealthV1.HEALTHY,
+    settled: bool = False,
+    raw_unresolved_thread_count: int = 0,
+    unaddressed_thread_count: int = 0,
+) -> MaintenanceSnapshotV1:
+    return MaintenanceSnapshotV1(
+        key=key or _key(),
+        observed_at=observed_at,
+        observation_health=health,
+        blockers=[],
+        next_actions=[],
+        required_ci_state=RequiredCIStateV1.PASSING,
+        mergeability="mergeable",
+        review_state="clean",
+        policy_unsettled_finding_count=0,
+        raw_unresolved_thread_count=raw_unresolved_thread_count,
+        unaddressed_thread_count=unaddressed_thread_count,
+        stable_observation_count=2,
+        stable_observation_first_at=observed_at - timedelta(seconds=10),
+        stable_observation_last_at=observed_at,
+        settled=settled,
+    )
+
+
+def test_repository_is_trimmed_for_display_and_casefolded_for_identity() -> None:
+    intent = _intent(repository="  Acme/Widget  ")
+    equivalent = _intent(repository="acme/widget")
+
+    assert intent.repository == "Acme/Widget"
+    assert intent.normalized_repository == "acme/widget"
+    assert ingress_identity_hash(intent) == ingress_identity_hash(equivalent)
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "Acme/Widget",
+        "git@github.com:Acme/Widget.git",
+        "ssh://git@github.com/Acme/Widget.git",
+        "https://github.com/Acme/Widget.git",
+    ],
+)
+def test_repository_clone_urls_share_owner_name_identity(repository: str) -> None:
+    intent = _intent(repository=repository)
+
+    assert intent.repository == "Acme/Widget"
+    assert intent.normalized_repository == "acme/widget"
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://gitlab.com/Acme/Widget.git",
+        "git@gitlab.com:Acme/Widget.git",
+        "ssh://git@evil.example/Acme/Widget.git",
+    ],
+)
+def test_repository_clone_urls_reject_malformed_hosts(repository: str) -> None:
+    with pytest.raises(ValidationError):
+        _intent(repository=repository)
+
+
+def test_models_reject_blank_fields_and_nonpositive_pr() -> None:
+    for field in (
+        "repository",
+        "pushed_ref",
+        "head_sha",
+        "workflow_type",
+        "reason",
+        "worktree_path",
+        "session_id",
+    ):
+        data = _intent().model_dump()
+        data[field] = "  "
+        with pytest.raises(ValidationError):
+            MaintenanceIntentV1(**data)
+    with pytest.raises(ValidationError):
+        _intent(pr_number=0)
+
+    key_data = _key().model_dump()
+    for field in ("repository", "head_sha", "workflow_type"):
+        with pytest.raises(ValidationError):
+            MaintenanceKeyV1(**{**key_data, field: "  "})
+    with pytest.raises(ValidationError):
+        MaintenanceKeyV1(**{**key_data, "pr_number": 0})
+
+
+def test_snapshot_models_are_frozen_and_extra_forbid() -> None:
+    intent = _intent()
+    key = _key()
+    snapshot = _snapshot()
+
+    for model in (intent, key, snapshot):
+        with pytest.raises(ValidationError):
+            model.__class__.model_validate({**model.model_dump(), "extra": 1})
+        with pytest.raises(ValidationError):
+            model.repository = "other/repo"  # type: ignore[misc]
+
+
+def test_settled_snapshot_rejects_unhealthy_or_unknown_facts() -> None:
+    with pytest.raises(ValidationError):
+        _snapshot(health=ObservationHealthV1.UNKNOWN, settled=True)
+
+
+def test_settled_snapshot_allows_visibly_addressed_open_threads() -> None:
+    snapshot = _snapshot(raw_unresolved_thread_count=1, settled=True)
+
+    assert snapshot.raw_unresolved_thread_count == 1
+    assert snapshot.unaddressed_thread_count == 0
+
+
+def test_settled_snapshot_rejects_unaddressed_threads() -> None:
+    with pytest.raises(ValidationError):
+        _snapshot(unaddressed_thread_count=1, settled=True)
+
+
+def test_snapshot_fact_collections_are_immutable() -> None:
+    snapshot = _snapshot()
+
+    assert isinstance(snapshot.blockers, tuple)
+    assert isinstance(snapshot.next_actions, tuple)
+    with pytest.raises(AttributeError):
+        snapshot.blockers.append("required_ci_failed")  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        snapshot.next_actions.append("fix_ci")  # type: ignore[attr-defined]
+    assert snapshot.model_dump(mode="json")["blockers"] == []
+    assert snapshot.model_dump(mode="json")["next_actions"] == []
+
+
+def test_snapshot_requires_explicit_settlement_evidence_fields() -> None:
+    complete = _snapshot().model_dump()
+    for field in (
+        "observation_health",
+        "blockers",
+        "next_actions",
+        "required_ci_state",
+        "mergeability",
+        "review_state",
+        "policy_unsettled_finding_count",
+        "raw_unresolved_thread_count",
+        "unaddressed_thread_count",
+        "stable_observation_count",
+        "stable_observation_first_at",
+        "stable_observation_last_at",
+        "settled",
+    ):
+        missing = {key: value for key, value in complete.items() if key != field}
+        with pytest.raises(ValidationError):
+            MaintenanceSnapshotV1(**missing)
+
+
+def test_v1_contract_exposes_only_canonical_fields_and_enum_members() -> None:
+    assert MaintenanceIntentV1.model_fields["pushed_ref"].validation_alias is None
+    assert (
+        MaintenanceSnapshotV1.model_fields["required_ci_state"].validation_alias is None
+    )
+    assert tuple(ObservationHealthV1.__members__) == (
+        "HEALTHY",
+        "UNHEALTHY",
+        "PARTIAL",
+        "UNKNOWN",
+        "UNAVAILABLE",
+    )
+
+
+def test_enqueue_is_duplicate_for_same_active_ingress_identity(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    first = enqueue_maintenance(_intent(), store=store)
+    second = enqueue_maintenance(_intent(reason="again"), store=store)
+
+    assert first.status is EnqueueStatusV1.ENQUEUED
+    assert second.status is EnqueueStatusV1.DUPLICATE
+    assert second.intent.requested_at == OBSERVED_AT
+
+
+def test_same_pr_number_in_different_repositories_is_isolated(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    enqueue_maintenance(_intent(repository="one/repo"), store=store)
+    other = enqueue_maintenance(_intent(repository="two/repo"), store=store)
+
+    assert other.status is EnqueueStatusV1.ENQUEUED
+
+
+def test_same_head_in_different_workflows_is_isolated(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    enqueue_maintenance(_intent(workflow_type="review"), store=store)
+    other = enqueue_maintenance(_intent(workflow_type="ci"), store=store)
+
+    assert other.status is EnqueueStatusV1.ENQUEUED
+    assert canonical_job_hash(_key(workflow_type="review")) != canonical_job_hash(
+        _key(workflow_type="ci")
+    )
+
+
+def test_no_pr_intent_reactivates_when_pr_is_known(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    first = enqueue_maintenance(unresolved, store=store)
+    store.mark_no_pr(
+        unresolved, next_attempt_at=OBSERVED_AT + timedelta(minutes=5)
+    )
+    second = enqueue_maintenance(
+        _intent(
+            pr_number=42,
+            reason="PR was created",
+            requested_at=OBSERVED_AT + timedelta(minutes=1),
+        ),
+        store=store,
+    )
+
+    assert first.status is EnqueueStatusV1.ENQUEUED
+    assert second.status is EnqueueStatusV1.REACTIVATED
+    assert second.intent.pr_number == 42
+    assert second.intent.reason == "PR was created"
+    assert second.state is IntentLifecycleStateV1.PENDING
+    assert store.list_intents()[0].next_attempt_at is None
+
+
+def test_duplicate_unresolved_enqueue_preserves_retry_backoff(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    enqueue_maintenance(unresolved, store=store)
+    retry_at = OBSERVED_AT + timedelta(minutes=5)
+    store.mark_no_pr(unresolved, next_attempt_at=retry_at)
+
+    duplicate = enqueue_maintenance(
+        unresolved.model_copy(
+            update={
+                "reason": "duplicate push",
+                "requested_at": OBSERVED_AT + timedelta(minutes=1),
+            }
+        ),
+        store=store,
+    )
+
+    record = store.list_intents()[0]
+    assert duplicate.status is EnqueueStatusV1.DUPLICATE
+    assert record.next_attempt_at == retry_at
+    assert record.intent.reason == unresolved.reason
+
+
+def test_duplicate_active_enqueue_refreshes_operational_metadata(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    original = _intent().model_copy(
+        update={"worktree_path": "/tmp/deleted-worktree"}
+    )
+    enqueue_maintenance(original, store=store)
+    retry_at = OBSERVED_AT + timedelta(minutes=5)
+    store.schedule_retry(original, next_attempt_at=retry_at)
+
+    duplicate = enqueue_maintenance(
+        original.model_copy(
+            update={
+                "worktree_path": "/tmp/replacement-worktree",
+                "session_id": "replacement-session",
+                "requested_at": OBSERVED_AT + timedelta(minutes=1),
+            }
+        ),
+        store=store,
+    )
+
+    record = store.list_intents()[0]
+    assert duplicate.status is EnqueueStatusV1.DUPLICATE
+    assert record.intent.worktree_path == "/tmp/replacement-worktree"
+    assert record.intent.session_id == "replacement-session"
+    assert record.next_attempt_at == retry_at
+    assert record.revision == 3
+
+
+def test_stale_mark_no_pr_cannot_overwrite_known_pr_reactivation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    enqueue_maintenance(unresolved, store=store)
+    stale = store.list_intents()[0]
+    store.enqueue(
+        unresolved.model_copy(
+            update={"pr_number": 42, "reason": "PR created"}
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.mark_no_pr(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+    assert current.intent.pr_number == 42
+
+
+def test_stale_settle_cannot_consume_settled_record_reactivation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    initial = store.list_intents()[0]
+    settled = store.settle_intent(
+        intent,
+        _key(),
+        expected_generation=initial.generation,
+        expected_revision=initial.revision,
+    )
+    store.enqueue(intent.model_copy(update={"reason": "new reviewer feedback"}))
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.settle_intent(
+            settled.intent,
+            _key(),
+            expected_generation=settled.generation,
+            expected_revision=settled.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == settled.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+
+
+def test_stale_retry_and_promotion_cannot_mutate_reactivated_generation(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    unresolved = _intent(pr_number=None)
+    store.enqueue(unresolved)
+    stale = store.list_intents()[0]
+    store.enqueue(unresolved.model_copy(update={"pr_number": 42}))
+
+    with pytest.raises(RuntimeError, match="generation"):
+        store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+    with pytest.raises(RuntimeError, match="generation"):
+        store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation + 1
+    assert current.state is IntentLifecycleStateV1.PENDING
+    assert current.next_attempt_at is None
+
+
+def test_same_generation_stale_mark_no_pr_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    newer = store.schedule_retry(
+        intent,
+        next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.mark_no_pr(
+            stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.generation == stale.generation
+    assert current.revision == newer.revision
+    assert current.state is IntentLifecycleStateV1.PENDING
+
+
+def test_same_generation_stale_retry_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    promoted = store.promote_intent(
+        intent,
+        _key(),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.revision == promoted.revision
+    assert current.state is IntentLifecycleStateV1.PROMOTED
+
+
+def test_same_generation_stale_promotion_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    no_pr = store.mark_no_pr(
+        intent,
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    current = store.list_intents()[0]
+    assert current.revision == no_pr.revision
+    assert current.state is IntentLifecycleStateV1.NO_PR
+
+
+def test_settled_state_rejects_same_generation_stale_mutations(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    terminal_snapshot = _snapshot(settled=True)
+    settled = store.settle_intent(
+        intent,
+        _key(),
+        snapshot=terminal_snapshot,
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    stale_calls = (
+        lambda: store.mark_no_pr(
+            stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.schedule_retry(
+            stale.intent,
+            next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.promote_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+        lambda: store.settle_intent(
+            stale.intent,
+            _key(),
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        ),
+    )
+    for mutate in stale_calls:
+        with pytest.raises(RuntimeError, match="revision"):
+            mutate()
+
+    current = store.list_intents()[0]
+    assert current.state is IntentLifecycleStateV1.SETTLED
+    assert current.revision == settled.revision
+    assert store.read_snapshot(
+        MaintenanceTargetV1.exact(_key()), now=OBSERVED_AT
+    ).snapshot == terminal_snapshot
+
+
+def test_same_generation_stale_snapshot_write_is_rejected(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=42)
+    store.enqueue(intent)
+    stale = store.list_intents()[0]
+    store.schedule_retry(
+        intent,
+        next_attempt_at=OBSERVED_AT + timedelta(minutes=5),
+        expected_generation=stale.generation,
+        expected_revision=stale.revision,
+    )
+
+    with pytest.raises(RuntimeError, match="revision"):
+        store.write_snapshot(
+            _snapshot(),
+            intent=stale.intent,
+            expected_generation=stale.generation,
+            expected_revision=stale.revision,
+        )
+
+    assert (
+        store.read_snapshot(
+            MaintenanceTargetV1.exact(_key()), now=OBSERVED_AT
+        ).status
+        is SnapshotReadStatusV1.MISSING
+    )
+
+
+def test_list_intents_filters_typed_states_without_deleting_records(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    pending = _intent(head_sha="a" * 40, pr_number=42)
+    no_pr = _intent(head_sha="b" * 40, pr_number=None)
+    enqueue_maintenance(pending, store=store)
+    enqueue_maintenance(no_pr, store=store)
+
+    listed = store.list_intents(states={IntentLifecycleStateV1.PENDING})
+    all_records = store.list_intents()
+
+    assert [record.intent.head_sha for record in listed] == [pending.head_sha]
+    assert {record.state for record in all_records} == {
+        IntentLifecycleStateV1.PENDING,
+        IntentLifecycleStateV1.NO_PR,
+    }
+    assert store.intent_path(pending).is_file()
+    assert store.intent_path(no_pr).is_file()
+
+
+def test_list_intents_skips_unreadable_records(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(head_sha="a" * 40, pr_number=42)
+    enqueue_maintenance(intent, store=store)
+    corrupt = store.root / "intents" / "corrupt.json"
+    corrupt.parent.mkdir(parents=True, exist_ok=True)
+    corrupt.write_text("{not-json", encoding="utf-8")
+
+    listed = store.list_intents()
+
+    assert [record.intent.head_sha for record in listed] == [intent.head_sha]
+
+
+def test_mark_no_pr_exposes_unresolved_lookup_state(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+
+    enqueue_maintenance(intent, store=store)
+    record = mark_maintenance_intent_no_pr(intent, store=store)
+
+    assert record.state is IntentLifecycleStateV1.NO_PR
+    assert record.intent.pr_number is None
+
+
+def test_snapshot_is_fresh_at_ninety_seconds_and_stale_afterward(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    snapshot = _snapshot(observed_at=OBSERVED_AT)
+    write_maintenance_snapshot(snapshot, store=store)
+
+    fresh = read_maintenance_snapshot(
+        MaintenanceTargetV1(key=snapshot.key),
+        store=store,
+        now=OBSERVED_AT + timedelta(seconds=90),
+    )
+    stale = read_maintenance_snapshot(
+        MaintenanceTargetV1(key=snapshot.key),
+        store=store,
+        now=OBSERVED_AT + timedelta(seconds=90, microseconds=1),
+    )
+
+    assert fresh.status is SnapshotReadStatusV1.FRESH
+    assert stale.status is SnapshotReadStatusV1.STALE
+
+
+@pytest.mark.parametrize(
+    "max_age_seconds",
+    [-1.0, math.nan, math.inf, -math.inf],
+)
+def test_snapshot_readers_reject_invalid_max_age(
+    tmp_path: Path, max_age_seconds: float
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    target = MaintenanceTargetV1(key=_key())
+
+    with pytest.raises(ValueError):
+        store.read_snapshot(target, max_age_seconds=max_age_seconds)
+    with pytest.raises(ValueError):
+        read_maintenance_snapshot(target, store=store, max_age_seconds=max_age_seconds)
+
+
+def test_corrupt_snapshot_returns_invalid(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    snapshot = _snapshot()
+    write_maintenance_snapshot(snapshot, store=store)
+    store.snapshot_path(snapshot.key).write_text("{not-json", encoding="utf-8")
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1(key=snapshot.key), store=store, now=OBSERVED_AT
+    )
+
+    assert result.status is SnapshotReadStatusV1.INVALID
+    assert result.snapshot is None
+
+
+def test_json_null_snapshot_returns_invalid(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    snapshot = _snapshot()
+    write_maintenance_snapshot(snapshot, store=store)
+    store.snapshot_path(snapshot.key).write_text("null", encoding="utf-8")
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1(key=snapshot.key), store=store, now=OBSERVED_AT
+    )
+
+    assert result.status is SnapshotReadStatusV1.INVALID
+
+
+def test_old_head_cannot_satisfy_new_head_target(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    old = _snapshot(_key(head_sha="b" * 40))
+    write_maintenance_snapshot(old, store=store)
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1(key=_key(head_sha="c" * 40)),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status is SnapshotReadStatusV1.MISSING
+    assert result.snapshot is None
+
+
+def test_unresolved_target_follows_promotion_link(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=None)
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    store.promote_intent(intent, snapshot.key)
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status is SnapshotReadStatusV1.FRESH
+    assert result.snapshot is not None
+    assert result.snapshot.key == snapshot.key
+
+
+@pytest.mark.parametrize(
+    "state", [IntentLifecycleStateV1.PENDING, IntentLifecycleStateV1.NO_PR]
+)
+def test_unresolved_target_ignores_link_unless_intent_is_promoted(
+    tmp_path: Path, state: IntentLifecycleStateV1
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=None)
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(intent),
+        intent=intent,
+        state=state,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status is SnapshotReadStatusV1.MISSING
+
+
+@pytest.mark.parametrize("intent_pr_number", [None, 99])
+def test_unresolved_target_rejects_inconsistent_promoted_intent_pr(
+    tmp_path: Path, intent_pr_number: int | None
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=None)
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(pr_number=42, head_sha=intent.head_sha))
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(intent),
+        intent=_intent(pr_number=intent_pr_number),
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
+def test_unresolved_target_rejects_tampered_promoted_ingress_id(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    linked = MaintenanceIntentRecordV1(
+        ingress_id="tampered-ingress-id",
+        intent=intent,
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "promote", "mark_no_pr"])
+def test_mutations_reject_tampered_intent_record_ingress_id(
+    tmp_path: Path, operation: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id="tampered-ingress-id",
+        intent=intent,
+        state=IntentLifecycleStateV1.PENDING,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        if operation == "enqueue":
+            enqueue_maintenance(intent, store=store)
+        elif operation == "promote":
+            store.promote_intent(intent, _key(head_sha=intent.head_sha))
+        else:
+            mark_maintenance_intent_no_pr(intent, store=store)
+
+
+@pytest.mark.parametrize("operation", ["enqueue", "promote", "mark_no_pr"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "Other/Repo"),
+        ("pushed_ref", "refs/heads/other"),
+        ("head_sha", "b" * 40),
+        ("workflow_type", "other-workflow"),
+    ],
+)
+def test_mutations_reject_embedded_intent_identity_mismatch(
+    tmp_path: Path, operation: str, field: str, value: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    intent_data = intent.model_dump()
+    intent_data[field] = value
+    corrupted_intent = MaintenanceIntentV1(**intent_data)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(intent),
+        intent=corrupted_intent,
+        state=IntentLifecycleStateV1.PENDING,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        if operation == "enqueue":
+            enqueue_maintenance(intent, store=store)
+        elif operation == "promote":
+            store.promote_intent(intent, _key(head_sha=intent.head_sha))
+        else:
+            mark_maintenance_intent_no_pr(intent, store=store)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "Other/Repo"),
+        ("pushed_ref", "refs/heads/other"),
+        ("head_sha", "b" * 40),
+        ("workflow_type", "other-workflow"),
+    ],
+)
+def test_unresolved_target_rejects_cross_identity_promoted_record(
+    tmp_path: Path, field: str, value: str
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    enqueue_maintenance(intent, store=store)
+    snapshot = _snapshot(_key(head_sha=intent.head_sha))
+    intent_data = intent.model_dump()
+    intent_data[field] = value
+    corrupted_intent = MaintenanceIntentV1(**intent_data)
+    linked = MaintenanceIntentRecordV1(
+        ingress_id=ingress_identity_hash(corrupted_intent),
+        intent=corrupted_intent,
+        state=IntentLifecycleStateV1.PROMOTED,
+        canonical_key=snapshot.key,
+    )
+    store.intent_path(intent).write_text(linked.model_dump_json(), encoding="utf-8")
+    write_maintenance_snapshot(snapshot, store=store)
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status in {
+        SnapshotReadStatusV1.INVALID,
+        SnapshotReadStatusV1.MISSING,
+    }
+    assert result.snapshot is None
+
+
+def test_corrupt_promotion_link_returns_invalid(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=None)
+    enqueue_maintenance(intent, store=store)
+    store.intent_path(intent).write_text("{not-json", encoding="utf-8")
+
+    result = read_maintenance_snapshot(
+        MaintenanceTargetV1.unresolved(
+            repository=intent.repository,
+            pushed_ref=intent.pushed_ref,
+            head_sha=intent.head_sha,
+            workflow_type=intent.workflow_type,
+        ),
+        store=store,
+        now=OBSERVED_AT,
+    )
+
+    assert result.status is SnapshotReadStatusV1.INVALID
+
+
+def test_default_root_honors_apd_override(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    override = tmp_path / "override"
+    monkeypatch.setenv("APD_LIFECYCLE_STATE_DIR", str(override))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg"))
+
+    assert LifecycleStore().root == override
+
+
+def test_default_root_honors_xdg_state_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("APD_LIFECYCLE_STATE_DIR", raising=False)
+    xdg = tmp_path / "xdg"
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
+
+    assert LifecycleStore().root == xdg / "agentic-pr-dash" / "lifecycle"
+
+
+def test_default_root_falls_back_to_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("APD_LIFECYCLE_STATE_DIR", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    assert (
+        LifecycleStore().root
+        == home / ".local" / "state" / "agentic-pr-dash" / "lifecycle"
+    )
+
+
+def test_atomic_snapshot_replacement_never_exposes_partial_json(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    first = _snapshot(observed_at=OBSERVED_AT)
+    second = _snapshot(observed_at=OBSERVED_AT + timedelta(seconds=1))
+    write_maintenance_snapshot(first, store=store)
+    errors: list[Exception] = []
+
+    def reader() -> None:
+        for _ in range(200):
+            try:
+                raw = store.snapshot_path(first.key).read_text(encoding="utf-8")
+                loaded = MaintenanceSnapshotV1.model_validate_json(raw)
+                assert loaded.observed_at in {first.observed_at, second.observed_at}
+            except (
+                AssertionError,
+                OSError,
+                UnicodeDecodeError,
+                ValidationError,
+            ) as exc:  # pragma: no cover - only on a torn read
+                errors.append(exc)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    for _ in range(50):
+        write_maintenance_snapshot(second if _ % 2 else first, store=store)
+    thread.join()
+
+    assert errors == []
+    assert os.stat(store.snapshot_path(first.key)).st_mode & 0o077 == 0
+
+
+def test_state_directories_and_files_are_private_on_posix(tmp_path: Path) -> None:
+    if os.name != "posix":
+        pytest.skip("POSIX permissions are not portable")
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent()
+    snapshot = _snapshot()
+    enqueue_maintenance(intent, store=store)
+    write_maintenance_snapshot(snapshot, store=store)
+
+    assert S_IMODE(store.root.stat().st_mode) == 0o700
+    assert S_IMODE((store.root / "intents").stat().st_mode) == 0o700
+    assert S_IMODE((store.root / "snapshots").stat().st_mode) == 0o700
+    assert S_IMODE(store.intent_path(intent).stat().st_mode) == 0o600
+    assert S_IMODE(store.snapshot_path(snapshot.key).stat().st_mode) == 0o600
+    assert S_IMODE((store.root / ".lifecycle.lock").stat().st_mode) == 0o600
+
+
+def test_lock_timeout_is_bounded_for_read_modify_write(tmp_path: Path) -> None:
+    if os.name != "posix":
+        pytest.skip("fcntl is not portable")
+    import fcntl
+
+    store = LifecycleStore(tmp_path / "state", lock_timeout_seconds=0.03)
+    store.root.mkdir(parents=True)
+    fd = os.open(store.root / ".lifecycle.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        started = datetime.now(UTC).timestamp()
+        with pytest.raises(TimeoutError):
+            enqueue_maintenance(_intent(), store=store)
+        assert datetime.now(UTC).timestamp() - started < 1
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+@pytest.mark.parametrize(
+    "lock_timeout_seconds",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_lock_timeout_must_be_finite_and_positive(
+    tmp_path: Path, lock_timeout_seconds: float
+) -> None:
+    with pytest.raises(ValueError):
+        LifecycleStore(tmp_path / "state", lock_timeout_seconds=lock_timeout_seconds)
+
+
+def test_read_modify_write_lock_deduplicates_concurrent_enqueues(
+    tmp_path: Path,
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    barrier = threading.Barrier(8)
+    statuses: list[EnqueueStatusV1] = []
+
+    def enqueue() -> None:
+        barrier.wait()
+        statuses.append(enqueue_maintenance(_intent(), store=store).status)
+
+    threads = [threading.Thread(target=enqueue) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert statuses.count(EnqueueStatusV1.ENQUEUED) == 1
+    assert statuses.count(EnqueueStatusV1.DUPLICATE) == 7

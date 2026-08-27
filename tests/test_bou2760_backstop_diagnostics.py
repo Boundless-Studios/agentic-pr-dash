@@ -96,6 +96,33 @@ def test_empty_review_observation_is_typed_as_observed(monkeypatch):
     assert result.value == []
 
 
+def test_review_observation_uses_explicit_repository(monkeypatch):
+    monkeypatch.setattr(
+        github_api,
+        "get_repo_info",
+        lambda cwd=None: pytest.fail("cwd repository must not be resolved"),
+    )
+    endpoints: list[str] = []
+
+    def fake_run(cmd, *args, **kwargs):
+        endpoints.extend(
+            part for part in cmd if isinstance(part, str) and part.startswith("repos/")
+        )
+        return _cp(json.dumps([[]]))
+
+    monkeypatch.setattr(github_api, "_run", fake_run)
+
+    result = github_api.get_review_submissions_observation(
+        24, HEAD, "/fork/worktree", repository="Upstream/Project"
+    )
+
+    assert result.observable
+    assert endpoints == [
+        "repos/Upstream/Project/pulls/24/reviews",
+        "repos/Upstream/Project/issues/24/comments",
+    ]
+
+
 def test_auth_failure_is_unavailable_instead_of_missing_backstop(monkeypatch):
     monkeypatch.setattr(github_api, "get_repo_info", lambda cwd=None: ("o", "r"))
     monkeypatch.setattr(

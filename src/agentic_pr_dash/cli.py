@@ -15,6 +15,7 @@ Subcommands:
     serve         Run the web dashboard.
     observe       Inspect the observability event store (comment scans, dispatches, etc.).
     stash         Race-safe labeled-stash push/apply/drop/list (shared cross-worktree stack).
+    lifecycle-hook Run the local-only cross-runtime PR convergence hook.
 
 ``check/finalize/complete/arm/list-owned/stop-gate/reconcile-prs`` route into
 the stateless maintenance executor; ``record`` / ``session-report`` into the
@@ -76,7 +77,7 @@ def _short_detail(details: dict) -> str:
 
 def _observe_main(argv: list[str]) -> int:
     import argparse
-    from datetime import datetime, timezone
+    from datetime import UTC, datetime
 
     parser = argparse.ArgumentParser(prog="agentic-pr-dash observe")
     parser.add_argument("--pr", type=int, default=None, help="Filter by PR number")
@@ -90,7 +91,7 @@ def _observe_main(argv: list[str]) -> int:
     if args.since:
         since_dt = datetime.fromisoformat(args.since)
         if since_dt.tzinfo is None:
-            since_dt = since_dt.replace(tzinfo=timezone.utc)
+            since_dt = since_dt.replace(tzinfo=UTC)
 
     store = _observe_get_event_store(args.cwd)
 
@@ -176,6 +177,10 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "stash":
         from . import stash
         return stash.main(rest)
+
+    if cmd == "lifecycle-hook":
+        from .codex_hooks import run_pr_convergence
+        return run_pr_convergence.main(rest)
 
     print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)

@@ -262,10 +262,10 @@ stay generic. Repo-specific policy can be invoked by configuration or by a local
 wrapper script in the downstream repo.
 
 The hook entrypoints stay small and declarative: pure shell-command parsing
-(segment splitting, `cd`/`gh pr` arm-target/`git push` detection, effective-git-cwd
-resolution) lives in `command_parser.py` and is shared by `run_arm_pr_watch.py`
-and `run_post_push_watch.py`, so the entrypoints only load the payload, call the
-parser, and write markers.
+(segment splitting, `cd`/`gh pr` target/`git push` detection, effective-git-cwd
+resolution) lives in `command_parser.py`. `run_pr_convergence.py` normalizes
+Claude, Codex, and Pi payloads, resolves local Git identity, and writes only
+durable lifecycle intents; it never observes GitHub or starts a worker.
 
 ## Code Map
 
@@ -277,7 +277,7 @@ parser, and write markers.
 | `src/agentic_pr_dash/github_api.py` | GitHub CLI/API access, PR metadata, CI checks, review threads, runner health. |
 | `src/agentic_pr_dash/maintenance_check.py` | Thin CLI layer: `main`, the `_cmd_*` subcommand dispatchers, arg parsing, and a re-export facade over `_maintenance/` (so `maintenance_check.X` keeps resolving for consumers and tests). |
 | `src/agentic_pr_dash/_maintenance/` | Behavior package the CLI delegates to (split out of `maintenance_check.py`): `pr_state.py` (PR resolution + GitHub reads + review threads), `markers.py` (ownership/session markers, heartbeats, leases, claims), `worktrees.py` (worktree iteration + maintenance-root resolution), `worktree_check.py` (the shared per-worktree blocker engine used by both `check` and `stop-gate`), `stop_gate.py` (stop-state, fingerprinting, prompt/waiter rendering), `completion.py` (completion replies + review-comment extraction), `reconcile.py` (orphan adoption + PR records), `waiter.py` (await pidfiles + liveness), `_common.py` (shared primitives). Cross-module calls are module-qualified so the owning module is the single monkeypatch seam. |
-| `src/agentic_pr_dash/stop_hook.py` | Typed host-adapter contract for invoking the canonical stop gate. Repositories provide only cwd/session identity and optional policy, ledger, and waiter configuration. APD preserves the gate's `0`/`2` result and owns bounded fail-closed handling for unexpected internal exceptions, including the redacted durable escape marker. |
+| `src/agentic_pr_dash/stop_hook.py` | Snapshot-only advisory Stop adapter. It reads the current exact-head lifecycle snapshot, enqueues stale/missing/invalid state, renders local blockers/actions, and always allows Stop even when state is unavailable. |
 | `src/agentic_pr_dash/maintenance.py` | Durable maintenance queue/state helpers. |
 | `src/agentic_pr_dash/loop.py` | Continuous check/fix/complete loop and executor dispatch. |
 | `src/agentic_pr_dash/orchestrator.py` | Dashboard polling, PR state machine, queue suppression, card enrichment. |
@@ -291,7 +291,7 @@ parser, and write markers.
 | `src/agentic_pr_dash/tracker.py` | Task tracker adapters. |
 | `src/agentic_pr_dash/ci_watch.py` | Thin module kept for the `python -m agentic_pr_dash.ci_watch` background-watcher entrypoint: `arm_post_push_watch`, `spawn_background_watcher`, `main`, plus a re-export facade over `_ci_watch/`. |
 | `src/agentic_pr_dash/_ci_watch/` | CI-watch behavior package: `config.py` (constants + `CIWatchConfig`/`from_env` + `eprint`), `repo.py` (git/PR helpers), `checks.py` (check snapshot/classification), `adapter.py` (status/complete adapter rendering+invocation), `results.py` (results-file serialization), `watcher.py` (background poll lifecycle). |
-| `src/agentic_pr_dash/codex_hooks/` | Hook adapters and shared hook runtime helpers, including `command_parser.py` (pure shell-command parsing: segment splitting, `cd`/`gh pr`/`git push` parsing, effective-git-cwd) shared by `run_arm_pr_watch.py` and `run_post_push_watch.py`. |
+| `src/agentic_pr_dash/codex_hooks/` | Hook adapters and shared runtime helpers, including `run_pr_convergence.py` (unified local lifecycle adapter) and `command_parser.py` (pure segment, `cd`, `gh pr`, `git push`, and effective-cwd parsing). |
 
 ## Data Model
 

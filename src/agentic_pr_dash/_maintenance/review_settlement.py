@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from agent_review_coordinator import (
     Disposition,
     Finding,
+    FindingSettlementState,
     ReviewLedger,
     ReviewPolicy,
     ReviewResult,
@@ -21,7 +22,16 @@ from agent_review_coordinator import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
-from agentic_pr_dash.github_api import ObservationReadResult, ObservationState
+from agentic_pr_dash._maintenance.completion import (
+    PolicyFindingClosure,
+    SettlementReplyStatus,
+    settlement_reply_status,
+)
+from agentic_pr_dash.github_api import (
+    COMPLETE_MARKER,
+    ObservationReadResult,
+    ObservationState,
+)
 from agentic_pr_dash.maintenance import terminal_clean_blockers
 from agentic_pr_dash.models import PRData
 
@@ -43,6 +53,8 @@ class FinalizationObservation(BaseModel):
     review: SettlementReport
     review_observation_state: ObservationState = ObservationState.OBSERVED
     diagnostics: list[str] = Field(default_factory=list)
+    addressed_thread_ids: list[str] = Field(default_factory=list)
+    unaddressed_thread_ids: list[str] = Field(default_factory=list)
     settlement_key: str = ""
 
 
@@ -118,6 +130,80 @@ def finding_from_thread(
             f"GitHub review thread {thread.node_id}; "
             f"top-level comment {thread.top.database_id}"
         ),
+    )
+
+
+def _closure_from_evaluation(
+    *,
+    ledger: ReviewLedger,
+    review: SettlementReport,
+    fingerprint: str,
+) -> PolicyFindingClosure | None:
+    finding = next(
+        (
+            item
+            for item in ledger.current_findings
+            if item.fingerprint == fingerprint
+        ),
+        None,
+    )
+    if finding is None:
+        return None
+    decision = next(
+        (
+            item
+            for item in ledger.architecture_decisions
+            if item.lineage_id == finding.lineage_id
+        ),
+        None,
+    )
+    return PolicyFindingClosure(
+        finding=finding.model_copy(deep=True),
+        state=review.finding_states.get(
+            fingerprint,
+            FindingSettlementState.UNRESOLVED,
+        ),
+        architecture_decision=(
+            decision.model_copy(deep=True) if decision is not None else None
+        ),
+    )
+
+
+def classify_finding_closure(
+    *,
+    policy: ReviewPolicy,
+    ledger: ReviewLedger,
+    fingerprint: str,
+) -> PolicyFindingClosure | None:
+    """Classify one finding solely through coordinator evaluation semantics."""
+
+    evaluated_ledger = ledger.model_copy(deep=True)
+    review = evaluate(policy=policy, ledger=evaluated_ledger)
+    return _closure_from_evaluation(
+        ledger=evaluated_ledger,
+        review=review,
+        fingerprint=fingerprint,
+    )
+
+
+def classify_thread_closure(
+    thread,
+    *,
+    policy: ReviewPolicy,
+    ledger: ReviewLedger,
+) -> PolicyFindingClosure | None:
+    """Find the coordinator closure corresponding to one current thread."""
+
+    finding = finding_from_thread(
+        thread,
+        repository=ledger.repository,
+        head_sha=ledger.head_sha,
+        reviewer_execution_id=f"github-thread:{thread.node_id}",
+    )
+    return classify_finding_closure(
+        policy=policy,
+        ledger=ledger,
+        fingerprint=finding.fingerprint,
     )
 
 
@@ -377,6 +463,8 @@ def _settlement_state_key(
     blockers: Sequence[str],
     review: SettlementReport,
     review_observation_state: ObservationState,
+    addressed_thread_ids: Sequence[str],
+    unaddressed_thread_ids: Sequence[str],
 ) -> str:
     """Hash structured settlement state, excluding rendered guidance text."""
 
@@ -390,6 +478,8 @@ def _settlement_state_key(
         "blockers": sorted(blockers),
         "review": review_state,
         "review_observation_state": review_observation_state.value,
+        "addressed_thread_ids": sorted(addressed_thread_ids),
+        "unaddressed_thread_ids": sorted(unaddressed_thread_ids),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -405,6 +495,7 @@ def evaluate_pr_snapshot(
     deferrals: Mapping[str, Mapping[str, object]],
     review_submissions: Sequence = (),
     review_observation: ObservationReadResult[Sequence] | None = None,
+    maintenance_author: str = "",
 ) -> FinalizationObservation:
     """Combine one live PR snapshot with provider-neutral review settlement."""
 
@@ -469,6 +560,41 @@ def evaluate_pr_snapshot(
         reviewer_count=policy.review.backstop.reviewer_count,
     )
     review = evaluate(policy=policy, ledger=settled_ledger)
+    addressed_thread_ids: list[str] = []
+    unaddressed_thread_ids: list[str] = []
+    for thread in current_threads:
+        finding = finding_from_thread(
+            thread,
+            repository=settled_ledger.repository,
+            head_sha=settled_ledger.head_sha,
+            reviewer_execution_id=f"github-thread:{thread.node_id}",
+        )
+        closure = _closure_from_evaluation(
+            ledger=settled_ledger,
+            review=review,
+            fingerprint=finding.fingerprint,
+        )
+        if closure is None or not closure.addressed:
+            unaddressed_thread_ids.append(thread.node_id)
+            continue
+        if closure.resolve_thread:
+            unaddressed_thread_ids.append(thread.node_id)
+            _append_once(blockers, "unresolved_fixed_review_threads")
+            continue
+        # Deferred findings use the same canonical reply contract as every
+        # other policy disposition; the completion publisher is responsible
+        # for upgrading legacy free-form deferral replies before this gate.
+        reply_status = settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author=maintenance_author,
+        )
+        if reply_status is SettlementReplyStatus.FRESH:
+            addressed_thread_ids.append(thread.node_id)
+        else:
+            unaddressed_thread_ids.append(thread.node_id)
+            _append_once(blockers, "unaddressed_review_threads")
     if review_observation_state is ObservationState.UNAVAILABLE:
         _append_once(blockers, "review_observation_unavailable")
     if review_observation_state in {
@@ -507,6 +633,8 @@ def evaluate_pr_snapshot(
         blockers=blockers,
         review=review,
         review_observation_state=review_observation_state,
+        addressed_thread_ids=addressed_thread_ids,
+        unaddressed_thread_ids=unaddressed_thread_ids,
     )
     return FinalizationObservation(
         repository=final_repository,
@@ -516,6 +644,8 @@ def evaluate_pr_snapshot(
         review=review,
         review_observation_state=review_observation_state,
         diagnostics=diagnostics,
+        addressed_thread_ids=addressed_thread_ids,
+        unaddressed_thread_ids=unaddressed_thread_ids,
         settlement_key=settlement_key,
     )
 

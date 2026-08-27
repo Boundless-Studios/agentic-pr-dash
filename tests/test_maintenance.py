@@ -76,3 +76,13 @@ def test_prompt_template_override(tmp_path, monkeypatch):
     config.load.cache_clear()
     prompt = maintenance.build_maintenance_prompt(_pr(worktree_path=str(tmp_path)))
     assert "FOLLOW THE HOUSE RULES." in prompt
+
+
+def test_changes_requested_prompt_instructs_agent_to_fetch_review_body(tmp_path):
+    prompt = maintenance.build_maintenance_prompt(
+        _pr(worktree_path=str(tmp_path), review_decision="CHANGES_REQUESTED")
+    )
+
+    assert "## Changes Requested" in prompt
+    assert "top-level review" in prompt
+    assert "fetch" in prompt.casefold()
