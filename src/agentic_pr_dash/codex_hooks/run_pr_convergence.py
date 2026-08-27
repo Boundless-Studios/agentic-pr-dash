@@ -13,6 +13,7 @@ from agentic_pr_dash.codex_hooks._payload import load_payload, normalized_payloa
 from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
+    git_push_source_branch,
     is_git_push,
     parse_gh_pr_arm_target,
     split_command_segments,
@@ -276,9 +277,23 @@ def local_git_identity(
     *,
     branch: str | None = None,
 ) -> LocalGitIdentity | None:
+    if branch is not None:
+        wanted = _local_branch_ref(branch)
+        if wanted is None:
+            return None
+        worktree = ""
+        candidate = ""
+        for line in _git(cwd, "worktree", "list", "--porcelain"):
+            if line.startswith("worktree "):
+                candidate = line.removeprefix("worktree ")
+            elif line == f"branch {wanted}":
+                worktree = candidate
+                break
+        if not worktree:
+            return None
+        cwd = worktree
     return _filesystem_git_identity(cwd, branch=branch) or _subprocess_git_identity(
-        cwd,
-        branch=branch,
+        cwd, branch=branch
     )
 
 
@@ -398,6 +413,13 @@ def _successful_targets(
     output_proves_single_push = push_segments == 1 and _output_proves_push_succeeded(
         payload
     )
+    pr_segments = sum(
+        index not in ambiguous and parse_gh_pr_arm_target(segment) is not None
+        for index, (_operator, segment) in enumerate(segments)
+    )
+    output_proves_single_pr = (
+        pr_segments == 1 and _output_pr_identity(payload) is not None
+    )
     states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {
         (True, base_cwd): frozenset()
     }
@@ -433,18 +455,24 @@ def _successful_targets(
                     proven_targets,
                 )
                 continue
-            outcomes = (True,) if push and output_proves_single_push else (True, False)
+            proven_success = (push and output_proves_single_push) or (
+                pr_target is not None and output_proves_single_pr
+            )
+            outcomes = (True,) if proven_success else (True, False)
             for succeeded in outcomes:
                 next_targets = proven_targets
                 if succeeded and cwd is not None:
                     if push:
+                        has_refspec, source_branch = git_push_source_branch(segment)
+                        if has_refspec and source_branch is None:
+                            continue
                         next_targets |= {
                             (
                                 index,
                                 "push",
                                 effective_git_cwd(segment, cwd),
                                 None,
-                                None,
+                                source_branch,
                             )
                         }
                     elif pr_target is not None:
@@ -485,6 +513,13 @@ def _enqueue_target(
     identity = local_git_identity(cwd, branch=target_branch)
     if identity is None:
         return
+    if kind == "pr" and pr_number is not None and target_branch is None:
+        identity = LocalGitIdentity(
+            identity.repository,
+            f"refs/pull/{pr_number}/head",
+            f"unresolved-pr:{pr_number}",
+            identity.worktree_path,
+        )
     if kind == "push":
         canonical_repository = _prior_pr_repository(identity, state_root)
         if canonical_repository is not None:

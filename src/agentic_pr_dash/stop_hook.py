@@ -8,6 +8,8 @@ from os import PathLike
 
 from .codex_hooks.run_pr_convergence import (
     WORKFLOW_TYPE,
+    LocalGitIdentity,
+    _prior_pr_repository,
     build_maintenance_intent,
     local_git_identity,
 )
@@ -66,8 +68,18 @@ def run_stop_hook(
     try:
         identity = local_git_identity(request.cwd)
         if identity is None:
-            print("[pr-convergence] advisory snapshot=invalid local_git_identity=missing")
+            print(
+                "[pr-convergence] advisory snapshot=invalid local_git_identity=missing"
+            )
             return 0
+        prior_repository = _prior_pr_repository(identity, request.state_root)
+        if prior_repository is not None:
+            identity = LocalGitIdentity(
+                prior_repository,
+                identity.pushed_ref,
+                identity.head_sha,
+                identity.worktree_path,
+            )
         target = MaintenanceTargetV1.unresolved(
             repository=identity.repository,
             pushed_ref=identity.pushed_ref,

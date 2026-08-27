@@ -6,6 +6,7 @@ invocations, ``git push`` detection, and the effective git cwd. They are pure
 (stdlib ``shlex``/``pathlib`` only, no config or I/O) so both ``run_arm_pr_watch``
 and ``run_post_push_watch`` can share them and they can be tested in isolation.
 """
+
 from __future__ import annotations
 
 import os
@@ -275,6 +276,44 @@ def is_git_push(command: str) -> bool:
             return False
         return False
     return False
+
+
+def git_push_source_branch(command: str) -> tuple[bool, str | None]:
+    """Return whether push has refspecs and its single local branch source."""
+    try:
+        tokens = shlex.split(command, comments=True)
+    except ValueError:
+        return False, None
+    index = _skip_command_prefixes(tokens)
+    while index < len(tokens) and tokens[index] != "push":
+        index += 1
+    if index >= len(tokens):
+        return False, None
+    index += 1
+    value_options = {"--repo", "--receive-pack", "--exec"}
+    positionals: list[str] = []
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            positionals.extend(tokens[index + 1 :])
+            break
+        if token in value_options:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        positionals.append(token)
+        index += 1
+    refspecs = positionals[1:] if positionals else []  # first positional is repository
+    if not refspecs:
+        return False, None
+    if len(refspecs) != 1:
+        return True, None
+    source = refspecs[0].lstrip("+").split(":", 1)[0]
+    if not source or source == "HEAD" or source.startswith("refs/tags/"):
+        return True, None
+    return True, source.removeprefix("refs/heads/")
 
 
 def effective_git_cwd(command: str, base_cwd: str) -> str:

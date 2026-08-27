@@ -273,6 +273,38 @@ class LifecycleWorkflow:
                 return "no_pr"
             self._persist_unavailable(record, record.intent.pr_number)
             return "deferred"
+        if record.intent.head_sha.startswith("unresolved-pr:"):
+            from agentic_pr_dash.codex_hooks.run_pr_convergence import (
+                local_git_identity,
+            )
+
+            branch = str(resolved.payload.get("headRefName") or "")
+            identity = local_git_identity(record.intent.worktree_path, branch=branch)
+            if identity is None or identity.head_sha != resolved.head_sha:
+                self._persist_unavailable(record, resolved.number)
+                return "deferred"
+            replacement = record.intent.model_copy(
+                update={
+                    "repository": resolved.repository,
+                    "pushed_ref": identity.pushed_ref,
+                    "head_sha": resolved.head_sha,
+                    "worktree_path": identity.worktree_path,
+                }
+            )
+            self.store.enqueue(replacement)
+            placeholder_key = MaintenanceKeyV1(
+                repository=record.intent.repository,
+                pr_number=resolved.number,
+                head_sha=record.intent.head_sha,
+                workflow_type=record.intent.workflow_type,
+            )
+            self.store.settle_intent(
+                record.intent,
+                placeholder_key,
+                expected_generation=record.generation,
+                expected_revision=record.revision,
+            )
+            return "progressed"
         if resolved.payload.get("state") == "MERGED":
             key = MaintenanceKeyV1(
                 repository=resolved.repository,
@@ -656,7 +688,10 @@ def _lifecycle_settlement_key(observation: FinalizationObservation, pr: PRData) 
 
     payload = {
         "review": observation.settlement_key,
-        "ci_checks": [check.model_dump(mode="json") for check in pr.ci_checks],
+        "ci_checks": sorted(
+            (check.model_dump(mode="json") for check in pr.ci_checks),
+            key=lambda check: json.dumps(check, sort_keys=True, separators=(",", ":")),
+        ),
         "threads": sorted(
             comment.thread_id
             for comment in pr.review_comments

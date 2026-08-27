@@ -396,6 +396,8 @@ def test_pr_branch_target_uses_the_exact_local_ref_identity(
     _git(repo, "commit", "-m", "branch head")
     branch_head = _git(repo, "rev-parse", "HEAD")
     _git(repo, "checkout", "feature/thin-hooks")
+    named_worktree = tmp_path / "named-worktree"
+    _git(repo, "worktree", "add", str(named_worktree), "feature/pr-head")
     state_root = tmp_path / "state"
     payload = {
         "hook_event_name": "PostToolUse",
@@ -416,13 +418,14 @@ def test_pr_branch_target_uses_the_exact_local_ref_identity(
     intent = records[0].intent
     assert intent.pushed_ref == "refs/heads/feature/pr-head"
     assert intent.head_sha == branch_head
+    assert intent.worktree_path == str(named_worktree)
 
 
 def test_numeric_ready_target_uses_named_pr_identity(
     tmp_path: Path, monkeypatch
 ) -> None:
     adapter = _adapter()
-    repo, current_head = _repository(tmp_path)
+    repo, _current_head = _repository(tmp_path)
     state_root = tmp_path / "state"
     payload = {
         "hook_event_name": "PostToolUse",
@@ -437,15 +440,15 @@ def test_numeric_ready_target_uses_named_pr_identity(
 
     intent = LifecycleStore(state_root).list_intents()[0].intent
     assert intent.pr_number == 42
-    assert intent.pushed_ref == "refs/heads/feature/thin-hooks"
-    assert intent.head_sha == current_head
+    assert intent.pushed_ref == "refs/pull/42/head"
+    assert intent.head_sha == "unresolved-pr:42"
 
 
 def test_numeric_ready_target_never_observes_github_in_the_hook(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     adapter = _adapter()
-    repo, head = _repository(tmp_path)
+    repo, _head = _repository(tmp_path)
     monkeypatch.setattr(
         adapter,
         "_resolve_numeric_pr_identity",
@@ -466,7 +469,110 @@ def test_numeric_ready_target_never_observes_github_in_the_hook(
 
     intent = LifecycleStore(state_root).list_intents()[0].intent
     assert intent.pr_number == 42
-    assert intent.head_sha == head
+    assert intent.head_sha == "unresolved-pr:42"
+
+
+def test_numeric_ready_identity_is_replaced_after_dashboard_resolution(
+    tmp_path: Path,
+) -> None:
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow, _ResolvedPR
+
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr ready 42"},
+            "tool_response": {"exit_code": 0},
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=state_root,
+        now=NOW,
+    )
+    store = LifecycleStore(state_root)
+    record = store.list_intents()[0]
+    payload = {
+        "number": 42,
+        "headRefName": "feature/thin-hooks",
+        "headRefOid": head,
+        "url": "https://github.com/Acme/Widget/pull/42",
+        "state": "OPEN",
+        "isDraft": False,
+    }
+
+    assert (
+            LifecycleWorkflow(store, context_loader=lambda _record: None)._resolution_outcome(
+            record, _ResolvedPR(payload, "Acme/Widget", 42, head)
+        )
+        == "progressed"
+    )
+
+    pending = [
+        item.intent
+        for item in store.list_intents()
+        if item.state is IntentLifecycleStateV1.PENDING
+    ]
+    assert len(pending) == 1
+    assert pending[0].head_sha == head
+    assert pending[0].pushed_ref == "refs/heads/feature/thin-hooks"
+
+
+def test_explicit_push_refspec_uses_source_branch_identity(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, _ = _repository(tmp_path)
+    _git(repo, "checkout", "-b", "feature/pushed")
+    (repo / "pushed.txt").write_text("pushed\n", encoding="utf-8")
+    _git(repo, "add", "pushed.txt")
+    _git(repo, "commit", "-m", "pushed branch")
+    pushed_head = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "feature/thin-hooks")
+    pushed_worktree = tmp_path / "pushed-worktree"
+    _git(repo, "worktree", "add", str(pushed_worktree), "feature/pushed")
+
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin feature/pushed"},
+            "tool_response": {
+                "exit_code": 0,
+                "stderr": "* [new branch] feature/pushed -> feature/pushed",
+            },
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=tmp_path / "state",
+        now=NOW,
+    )
+
+    intent = LifecycleStore(tmp_path / "state").list_intents()[0].intent
+    assert intent.pushed_ref == "refs/heads/feature/pushed"
+    assert intent.head_sha == pushed_head
+    assert intent.worktree_path == str(pushed_worktree)
+
+
+def test_compound_pr_create_url_proves_create_succeeded(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, _ = _repository(tmp_path)
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr create --fill; echo done"},
+            "tool_response": {
+                "exit_code": 0,
+                "stdout": "https://github.com/Acme/Widget/pull/42\ndone\n",
+            },
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=tmp_path / "state",
+        now=NOW,
+    )
+    assert LifecycleStore(tmp_path / "state").list_intents()[0].intent.pr_number == 42
 
 
 def test_pr_create_url_sets_canonical_repository_for_fork_worktree(
@@ -740,6 +846,44 @@ def test_stop_renders_fresh_and_stale_snapshot_actions_without_blocking(
     stale = capsys.readouterr().out
     assert "snapshot=stale" in stale
     assert "enqueued" in stale
+
+
+def test_stop_reuses_prior_upstream_repository(tmp_path: Path, capsys) -> None:
+    adapter = _adapter()
+    repo, _ = _repository(tmp_path, remote="git@github.com:ForkOwner/Widget.git")
+    state_root = tmp_path / "state"
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "gh pr create --fill"},
+            "tool_response": {
+                "exit_code": 0,
+                "stdout": "https://github.com/Upstream/Widget/pull/42\n",
+            },
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=state_root,
+        now=NOW,
+    )
+    store = LifecycleStore(state_root)
+    intent = store.list_intents()[0].intent
+    key = MaintenanceKeyV1(
+        repository="Upstream/Widget",
+        pr_number=42,
+        head_sha=intent.head_sha,
+        workflow_type=intent.workflow_type,
+    )
+    store.promote_intent(intent, key, snapshot=_snapshot(key, observed_at=NOW))
+
+    request = stop_hook.StopHookRequest(
+        cwd=str(repo), session_id="session-1", state_root=state_root
+    )
+    stop_hook.run_stop_hook(request, now=NOW + timedelta(seconds=1))
+
+    assert "snapshot=fresh" in capsys.readouterr().out
+    assert len(store.list_intents()) == 1
 
 
 def test_unified_adapter_records_a_durable_session_end_release(

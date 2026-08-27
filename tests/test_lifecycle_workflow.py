@@ -1802,6 +1802,51 @@ async def test_policy_finding_reaches_existing_dispatch_seam(
     assert dispatch.calls[0].review_comments
 
 
+def test_changes_requested_is_an_actionable_maintenance_blocker() -> None:
+    from agentic_pr_dash.lifecycle_workflow import _pr_data, _ResolvedPR
+    from agentic_pr_dash.maintenance import blockers_for_pr
+
+    pr = _pr_data(
+        _ResolvedPR(_pr_payload(), REPOSITORY, 7, HEAD),
+        _batch(review_decision="CHANGES_REQUESTED").observed[7],
+        "/tmp/worktree",
+    )
+    assert blockers_for_pr(pr) == ["changes_requested"]
+
+
+def test_lifecycle_settlement_key_ignores_ci_connection_order() -> None:
+    from dataclasses import replace
+
+    from agentic_pr_dash._maintenance.review_settlement import evaluate_pr_snapshot
+    from agentic_pr_dash.lifecycle_workflow import (
+        _lifecycle_settlement_key,
+        _pr_data,
+        _ResolvedPR,
+    )
+
+    first = _batch(
+        ci_checks=(
+            CICheck(name="z", status="completed", conclusion="success"),
+            CICheck(name="a", status="completed", conclusion="success"),
+        )
+    ).observed[7]
+    second = replace(first, ci_checks=tuple(reversed(first.ci_checks)))
+    resolved = _ResolvedPR(_pr_payload(), REPOSITORY, 7, HEAD)
+    pr1 = _pr_data(resolved, first, "/tmp/worktree")
+    pr2 = _pr_data(resolved, second, "/tmp/worktree")
+    observation = evaluate_pr_snapshot(
+        pr=pr1,
+        policy=_policy(),
+        ledger=_ledger(),
+        threads=(),
+        deferrals={},
+        review_observation=github_api.ObservationReadResult.observed([]),
+    )
+    assert _lifecycle_settlement_key(observation, pr1) == _lifecycle_settlement_key(
+        observation, pr2
+    )
+
+
 @pytest.mark.asyncio
 async def test_live_owner_defers_existing_orchestrator_dispatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
