@@ -257,10 +257,16 @@ def run_provider_entrypoint(
             "tool_response": {"exit_code": exit_code, "stderr": stderr},
         }
         configured_model = _option_value(argv, "--configured-model")
+        configured_provider = _option_value(argv, "--configured-provider")
         default_model = _option_value(argv, "--default-model")
-        if configured_model is not None or default_model is not None:
+        if (
+            configured_model is not None
+            or configured_provider is not None
+            or default_model is not None
+        ):
             payload["dispatch_model_resolution"] = {
                 "configured_model": configured_model,
+                "configured_provider": configured_provider,
                 "default_model": default_model,
             }
     else:
@@ -369,10 +375,16 @@ def _structured_stdin_payload(argv: list[str]) -> dict[str, object] | None:
         },
     }
     configured_model = _option_value(argv, "--configured-model")
+    configured_provider = _option_value(argv, "--configured-provider")
     default_model = _option_value(argv, "--default-model")
-    if configured_model is not None or default_model is not None:
+    if (
+        configured_model is not None
+        or configured_provider is not None
+        or default_model is not None
+    ):
         payload["dispatch_model_resolution"] = {
             "configured_model": configured_model,
+            "configured_provider": configured_provider,
             "default_model": default_model,
         }
     return payload
@@ -395,6 +407,17 @@ def _observation_from_request(
             resolution,
             ignore_user_config=structured.ignore_user_config,
         )
+        configured_provider = _adapter_configured_provider(
+            resolution, ignore_user_config=structured.ignore_user_config
+        )
+        if (
+            configured_provider is not None
+            and structured.gen_ai_provider_name == "openai"
+        ):
+            structured = replace(
+                structured,
+                gen_ai_provider_name=configured_provider,
+            )
         if (
             structured.provider is DispatchProvider.OPENCODE
             and structured.gen_ai_provider_name is None
@@ -588,6 +611,8 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
     index = 1
     while index < len(argv):
         token = argv[index]
+        if token == "--":
+            return False
         if token in {"--image", "-i"}:
             return False
         if token in value_options:
@@ -598,6 +623,17 @@ def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bo
             continue
         return token in {"exec", "e"}
     return False
+
+
+def _adapter_configured_provider(
+    resolution: object, *, ignore_user_config: bool = False
+) -> str | None:
+    if ignore_user_config or not isinstance(resolution, dict):
+        return None
+    configured = resolution.get("configured_provider")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    return None
 
 
 def _adapter_resolution_source(
@@ -747,8 +783,8 @@ def resolve_provider_model(
     """Resolve model attribution supplied by a repository adapter.
 
     ``dispatch_model_resolution`` is an optional payload mapping with
-    ``configured_model`` and ``default_model`` string candidates. An explicit
-    provider CLI model always wins.
+    ``configured_model``, ``configured_provider``, and ``default_model`` string
+    candidates. An explicit provider CLI model always wins.
     """
     if requested_model:
         return requested_model

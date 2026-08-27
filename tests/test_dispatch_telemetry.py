@@ -381,6 +381,34 @@ def test_dangerous_bypass_policy_is_not_order_dependent() -> None:
     assert attributes["gaia.dispatch.approval_mode"] == "never"
 
 
+def test_yolo_alias_sets_effective_policy_attributes() -> None:
+    telemetry = _telemetry(
+        "codex",
+        "exec",
+        "-c",
+        'sandbox_mode="read-only"',
+        "-c",
+        'approval_policy="untrusted"',
+        "--yolo",
+        "prompt",
+    )
+
+    attributes = telemetry.otel_attributes()
+    assert attributes["gaia.dispatch.sandbox_mode"] == "danger-full-access"
+    assert attributes["gaia.dispatch.approval_mode"] == "never"
+
+
+def test_remote_endpoint_value_is_redacted() -> None:
+    secret = "PRIVATE_SENTINEL"
+    telemetry = _telemetry(
+        "codex", "--remote", f"wss://user:{secret}@example.com", "exec", "prompt"
+    )
+
+    serialized = json.dumps(telemetry.otel_attributes())
+    assert secret not in serialized
+    assert telemetry.sanitized_argv[2] == "<redacted:option>"
+
+
 def test_full_auto_sets_compatible_sandbox_mode() -> None:
     telemetry = _telemetry("codex", "exec", "--full-auto", "prompt")
 

@@ -65,6 +65,7 @@ _CODEX_VALUE_OPTIONS = {
     "--model",
     "--output-last-message",
     "--profile",
+    "--remote",
     "--sandbox",
     "-a",
     "-C",
@@ -79,6 +80,7 @@ _OPENCODE_VALUE_OPTIONS = {"--model", "--session", "-m", "-s"}
 _REDACTED_VALUE_OPTIONS = {
     "--image",
     "--output-last-message",
+    "--remote",
     "--session",
     "-i",
     "-o",
@@ -459,7 +461,10 @@ def _sanitize_and_resolve(
                 oss_mode = True
             elif token == "--full-auto" and not bypass_policy:
                 full_auto = True
-            elif token == "--dangerously-bypass-approvals-and-sandbox":
+            elif token in {
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--yolo",
+            }:
                 bypass_policy = True
                 sandbox_mode = "danger-full-access"
                 approval_mode = "never"

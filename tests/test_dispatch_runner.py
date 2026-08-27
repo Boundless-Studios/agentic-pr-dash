@@ -392,6 +392,52 @@ def test_structured_help_or_version_invocation_is_rejected(
     assert callbacks == []
 
 
+def test_structured_codex_dispatch_rejects_exec_after_option_terminator(
+    tmp_path: Path,
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "--", "exec", "--help"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+
+
+def test_structured_codex_provider_uses_adapter_configured_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={
+            "configured_model": "qwen3-coder",
+            "configured_provider": "ollama",
+        },
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
