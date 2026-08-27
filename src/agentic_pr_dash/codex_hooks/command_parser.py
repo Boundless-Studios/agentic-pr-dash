@@ -266,11 +266,7 @@ def is_git_push(command: str) -> bool:
             if token.startswith("-c") and token != "-c":
                 index += 1
                 continue
-            if (
-                token.startswith("--git-dir=")
-                or token.startswith("--work-tree=")
-                or token.startswith("--namespace=")
-            ):
+            if token.startswith(("--git-dir=", "--work-tree=", "--namespace=")):
                 index += 1
                 continue
             return False

@@ -3,6 +3,7 @@
 These exercise the pure parsing helpers directly (no hook payload / I/O), as a
 companion to the end-to-end hook tests in test_codex_hooks.py.
 """
+
 from __future__ import annotations
 
 from agentic_pr_dash.codex_hooks.command_parser import (
@@ -15,7 +16,6 @@ from agentic_pr_dash.codex_hooks.command_parser import (
     parse_gh_pr_arm_target,
     split_command_segments,
 )
-
 
 # --- is_git_token -----------------------------------------------------------
 
