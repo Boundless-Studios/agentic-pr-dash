@@ -1263,10 +1263,17 @@ def _cmd_complete_unleased(
     if getattr(args, "sweep_p2", False):
         return _cmd_complete_sweep_p2(args)
 
+    from agent_review_coordinator import (  # noqa: PLC0415
+        Disposition,
+        FindingSettlementState,
+    )
+
     from . import github_api, maintenance  # noqa: PLC0415
     from ._maintenance import completion
+    from ._maintenance.completion import PolicyFindingClosure
     from ._maintenance.review_settlement import (
         classify_thread_closure,
+        finding_from_thread,
     )
     from .github_api import COMPLETE_MARKER  # noqa: PLC0415
     from .lifecycle_workflow import (
@@ -1393,6 +1400,57 @@ def _cmd_complete_unleased(
         # deferral is that this PR does not stay open waiting on it.
         if deferred_review.is_thread_deferred(cwd, resolved_pr_number, thread.node_id):
             deferred_count += 1
+            record = deferred_review.deferred_threads_for_pr(
+                cwd, resolved_pr_number
+            )[thread.node_id]
+            finding = finding_from_thread(
+                thread,
+                repository=str(pr.repo or _repo_slug(cwd)),
+                head_sha=head_sha,
+                reviewer_execution_id=f"github-thread:{thread.node_id}",
+            ).model_copy(
+                update={
+                    "disposition": Disposition.DEFER,
+                    "rationale": str(record.get("reason") or "Evaluated deferral"),
+                    "deferred_to_issue": str(record.get("ticket") or "") or None,
+                }
+            )
+            closure = PolicyFindingClosure(
+                finding=finding,
+                state=FindingSettlementState.DEFERRED_TO_EXISTING_ISSUE,
+            )
+            stub = ReviewComment(
+                id=thread.top.database_id,
+                author=thread.top.author,
+                body=thread.top.body,
+                path=thread.top.path,
+                line=thread.top.line,
+                created_at=thread.top.created_at,
+                is_inline=True,
+                thread_id=thread.node_id,
+            )
+            completion.apply_thread_settlement(
+                thread=thread,
+                closure=closure,
+                marker=COMPLETE_MARKER,
+                head_sha=head_sha,
+                fixing_commit=None,
+                maintenance_author=maintenance_author,
+                reply=lambda body, comment=stub: github_api.reply_to_review_comment(
+                    resolved_pr_number, comment, body, cwd
+                ),
+                refetch=lambda node_id=thread.node_id: next(
+                    (
+                        current
+                        for current in github_api.get_review_threads(
+                            resolved_pr_number, cwd, strict=True
+                        )
+                        if current.node_id == node_id
+                    ),
+                    None,
+                ),
+                resolve=lambda: False,
+            )
             continue
         if review_context is not None:
             closure = (

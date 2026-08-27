@@ -18,12 +18,13 @@ was added to ``_cmd_complete``'s per-thread loop.
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 
 from agentic_pr_dash import github_api, maintenance
 from agentic_pr_dash import maintenance_check as mc
+from agentic_pr_dash._maintenance import deferred_review as dr
 from agentic_pr_dash.github_api import ReviewThread, ReviewThreadComment
 from agentic_pr_dash.models import PRData, PRStatus
-from agentic_pr_dash._maintenance import deferred_review as dr
 
 ANCHOR = "backend/src/gaia/api/app.py"
 SPANS_AT_ANCHOR = [(6, 8, 6, 9)]
@@ -52,6 +53,11 @@ def _wire(monkeypatch, *, thread: ReviewThread):
     reply_calls: list[object] = []
 
     monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: _pr())
+    monkeypatch.setattr(
+        mc,
+        "load_config",
+        lambda cwd: SimpleNamespace(maintenance_mutation_identity="maintenance-bot"),
+    )
     monkeypatch.setattr(github_api, "get_local_pr_head", lambda branch, cwd: ("", ""))
     monkeypatch.setattr(github_api, "_is_ancestor", lambda a, d, cwd: False)
     monkeypatch.setattr(
@@ -65,7 +71,7 @@ def _wire(monkeypatch, *, thread: ReviewThread):
         lambda base, head, path, cwd=None: list(SPANS_AT_ANCHOR),
     )
     monkeypatch.setattr(
-        github_api, "get_review_threads", lambda n, cwd=None: [thread]
+        github_api, "get_review_threads", lambda n, cwd=None, **kwargs: [thread]
     )
 
     def _resolve(node_id, cwd=None):
@@ -101,12 +107,10 @@ def test_control_fully_addressed_thread_still_auto_resolves(monkeypatch) -> None
     assert [t for t, _ in replied] == ["t1"]
 
 
-def test_deferred_thread_is_never_auto_resolved_even_with_full_evidence(
+def test_deferred_thread_gets_canonical_reply_without_resolution(
     tmp_path, monkeypatch
 ) -> None:
-    """The fix: deferral outranks the evidence gate entirely — a deferred
-    thread is never resolved or replied to by `complete`, regardless of
-    whether the fixing commits would otherwise satisfy the evidence bar."""
+    """A deferred thread remains open but receives structured disposition."""
     thread = _thread()
     cwd = str(tmp_path)
     resolved, replied = _wire(monkeypatch, thread=thread)
@@ -119,7 +123,9 @@ def test_deferred_thread_is_never_auto_resolved_even_with_full_evidence(
 
     assert rc == 0
     assert resolved == [], "a deferred thread must never be auto-resolved by complete"
-    assert replied == [], "complete must not post its own completion reply over a deferral"
+    assert len(replied) == 1
+    assert "<!-- agentic-pr-dash:completed -->" in replied[0][1]
+    assert "- Disposition: `defer`" in replied[0][1]
 
 
 def test_deferred_thread_does_not_count_as_a_remaining_blocker(

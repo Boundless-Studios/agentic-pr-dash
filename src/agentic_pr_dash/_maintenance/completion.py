@@ -389,9 +389,9 @@ def settlement_reply_status(
 ) -> SettlementReplyStatus:
     """Return whether the exact current closure is visible after reviewer input."""
 
-    matching_reply_times: list[datetime] = []
-    reviewer_times = [_reply_timestamp(thread.top.created_at)]
-    for reply in thread.replies:
+    matching_reply_positions: list[tuple[datetime, int]] = []
+    reviewer_positions = [(_reply_timestamp(thread.top.created_at), -1)]
+    for index, reply in enumerate(thread.replies):
         metadata = parse_structured_settlement_reply(reply.body)
         timestamp = _reply_timestamp(reply.created_at)
         if (
@@ -407,20 +407,22 @@ def settlement_reply_status(
                 fixing_commit=fixing_commit,
             )
         ):
-            matching_reply_times.append(timestamp)
+            matching_reply_positions.append((timestamp, index))
         else:
             # Any later nonmatching response is new review input, including a
             # structured reply for another head, finding, or evidence set.
-            reviewer_times.append(timestamp)
-    if not matching_reply_times:
+            reviewer_positions.append((timestamp, index))
+    if not matching_reply_positions:
         return SettlementReplyStatus.MISSING
 
-    if any(timestamp is None for timestamp in reviewer_times):
+    if any(timestamp is None for timestamp, _ in reviewer_positions):
         return SettlementReplyStatus.REOPENED
     latest_reviewer = max(
-        timestamp for timestamp in reviewer_times if timestamp is not None
+        (timestamp, index)
+        for timestamp, index in reviewer_positions
+        if timestamp is not None
     )
-    if max(matching_reply_times) > latest_reviewer:
+    if max(matching_reply_positions) > latest_reviewer:
         return SettlementReplyStatus.FRESH
     return SettlementReplyStatus.REOPENED
 

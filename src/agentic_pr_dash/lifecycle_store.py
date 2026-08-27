@@ -310,9 +310,20 @@ class LifecycleStore:
                 )
                 status = EnqueueStatusV1.REACTIVATED
             else:
-                record = existing
+                intent_data = existing.intent.model_dump()
+                intent_data.update(
+                    worktree_path=intent.worktree_path,
+                    session_id=intent.session_id,
+                    requested_at=intent.requested_at,
+                )
+                record = existing.model_copy(
+                    update={
+                        "intent": MaintenanceIntentV1(**intent_data),
+                        "revision": existing.revision + 1,
+                    }
+                )
                 status = EnqueueStatusV1.DUPLICATE
-            if status is not EnqueueStatusV1.DUPLICATE:
+            if existing is None or record != existing:
                 _write_json(path, record.model_dump(mode="json"))
         return EnqueueResultV1(
             status=status,

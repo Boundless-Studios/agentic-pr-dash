@@ -130,7 +130,73 @@ def _pr_payload() -> dict[str, object]:
         "mergeStateStatus": "CLEAN",
         "mergeable": "MERGEABLE",
         "reviewDecision": "APPROVED",
+        "author": {"login": "pr-author"},
     }
+
+
+@pytest.mark.asyncio
+async def test_missing_review_context_uses_policy_neutral_observation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *a, **k: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(store, context_loader=lambda record: None).drain()
+
+    record = store.list_intents()[0]
+    assert result.progressed == 1
+    assert record.state is IntentLifecycleStateV1.PROMOTED
+    assert record.canonical_key is not None
+
+
+@pytest.mark.asyncio
+async def test_superseded_exact_head_intent_becomes_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    old_head = "b" * 40
+    store.enqueue(_intent(pr_number=7, head_sha=old_head))
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
+
+    assert result.progressed == 1
+    assert store.list_intents()[0].state is IntentLifecycleStateV1.SETTLED
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_excludes_pr_author_from_review_observation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *a, **k: _batch()
+    )
+    excluded: list[set[str]] = []
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: excluded.append(k["excluded_authors"])
+        or github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
+
+    assert excluded == [{"pr-author"}]
 
 
 def _ordered_intents(*, count: int = 2) -> list[MaintenanceIntentV1]:
@@ -608,7 +674,7 @@ async def test_dispatch_retries_after_coordinator_defers_same_facts(
 
 
 @pytest.mark.asyncio
-async def test_old_intent_head_drift_is_not_promoted_or_observed(
+async def test_old_intent_head_drift_is_retired_without_observation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = LifecycleStore(tmp_path / "state")
@@ -642,26 +708,14 @@ async def test_old_intent_head_drift_is_not_promoted_or_observed(
     repeated = await workflow.drain()
 
     record = store.list_intents()[0]
-    assert result.deferred == 1
+    assert result.progressed == 1
     assert repeated.examined == 0
-    assert record.state is IntentLifecycleStateV1.PENDING
-    assert record.canonical_key is None
-    assert record.next_attempt_at == OBSERVED_AT + timedelta(seconds=30)
+    assert record.state is IntentLifecycleStateV1.SETTLED
+    assert record.canonical_key is not None
+    assert record.canonical_key.head_sha == old_intent.head_sha
+    assert record.next_attempt_at is None
     assert calls["resolve"] == 1
     assert calls["batch"] == 0
-    drift = store.read_snapshot(
-        MaintenanceTargetV1.exact(
-            MaintenanceKeyV1(
-                repository=REPOSITORY,
-                pr_number=7,
-                head_sha=old_intent.head_sha,
-                workflow_type=old_intent.workflow_type,
-            )
-        ),
-        now=OBSERVED_AT,
-    ).snapshot
-    assert drift is not None
-    assert drift.blockers == (MaintenanceBlockerV1.OBSERVATION_UNAVAILABLE,)
 
 
 @pytest.mark.asyncio

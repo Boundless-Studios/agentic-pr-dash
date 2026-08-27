@@ -317,6 +317,34 @@ def test_duplicate_unresolved_enqueue_preserves_retry_backoff(tmp_path: Path) ->
     assert record.intent.reason == unresolved.reason
 
 
+def test_duplicate_active_enqueue_refreshes_operational_metadata(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    original = _intent().model_copy(
+        update={"worktree_path": "/tmp/deleted-worktree"}
+    )
+    enqueue_maintenance(original, store=store)
+    retry_at = OBSERVED_AT + timedelta(minutes=5)
+    store.schedule_retry(original, next_attempt_at=retry_at)
+
+    duplicate = enqueue_maintenance(
+        original.model_copy(
+            update={
+                "worktree_path": "/tmp/replacement-worktree",
+                "session_id": "replacement-session",
+                "requested_at": OBSERVED_AT + timedelta(minutes=1),
+            }
+        ),
+        store=store,
+    )
+
+    record = store.list_intents()[0]
+    assert duplicate.status is EnqueueStatusV1.DUPLICATE
+    assert record.intent.worktree_path == "/tmp/replacement-worktree"
+    assert record.intent.session_id == "replacement-session"
+    assert record.next_attempt_at == retry_at
+    assert record.revision == 3
+
+
 def test_stale_mark_no_pr_cannot_overwrite_known_pr_reactivation(
     tmp_path: Path,
 ) -> None:

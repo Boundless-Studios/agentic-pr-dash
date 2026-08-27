@@ -14,6 +14,8 @@ from agent_review_coordinator import (
     FindingSettlementState,
     ReviewLedger,
     ReviewPolicy,
+    ReviewResult,
+    ReviewStage,
 )
 
 from . import coordinator, github_api
@@ -273,8 +275,19 @@ class LifecycleWorkflow:
             self._persist_unavailable(record, resolved.number)
             return "deferred"
         if resolved.head_sha != record.intent.head_sha:
-            self._persist_unavailable(record, resolved.number)
-            return "deferred"
+            key = MaintenanceKeyV1(
+                repository=resolved.repository,
+                pr_number=resolved.number,
+                head_sha=record.intent.head_sha,
+                workflow_type=record.intent.workflow_type,
+            )
+            self.store.settle_intent(
+                record.intent,
+                key,
+                expected_generation=record.generation,
+                expected_revision=record.revision,
+            )
+            return "progressed"
         return None
 
     async def _collect_batch(
@@ -392,7 +405,7 @@ class LifecycleWorkflow:
             payload = github_api.resolve_pr(
                 intent.pr_number,
                 "number,title,headRefName,headRefOid,baseRefName,url,state,isDraft,"
-                "mergeStateStatus,mergeable,reviewDecision",
+                "mergeStateStatus,mergeable,reviewDecision,author",
                 cwd,
                 force=True,
             )
@@ -414,7 +427,7 @@ class LifecycleWorkflow:
     ) -> _ObservedPR | None:
         context = self._review_context(record)
         if context is None:
-            return None
+            context = _policy_neutral_context(record)
         policy, ledger = context
         if aggregate is None:
             owner, repo = resolved.repository.split("/", 1)
@@ -732,6 +745,11 @@ def _pr_data(
         branch=str(payload.get("headRefName") or ""),
         base_branch=str(payload.get("baseRefName") or "main"),
         url=str(payload.get("url") or ""),
+        author=(
+            str(payload["author"].get("login") or "")
+            if isinstance(payload.get("author"), dict)
+            else ""
+        ),
         is_draft=bool(payload.get("isDraft")),
         merge_state=observed.merge_state,
         mergeable=observed.mergeable,
@@ -746,6 +764,38 @@ def _pr_data(
         ),
         worktree_path=worktree_path,
     )
+
+
+def _policy_neutral_context(record: MaintenanceIntentRecordV1) -> ReviewContext:
+    """Represent repositories that have not opted into policy settlement."""
+
+    policy = ReviewPolicy.model_validate(
+        {
+            "version": 1,
+            "review": {
+                "local": {"reviewer_count": 1},
+                "backstop": {"reviewer_count": 1, "trigger": "new_head_sha"},
+            },
+        }
+    )
+    ledger = ReviewLedger(
+        repository=record.intent.repository,
+        head_sha=record.intent.head_sha,
+        delivery_id=f"policy-neutral:{record.ingress_id}",
+        review_charter_version="policy-neutral-v1",
+    )
+    for stage in (ReviewStage.LOCAL, ReviewStage.BACKSTOP):
+        ledger.submit(
+            ReviewResult(
+                repository=ledger.repository,
+                head_sha=ledger.head_sha,
+                stage=stage,
+                round_number=1,
+                slot_number=1,
+                reviewer_execution_id=f"policy-neutral-{stage.value}",
+            )
+        )
+    return policy, ledger
 
 
 def _failing_checks(observed: github_api.PrMaintenanceSnapshot) -> list[str]:

@@ -855,6 +855,36 @@ def test_reviewer_followup_reopens_structured_non_code_reply():
     assert outcome.actionable
 
 
+def test_same_second_reply_order_breaks_settlement_timestamp_ties():
+    closure = _policy_closure(
+        Disposition.WRONG_OWNER,
+        FindingSettlementState.DECLINED_WITH_RATIONALE,
+    )
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha=closure.finding.head_sha,
+    )
+    thread = _thread("[P2] Preserve ordering", created="2026-01-01T00:00:00Z")
+    thread.replies.extend(
+        [
+            ReviewThreadComment(
+                database_id=43, path=ANCHOR, line=7, body="Still open",
+                author="reviewer", created_at="2026-01-01T00:00:00Z",
+            ),
+            ReviewThreadComment(
+                database_id=44, path=ANCHOR, line=7, body=body,
+                author="maintenance-bot", created_at="2026-01-01T00:00:00Z",
+            ),
+        ]
+    )
+
+    assert completion.settlement_reply_status(
+        thread, closure, marker=COMPLETE_MARKER,
+        maintenance_author="maintenance-bot",
+    ) is completion.SettlementReplyStatus.FRESH
+
+
 def test_unrelated_evidence_does_not_make_non_code_reply_fresh():
     closure = _policy_closure(
         Disposition.WRONG_OWNER,
