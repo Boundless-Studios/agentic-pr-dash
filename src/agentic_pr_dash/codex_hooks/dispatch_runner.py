@@ -413,7 +413,7 @@ def _observation_from_request(
         )
         if (
             configured_provider is not None
-            and structured.gen_ai_provider_name == "openai"
+            and structured.gen_ai_provider_name in {None, "openai"}
             and not structured.provider_explicit
         ):
             structured = replace(
@@ -557,7 +557,7 @@ def _structured_telemetry(
         or not _valid_start_time(start_time_unix_nano)
     ):
         return None
-    executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1]
+    executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
     if executable not in {
         request.provider.value,
         f"{request.provider.value}.exe",

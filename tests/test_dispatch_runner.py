@@ -438,6 +438,31 @@ def test_structured_codex_provider_uses_adapter_configured_provider(
     assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
 
 
+def test_structured_codex_bare_oss_uses_adapter_configured_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={"configured_provider": "ollama"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "--oss", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
+
+
 def test_structured_codex_provider_preserves_explicit_config_override(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -610,6 +635,32 @@ def test_structured_metadata_rejects_wrong_provider_or_subcommand(
 
     assert result.observation is None
     assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("provider", "argv"),
+    [
+        (DispatchProvider.CODEX, ["Codex.EXE", "exec", "review"]),
+        (DispatchProvider.OPENCODE, ["OpenCode.exe", "run", "review"]),
+    ],
+)
+def test_structured_metadata_accepts_case_insensitive_windows_executable(
+    tmp_path: Path, provider: DispatchProvider, argv: list[str]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=provider,
+        command="<redacted>",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": argv,
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
 
 
 @pytest.mark.parametrize("terminal_option", ["-h", "--help"])
