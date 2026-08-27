@@ -8,6 +8,7 @@ from __future__ import annotations
 from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
+    git_push_source_branch,
     is_gh_pr_open,
     is_git_push,
     is_git_token,
@@ -124,6 +125,20 @@ def test_is_git_push_false_for_non_push_or_non_git():
 
 def test_is_git_push_detects_homebrew_path_git():
     assert is_git_push("/opt/homebrew/bin/git push origin HEAD") is True
+
+
+def test_push_source_branch_consumes_push_option_values():
+    assert git_push_source_branch("git push -o ci.skip origin feature") == (
+        True,
+        "feature",
+    )
+    assert git_push_source_branch(
+        "git push --push-option=ci.skip origin feature"
+    ) == (True, "feature")
+    assert git_push_source_branch("git push -oci.skip origin feature") == (
+        True,
+        "feature",
+    )
 
 
 # --- effective_git_cwd ------------------------------------------------------

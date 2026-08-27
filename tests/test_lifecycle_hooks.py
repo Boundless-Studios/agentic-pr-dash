@@ -711,21 +711,14 @@ def test_push_inside_pipeline_or_background_group_remains_ambiguous(
     assert LifecycleStore(state_root).list_intents() == ()
 
 
-@pytest.mark.parametrize(
-    "head",
-    ("missing-branch", "someone:feature/pr-head"),
-)
-def test_pr_nonlocal_or_missing_branch_target_is_skipped(
-    tmp_path: Path,
-    head: str,
-) -> None:
+def test_pr_missing_branch_target_is_skipped(tmp_path: Path) -> None:
     adapter = _adapter()
     repo, _current_head = _repository(tmp_path)
     state_root = tmp_path / "state"
     payload = {
         "hook_event_name": "PostToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": f"gh pr create --fill --head {head}"},
+        "tool_input": {"command": "gh pr create --fill --head missing-branch"},
         "tool_response": {
             "exit_code": 0,
             "stdout": "https://github.com/Acme/Widget/pull/42\n",
@@ -736,6 +729,34 @@ def test_pr_nonlocal_or_missing_branch_target_is_skipped(
 
     assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
     assert LifecycleStore(state_root).list_intents() == ()
+
+
+def test_pr_fork_qualified_head_uses_local_branch_and_upstream_url(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path, remote="git@github.com:ForkOwner/Widget.git")
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": "gh pr create --fill --head ForkOwner:feature/thin-hooks"
+        },
+        "tool_response": {
+            "exit_code": 0,
+            "stdout": "https://github.com/Upstream/Widget/pull/42\n",
+        },
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
+    assert intent.repository == "Upstream/Widget"
+    assert intent.pushed_ref == "refs/heads/feature/thin-hooks"
+    assert intent.head_sha == head
 
 
 def test_stop_reads_only_the_exact_head_snapshot_and_is_advisory_during_outage(

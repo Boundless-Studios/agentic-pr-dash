@@ -510,7 +510,10 @@ def _enqueue_target(
     now: datetime | None,
 ) -> None:
     pr_number = int(explicit_pr_number) if explicit_pr_number is not None else None
-    identity = local_git_identity(cwd, branch=target_branch)
+    local_branch = target_branch
+    if kind == "pr" and local_branch is not None and ":" in local_branch:
+        _owner, local_branch = local_branch.split(":", 1)
+    identity = local_git_identity(cwd, branch=local_branch)
     if identity is None:
         return
     if kind == "pr" and pr_number is not None and target_branch is None:

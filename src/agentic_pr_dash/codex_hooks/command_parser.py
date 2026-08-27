@@ -290,7 +290,7 @@ def git_push_source_branch(command: str) -> tuple[bool, str | None]:
     if index >= len(tokens):
         return False, None
     index += 1
-    value_options = {"--repo", "--receive-pack", "--exec"}
+    value_options = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
     positionals: list[str] = []
     while index < len(tokens):
         token = tokens[index]
