@@ -554,6 +554,31 @@ def test_explicit_push_refspec_uses_source_branch_identity(tmp_path: Path) -> No
     assert intent.worktree_path == str(pushed_worktree)
 
 
+def test_bare_head_push_uses_checked_out_branch_as_destination(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push origin HEAD"},
+            "tool_response": {
+                "exit_code": 0,
+                "stderr": "HEAD -> feature/thin-hooks",
+            },
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=tmp_path / "state",
+        now=NOW,
+    )
+
+    intent = LifecycleStore(tmp_path / "state").list_intents()[0].intent
+    assert intent.pushed_ref == "refs/heads/feature/thin-hooks"
+    assert intent.head_sha == head
+
+
 def test_renamed_push_refspec_uses_source_sha_and_destination_branch(tmp_path: Path) -> None:
     adapter = _adapter()
     repo, _ = _repository(tmp_path)

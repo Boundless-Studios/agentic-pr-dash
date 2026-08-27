@@ -516,6 +516,7 @@ class LifecycleWorkflow:
             resolved.number,
             record.intent.head_sha,
             record.intent.worktree_path,
+            repository=resolved.repository,
             excluded_authors=_excluded_review_authors(pr),
         )
         if not review_observation.observable:
@@ -544,7 +545,7 @@ class LifecycleWorkflow:
             for comment in pr.review_comments
             if comment.thread_id not in addressed_thread_ids
         ]
-        pr.review_comments.extend(_policy_review_comments(observation))
+        pr.review_comments.extend(_policy_review_comments(observation, ledger))
         return _ObservedPR(
             observation,
             pr,
@@ -741,24 +742,47 @@ def _observation_health(
 
 
 def _policy_review_comments(
-    observation: FinalizationObservation,
+    observation: FinalizationObservation, ledger: ReviewLedger
 ) -> list[ReviewComment]:
     fingerprints = sorted(
         fingerprint
         for fingerprint, state in observation.review.finding_states.items()
         if state is FindingSettlementState.UNRESOLVED
     )
-    return [
-        ReviewComment(
-            id=-(ordinal + 1),
-            author="review-policy",
-            body=f"Unsettled policy finding {fingerprint}",
-            path=".github/pull-request",
-            created_at="",
-            thread_id=f"policy:{fingerprint}",
+    findings = {finding.fingerprint: finding for finding in ledger.current_findings}
+    comments: list[ReviewComment] = []
+    for ordinal, fingerprint in enumerate(fingerprints):
+        finding = findings.get(fingerprint)
+        if finding is None:
+            body = f"Unsettled policy finding {fingerprint}"
+            path = ".github/pull-request"
+            line = None
+        else:
+            details = [
+                f"Unsettled policy finding {fingerprint}",
+                f"[{finding.severity.value.upper()}] {finding.title}",
+                finding.explanation,
+                f"Invariant: {finding.invariant}",
+            ]
+            if finding.evidence:
+                details.append(f"Evidence: {finding.evidence}")
+            if finding.reproduction:
+                details.append(f"Reproduction: {finding.reproduction}")
+            body = "\n\n".join(details)
+            path = finding.path
+            line = finding.line
+        comments.append(
+            ReviewComment(
+                id=-(ordinal + 1),
+                author="review-policy",
+                body=body,
+                path=path,
+                line=line,
+                created_at="",
+                thread_id=f"policy:{fingerprint}",
+            )
         )
-        for ordinal, fingerprint in enumerate(fingerprints)
-    ]
+    return comments
 
 
 def _same_snapshot_facts(

@@ -2676,6 +2676,7 @@ def _read_review_submissions(
     head_sha: str,
     cwd: str | None = None,
     *,
+    repository: str | None = None,
     excluded_authors: set[str] | None = None,
     strict: bool = False,
 ) -> _ReviewSubmissionRead:
@@ -2693,7 +2694,10 @@ def _read_review_submissions(
     permission mandatory.
     """
 
-    owner, repo = get_repo_info(cwd)
+    if repository and "/" in repository:
+        owner, repo = repository.split("/", 1)
+    else:
+        owner, repo = get_repo_info(cwd)
     if not owner or not repo:
         if strict:
             raise RuntimeError(
@@ -2953,6 +2957,7 @@ def get_review_submissions_observation(
     head_sha: str,
     cwd: str | None = None,
     *,
+    repository: str | None = None,
     excluded_authors: set[str] | None = None,
 ) -> ObservationReadResult[list[ReviewSubmission]]:
     """Read current-head review evidence without collapsing failure into missing.
@@ -2969,6 +2974,7 @@ def get_review_submissions_observation(
             pr_number,
             head_sha,
             cwd,
+            repository=repository,
             excluded_authors=excluded_authors,
             strict=True,
         )

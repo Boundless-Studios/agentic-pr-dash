@@ -524,6 +524,8 @@ def _enqueue_target(
     identity = local_git_identity(cwd, branch=local_branch)
     if identity is None:
         return
+    if kind == "push" and destination_branch == "HEAD":
+        destination_branch = identity.pushed_ref.removeprefix("refs/heads/")
     if kind == "push" and destination_branch is not None:
         identity = LocalGitIdentity(
             identity.repository,

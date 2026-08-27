@@ -12,6 +12,7 @@ import pytest
 from agent_review_coordinator import (
     Disposition,
     Finding,
+    FindingSettlementState,
     ReviewLedger,
     ReviewPolicy,
     ReviewResult,
@@ -157,6 +158,68 @@ async def test_missing_review_context_uses_policy_neutral_observation(
     assert result.progressed == 1
     assert record.state is IntentLifecycleStateV1.PROMOTED
     assert record.canonical_key is not None
+
+
+@pytest.mark.asyncio
+async def test_review_observation_reads_from_resolved_repository(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    observed_repositories: list[str | None] = []
+
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *a, **k: _batch()
+    )
+
+    def observe_reviews(*args, repository=None, **kwargs):
+        observed_repositories.append(repository)
+        return github_api.ObservationReadResult.observed([])
+
+    monkeypatch.setattr(
+        github_api, "get_review_submissions_observation", observe_reviews
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
+
+    assert observed_repositories == [REPOSITORY]
+
+
+def test_policy_review_comment_contains_actionable_finding_details() -> None:
+    from agentic_pr_dash.lifecycle_workflow import _policy_review_comments
+
+    ledger = _ledger_with_unresolved_finding()
+    finding = next(
+        item
+        for item in ledger.current_findings
+        if item.title == "Unresolved local finding"
+    )
+    observation = type(
+        "Observation",
+        (),
+        {
+            "review": type(
+                "Review",
+                (),
+                {
+                    "finding_states": {
+                        finding.fingerprint: FindingSettlementState.UNRESOLVED
+                    }
+                },
+            )()
+        },
+    )()
+
+    comments = _policy_review_comments(observation, ledger)
+
+    assert len(comments) == 1
+    assert comments[0].path == "src/example.py"
+    assert "Unresolved local finding" in comments[0].body
+    assert "The lifecycle workflow must retain this finding." in comments[0].body
+    assert "local finding invariant" in comments[0].body
+    assert finding.fingerprint in comments[0].body
 
 
 @pytest.mark.asyncio
