@@ -423,15 +423,6 @@ def test_numeric_ready_target_uses_named_pr_identity(
 ) -> None:
     adapter = _adapter()
     repo, current_head = _repository(tmp_path)
-    named_head = "d" * 40
-    monkeypatch.setattr(
-        adapter,
-        "_resolve_numeric_pr_identity",
-        lambda cwd, number: adapter.LocalGitIdentity(
-            "Acme/Widget", "refs/heads/feature/named-pr", named_head, cwd
-        ),
-        raising=False,
-    )
     state_root = tmp_path / "state"
     payload = {
         "hook_event_name": "PostToolUse",
@@ -446,10 +437,136 @@ def test_numeric_ready_target_uses_named_pr_identity(
 
     intent = LifecycleStore(state_root).list_intents()[0].intent
     assert intent.pr_number == 42
-    assert intent.pushed_ref == "refs/heads/feature/named-pr"
-    assert intent.head_sha == named_head
-    assert intent.head_sha != current_head
+    assert intent.pushed_ref == "refs/heads/feature/thin-hooks"
+    assert intent.head_sha == current_head
+
+
+def test_numeric_ready_target_never_observes_github_in_the_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_numeric_pr_identity",
+        lambda *_args, **_kwargs: pytest.fail("numeric ready must remain local-only"),
+        raising=False,
+    )
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "gh pr ready 42"},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
     assert intent.pr_number == 42
+    assert intent.head_sha == head
+
+
+def test_pr_create_url_sets_canonical_repository_for_fork_worktree(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    repo, head = _repository(
+        tmp_path, remote="git@github.com:ForkOwner/Widget.git"
+    )
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "gh pr create --fill"},
+        "tool_response": {
+            "exit_code": 0,
+            "stdout": "https://github.com/Upstream/Widget/pull/42\n",
+        },
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
+    assert intent.repository == "Upstream/Widget"
+    assert intent.pr_number == 42
+    assert intent.head_sha == head
+
+
+def test_git_url_rewrite_is_applied_to_origin_identity(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path, remote="gh:Acme/Widget.git")
+    _git(repo, "config", "url.git@github.com:.insteadOf", "gh:")
+
+    identity = adapter.local_git_identity(str(repo))
+
+    assert identity is not None
+    assert identity.repository == "Acme/Widget"
+    assert identity.head_sha == head
+
+
+def test_post_tool_use_without_exit_code_preserves_success_compatibility(
+    tmp_path: Path,
+) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git push"},
+        "tool_response": {},
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
+    assert intent.head_sha == head
+
+
+def test_push_after_unrelated_pipeline_is_enqueued(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "pytest | tee test.log; git push"},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
+    assert intent.head_sha == head
+
+
+@pytest.mark.parametrize("command", ("git push | tee push.log", "git push & wait"))
+def test_push_inside_pipeline_or_background_group_remains_ambiguous(
+    tmp_path: Path, command: str
+) -> None:
+    adapter = _adapter()
+    repo, _head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": command},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+    assert LifecycleStore(state_root).list_intents() == ()
 
 
 @pytest.mark.parametrize(

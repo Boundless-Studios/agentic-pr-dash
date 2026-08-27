@@ -22,6 +22,10 @@ WORKFLOW_TYPE = "pr-maintenance"
 _PR_URL = re.compile(
     r"https?://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/pull/(?P<number>\d+)"
 )
+_DIRECT_GITHUB_REMOTE = re.compile(
+    r"^(?:https?://github\.com/|ssh://git@github\.com/|git@github\.com:)",
+    re.IGNORECASE,
+)
 _PUSH_UPDATE = re.compile(
     r"^(?:[0-9a-f]{4,}\.{2,3}[0-9a-f]{4,}|"
     r"\[(?:new branch|new tag|deleted|up to date)\])\s+.+\s+->\s+.+$",
@@ -207,8 +211,16 @@ def _filesystem_git_identity(
     if head is None:
         return None
     head_sha, pushed_ref = head
+    raw_remote = _origin_url(common_dir)
+    if _DIRECT_GITHUB_REMOTE.match(raw_remote):
+        remote = raw_remote
+    else:
+        resolved_remote = _git(str(worktree), "remote", "get-url", "origin")
+        if len(resolved_remote) != 1:
+            return None
+        remote = resolved_remote[0]
     try:
-        repository = _canonical_repository(_origin_url(common_dir))
+        repository = _canonical_repository(remote)
     except ValueError:
         return None
     return LocalGitIdentity(
@@ -244,7 +256,7 @@ def _subprocess_git_identity(
         if len(checkout) != 2:
             return None
         worktree_path, head_sha = checkout
-    remote = _git(worktree_path, "config", "--get", "remote.origin.url")
+    remote = _git(worktree_path, "remote", "get-url", "origin")
     if len(remote) != 1:
         return None
     try:
@@ -293,7 +305,7 @@ def _exit_code(payload: dict) -> int | None:
     return None
 
 
-def _output_pr_number(payload: dict, repository: str) -> int | None:
+def _output_pr_identity(payload: dict) -> tuple[str, int] | None:
     response = payload.get("tool_response")
     if not isinstance(response, dict):
         return None
@@ -302,9 +314,10 @@ def _output_pr_number(payload: dict, repository: str) -> int | None:
         if not isinstance(value, str):
             continue
         for match in _PR_URL.finditer(value):
-            candidate = f"{match.group('owner')}/{match.group('repo')}"
-            if candidate.casefold() == repository.casefold():
-                return int(match.group("number"))
+            return (
+                f"{match.group('owner')}/{match.group('repo')}",
+                int(match.group("number")),
+            )
     return None
 
 
@@ -371,9 +384,17 @@ def _successful_targets(
     payload: dict,
 ) -> tuple[tuple[str, str, str | None, str | None], ...]:
     segments = split_command_segments(command)
-    if any(operator in {"|", "&"} for operator, _segment in segments):
-        return ()
-    push_segments = sum(is_git_push(segment) for _operator, segment in segments)
+    ambiguous = {
+        index
+        for index, (operator, _segment) in enumerate(segments)
+        if operator in {"|", "&"}
+        for index in (index - 1, index)
+        if index >= 0
+    }
+    push_segments = sum(
+        index not in ambiguous and is_git_push(segment)
+        for index, (_operator, segment) in enumerate(segments)
+    )
     output_proves_single_push = push_segments == 1 and _output_proves_push_succeeded(
         payload
     )
@@ -382,8 +403,10 @@ def _successful_targets(
     }
     for index, (leading_op, segment) in enumerate(segments):
         destination = cd_target(segment)
-        push = is_git_push(segment)
-        pr_target = parse_gh_pr_arm_target(segment)
+        push = index not in ambiguous and is_git_push(segment)
+        pr_target = (
+            parse_gh_pr_arm_target(segment) if index not in ambiguous else None
+        )
         next_states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {}
         for (previous_succeeded, cwd), proven_targets in states.items():
             executes = (
@@ -461,15 +484,19 @@ def _enqueue_target(
     now: datetime | None,
 ) -> None:
     pr_number = int(explicit_pr_number) if explicit_pr_number is not None else None
-    identity = (
-        _resolve_numeric_pr_identity(cwd, pr_number)
-        if kind == "pr" and pr_number is not None
-        else local_git_identity(cwd, branch=target_branch)
-    )
+    identity = local_git_identity(cwd, branch=target_branch)
     if identity is None:
         return
     if kind == "pr" and pr_number is None:
-        pr_number = _output_pr_number(payload, identity.repository)
+        output_identity = _output_pr_identity(payload)
+        if output_identity is not None:
+            repository, pr_number = output_identity
+            identity = LocalGitIdentity(
+                repository,
+                identity.pushed_ref,
+                identity.head_sha,
+                identity.worktree_path,
+            )
     enqueue_maintenance(
         build_maintenance_intent(
             identity,
@@ -483,33 +510,6 @@ def _enqueue_target(
             pr_number=pr_number,
         ),
         root=state_root,
-    )
-
-
-def _resolve_numeric_pr_identity(cwd: str, pr_number: int) -> LocalGitIdentity | None:
-    """Resolve a numeric ready target without borrowing the checkout's head."""
-
-    from agentic_pr_dash import github_api
-
-    payload = github_api.resolve_pr(
-        pr_number,
-        "number,headRefName,headRefOid,url",
-        cwd,
-        force=True,
-    )
-    if not isinstance(payload, dict):
-        return None
-    branch = payload.get("headRefName")
-    head_sha = payload.get("headRefOid")
-    url = payload.get("url")
-    match = _PR_URL.search(url) if isinstance(url, str) else None
-    if not isinstance(branch, str) or not isinstance(head_sha, str) or match is None:
-        return None
-    return LocalGitIdentity(
-        repository=f"{match.group('owner')}/{match.group('repo')}",
-        pushed_ref=f"refs/heads/{branch}",
-        head_sha=head_sha,
-        worktree_path=str(_worktree_root(cwd) or cwd),
     )
 
 
@@ -598,7 +598,7 @@ def _run_payload(
         return 0
     exit_code = _exit_code(payload)
     if exit_code is None:
-        return 0
+        exit_code = 0
     normalized = normalized_payload(payload)
     if normalized.get("tool_name") != "Bash":
         return 0

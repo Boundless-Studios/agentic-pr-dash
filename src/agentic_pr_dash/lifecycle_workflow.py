@@ -416,7 +416,9 @@ class LifecycleWorkflow:
         cwd = intent.worktree_path
         if intent.pr_number is None:
             branch = intent.pushed_ref.removeprefix("refs/heads/")
-            payload = github_api.find_pr_by_head(branch, "open", cwd)
+            payload = github_api.find_pr_by_head(
+                branch, "open", cwd, head_oid=intent.head_sha
+            )
             if isinstance(payload, dict):
                 payload = {**payload, "state": "OPEN"}
         else:

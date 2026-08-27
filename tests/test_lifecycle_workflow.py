@@ -176,6 +176,34 @@ async def test_superseded_exact_head_intent_becomes_terminal(
 
 
 @pytest.mark.asyncio
+async def test_unresolved_intent_lookup_matches_the_exact_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=None, head_sha=HEAD))
+    observed: list[str | None] = []
+
+    def find_pr_by_head(branch, state, cwd, *, head_oid=None):
+        observed.append(head_oid)
+        return _pr_payload()
+
+    monkeypatch.setattr(github_api, "find_pr_by_head", find_pr_by_head)
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *a, **k: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
+
+    assert observed == [HEAD]
+
+
+@pytest.mark.asyncio
 async def test_merged_exact_pr_intent_becomes_terminal(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -345,7 +373,7 @@ async def test_open_branch_lookup_without_state_field_can_promote(
     monkeypatch.setattr(
         github_api,
         "find_pr_by_head",
-        lambda branch, state="open", cwd=None: branch_payload,
+        lambda branch, state="open", cwd=None, head_oid=None: branch_payload,
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
