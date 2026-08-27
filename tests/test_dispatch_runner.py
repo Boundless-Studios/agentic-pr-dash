@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import sys
-from io import StringIO
+import time
+from io import BytesIO, StringIO, TextIOWrapper
 from pathlib import Path
 
 import pytest
@@ -23,6 +24,7 @@ from agentic_pr_dash.dispatch_observation import (
     DispatchProvider,
     DispatchSource,
 )
+from agentic_pr_dash.dispatch_telemetry import DispatchTelemetry
 
 
 def _request(
@@ -131,6 +133,27 @@ def test_flagless_dispatch_resolves_adapter_model_candidates(
     assert result.observation.resolved_model == expected
 
 
+def test_ignore_user_config_excludes_configured_model_candidate(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={
+            "configured_model": "user-model",
+            "default_model": "codex-default",
+        },
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "--ignore-user-config", "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.resolved_model == "codex-default"
+
+
 def test_explicit_model_wins_over_adapter_resolution(tmp_path: Path) -> None:
     result = run_dispatch_hook(
         _request(
@@ -147,6 +170,32 @@ def test_explicit_model_wins_over_adapter_resolution(tmp_path: Path) -> None:
     assert result.observation is not None
     assert result.observation.requested_model == "explicit"
     assert result.observation.resolved_model == "explicit"
+
+
+def test_structured_opencode_provider_uses_adapter_resolved_model(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.OPENCODE,
+        command="<redacted>",
+        model_resolution={"configured_model": "openai/gpt-5"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["opencode", "run", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.resolved_model == "openai/gpt-5"
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "openai"
 
 
 @pytest.mark.parametrize(
@@ -202,6 +251,555 @@ def test_persisted_dispatch_omits_raw_command_content(tmp_path: Path) -> None:
     assert persisted["provider"] == "codex"
     assert persisted["task_type"] == "review"
     assert DispatchObservation.from_dict(persisted).command == "<redacted>"
+
+
+def test_structured_dispatch_is_authoritative_over_raw_command(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec --model wrong-model legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": [
+            "/usr/local/bin/codex",
+            "exec",
+            "--model",
+            "gpt-5.6-sol",
+            "private prompt",
+        ],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.command == "<redacted>"
+    assert result.observation.requested_model == "gpt-5.6-sol"
+    assert result.observation.resolved_model == "gpt-5.6-sol"
+    assert result.observation.classification_authority.value == "declared"
+    persisted = json.loads(request.ledger_path.read_text(encoding="utf-8"))
+    assert persisted["requested_model"] == "gpt-5.6-sol"
+    assert "wrong-model" not in json.dumps(persisted)
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("--local-provider", "ollama"),
+        ("--enable", "responses_websockets"),
+        ("--disable", "responses_websockets"),
+        ("--remote", "ws://localhost:4500"),
+        ("--remote-auth-token-env", "CODEX_REMOTE_TOKEN"),
+        ("-a", "never"),
+    ],
+)
+def test_structured_codex_dispatch_skips_value_taking_global_options(
+    tmp_path: Path, option: str, value: str
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "--oss", option, value, "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("option", ["--image", "-i"])
+def test_structured_codex_dispatch_rejects_variadic_image_before_exec(
+    tmp_path: Path, option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", option, "/tmp/input.png", "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("option", ["--image=/tmp/input.png", "-i=/tmp/input.png"])
+def test_structured_codex_dispatch_accepts_attached_image_before_exec(
+    tmp_path: Path, option: str
+) -> None:
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", option, "exec", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("option", ["-C", "--cd"])
+def test_structured_codex_dispatch_rejects_nul_working_root(
+    tmp_path: Path, option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", option, "bad\0path", "private prompt"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["codex", "exec", "--help"],
+        ["codex", "--version", "exec"],
+        ["codex", "-V", "exec"],
+        ["codex", "--help", "exec"],
+    ],
+)
+def test_structured_help_or_version_invocation_is_rejected(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {"argv": argv, "task_type": "review"}
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+
+
+def test_structured_codex_dispatch_rejects_exec_after_option_terminator(
+    tmp_path: Path,
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "--", "exec", "--help"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+
+
+def test_structured_codex_provider_uses_adapter_configured_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={
+            "configured_model": "qwen3-coder",
+            "configured_provider": "ollama",
+        },
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
+
+
+def test_structured_codex_bare_oss_uses_adapter_configured_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={"configured_provider": "ollama"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "--oss", "private prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
+
+
+def test_structured_codex_provider_preserves_explicit_config_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={"configured_provider": "ollama"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "-c", 'model_provider="openai"', "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "openai"
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"argv": "codex exec review", "task_type": "review"},
+        {"argv": ["codex", "exec", "review"], "task_type": ""},
+        {
+            "argv": ["codex", "exec", "review"],
+            "task_type": "review",
+            "start_time_unix_nano": "invalid",
+        },
+    ],
+)
+def test_present_but_invalid_structured_metadata_fails_closed(
+    tmp_path: Path, metadata: dict[str, object]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec --model wrong-model legacy prompt",
+    )
+    request.payload["dispatch_telemetry"] = metadata
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("start_time", [True, -1, 10**30])
+def test_structured_metadata_rejects_implausible_start_time(
+    tmp_path: Path, start_time: object
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+        "start_time_unix_nano": start_time,
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    "response", [{}, {"exit_code": "not-a-number"}, {"exit_code": 0.5}]
+)
+def test_interactive_structured_dispatch_rejects_unknown_outcome(
+    tmp_path: Path, response: dict[str, object]
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+    )
+    request.payload["tool_response"] = response
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
+
+
+def test_camel_case_exit_code_is_used_in_error_attribute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        response={"exitCode": 1},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
+
+
+def test_legacy_camel_case_exit_code_is_used_in_error_attribute(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+        response={"exitCode": 1},
+    )
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["git", "status"],
+        ["opencode", "run", "review"],
+        ["codex", "review"],
+    ],
+)
+def test_structured_metadata_rejects_wrong_provider_or_subcommand(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": argv,
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("provider", "argv"),
+    [
+        (DispatchProvider.CODEX, ["Codex.EXE", "exec", "review"]),
+        (DispatchProvider.OPENCODE, ["OpenCode.exe", "run", "review"]),
+    ],
+)
+def test_structured_metadata_accepts_case_insensitive_windows_executable(
+    tmp_path: Path, provider: DispatchProvider, argv: list[str]
+) -> None:
+    request = _request(
+        tmp_path,
+        provider=provider,
+        command="<redacted>",
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": argv,
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("terminal_option", ["-h", "--help"])
+def test_structured_opencode_help_invocation_is_rejected(
+    tmp_path: Path, terminal_option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(
+        tmp_path, provider=DispatchProvider.OPENCODE, command="<redacted>"
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["opencode", "run", terminal_option],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
+    assert not request.ledger_path.exists()
+
+
+def test_legacy_dispatch_emits_typed_parse_status(tmp_path: Path, monkeypatch) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+
+    result = run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="codex exec review",
+        )
+    )
+
+    assert result.observation is not None
+    assert emitted[0][0].parse_status.value == "legacy_parsed"
+
+
+def test_legacy_config_model_does_not_claim_explicit_flag_provenance(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+
+    run_dispatch_hook(
+        _request(
+            tmp_path,
+            provider=DispatchProvider.CODEX,
+            command="codex exec -c model=gpt-5.6-sol review",
+        )
+    )
+
+    assert emitted[0][0].resolution_source.value == "unavailable"
+
+
+def test_unavailable_span_has_low_cardinality_error_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append((telemetry, kwargs)),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="codex exec review",
+        response={"exit_code": 1, "stderr": "quota exhausted"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "review"],
+        "task_type": "review",
+    }
+
+    run_dispatch_hook(request)
+
+    assert emitted[0][1]["error_type"] == "provider.unavailable"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["codex", "--model", "gpt-5", "exec", "prompt"],
+        ["codex", "e", "prompt"],
+    ],
+)
+def test_structured_codex_accepts_global_options_and_exec_alias(
+    tmp_path: Path, argv: list[str]
+) -> None:
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {"argv": argv, "task_type": "exec"}
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+
+
+def test_structured_telemetry_forwards_codex_home(tmp_path: Path, monkeypatch) -> None:
+    emitted = []
+    monkeypatch.setenv("CODEX_HOME", "/safe/codex-home")
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: emitted.append(telemetry),
+    )
+    request = _request(tmp_path, provider=DispatchProvider.CODEX, command="<redacted>")
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "prompt"],
+        "task_type": "exec",
+    }
+
+    run_dispatch_hook(request)
+
+    assert emitted[0].codex_home == "/safe/codex-home"
+
+
+def test_non_review_structured_dispatch_drops_review_verdict(tmp_path: Path) -> None:
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        response={"exit_code": 0, "review_verdict": {"findings": []}},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert result.observation.review_verdict is None
 
 
 @pytest.mark.parametrize("provider", list(DispatchProvider))
@@ -420,7 +1018,7 @@ def test_canonical_multiline_review_with_stdin_redirect_keeps_classification(
         tmp_path,
         provider=DispatchProvider.CODEX,
         command=(
-            "codex exec --sandbox workspace-write \"Review this diff:\n"
+            'codex exec --sandbox workspace-write "Review this diff:\n'
             "+print('safe; quoted')\" </dev/null"
         ),
         classification={"task_type": "review", "framework": "coding-agent/v1"},
@@ -691,6 +1289,25 @@ def test_detached_opencode_entrypoint_persists_without_context(
     assert capsys.readouterr().out == ""
 
 
+def test_detached_entrypoint_normalizes_string_exit_code_for_error_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(tmp_path / "dispatch.jsonl"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+
+    result = run_opencode_dispatch_logger.main(
+        ["--command", "opencode run review", "--exit-code", "1"]
+    )
+
+    assert result == 0
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
+
+
 def test_detached_entrypoint_accepts_adapter_model_resolution(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -715,6 +1332,204 @@ def test_detached_entrypoint_accepts_adapter_model_resolution(
     persisted = json.loads(ledger.read_text(encoding="utf-8"))
     assert persisted["requested_model"] is None
     assert persisted["resolved_model"] == "kimi-for-coding/k3-256k"
+
+
+def test_detached_entrypoint_accepts_nul_delimited_structured_argv(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    secret = "private prompt body"
+    argv = ("codex", "exec", "--model", "gpt-5.6-sol", secret)
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"\0".join(value.encode() for value in argv) + b"\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--structured-stdin",
+            "--task-type",
+            "review",
+            "--exit-code",
+            "0",
+        ]
+    )
+
+    assert result == 0
+    serialized = ledger.read_text(encoding="utf-8")
+    persisted = json.loads(serialized)
+    assert persisted["requested_model"] == "gpt-5.6-sol"
+    assert persisted["resolved_model"] == "gpt-5.6-sol"
+    assert persisted["classification_authority"] == "declared"
+    assert secret not in serialized
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [("-C", "target"), ("--cd", "target")],
+)
+def test_structured_entrypoint_routes_default_paths_to_overridden_worktree(
+    tmp_path: Path, monkeypatch, option: str, value: str
+) -> None:
+    launch_root = tmp_path / "launch"
+    target_root = launch_root / value
+    launch_root.mkdir()
+    target_root.mkdir()
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.delenv("DISPATCH_AVAILABILITY_PATH", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(launch_root))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(f"codex\0exec\0{option}\0{value}\0prompt\0".encode())),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", "--exit-code", "0"]
+    )
+
+    assert result == 0
+    ledger = target_root / ".beads" / "interactions.jsonl"
+    assert json.loads(ledger.read_text(encoding="utf-8"))["worktree_root"] == str(
+        target_root
+    )
+    assert not (launch_root / ".beads" / "interactions.jsonl").exists()
+
+
+def test_structured_entrypoint_does_not_create_missing_worktree_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    launch_root = tmp_path / "launch"
+    missing_root = tmp_path / "missing"
+    launch_root.mkdir()
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.delenv("DISPATCH_AVAILABILITY_PATH", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(launch_root))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(
+            BytesIO(f"codex\0exec\0-C\0{missing_root}\0prompt\0".encode())
+        ),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", "--exit-code", "1"]
+    )
+
+    assert result == 0
+    assert not missing_root.exists()
+    assert (launch_root / ".beads" / "interactions.jsonl").exists()
+
+
+@pytest.mark.parametrize(
+    "exit_code_args", [["--exit-code", "not-a-number"], ["--exit-code"]]
+)
+def test_structured_detached_entrypoint_rejects_malformed_exit_code(
+    tmp_path: Path, monkeypatch, exit_code_args: list[str]
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", *exit_code_args]
+    )
+
+    assert result == 0
+    assert not ledger.exists()
+
+
+def test_structured_detached_entrypoint_rejects_option_as_task_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "--exit-code", "0"]
+    )
+
+    assert result == 0
+    assert not ledger.exists()
+
+
+def test_interactive_structured_payload_rejects_nul_cwd(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(
+            json.dumps(
+                {
+                    "session_id": "session-1",
+                    "cwd": f"{tmp_path}\0invalid",
+                    "tool_input": {"command": "<redacted>"},
+                    "tool_response": {"exit_code": 0},
+                    "dispatch_telemetry": {
+                        "argv": ["codex", "exec", "private prompt"],
+                        "task_type": "exec",
+                    },
+                }
+            )
+        ),
+    )
+
+    result = run_codex_dispatch_logger.main([])
+
+    assert result == 0
+    assert not (tmp_path / ".beads" / "interactions.jsonl").exists()
+
+
+def test_structured_detached_failure_preserves_unavailability_detection(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    availability = tmp_path / "codex-availability.json"
+    error_file = tmp_path / "codex-error.txt"
+    error_file.write_text("usage quota exhausted", encoding="utf-8")
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("DISPATCH_AVAILABILITY_PATH", str(availability))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        [
+            "--structured-stdin",
+            "--task-type",
+            "exec",
+            "--exit-code",
+            "1",
+            "--error-file",
+            str(error_file),
+            "--started-at-unix-nano",
+            str(time.time_ns()),
+        ]
+    )
+
+    assert result == 0
+    assert json.loads(ledger.read_text(encoding="utf-8"))["outcome"] == "unavailable"
+    assert json.loads(availability.read_text(encoding="utf-8"))["available"] is False
 
 
 def test_detached_failure_reads_error_file_for_unavailability(

@@ -246,6 +246,40 @@ executor = "codex exec --full-auto {prompt}"
 executor = "aider --message {prompt} --yes"
 ```
 
+### Agent dispatch telemetry
+
+Structured coding-agent producers can report a completed dispatch without
+flattening argv into shell text:
+
+```bash
+printf '%s\0' codex exec --model gpt-5.6-sol '<prompt>' \
+  | agentic-pr-dash-codex-dispatch \
+      --structured-stdin \
+      --task-type review \
+      --exit-code 0 \
+      --started-at-unix-nano 1787760000000000000
+```
+
+The NUL-delimited stream preserves argument boundaries without putting prompt
+content in the logger's own process arguments. The observer emits an
+`agent.dispatch` OpenTelemetry span using standard `process.*` and `gen_ai.*`
+attributes plus a bounded `gaia.dispatch.*` extension for routing and policy
+facts that OpenTelemetry does not standardize. It also projects the same typed
+record into the existing dispatch JSONL shape while downstream readers migrate.
+
+`process.command_args` is sanitized before export. Prompt-bearing positional
+arguments, unknown attached option values, non-allowlisted config values, stdin,
+and arbitrary environment variables are never recorded. `CODEX_HOME` is the
+only currently allowlisted environment value. Argument count and string sizes
+are bounded with deterministic truncation markers. OpenTelemetry remains a
+no-op unless the host application configures an SDK/exporter; no collector is
+required for the JSONL compatibility projection.
+
+The older `--command` interface remains available for legacy hook payloads. It
+is a compatibility path: structured metadata is authoritative whenever both
+forms are present, and policy consumers must not infer routing from the raw
+command in that case.
+
 ## The agentic review loop
 
 Each tick, the loop walks your open PRs and runs `check` on every one — a
