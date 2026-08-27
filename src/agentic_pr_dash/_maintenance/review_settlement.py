@@ -581,15 +581,16 @@ def evaluate_pr_snapshot(
             unaddressed_thread_ids.append(thread.node_id)
             _append_once(blockers, "unresolved_fixed_review_threads")
             continue
-        if (
-            settlement_reply_status(
-                thread,
-                closure,
-                marker=COMPLETE_MARKER,
-                maintenance_author=maintenance_author,
-            )
-            is SettlementReplyStatus.FRESH
-        ):
+        # Deferred findings use the same canonical reply contract as every
+        # other policy disposition; the completion publisher is responsible
+        # for upgrading legacy free-form deferral replies before this gate.
+        reply_status = settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author=maintenance_author,
+        )
+        if reply_status is SettlementReplyStatus.FRESH:
             addressed_thread_ids.append(thread.node_id)
         else:
             unaddressed_thread_ids.append(thread.node_id)

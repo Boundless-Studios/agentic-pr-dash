@@ -448,7 +448,7 @@ class LifecycleWorkflow:
             resolved.number,
             record.intent.head_sha,
             record.intent.worktree_path,
-            excluded_authors={pr.author} if pr.author else set(),
+            excluded_authors=_excluded_review_authors(pr),
         )
         if not review_observation.observable:
             return None
@@ -796,6 +796,12 @@ def _policy_neutral_context(record: MaintenanceIntentRecordV1) -> ReviewContext:
             )
         )
     return policy, ledger
+
+
+def _excluded_review_authors(pr: PRData) -> set[str]:
+    """Keep PR-author submissions out of lifecycle review quorum evidence."""
+
+    return {pr.author} if pr.author else set()
 
 
 def _failing_checks(observed: github_api.PrMaintenanceSnapshot) -> list[str]:
