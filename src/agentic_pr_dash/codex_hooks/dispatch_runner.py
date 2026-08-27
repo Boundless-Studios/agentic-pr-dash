@@ -8,8 +8,9 @@ import re
 import shlex
 import sys
 import tempfile
+import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from agentic_pr_dash.dispatch_observation import (
@@ -18,6 +19,12 @@ from agentic_pr_dash.dispatch_observation import (
     DispatchOutcome,
     DispatchProvider,
     DispatchSource,
+)
+from agentic_pr_dash.dispatch_telemetry import (
+    DispatchParseStatus,
+    DispatchResolutionSource,
+    DispatchTelemetry,
+    emit_dispatch_span,
 )
 
 
@@ -48,6 +55,8 @@ _UNAVAILABLE_PATTERN = re.compile(
 )
 _ERROR_SCAN_CHUNK_SIZE = 64 * 1024
 _ERROR_SCAN_OVERLAP = 64
+_STRUCTURED_STDIN_LIMIT = 1024 * 1024
+_MIN_PLAUSIBLE_UNIX_NANO = 946_684_800_000_000_000
 _REVIEW_PATTERN = re.compile(r"\b(?:review|audit|fix|debug)\b", re.IGNORECASE)
 
 AGENT_CLASSIFY_MAP = [
@@ -224,7 +233,12 @@ def run_provider_entrypoint(
     """Translate hook stdin or detached CLI arguments into a dispatch request."""
 
     source = DispatchSource.INTERACTIVE_HOOK
-    if "--command" in argv:
+    if "--structured-stdin" in argv:
+        source = DispatchSource.DETACHED_RUNNER
+        payload = _structured_stdin_payload(argv)
+        if payload is None:
+            return 0
+    elif "--command" in argv:
         source = DispatchSource.DETACHED_RUNNER
         command = _option_value(argv, "--command") or ""
         exit_code = _option_value(argv, "--exit-code")
@@ -243,10 +257,16 @@ def run_provider_entrypoint(
             "tool_response": {"exit_code": exit_code, "stderr": stderr},
         }
         configured_model = _option_value(argv, "--configured-model")
+        configured_provider = _option_value(argv, "--configured-provider")
         default_model = _option_value(argv, "--default-model")
-        if configured_model is not None or default_model is not None:
+        if (
+            configured_model is not None
+            or configured_provider is not None
+            or default_model is not None
+        ):
             payload["dispatch_model_resolution"] = {
                 "configured_model": configured_model,
+                "configured_provider": configured_provider,
                 "default_model": default_model,
             }
     else:
@@ -258,7 +278,10 @@ def run_provider_entrypoint(
             return 0
         payload = _normalize_hook_payload(raw)
 
-    root = Path(str(payload.get("cwd") or os.getcwd()))
+    cwd = str(payload.get("cwd") or os.getcwd())
+    if "\0" in cwd:
+        return 0
+    root = Path(cwd)
     request = DispatchHookRequest(
         provider=provider,
         source=source,
@@ -273,6 +296,25 @@ def run_provider_entrypoint(
             )
         ),
     )
+    structured = _structured_telemetry(request)
+    if structured is not None:
+        effective_root = Path(structured.cwd)
+        use_effective_root = _usable_working_directory(effective_root)
+        request = replace(
+            request,
+            ledger_path=(
+                request.ledger_path
+                if "MODEL_DISPATCH_LOG" in os.environ or not use_effective_root
+                else effective_root / ".beads" / "interactions.jsonl"
+            ),
+            availability_path=(
+                request.availability_path
+                if "DISPATCH_AVAILABILITY_PATH" in os.environ or not use_effective_root
+                else effective_root
+                / ".agentic-pr-dash"
+                / f"{provider.value}-availability.json"
+            ),
+        )
     result = run_dispatch_hook(request, callback)
     if result.additional_context:
         print(
@@ -288,9 +330,140 @@ def run_provider_entrypoint(
     return 0
 
 
+def _structured_stdin_payload(argv: list[str]) -> dict[str, object] | None:
+    task_type = _option_value(argv, "--task-type")
+    if not task_type or task_type.startswith("-"):
+        return None
+    try:
+        raw = sys.stdin.buffer.read(_STRUCTURED_STDIN_LIMIT + 1)
+        if len(raw) > _STRUCTURED_STDIN_LIMIT or not raw.endswith(b"\0"):
+            return None
+        command_argv = [part.decode("utf-8") for part in raw[:-1].split(b"\0")]
+    except (AttributeError, UnicodeDecodeError, OSError):
+        return None
+    if not command_argv or any("\0" in value for value in command_argv):
+        return None
+
+    exit_code_raw = _option_value(argv, "--exit-code")
+    try:
+        exit_code = int(exit_code_raw) if exit_code_raw is not None else None
+    except ValueError:
+        return None
+    if exit_code is None:
+        return None
+    stderr = ""
+    error_file = _option_value(argv, "--error-file")
+    if error_file:
+        try:
+            if _error_file_reports_unavailable(Path(error_file)):
+                stderr = "quota"
+        except OSError:
+            pass
+    started_at = _option_value(argv, "--started-at-unix-nano")
+    try:
+        start_time_unix_nano = int(started_at) if started_at is not None else None
+    except ValueError:
+        return None
+    payload: dict[str, object] = {
+        "session_id": os.environ.get("CLAUDE_SESSION_ID", ""),
+        "cwd": os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd()),
+        "tool_input": {"command": "<redacted>"},
+        "tool_response": {"exit_code": exit_code, "stderr": stderr},
+        "dispatch_telemetry": {
+            "argv": command_argv,
+            "task_type": task_type,
+            "start_time_unix_nano": start_time_unix_nano,
+        },
+    }
+    configured_model = _option_value(argv, "--configured-model")
+    configured_provider = _option_value(argv, "--configured-provider")
+    default_model = _option_value(argv, "--default-model")
+    if (
+        configured_model is not None
+        or configured_provider is not None
+        or default_model is not None
+    ):
+        payload["dispatch_model_resolution"] = {
+            "configured_model": configured_model,
+            "configured_provider": configured_provider,
+            "default_model": default_model,
+        }
+    return payload
+
+
 def _observation_from_request(
     request: DispatchHookRequest,
 ) -> DispatchObservation | None:
+    structured = _structured_telemetry(request)
+    if "dispatch_telemetry" in request.payload:
+        if structured is None:
+            return None
+        response = request.payload.get("tool_response")
+        if not isinstance(response, dict) or _exit_code(response) is None:
+            return None
+        outcome = _outcome(response)
+        resolution = request.payload.get("dispatch_model_resolution")
+        effective_model = resolve_provider_model(
+            structured.requested_model,
+            resolution,
+            ignore_user_config=structured.ignore_user_config,
+        )
+        configured_provider = _adapter_configured_provider(
+            resolution, ignore_user_config=structured.ignore_user_config
+        )
+        if (
+            configured_provider is not None
+            and structured.gen_ai_provider_name in {None, "openai"}
+            and not structured.provider_explicit
+        ):
+            structured = replace(
+                structured,
+                gen_ai_provider_name=configured_provider,
+            )
+        if (
+            structured.provider is DispatchProvider.OPENCODE
+            and structured.gen_ai_provider_name is None
+            and effective_model
+            and "/" in effective_model
+        ):
+            structured = replace(
+                structured,
+                gen_ai_provider_name=effective_model.split("/", 1)[0],
+            )
+        if structured.resolution_source is DispatchResolutionSource.UNAVAILABLE:
+            structured = replace(
+                structured,
+                resolution_source=_adapter_resolution_source(
+                    resolution, ignore_user_config=structured.ignore_user_config
+                ),
+            )
+        verdict = response.get("review_verdict")
+        if (
+            not isinstance(verdict, dict)
+            or outcome is not DispatchOutcome.SUCCESS
+            or structured.task_type != "review"
+        ):
+            verdict = None
+        emit_dispatch_span(
+            structured,
+            outcome=outcome,
+            effective_model=effective_model,
+            error_type=(
+                f"process.exit_code.{_exit_code(response)}"
+                if outcome is DispatchOutcome.FAILURE
+                else (
+                    "provider.unavailable"
+                    if outcome is DispatchOutcome.UNAVAILABLE
+                    else None
+                )
+            ),
+        )
+        return structured.to_dispatch_observation(
+            outcome=outcome,
+            effective_model=effective_model,
+            review_verdict=dict(verdict) if verdict is not None else None,
+        )
+
     tool_input = request.payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
@@ -323,7 +496,7 @@ def _observation_from_request(
         request.payload.get("dispatch_model_resolution"),
     )
 
-    return DispatchObservation(
+    observation = DispatchObservation(
         provider=request.provider,
         source=request.source,
         session_id=str(request.payload.get("session_id") or ""),
@@ -341,6 +514,148 @@ def _observation_from_request(
         ),
         classification_framework=declared[1] if declared is not None else None,
     )
+    legacy_telemetry = DispatchTelemetry.from_legacy_observation(
+        observation,
+        parse_status=(
+            DispatchParseStatus.LEGACY_PARSED
+            if direct_invocation
+            else DispatchParseStatus.AMBIGUOUS
+        ),
+    )
+    emit_dispatch_span(
+        legacy_telemetry,
+        outcome=outcome,
+        effective_model=resolved_model,
+        error_type=(
+            f"process.exit_code.{_exit_code(response)}"
+            if outcome is DispatchOutcome.FAILURE
+            else (
+                "provider.unavailable"
+                if outcome is DispatchOutcome.UNAVAILABLE
+                else None
+            )
+        ),
+    )
+    return observation
+
+
+def _structured_telemetry(
+    request: DispatchHookRequest,
+) -> DispatchTelemetry | None:
+    metadata = request.payload.get("dispatch_telemetry")
+    if not isinstance(metadata, dict):
+        return None
+    argv = metadata.get("argv")
+    task_type = metadata.get("task_type")
+    start_time_unix_nano = metadata.get("start_time_unix_nano")
+    if (
+        not isinstance(argv, list)
+        or not argv
+        or not all(isinstance(value, str) for value in argv)
+        or not isinstance(task_type, str)
+        or not task_type.strip()
+        or not _valid_start_time(start_time_unix_nano)
+    ):
+        return None
+    executable = argv[0].replace("\\", "/").rsplit("/", 1)[-1].casefold()
+    if executable not in {
+        request.provider.value,
+        f"{request.provider.value}.exe",
+    } or not _has_supported_subcommand(argv, request.provider):
+        return None
+    try:
+        return DispatchTelemetry.from_argv(
+            provider=request.provider,
+            source=request.source,
+            argv=argv,
+            cwd=str(request.payload.get("cwd") or os.getcwd()),
+            task_type=task_type.strip(),
+            session_id=str(request.payload.get("session_id") or ""),
+            environment={"CODEX_HOME": os.environ["CODEX_HOME"]}
+            if "CODEX_HOME" in os.environ
+            else None,
+            start_time_unix_nano=start_time_unix_nano,
+        )
+    except (OSError, ValueError):
+        return None
+
+
+def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bool:
+    if provider is DispatchProvider.OPENCODE:
+        if len(argv) < 2 or argv[1] != "run":
+            return False
+        option_tokens = argv[2 : argv.index("--")] if "--" in argv else argv[2:]
+        return not any(
+            token in {"-h", "--help", "-V", "--version"}
+            for token in option_tokens
+        )
+    if provider is not DispatchProvider.CODEX:
+        return False
+    option_tokens = argv[1 : argv.index("--")] if "--" in argv else argv[1:]
+    if any(token in {"-h", "--help", "-V", "--version"} for token in option_tokens):
+        return False
+    value_options = {
+        "--add-dir",
+        "--ask-for-approval",
+        "--cd",
+        "--config",
+        "--disable",
+        "--enable",
+        "--image",
+        "--local-provider",
+        "--model",
+        "--profile",
+        "--remote",
+        "--remote-auth-token-env",
+        "--sandbox",
+        "-a",
+        "-C",
+        "-c",
+        "-i",
+        "-m",
+        "-p",
+        "-s",
+    }
+    index = 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return False
+        if token in {"--image", "-i"}:
+            return False
+        if token in value_options:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token in {"exec", "e"}
+    return False
+
+
+def _adapter_configured_provider(
+    resolution: object, *, ignore_user_config: bool = False
+) -> str | None:
+    if ignore_user_config or not isinstance(resolution, dict):
+        return None
+    configured = resolution.get("configured_provider")
+    if isinstance(configured, str) and configured.strip():
+        return configured.strip()
+    return None
+
+
+def _adapter_resolution_source(
+    resolution: object, *, ignore_user_config: bool = False
+) -> DispatchResolutionSource:
+    if not isinstance(resolution, dict):
+        return DispatchResolutionSource.UNAVAILABLE
+    configured = resolution.get("configured_model")
+    if not ignore_user_config and isinstance(configured, str) and configured.strip():
+        return DispatchResolutionSource.BASE_CONFIG
+    default = resolution.get("default_model")
+    if isinstance(default, str) and default.strip():
+        return DispatchResolutionSource.TASK_ROUTING
+    return DispatchResolutionSource.UNAVAILABLE
 
 
 def _declared_classification(payload: dict[str, object]) -> tuple[str, str] | None:
@@ -377,6 +692,15 @@ def _option_value(argv: list[str], option: str) -> str | None:
     except ValueError:
         return None
     return argv[index + 1] if index + 1 < len(argv) else None
+
+
+def _usable_working_directory(path: Path) -> bool:
+    """Return whether default telemetry files can safely be rooted at *path*."""
+
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
 
 
 def _matches_provider(command: str, provider: DispatchProvider) -> bool:
@@ -468,19 +792,27 @@ def _skip_timeout_prefix(tokens: list[str], index: int) -> int:
 
 
 def resolve_provider_model(
-    requested_model: str | None, resolution: object
+    requested_model: str | None,
+    resolution: object,
+    *,
+    ignore_user_config: bool = False,
 ) -> str | None:
     """Resolve model attribution supplied by a repository adapter.
 
     ``dispatch_model_resolution`` is an optional payload mapping with
-    ``configured_model`` and ``default_model`` string candidates. An explicit
-    provider CLI model always wins.
+    ``configured_model``, ``configured_provider``, and ``default_model`` string
+    candidates. An explicit provider CLI model always wins.
     """
     if requested_model:
         return requested_model
     if not isinstance(resolution, dict):
         return None
-    for key in ("configured_model", "default_model"):
+    keys = (
+        ("default_model",)
+        if ignore_user_config
+        else ("configured_model", "default_model")
+    )
+    for key in keys:
         candidate = resolution.get(key)
         if isinstance(candidate, str) and candidate.strip():
             return candidate.strip()
@@ -516,6 +848,28 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
     if isinstance(stderr, str) and _UNAVAILABLE_PATTERN.search(stderr):
         return DispatchOutcome.UNAVAILABLE
     return DispatchOutcome.FAILURE
+
+
+def _exit_code(response: dict[object, object]) -> int | None:
+    exit_code = response.get("exit_code", response.get("exitCode"))
+    if isinstance(exit_code, bool):
+        return None
+    if isinstance(exit_code, int):
+        return exit_code
+    if not isinstance(exit_code, str):
+        return None
+    try:
+        return int(exit_code)
+    except ValueError:
+        return None
+
+
+def _valid_start_time(value: object) -> bool:
+    return value is None or (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and _MIN_PLAUSIBLE_UNIX_NANO <= value <= time.time_ns()
+    )
 
 
 def _error_file_reports_unavailable(path: Path) -> bool:
