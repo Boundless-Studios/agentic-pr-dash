@@ -64,9 +64,7 @@ def _repository(
 
 def _adapter():
     try:
-        return importlib.import_module(
-            "agentic_pr_dash.codex_hooks.run_pr_convergence"
-        )
+        return importlib.import_module("agentic_pr_dash.codex_hooks.run_pr_convergence")
     except ModuleNotFoundError:
         pytest.fail("the unified run_pr_convergence adapter is missing")
 
@@ -391,7 +389,7 @@ def test_pr_branch_target_uses_the_exact_local_ref_identity(
     command: str,
 ) -> None:
     adapter = _adapter()
-    repo, current_head = _repository(tmp_path)
+    repo, _current_head = _repository(tmp_path)
     _git(repo, "checkout", "-b", "feature/pr-head")
     (repo / "branch.txt").write_text("branch head\n", encoding="utf-8")
     _git(repo, "add", "branch.txt")
@@ -418,6 +416,38 @@ def test_pr_branch_target_uses_the_exact_local_ref_identity(
     intent = records[0].intent
     assert intent.pushed_ref == "refs/heads/feature/pr-head"
     assert intent.head_sha == branch_head
+
+
+def test_numeric_ready_target_uses_named_pr_identity(
+    tmp_path: Path, monkeypatch
+) -> None:
+    adapter = _adapter()
+    repo, current_head = _repository(tmp_path)
+    named_head = "d" * 40
+    monkeypatch.setattr(
+        adapter,
+        "_resolve_numeric_pr_identity",
+        lambda cwd, number: adapter.LocalGitIdentity(
+            "Acme/Widget", "refs/heads/feature/named-pr", named_head, cwd
+        ),
+        raising=False,
+    )
+    state_root = tmp_path / "state"
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "exec_command",
+        "tool_input": {"cmd": "gh pr ready 42", "workdir": str(repo)},
+        "tool_response": {"exit_code": 0},
+        "cwd": str(tmp_path),
+        "session_id": "session-1",
+    }
+
+    assert adapter.run_payload(payload, state_root=state_root, now=NOW) == 0
+
+    intent = LifecycleStore(state_root).list_intents()[0].intent
+    assert intent.pr_number == 42
+    assert intent.pushed_ref == "refs/heads/feature/named-pr"
+    assert intent.head_sha == named_head
     assert intent.head_sha != current_head
     assert intent.pr_number == 42
 
@@ -670,7 +700,10 @@ def test_legacy_watchers_are_removed_and_hook_imports_stay_local_only() -> None:
         "start_daemon",
         "start_worker",
     }
-    for path in (hook_dir / "run_pr_convergence.py", PROJECT_ROOT / "src" / "agentic_pr_dash" / "stop_hook.py"):
+    for path in (
+        hook_dir / "run_pr_convergence.py",
+        PROJECT_ROOT / "src" / "agentic_pr_dash" / "stop_hook.py",
+    ):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         imported = {
             alias.name

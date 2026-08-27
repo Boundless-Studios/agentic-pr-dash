@@ -176,6 +176,23 @@ async def test_superseded_exact_head_intent_becomes_terminal(
 
 
 @pytest.mark.asyncio
+async def test_merged_exact_pr_intent_becomes_terminal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(
+        github_api, "resolve_pr", lambda *a, **k: {**_pr_payload(), "state": "MERGED"}
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
+
+    assert result.progressed == 1
+    assert store.list_intents()[0].state is IntentLifecycleStateV1.SETTLED
+
+
+@pytest.mark.asyncio
 async def test_lifecycle_excludes_pr_author_from_review_observation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -189,8 +206,10 @@ async def test_lifecycle_excludes_pr_author_from_review_observation(
     monkeypatch.setattr(
         github_api,
         "get_review_submissions_observation",
-        lambda *a, **k: excluded.append(k["excluded_authors"])
-        or github_api.ObservationReadResult.observed([]),
+        lambda *a, **k: (
+            excluded.append(k["excluded_authors"])
+            or github_api.ObservationReadResult.observed([])
+        ),
     )
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
@@ -306,9 +325,7 @@ async def test_stale_no_pr_resolution_cannot_overwrite_concurrent_reactivation(
     monkeypatch.setattr(github_api, "find_pr_by_head", resolve_then_reactivate)
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
-    result = await LifecycleWorkflow(
-        store, policy=_policy(), ledger=_ledger()
-    ).drain()
+    result = await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
 
     current = store.list_intents()[0]
     assert result.deferred == 1
@@ -340,9 +357,7 @@ async def test_open_branch_lookup_without_state_field_can_promote(
     )
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
-    result = await LifecycleWorkflow(
-        store, policy=_policy(), ledger=_ledger()
-    ).drain()
+    result = await LifecycleWorkflow(store, policy=_policy(), ledger=_ledger()).drain()
 
     assert result.progressed == 1
     assert store.list_intents()[0].state is IntentLifecycleStateV1.PROMOTED
@@ -1198,9 +1213,7 @@ async def test_reactivated_generation_requires_two_fresh_clean_observations(
     )
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
 
-    workflow = LifecycleWorkflow(
-        store, policy=_policy(), ledger=_ledger(), now=clock
-    )
+    workflow = LifecycleWorkflow(store, policy=_policy(), ledger=_ledger(), now=clock)
     await workflow.drain()
     clock.current += timedelta(seconds=30)
     await workflow.drain()
@@ -1272,12 +1285,8 @@ async def test_drain_batches_observations_for_same_repository(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     store = LifecycleStore(tmp_path / "state")
-    first = _intent(pr_number=7).model_copy(
-        update={"pushed_ref": "refs/heads/first"}
-    )
-    second = _intent(pr_number=8).model_copy(
-        update={"pushed_ref": "refs/heads/second"}
-    )
+    first = _intent(pr_number=7).model_copy(update={"pushed_ref": "refs/heads/first"})
+    second = _intent(pr_number=8).model_copy(update={"pushed_ref": "refs/heads/second"})
     store.enqueue(first)
     store.enqueue(second)
 
@@ -1749,9 +1758,7 @@ async def test_lifecycle_dispatch_respects_claim_exclusion_and_adoption(
     monkeypatch.setattr(
         coordinator, "worktree_has_dirty_or_unpushed_changes", lambda path: False
     )
-    intent = _intent(pr_number=7).model_copy(
-        update={"worktree_path": str(worktree)}
-    )
+    intent = _intent(pr_number=7).model_copy(update={"worktree_path": str(worktree)})
     observed = _batch(
         ci_checks=(CICheck(name="tests", status="completed", conclusion="failure"),)
     ).observed[7]
@@ -1777,9 +1784,7 @@ async def test_lifecycle_dispatch_respects_claim_exclusion_and_adoption(
         github_api,
         "collect_pr_maintenance_snapshots",
         lambda *args, **kwargs: _batch(
-            ci_checks=(
-                CICheck(name="tests", status="completed", conclusion="failure"),
-            )
+            ci_checks=(CICheck(name="tests", status="completed", conclusion="failure"),)
         ),
     )
     monkeypatch.setattr(
@@ -1855,6 +1860,66 @@ async def test_changed_observation_resets_stability(
     assert snapshot.stable_observation_count == 0
     assert not snapshot.settled
     assert snapshot.blockers == (MaintenanceBlockerV1.MERGE_CONFLICT,)
+
+
+@pytest.mark.asyncio
+async def test_equal_aggregate_counts_with_changed_settlement_key_reset_stability(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    class Clock:
+        current = OBSERVED_AT
+
+        def __call__(self) -> datetime:
+            return self.current
+
+    clock = Clock()
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    observations = iter(
+        (
+            _batch(
+                ci_checks=(
+                    CICheck(name="tests-a", status="completed", conclusion="success"),
+                )
+            ),
+            _batch(
+                ci_checks=(
+                    CICheck(name="tests-b", status="completed", conclusion="success"),
+                )
+            ),
+        )
+    )
+    monkeypatch.setattr(
+        github_api,
+        "collect_pr_maintenance_snapshots",
+        lambda *a, **k: next(observations),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    workflow = LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=clock,
+        stabilization_interval=timedelta(0),
+    )
+    await workflow.drain()
+    clock.current += timedelta(seconds=30)
+    await workflow.drain()
+
+    record = store.list_intents()[0]
+    snapshot = store.read_snapshot(
+        MaintenanceTargetV1.exact(record.canonical_key), now=clock.current
+    ).snapshot
+    assert snapshot is not None
+    assert snapshot.stable_observation_count == 1
+    assert not snapshot.settled
 
 
 @pytest.mark.asyncio
@@ -1966,3 +2031,46 @@ def test_default_review_context_loader_reads_worktree_policy_and_ledger(
     assert context is not None
     assert context[0].review.local.reviewer_count == 1
     assert context[1].repository == REPOSITORY
+
+
+def test_invalid_configured_review_context_raises(tmp_path: Path) -> None:
+    from agentic_pr_dash.lifecycle_workflow import load_review_context_for_worktree
+
+    policy_path = tmp_path / "config" / "review-policy.yaml"
+    policy_path.parent.mkdir()
+    policy_path.write_text("not: [valid", encoding="utf-8")
+    ledger_path = tmp_path / ".agentic-review" / "ledger.json"
+    ledger_path.parent.mkdir()
+    ledger_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(Exception, match="review context"):
+        load_review_context_for_worktree(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_policy_neutral_context_matches_repository_case_insensitively(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intent = _intent(pr_number=7).model_copy(update={"repository": "acme/widget"})
+    store.enqueue(intent)
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *a, **k: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    result = await LifecycleWorkflow(store, context_loader=lambda record: None).drain()
+
+    assert result.progressed == 1
+    snapshot = store.read_snapshot(
+        MaintenanceTargetV1.exact(store.list_intents()[0].canonical_key),
+        now=OBSERVED_AT,
+    ).snapshot
+    assert snapshot is not None
+    assert MaintenanceBlockerV1.REVIEW_FINDINGS not in snapshot.blockers

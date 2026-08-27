@@ -55,37 +55,79 @@ SPANS_AT_ANCHOR = [(6, 8, 6, 9)]
 SPANS_ELSEWHERE_IN_FILE = [(100, 110, 100, 112)]
 
 
-def _thread(body, *, path=ANCHOR, created="2026-01-01T00:00:00Z", outdated=False,
-            line=7, original_line=None, replies=(), node_id="t1"):
+def _thread(
+    body,
+    *,
+    path=ANCHOR,
+    created="2026-01-01T00:00:00Z",
+    outdated=False,
+    line=7,
+    original_line=None,
+    replies=(),
+    node_id="t1",
+):
     c = ReviewThreadComment(
-        database_id=42, path=path, line=line, body=body,
-        author="rev", created_at=created, original_line=original_line,
+        database_id=42,
+        path=path,
+        line=line,
+        body=body,
+        author="rev",
+        created_at=created,
+        original_line=original_line,
     )
     reply_comments = [
         ReviewThreadComment(
-            database_id=43 + i, path=path, line=line, body=reply_body,
-            author="bot", created_at=created,
+            database_id=43 + i,
+            path=path,
+            line=line,
+            body=reply_body,
+            author="bot",
+            created_at=created,
         )
         for i, reply_body in enumerate(replies)
     ]
-    return ReviewThread(node_id=node_id, is_resolved=False, is_outdated=outdated,
-                        top=c, replies=reply_comments)
+    return ReviewThread(
+        node_id=node_id,
+        is_resolved=False,
+        is_outdated=outdated,
+        top=c,
+        replies=reply_comments,
+    )
 
 
 def _pr():
     return PRData(
-        number=2139, repo=REPOSITORY, title="t", branch="b",
+        number=2139,
+        repo=REPOSITORY,
+        title="t",
+        branch="b",
         url="https://x/pull/2139",
-        failing_checks=[], review_comments=[], merge_state="CLEAN",
-        latest_commit_sha="headsha", latest_commit_date="2026-02-01T00:00:00Z",
-        worktree_path="/wt", status=PRStatus.CLEAN,
+        failing_checks=[],
+        review_comments=[],
+        merge_state="CLEAN",
+        latest_commit_sha="headsha",
+        latest_commit_date="2026-02-01T00:00:00Z",
+        worktree_path="/wt",
+        status=PRStatus.CLEAN,
     )
 
 
-def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
-          threads=None, resolve_result=True, reply_result=True, events=None,
-          commits=None, files_by_commit=None, commit_dates=None,
-          thread_snapshots=None, mutation_author="maintenance-bot"):
+def _wire(
+    monkeypatch,
+    *,
+    thread,
+    touched_files,
+    spans=SPANS_AT_ANCHOR,
+    threads=None,
+    resolve_result=True,
+    reply_result=True,
+    events=None,
+    commits=None,
+    files_by_commit=None,
+    commit_dates=None,
+    thread_snapshots=None,
+    mutation_author="maintenance-bot",
+):
     """Stub the gh/GraphQL boundary so `_cmd_complete` runs offline.
 
     Records every `resolve_review_thread` call into ``resolved`` and every
@@ -105,15 +147,16 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     # One post-baseline commit exists (a real fixing push landed) ...
     effective_commits = commits or [("c0ffee", "fix: logging")]
     monkeypatch.setattr(
-        github_api, "get_new_pr_commits",
+        github_api,
+        "get_new_pr_commits",
         lambda *a, **k: list(effective_commits),
     )
     # ... and it touched exactly `touched_files`.
     monkeypatch.setattr(
-        github_api, "get_commit_changed_files",
+        github_api,
+        "get_commit_changed_files",
         lambda sha, cwd=None: list(
-            files_by_commit[sha] if files_by_commit is not None
-            else touched_files
+            files_by_commit[sha] if files_by_commit is not None else touched_files
         ),
     )
     effective_commit_dates = commit_dates or {
@@ -126,7 +169,8 @@ def _wire(monkeypatch, *, thread, touched_files, spans=SPANS_AT_ANCHOR,
     )
     # ... changing exactly `spans` (hunk line ranges) in each touched file.
     monkeypatch.setattr(
-        github_api, "get_changed_line_spans",
+        github_api,
+        "get_changed_line_spans",
         lambda base, head, path, cwd=None: None if spans is None else list(spans),
     )
     all_threads = threads if threads is not None else [thread]
@@ -710,12 +754,48 @@ def test_failed_structured_reply_prevents_resolution_and_stays_actionable():
 @pytest.mark.parametrize(
     ("disposition", "state", "duplicate_of", "deferred_to_issue", "expected"),
     [
-        (Disposition.REJECT, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `reject`"),
-        (Disposition.STALE, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `stale`"),
-        (Disposition.DECLINED, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `declined`"),
-        (Disposition.WRONG_OWNER, FindingSettlementState.DECLINED_WITH_RATIONALE, None, None, "- Disposition: `wrong_owner`"),
-        (Disposition.DUPLICATE, FindingSettlementState.DECLINED_WITH_RATIONALE, "finding:prior", None, "- Duplicate of: `finding:prior`"),
-        (Disposition.DEFERRED_TO_EXISTING_ISSUE, FindingSettlementState.DEFERRED_TO_EXISTING_ISSUE, None, "BOU-918", "- Existing issue: `BOU-918`"),
+        (
+            Disposition.REJECT,
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+            None,
+            None,
+            "- Disposition: `reject`",
+        ),
+        (
+            Disposition.STALE,
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+            None,
+            None,
+            "- Disposition: `stale`",
+        ),
+        (
+            Disposition.DECLINED,
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+            None,
+            None,
+            "- Disposition: `declined`",
+        ),
+        (
+            Disposition.WRONG_OWNER,
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+            None,
+            None,
+            "- Disposition: `wrong_owner`",
+        ),
+        (
+            Disposition.DUPLICATE,
+            FindingSettlementState.DECLINED_WITH_RATIONALE,
+            "finding:prior",
+            None,
+            "- Duplicate of: `finding:prior`",
+        ),
+        (
+            Disposition.DEFERRED_TO_EXISTING_ISSUE,
+            FindingSettlementState.DEFERRED_TO_EXISTING_ISSUE,
+            None,
+            "BOU-918",
+            "- Existing issue: `BOU-918`",
+        ),
     ],
 )
 def test_non_code_policy_outcomes_reply_but_never_resolve(
@@ -869,20 +949,33 @@ def test_same_second_reply_order_breaks_settlement_timestamp_ties():
     thread.replies.extend(
         [
             ReviewThreadComment(
-                database_id=43, path=ANCHOR, line=7, body="Still open",
-                author="reviewer", created_at="2026-01-01T00:00:00Z",
+                database_id=43,
+                path=ANCHOR,
+                line=7,
+                body="Still open",
+                author="reviewer",
+                created_at="2026-01-01T00:00:00Z",
             ),
             ReviewThreadComment(
-                database_id=44, path=ANCHOR, line=7, body=body,
-                author="maintenance-bot", created_at="2026-01-01T00:00:00Z",
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body=body,
+                author="maintenance-bot",
+                created_at="2026-01-01T00:00:00Z",
             ),
         ]
     )
 
-    assert completion.settlement_reply_status(
-        thread, closure, marker=COMPLETE_MARKER,
-        maintenance_author="maintenance-bot",
-    ) is completion.SettlementReplyStatus.FRESH
+    assert (
+        completion.settlement_reply_status(
+            thread,
+            closure,
+            marker=COMPLETE_MARKER,
+            maintenance_author="maintenance-bot",
+        )
+        is completion.SettlementReplyStatus.FRESH
+    )
 
 
 def test_unrelated_evidence_does_not_make_non_code_reply_fresh():
@@ -1037,6 +1130,7 @@ def test_different_reviewer_followup_reopens_structured_non_code_reply():
 
 # --- negative: anchor touched, body points elsewhere -> DO NOT resolve --------
 
+
 def test_anchor_touch_but_body_points_at_untouched_module_not_resolved(monkeypatch):
     thread = _thread(
         "Initialize logging for worker Cloud Run app too — see "
@@ -1068,6 +1162,7 @@ def test_anchor_touch_but_body_points_at_untouched_path_not_resolved(monkeypatch
 
 # --- positive: anchored hunk changed, body has no other-file ref -> resolves ---
 
+
 def test_anchored_hunk_changed_body_no_other_ref_still_resolves(monkeypatch):
     thread = _thread("Please add a docstring and fix the typo here.")
     resolved, replied = _wire(monkeypatch, thread=thread, touched_files=[ANCHOR])
@@ -1081,7 +1176,9 @@ def test_anchored_hunk_changed_body_no_other_ref_still_resolves(monkeypatch):
     assert [t for t, _ in replied] == ["t1"]
 
 
-def test_anchored_hunk_changed_body_references_the_anchor_file_still_resolves(monkeypatch):
+def test_anchored_hunk_changed_body_references_the_anchor_file_still_resolves(
+    monkeypatch,
+):
     # Body references its own anchor module — that is NOT "elsewhere".
     thread = _thread("Fix the logging init in app.py / gaia.api.app")
     resolved, _ = _wire(monkeypatch, thread=thread, touched_files=[ANCHOR])
@@ -1092,11 +1189,14 @@ def test_anchored_hunk_changed_body_references_the_anchor_file_still_resolves(mo
     assert resolved == ["t1"]
 
 
-def test_anchored_hunk_changed_body_references_a_touched_other_file_still_resolves(monkeypatch):
+def test_anchored_hunk_changed_body_references_a_touched_other_file_still_resolves(
+    monkeypatch,
+):
     # Body points at worker_app.py AND the fixing commit DID touch it -> clear.
     thread = _thread("Initialize logging in gaia.api.worker_app too (worker_app.py).")
     resolved, _ = _wire(
-        monkeypatch, thread=thread,
+        monkeypatch,
+        thread=thread,
         touched_files=[ANCHOR, "backend/src/gaia/api/worker_app.py"],
     )
 
@@ -1108,20 +1208,22 @@ def test_anchored_hunk_changed_body_references_a_touched_other_file_still_resolv
 
 # --- direct unit coverage of the heuristic helper -----------------------------
 
+
 def test_thread_points_elsewhere_helper():
     touched = {ANCHOR}
     # References an untouched module -> ambiguous.
-    assert mc._thread_points_elsewhere(
-        "see gaia.api.worker_app", ANCHOR, touched) is True
+    assert (
+        mc._thread_points_elsewhere("see gaia.api.worker_app", ANCHOR, touched) is True
+    )
     # References only its own anchor -> not elsewhere.
-    assert mc._thread_points_elsewhere(
-        "fix app.py here", ANCHOR, touched) is False
+    assert mc._thread_points_elsewhere("fix app.py here", ANCHOR, touched) is False
     # No file/module reference at all -> not elsewhere.
-    assert mc._thread_points_elsewhere(
-        "add a docstring", ANCHOR, touched) is False
+    assert mc._thread_points_elsewhere("add a docstring", ANCHOR, touched) is False
     # Prose dotted token (e.g.) must not trip the gate.
-    assert mc._thread_points_elsewhere(
-        "do this, e.g. add a guard", ANCHOR, touched) is False
+    assert (
+        mc._thread_points_elsewhere("do this, e.g. add a guard", ANCHOR, touched)
+        is False
+    )
 
 
 def test_thread_points_elsewhere_ignores_badge_url_and_callable_mentions():
@@ -1198,15 +1300,17 @@ def test_leaving_open_message_names_the_conflicting_path(monkeypatch, capsys):
 def test_thread_elsewhere_refs_helper_returns_conflicting_refs():
     touched = {ANCHOR}
     # Untouched module reference is reported.
-    assert mc._thread_elsewhere_refs(
-        "see gaia.api.worker_app", ANCHOR, touched) == ["gaia.api.worker_app"]
+    assert mc._thread_elsewhere_refs("see gaia.api.worker_app", ANCHOR, touched) == [
+        "gaia.api.worker_app"
+    ]
     # Only the anchor / touched refs -> nothing points elsewhere.
     assert mc._thread_elsewhere_refs("fix app.py here", ANCHOR, touched) == []
     assert mc._thread_elsewhere_refs("add a docstring", ANCHOR, touched) == []
     # De-duplicated, in body order.
     assert mc._thread_elsewhere_refs(
         "scripts/a.py then scripts/a.py then scripts/b.py",
-        DECK_CONF, {DECK_CONF},
+        DECK_CONF,
+        {DECK_CONF},
     ) == ["scripts/a.py", "scripts/b.py"]
 
 
@@ -1219,7 +1323,9 @@ def test_bou2095_file_touched_but_anchored_hunk_untouched_not_resolved(monkeypat
     # "Addressed by" reply.
     thread = _thread("Guard against a None campaign here.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
 
@@ -1236,11 +1342,15 @@ def test_bou2095_pure_line_drift_outdated_not_resolved(monkeypatch):
     # The anchored hunk (line 50) never changed. Must stay OPEN.
     thread = _thread(
         "Rename this variable for clarity.",
-        outdated=True, line=None, original_line=50,
+        outdated=True,
+        line=None,
+        original_line=50,
     )
     # Insertion at top: old side empty (end < start), new lines 1-3 added.
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=[(1, 0, 1, 3)],
     )
 
@@ -1256,7 +1366,9 @@ def test_bou2095_anchored_hunk_content_changed_resolves(monkeypatch):
     # genuine auto-resolution is preserved, with the completion reply.
     thread = _thread("Guard against a None campaign here.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_AT_ANCHOR,
     )
 
@@ -1271,8 +1383,11 @@ def test_bou2320_completion_replies_before_resolving(monkeypatch):
     thread = _thread("Guard against a None campaign here.")
     events = []
     _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
-        spans=SPANS_AT_ANCHOR, events=events,
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR,
+        events=events,
     )
 
     rc = mc._cmd_complete(_args())
@@ -1281,12 +1396,14 @@ def test_bou2320_completion_replies_before_resolving(monkeypatch):
     assert events == [("reply", "t1"), ("resolve", "t1")]
 
 
-def test_bou2320_resolve_failure_keeps_marker_reply_and_blocker(
-        monkeypatch, capsys):
+def test_bou2320_resolve_failure_keeps_marker_reply_and_blocker(monkeypatch, capsys):
     thread = _thread("Guard against a None campaign here.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
-        spans=SPANS_AT_ANCHOR, resolve_result=False,
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR,
+        resolve_result=False,
     )
 
     rc = mc._cmd_complete(_args())
@@ -1304,8 +1421,11 @@ def test_bou2320_resolve_failure_keeps_marker_reply_and_blocker(
 def test_bou2320_reply_failure_prevents_resolution(monkeypatch, capsys):
     thread = _thread("Guard against a None campaign here.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
-        spans=SPANS_AT_ANCHOR, reply_result=False,
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
+        spans=SPANS_AT_ANCHOR,
+        reply_result=False,
     )
 
     rc = mc._cmd_complete(_args())
@@ -1325,7 +1445,10 @@ def test_bou2095_multi_thread_same_file_only_fixed_hunk_resolves(monkeypatch):
     t1 = _thread("Fix the off-by-one here.", node_id="t1", line=7)
     t2 = _thread("This branch needs a docstring.", node_id="t2", line=200)
     resolved, replied = _wire(
-        monkeypatch, thread=t1, threads=[t1, t2], touched_files=[ANCHOR],
+        monkeypatch,
+        thread=t1,
+        threads=[t1, t2],
+        touched_files=[ANCHOR],
         spans=SPANS_AT_ANCHOR,
     )
 
@@ -1341,10 +1464,14 @@ def test_bou2095_outdated_anchored_hunk_changed_still_resolves(monkeypatch):
     # ORIGINAL anchor line's hunk was rewritten, that is positive evidence.
     thread = _thread(
         "Guard against a None campaign here.",
-        outdated=True, line=None, original_line=7,
+        outdated=True,
+        line=None,
+        original_line=7,
     )
     resolved, _ = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_AT_ANCHOR,
     )
 
@@ -1360,7 +1487,10 @@ def test_bou2095_diff_unavailable_is_no_evidence_not_resolved(monkeypatch):
     # touched.
     thread = _thread("Guard against a None campaign here.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR], spans=None,
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
+        spans=None,
     )
 
     rc = mc._cmd_complete(_args())
@@ -1379,11 +1509,60 @@ def test_bou2095_existing_completion_reply_resolves_as_retry(monkeypatch):
         replies=(f"{COMPLETE_MARKER}\nAddressed by the local maintenance loop.",),
     )
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
 
     rc = mc._cmd_complete(_args())
+
+    assert rc == 0
+    assert resolved == ["t1"]
+    assert replied == []
+
+
+def test_policy_fixed_reply_retries_resolution_without_new_baseline_commits(
+    tmp_path, monkeypatch
+) -> None:
+    from agentic_pr_dash.lifecycle_workflow import load_review_context_for_worktree
+
+    fixing_commit = "c" * 40
+    thread = _thread("Guard against a None campaign here.")
+    _write_policy_context(tmp_path, thread, Disposition.FIXED)
+    context = load_review_context_for_worktree(tmp_path)
+    assert context is not None
+    closure = review_settlement.classify_thread_closure(
+        thread,
+        policy=context[0],
+        ledger=context[1],
+    )
+    assert closure is not None
+    body = completion.structured_settlement_reply_body(
+        marker=COMPLETE_MARKER,
+        finding=closure.finding,
+        head_sha="headsha",
+        fixing_commit=fixing_commit,
+    )
+    thread.replies.append(
+        ReviewThreadComment(
+            database_id=99,
+            path=ANCHOR,
+            line=7,
+            body=body,
+            author="maintenance-bot",
+            created_at="2026-02-02T00:00:00Z",
+        )
+    )
+    resolved, replied = _wire(
+        monkeypatch,
+        thread=thread,
+        touched_files=[],
+        commits=[],
+    )
+    monkeypatch.setattr(github_api, "get_new_pr_commits", lambda *a, **k: [])
+
+    rc = mc._cmd_complete(_args(cwd=str(tmp_path)))
 
     assert rc == 0
     assert resolved == ["t1"]
@@ -1403,7 +1582,9 @@ def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch)
         ),
     )
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
 
@@ -1415,32 +1596,47 @@ def test_pr78_stale_marker_after_reviewer_followup_does_not_resolve(monkeypatch)
 
 
 def test_bou2320_reopened_thread_with_newer_head_requires_manual_confirmation(
-        monkeypatch, capsys):
+    monkeypatch, capsys
+):
     # The failed resolve left a marker, then the reviewer rejected the fix
     # AFTER the current HEAD was pushed. Even if the base..HEAD hunk still
     # intersects the anchor, reopened feedback requires manual confirmation.
     top = ReviewThreadComment(
-        database_id=42, path=ANCHOR, line=7,
-        body="Guard against a None campaign here.", author="rev",
+        database_id=42,
+        path=ANCHOR,
+        line=7,
+        body="Guard against a None campaign here.",
+        author="rev",
         created_at="2026-01-01T00:00:00Z",
     )
     thread = ReviewThread(
-        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        node_id="t1",
+        is_resolved=False,
+        is_outdated=False,
+        top=top,
         replies=[
             ReviewThreadComment(
-                database_id=43, path=ANCHOR, line=7,
+                database_id=43,
+                path=ANCHOR,
+                line=7,
                 body=f"{COMPLETE_MARKER}\nAddressed in an earlier attempt.",
-                author="bot", created_at="2026-01-15T00:00:00Z",
+                author="bot",
+                created_at="2026-01-15T00:00:00Z",
             ),
             ReviewThreadComment(
-                database_id=44, path=ANCHOR, line=7,
-                body="This is still not fixed.", author="rev",
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="This is still not fixed.",
+                author="rev",
                 created_at="2026-03-01T00:00:00Z",
             ),
         ],
     )
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_AT_ANCHOR,
     )
 
@@ -1455,23 +1651,36 @@ def test_bou2320_reopened_thread_with_newer_head_requires_manual_confirmation(
 
 
 def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
-        monkeypatch, capsys):
+    monkeypatch, capsys
+):
     top = ReviewThreadComment(
-        database_id=42, path=ANCHOR, line=7,
-        body="Guard against a None campaign here.", author="rev",
+        database_id=42,
+        path=ANCHOR,
+        line=7,
+        body="Guard against a None campaign here.",
+        author="rev",
         created_at="2026-01-01T00:00:00Z",
     )
     thread = ReviewThread(
-        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        node_id="t1",
+        is_resolved=False,
+        is_outdated=False,
+        top=top,
         replies=[
             ReviewThreadComment(
-                database_id=43, path=ANCHOR, line=7,
+                database_id=43,
+                path=ANCHOR,
+                line=7,
                 body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
-                author="bot", created_at="2026-01-15T00:00:00Z",
+                author="bot",
+                created_at="2026-01-15T00:00:00Z",
             ),
             ReviewThreadComment(
-                database_id=44, path=ANCHOR, line=7,
-                body="The change in A is still wrong.", author="rev",
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="The change in A is still wrong.",
+                author="rev",
                 created_at="2026-01-20T00:00:00Z",
             ),
         ],
@@ -1497,23 +1706,36 @@ def test_bou2320_unrelated_newer_commit_does_not_freshen_old_anchor_change(
 
 
 def test_bou2320_newer_anchor_change_still_requires_manual_confirmation(
-        monkeypatch, capsys):
+    monkeypatch, capsys
+):
     top = ReviewThreadComment(
-        database_id=42, path=ANCHOR, line=7,
-        body="Guard against a None campaign here.", author="rev",
+        database_id=42,
+        path=ANCHOR,
+        line=7,
+        body="Guard against a None campaign here.",
+        author="rev",
         created_at="2026-01-01T00:00:00Z",
     )
     thread = ReviewThread(
-        node_id="t1", is_resolved=False, is_outdated=False, top=top,
+        node_id="t1",
+        is_resolved=False,
+        is_outdated=False,
+        top=top,
         replies=[
             ReviewThreadComment(
-                database_id=43, path=ANCHOR, line=7,
+                database_id=43,
+                path=ANCHOR,
+                line=7,
                 body=f"{COMPLETE_MARKER}\nAddressed in commit A.",
-                author="bot", created_at="2026-01-15T00:00:00Z",
+                author="bot",
+                created_at="2026-01-15T00:00:00Z",
             ),
             ReviewThreadComment(
-                database_id=44, path=ANCHOR, line=7,
-                body="The change in A is still wrong.", author="rev",
+                database_id=44,
+                path=ANCHOR,
+                line=7,
+                body="The change in A is still wrong.",
+                author="rev",
                 created_at="2026-01-20T00:00:00Z",
             ),
         ],
@@ -1545,7 +1767,9 @@ def test_pr78_head_side_anchor_matching_only_old_span_not_resolved(monkeypatch):
     # count as hunk evidence.
     thread = _thread("Guard against a None campaign here.", line=50)
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=[(48, 52, 120, 124)],
     )
 
@@ -1561,10 +1785,14 @@ def test_pr78_outdated_anchor_matching_only_new_span_not_resolved(monkeypatch):
     # coordinate; overlap with only the new-side span is not evidence.
     thread = _thread(
         "Guard against a None campaign here.",
-        outdated=True, line=None, original_line=122,
+        outdated=True,
+        line=None,
+        original_line=122,
     )
     resolved, _ = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=[(48, 52, 120, 124)],
     )
 
@@ -1575,17 +1803,22 @@ def test_pr78_outdated_anchor_matching_only_new_span_not_resolved(monkeypatch):
 
 
 def test_pr78_left_open_outdated_thread_keeps_review_comments_blocker(
-        monkeypatch, capsys):
+    monkeypatch, capsys
+):
     # PR #78 review (comment 3605704917, P1): a drift-outdated thread the gate
     # deliberately leaves open must keep the bead open as a review_comments
     # blocker — the downstream scan filters skip is_outdated, so without this
     # `complete` would report "no blockers remain" and close the bead.
     thread = _thread(
         "Rename this variable for clarity.",
-        outdated=True, line=None, original_line=50,
+        outdated=True,
+        line=None,
+        original_line=50,
     )
     resolved, _ = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=[(1, 0, 1, 3)],
     )
 
@@ -1604,7 +1837,9 @@ def test_bou2095_file_level_comment_resolves_on_file_content_change(monkeypatch)
     # any content change in the file is anchored-hunk evidence.
     thread = _thread("Please add a module docstring.", line=None, original_line=None)
     resolved, _ = _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
 
@@ -1617,7 +1852,9 @@ def test_bou2095_file_level_comment_resolves_on_file_content_change(monkeypatch)
 def test_bou2095_leaving_open_message_explains_hunk_mismatch(monkeypatch, capsys):
     thread = _thread("Guard against a None campaign here.")
     _wire(
-        monkeypatch, thread=thread, touched_files=[ANCHOR],
+        monkeypatch,
+        thread=thread,
+        touched_files=[ANCHOR],
         spans=SPANS_ELSEWHERE_IN_FILE,
     )
 
@@ -1641,7 +1878,10 @@ def test_spans_intersect_line_helper():
     assert mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES, "new") is True
     assert mc._spans_intersect_line(spans, 10 - mc._ANCHOR_CONTEXT_LINES, "new") is True
     # Beyond the fuzz.
-    assert mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES + 1, "new") is False
+    assert (
+        mc._spans_intersect_line(spans, 14 + mc._ANCHOR_CONTEXT_LINES + 1, "new")
+        is False
+    )
     assert mc._spans_intersect_line(spans, 1, "new") is False
     # PR #78 review: each coordinate is compared ONLY against its own diff
     # side — old-side overlap is not evidence for a head-side anchor and
@@ -1663,7 +1903,9 @@ def test_get_changed_line_spans_parses_real_git_diff(tmp_path):
     def _git(*args):
         subprocess.run(
             ["git", "-C", str(tmp_path), *args],
-            check=True, capture_output=True, text=True,
+            check=True,
+            capture_output=True,
+            text=True,
         )
 
     _git("init", "-q")
@@ -1675,7 +1917,9 @@ def test_get_changed_line_spans_parses_real_git_diff(tmp_path):
     _git("commit", "-qm", "base")
     base = subprocess.run(
         ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     # Change line 5 and delete line 15.
     lines = f.read_text().splitlines(keepends=True)
@@ -1685,7 +1929,9 @@ def test_get_changed_line_spans_parses_real_git_diff(tmp_path):
     _git("commit", "-aqm", "fix")
     head = subprocess.run(
         ["git", "-C", str(tmp_path), "rev-parse", "HEAD"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
     spans = github_api.get_changed_line_spans(base, head, "a.py", str(tmp_path))
@@ -1694,10 +1940,13 @@ def test_get_changed_line_spans_parses_real_git_diff(tmp_path):
     # `+14,0` -> empty new span encoded (14, 13).
     assert spans == [(5, 5, 5, 5), (15, 15, 14, 13)]
     # Unknown SHA -> None (no evidence), not [].
-    assert github_api.get_changed_line_spans(
-        "0" * 40, head, "a.py", str(tmp_path)) is None
+    assert (
+        github_api.get_changed_line_spans("0" * 40, head, "a.py", str(tmp_path)) is None
+    )
     # Untouched path -> [] (real evidence of no change).
-    assert github_api.get_changed_line_spans(base, head, "other.py", str(tmp_path)) == []
+    assert (
+        github_api.get_changed_line_spans(base, head, "other.py", str(tmp_path)) == []
+    )
 
 
 # --- BOU-2408: the "not addressed" skip must explain itself --------------------
@@ -1719,7 +1968,9 @@ def test_bou2408_untouched_anchor_explains_why_thread_stays_open(monkeypatch, ca
     """Anchored file not touched by the fixing commits -> say so."""
     thread = _thread("Force the Docker path in remote-mount tests.")
     resolved, replied = _wire(
-        monkeypatch, thread=thread, touched_files=["some/other/file.py"],
+        monkeypatch,
+        thread=thread,
+        touched_files=["some/other/file.py"],
     )
 
     rc = mc._cmd_complete(_args())

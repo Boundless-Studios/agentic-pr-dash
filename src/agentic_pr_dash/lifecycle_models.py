@@ -220,6 +220,7 @@ class MaintenanceSnapshotV1(BaseModel):
     policy_unsettled_finding_count: int = Field(ge=0)
     raw_unresolved_thread_count: int = Field(ge=0)
     unaddressed_thread_count: int = Field(ge=0)
+    settlement_key: str = ""
     stable_observation_count: int = Field(ge=0)
     stable_observation_first_at: datetime | None
     stable_observation_last_at: datetime | None
@@ -257,10 +258,7 @@ class MaintenanceSnapshotV1(BaseModel):
             raise ValueError("settled observations require clean review state")
         if self.blockers or self.next_actions:
             raise ValueError("settled observations cannot have blockers or actions")
-        if (
-            self.policy_unsettled_finding_count
-            or self.unaddressed_thread_count
-        ):
+        if self.policy_unsettled_finding_count or self.unaddressed_thread_count:
             raise ValueError("settled observations cannot have unaddressed findings")
         if self.stable_observation_count < 2:
             raise ValueError("settled observations require stable observations")

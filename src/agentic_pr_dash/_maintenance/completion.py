@@ -1,4 +1,5 @@
 """Completion-phase helpers — thread resolution and completion reply."""
+
 from __future__ import annotations
 
 import json
@@ -39,9 +40,7 @@ _MODULE_REF_STOPWORDS = frozenset({"e.g", "i.e", "etc"})
 # lines matches the diff context GitHub shows around an inline comment.
 _ANCHOR_CONTEXT_LINES = 3
 
-_SETTLEMENT_MARKER_RE = re.compile(
-    r"^<!-- agentic-pr-dash:[a-z0-9-]+ -->$"
-)
+_SETTLEMENT_MARKER_RE = re.compile(r"^<!-- agentic-pr-dash:[a-z0-9-]+ -->$")
 _SETTLEMENT_FIELDS: tuple[tuple[str, bool], ...] = (
     ("Head SHA", True),
     ("Finding fingerprint", True),
@@ -220,10 +219,7 @@ def structured_settlement_reply_body(
     if architecture_decision is not None:
         lines.extend(
             [
-                (
-                    "- Architecture decision: "
-                    f"`{architecture_decision.decision.value}`"
-                ),
+                (f"- Architecture decision: `{architecture_decision.decision.value}`"),
                 f"- Architecture lineage: `{architecture_decision.lineage_id}`",
                 f"- Architecture decided by: `{architecture_decision.decided_by}`",
                 (
@@ -265,9 +261,7 @@ def _canonical_reply_fields(body: str) -> dict[str, str] | None:
             return None
         previous_index = index
         if quoted:
-            if len(value) < 2 or not (
-                value.startswith("`") and value.endswith("`")
-            ):
+            if len(value) < 2 or not (value.startswith("`") and value.endswith("`")):
                 return None
             value = value[1:-1]
         value = value.strip()
@@ -295,12 +289,8 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
     try:
         metadata = SettlementReplyMetadata(
             head_sha=_reply_field(fields, "Head SHA") or "",
-            finding_fingerprint=(
-                _reply_field(fields, "Finding fingerprint") or ""
-            ),
-            disposition=Disposition(
-                _reply_field(fields, "Disposition") or ""
-            ),
+            finding_fingerprint=(_reply_field(fields, "Finding fingerprint") or ""),
+            disposition=Disposition(_reply_field(fields, "Disposition") or ""),
             rationale=_reply_field(fields, "Rationale") or "",
             evidence=_reply_field(fields, "Evidence") or "",
             fixing_commit=_reply_field(fields, "Fixing commit"),
@@ -308,9 +298,7 @@ def parse_structured_settlement_reply(body: str) -> SettlementReplyMetadata | No
             deferred_to_issue=_reply_field(fields, "Existing issue"),
             architecture_decision=(
                 ArchitectureDecisionKind(value)
-                if (
-                    value := _reply_field(fields, "Architecture decision")
-                )
+                if (value := _reply_field(fields, "Architecture decision"))
                 else None
             ),
             architecture_lineage_id=_reply_field(fields, "Architecture lineage"),
@@ -427,6 +415,37 @@ def settlement_reply_status(
     return SettlementReplyStatus.REOPENED
 
 
+def fresh_fixed_reply_commit(
+    thread,  # type: ignore[no-untyped-def]
+    closure: PolicyFindingClosure,
+    *,
+    marker: str,
+    maintenance_author: str,
+) -> str | None:
+    """Return fixing evidence from an unreopened canonical fixed reply."""
+
+    if closure.finding.disposition is not Disposition.FIXED:
+        return None
+    for reply in reversed(thread.replies):
+        if reply.author.casefold() != maintenance_author.casefold():
+            continue
+        metadata = parse_structured_settlement_reply(reply.body)
+        if metadata is None or metadata.fixing_commit is None:
+            continue
+        if (
+            settlement_reply_status(
+                thread,
+                closure,
+                marker=marker,
+                maintenance_author=maintenance_author,
+                fixing_commit=metadata.fixing_commit,
+            )
+            is SettlementReplyStatus.FRESH
+        ):
+            return metadata.fixing_commit
+    return None
+
+
 def apply_thread_settlement(
     *,
     thread,  # type: ignore[no-untyped-def]
@@ -516,9 +535,7 @@ def _spans_intersect_line(
     old-side numbers happen to overlap the head-side anchor (PR #78 review).
     """
     for old_start, old_end, new_start, new_end in spans:
-        start, end = (
-            (new_start, new_end) if side == "new" else (old_start, old_end)
-        )
+        start, end = (new_start, new_end) if side == "new" else (old_start, old_end)
         if end < start:  # empty side: pure insertion/deletion counterpart
             continue
         if start - _ANCHOR_CONTEXT_LINES <= anchor_line <= end + _ANCHOR_CONTEXT_LINES:
@@ -605,7 +622,9 @@ def _completion_reply_body(
     lines = [marker]
     if len(unique) == 1:
         sha, msg = unique[0]
-        lines.append(f"Addressed by the local maintenance loop in {sha[:9]} — {_commit_subject(msg)}.")
+        lines.append(
+            f"Addressed by the local maintenance loop in {sha[:9]} — {_commit_subject(msg)}."
+        )
     elif unique:
         lines.append("Addressed by the local maintenance loop in:")
         lines.extend(f"- `{sha[:9]}` {_commit_subject(msg)}" for sha, msg in unique[:6])
@@ -633,16 +652,18 @@ def _review_comments_from_threads(threads) -> list:
     out = []
     for t in threads:
         top = t.top
-        out.append(ReviewComment(
-            id=top.database_id,
-            author=top.author,
-            body=top.body,
-            path=top.path,
-            line=top.line,
-            created_at=top.created_at,
-            is_inline=True,
-            thread_id=t.node_id,
-        ))
+        out.append(
+            ReviewComment(
+                id=top.database_id,
+                author=top.author,
+                body=top.body,
+                path=top.path,
+                line=top.line,
+                created_at=top.created_at,
+                is_inline=True,
+                thread_id=t.node_id,
+            )
+        )
     return out
 
 
@@ -666,8 +687,26 @@ def _ref_matches_touched(ref: str, touched: set[str]) -> bool:
     if not touched:
         return False
     if "/" in ref or ref.endswith(
-        (".py", ".pyi", ".ts", ".tsx", ".js", ".jsx", ".gd", ".go", ".rs",
-         ".java", ".kt", ".rb", ".c", ".h", ".cpp", ".hpp", ".sql", ".sh")
+        (
+            ".py",
+            ".pyi",
+            ".ts",
+            ".tsx",
+            ".js",
+            ".jsx",
+            ".gd",
+            ".go",
+            ".rs",
+            ".java",
+            ".kt",
+            ".rb",
+            ".c",
+            ".h",
+            ".cpp",
+            ".hpp",
+            ".sql",
+            ".sh",
+        )
     ):
         base = ref.rsplit("/", 1)[-1]
         for t in touched:
@@ -686,8 +725,9 @@ def _ref_matches_touched(ref: str, touched: set[str]) -> bool:
     return False
 
 
-def _thread_elsewhere_refs(body: str, anchor_path: str | None,
-                           touched: set[str]) -> list[str]:
+def _thread_elsewhere_refs(
+    body: str, anchor_path: str | None, touched: set[str]
+) -> list[str]:
     """Body file/module refs that point at something NOT among ``touched``.
 
     Returns the concrete references (in body order, de-duplicated) that neither
@@ -711,9 +751,24 @@ def _thread_elsewhere_refs(body: str, anchor_path: str | None,
                     tuple(
                         f".{ext}"
                         for ext in (
-                            "py", "pyi", "ts", "tsx", "js", "jsx", "gd", "go",
-                            "rs", "java", "kt", "rb", "c", "h", "cpp", "hpp",
-                            "sql", "sh",
+                            "py",
+                            "pyi",
+                            "ts",
+                            "tsx",
+                            "js",
+                            "jsx",
+                            "gd",
+                            "go",
+                            "rs",
+                            "java",
+                            "kt",
+                            "rb",
+                            "c",
+                            "h",
+                            "cpp",
+                            "hpp",
+                            "sql",
+                            "sh",
                         )
                     )
                 )
@@ -725,7 +780,8 @@ def _thread_elsewhere_refs(body: str, anchor_path: str | None,
     return elsewhere
 
 
-def _thread_points_elsewhere(body: str, anchor_path: str | None,
-                             touched: set[str]) -> bool:
+def _thread_points_elsewhere(
+    body: str, anchor_path: str | None, touched: set[str]
+) -> bool:
     """True if the thread body references a file/module NOT among ``touched``."""
     return bool(_thread_elsewhere_refs(body, anchor_path, touched))

@@ -82,7 +82,9 @@ def _git_directories(worktree: Path) -> tuple[Path, Path] | None:
     if marker.is_dir():
         return marker, marker
     try:
-        prefix, separator, value = marker.read_text(encoding="utf-8").strip().partition(":")
+        prefix, separator, value = (
+            marker.read_text(encoding="utf-8").strip().partition(":")
+        )
     except OSError:
         return None
     if prefix.casefold() != "gitdir" or not separator or not value.strip():
@@ -372,8 +374,8 @@ def _successful_targets(
     if any(operator in {"|", "&"} for operator, _segment in segments):
         return ()
     push_segments = sum(is_git_push(segment) for _operator, segment in segments)
-    output_proves_single_push = (
-        push_segments == 1 and _output_proves_push_succeeded(payload)
+    output_proves_single_push = push_segments == 1 and _output_proves_push_succeeded(
+        payload
     )
     states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {
         (True, base_cwd): frozenset()
@@ -426,9 +428,7 @@ def _successful_targets(
                         }
                     elif pr_target is not None:
                         pr_number, branch = pr_target
-                        next_targets |= {
-                            (index, "pr", cwd, pr_number, branch)
-                        }
+                        next_targets |= {(index, "pr", cwd, pr_number, branch)}
                 _merge_shell_state(
                     next_states,
                     (succeeded, cwd),
@@ -460,10 +460,14 @@ def _enqueue_target(
     state_root: str | PathLike[str] | None,
     now: datetime | None,
 ) -> None:
-    identity = local_git_identity(cwd, branch=target_branch)
+    pr_number = int(explicit_pr_number) if explicit_pr_number is not None else None
+    identity = (
+        _resolve_numeric_pr_identity(cwd, pr_number)
+        if kind == "pr" and pr_number is not None
+        else local_git_identity(cwd, branch=target_branch)
+    )
     if identity is None:
         return
-    pr_number = int(explicit_pr_number) if explicit_pr_number is not None else None
     if kind == "pr" and pr_number is None:
         pr_number = _output_pr_number(payload, identity.repository)
     enqueue_maintenance(
@@ -482,7 +486,36 @@ def _enqueue_target(
     )
 
 
-def enqueue_maintenance(intent: object, *, root: str | PathLike[str] | None = None) -> object:
+def _resolve_numeric_pr_identity(cwd: str, pr_number: int) -> LocalGitIdentity | None:
+    """Resolve a numeric ready target without borrowing the checkout's head."""
+
+    from agentic_pr_dash import github_api
+
+    payload = github_api.resolve_pr(
+        pr_number,
+        "number,headRefName,headRefOid,url",
+        cwd,
+        force=True,
+    )
+    if not isinstance(payload, dict):
+        return None
+    branch = payload.get("headRefName")
+    head_sha = payload.get("headRefOid")
+    url = payload.get("url")
+    match = _PR_URL.search(url) if isinstance(url, str) else None
+    if not isinstance(branch, str) or not isinstance(head_sha, str) or match is None:
+        return None
+    return LocalGitIdentity(
+        repository=f"{match.group('owner')}/{match.group('repo')}",
+        pushed_ref=f"refs/heads/{branch}",
+        head_sha=head_sha,
+        worktree_path=str(_worktree_root(cwd) or cwd),
+    )
+
+
+def enqueue_maintenance(
+    intent: object, *, root: str | PathLike[str] | None = None
+) -> object:
     """Lazy, injectable boundary over the typed durable enqueue operation."""
 
     from agentic_pr_dash.lifecycle_store import (

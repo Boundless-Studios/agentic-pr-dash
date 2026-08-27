@@ -185,6 +185,7 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
     CI checks are in-flight.
     """
     from agentic_pr_dash import maintenance  # noqa: PLC0415
+
     for worktree in owned:
         pr = _resolve_pr_for_branch(worktree)
         if pr is _GH_UNAVAILABLE or pr is None:
@@ -193,6 +194,7 @@ def _collect_await_watch_pending(owned: list[str], cwd: str, session_id: str) ->
             continue
         # Populate ci_watch_pending (best-effort)
         from agentic_pr_dash import github_api  # noqa: PLC0415
+
         pr.ci_watch_pending = github_api.required_checks_pending(pr.number, worktree)
         if maintenance.watch_pending_for_pr(pr):
             return True
@@ -397,9 +399,7 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
     )
 
     try:
-        policy = ReviewPolicy.from_yaml(
-            Path(args.policy).read_text(encoding="utf-8")
-        )
+        policy = ReviewPolicy.from_yaml(Path(args.policy).read_text(encoding="utf-8"))
         ledger_path = Path(
             args.ledger
             or os.path.join(
@@ -426,10 +426,7 @@ def _cmd_finalize(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(missing))
             else:
-                print(
-                    "PR not settled: review_ledger_missing "
-                    f"({ledger_path})"
-                )
+                print(f"PR not settled: review_ledger_missing ({ledger_path})")
             return 10
         ledger = ReviewLedger.model_validate_json(
             ledger_path.read_text(encoding="utf-8")
@@ -546,20 +543,29 @@ def _monitor_observation(args: argparse.Namespace) -> tuple[int, str]:
             print(f"PR #{args.pr} not settled: review_ledger_missing")
             return 10, pr.latest_commit_sha
         try:
-            policy = ReviewPolicy.from_yaml(Path(policy_path).read_text(encoding="utf-8"))
-            ledger = ReviewLedger.model_validate_json(ledger_path.read_text(encoding="utf-8"))
+            policy = ReviewPolicy.from_yaml(
+                Path(policy_path).read_text(encoding="utf-8")
+            )
+            ledger = ReviewLedger.model_validate_json(
+                ledger_path.read_text(encoding="utf-8")
+            )
             snapshot = _observe_finalization(args, policy, ledger, pr=pr)
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"PR #{args.pr} settlement is unobservable: {exc}")
             return 11, pr.latest_commit_sha
         if not snapshot.clean:
-            work = [*snapshot.blockers, *snapshot.review.required_actions, *snapshot.review.missing_slots]
+            work = [
+                *snapshot.blockers,
+                *snapshot.review.required_actions,
+                *snapshot.review.missing_slots,
+            ]
             print(_render_unsettled_message(work))
             missing_only_backstop = all(
                 slot.startswith("backstop:") for slot in snapshot.review.missing_slots
             )
             if (
-                set(snapshot.blockers) <= {"ci_pending", "ci_unavailable", "not_mergeable"}
+                set(snapshot.blockers)
+                <= {"ci_pending", "ci_unavailable", "not_mergeable"}
                 and not snapshot.review.required_actions
                 and missing_only_backstop
             ):
@@ -629,7 +635,10 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
     try:
         while True:
             if _foreground_deadline_reached(started, args.max_wait):
-                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                print(
+                    f"PR settlement timed out after exactly {args.max_wait:g} seconds",
+                    file=sys.stderr,
+                )
                 return 10
             remaining = args.max_wait - (time.monotonic() - started)
             previous_handler = signal.getsignal(signal.SIGALRM)
@@ -651,7 +660,10 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 signal.setitimer(signal.ITIMER_REAL, 0)
                 signal.signal(signal.SIGALRM, previous_handler)
             if _foreground_deadline_reached(started, args.max_wait):
-                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                print(
+                    f"PR settlement timed out after exactly {args.max_wait:g} seconds",
+                    file=sys.stderr,
+                )
                 return 10
             if result == 0:
                 now = time.monotonic()
@@ -670,9 +682,17 @@ def _cmd_monitor(args: argparse.Namespace) -> int:
                 clean = 0
                 clean_head = ""
             if _foreground_deadline_reached(started, args.max_wait):
-                print(f"PR settlement timed out after exactly {args.max_wait:g} seconds", file=sys.stderr)
+                print(
+                    f"PR settlement timed out after exactly {args.max_wait:g} seconds",
+                    file=sys.stderr,
+                )
                 return 10
-            time.sleep(min(args.poll_interval, max(0.0, args.max_wait - (time.monotonic() - started))))
+            time.sleep(
+                min(
+                    args.poll_interval,
+                    max(0.0, args.max_wait - (time.monotonic() - started)),
+                )
+            )
     finally:
         if not settled:
             _release_foreground_ownership(args)
@@ -837,9 +857,7 @@ def _cmd_arm(args: argparse.Namespace) -> int:
             explicit_branch = explicit_branch.split(":", 1)[-1]
         current_branch = _current_branch(cwd)
         if explicit_branch and explicit_branch != current_branch:
-            print(
-                f"branch {explicit_branch} is not checked out in {cwd}; not arming"
-            )
+            print(f"branch {explicit_branch} is not checked out in {cwd}; not arming")
             return 0
         branch = explicit_branch or current_branch
         if not branch:
@@ -880,7 +898,9 @@ def _cmd_arm(args: argparse.Namespace) -> int:
         if status:
             print(f"PR #{pr_number} is a draft; not arming")
             return 0
-        head_branch, why = _pr_head_branch_detailed(cwd, int(pr_number), deadline=_deadline)
+        head_branch, why = _pr_head_branch_detailed(
+            cwd, int(pr_number), deadline=_deadline
+        )
         if head_branch is None:
             print(
                 f"could not determine PR #{pr_number}'s head branch; not arming.\n"
@@ -916,6 +936,7 @@ def _arm_refusal_message(cwd: str, pr_number: int) -> str:
     """
     try:
         from agentic_pr_dash import ownership  # noqa: PLC0415
+
         repo = _repo_slug(cwd)
         snap = ownership.snapshot()
         # `claim_for` returns the recorded claim regardless of status or
@@ -950,10 +971,14 @@ def _cmd_list_owned(args: argparse.Namespace) -> int:
         try:
             probe = subprocess.run(
                 ["git", "-C", root, "worktree", "list", "--porcelain"],
-                capture_output=True, text=True, timeout=10,
+                capture_output=True,
+                text=True,
+                timeout=10,
             )
         except (OSError, subprocess.TimeoutExpired):
-            print(f"list-owned: worktree probe failed/timed out: {root}", file=sys.stderr)
+            print(
+                f"list-owned: worktree probe failed/timed out: {root}", file=sys.stderr
+            )
             if root == anchor:
                 anchor_failed = True
             continue
@@ -1100,8 +1125,7 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
     detected_p1 = (
         _thread_is_p1(thread)
         if thread is not None
-        else review_finding is not None
-        and review_finding.severity.value == "P1"
+        else review_finding is not None and review_finding.severity.value == "P1"
     )
     if detected_p1 or supplied_severity == "P1":
         print(
@@ -1123,12 +1147,11 @@ def _cmd_complete_defer(args: argparse.Namespace) -> int:
 
     try:
         record = deferred_review.defer_thread(
-            cwd, pr.number,
+            cwd,
+            pr.number,
             thread_id=thread_id,
             comment_id=(
-                thread.top.database_id
-                if thread is not None
-                else review.review_id
+                thread.top.database_id if thread is not None else review.review_id
             ),
             severity=args.severity or "",
             ticket=args.ticket or "",
@@ -1244,8 +1267,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     )
     if not result.executed:
         print(
-            f"finalization deferred for PR #{pr.number} at {head_sha}: "
-            f"{result.reason}",
+            f"finalization deferred for PR #{pr.number} at {head_sha}: {result.reason}",
             file=sys.stderr,
         )
     elif result.exit_code == 2 and result.reason != "completed":
@@ -1311,8 +1333,7 @@ def _cmd_complete_unleased(
 
     local_head_sha, local_head_date = github_api.get_local_pr_head(pr.branch, cwd)
     local_is_fresh = bool(local_head_sha) and (
-        not api_head_sha
-        or github_api._is_ancestor(api_head_sha, local_head_sha, cwd)
+        not api_head_sha or github_api._is_ancestor(api_head_sha, local_head_sha, cwd)
     )
     if local_is_fresh:
         head_sha = local_head_sha
@@ -1321,8 +1342,13 @@ def _cmd_complete_unleased(
 
     baseline = args.baseline or ""
     new_commits = github_api.get_new_pr_commits(
-        resolved_pr_number, baseline, head_sha, cwd, pr_branch=pr.branch,
-        api_head_sha=api_head_sha)
+        resolved_pr_number,
+        baseline,
+        head_sha,
+        cwd,
+        pr_branch=pr.branch,
+        api_head_sha=api_head_sha,
+    )
     # BOU-2417: None means the commit range could not be determined (gh outage /
     # unusable payload), NOT "no commits landed since the baseline". Treating
     # the two alike is how an outage gets to look like a fix that never landed,
@@ -1357,7 +1383,8 @@ def _cmd_complete_unleased(
     def _spans_for(path: str) -> list[tuple[int, int, int, int]] | None:
         if path not in spans_by_path:
             spans_by_path[path] = github_api.get_changed_line_spans(
-                baseline, head_sha, path, cwd)
+                baseline, head_sha, path, cwd
+            )
         return spans_by_path[path]
 
     # BOU-2095 P1 (PR #78 review): every unresolved thread this run does NOT
@@ -1400,9 +1427,18 @@ def _cmd_complete_unleased(
         # deferral is that this PR does not stay open waiting on it.
         if deferred_review.is_thread_deferred(cwd, resolved_pr_number, thread.node_id):
             deferred_count += 1
-            record = deferred_review.deferred_threads_for_pr(
-                cwd, resolved_pr_number
-            )[thread.node_id]
+            record = deferred_review.deferred_threads_for_pr(cwd, resolved_pr_number)[
+                thread.node_id
+            ]
+            ticket = str(record.get("ticket") or "").strip()
+            if not ticket:
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"info: leaving deferred thread {thread.node_id} blocking — "
+                    "a tracking issue is required for canonical deferral settlement",
+                    file=sys.stderr,
+                )
+                continue
             finding = finding_from_thread(
                 thread,
                 repository=str(pr.repo or _repo_slug(cwd)),
@@ -1412,7 +1448,7 @@ def _cmd_complete_unleased(
                 update={
                     "disposition": Disposition.DEFER,
                     "rationale": str(record.get("reason") or "Evaluated deferral"),
-                    "deferred_to_issue": str(record.get("ticket") or "") or None,
+                    "deferred_to_issue": ticket,
                 }
             )
             closure = PolicyFindingClosure(
@@ -1429,28 +1465,44 @@ def _cmd_complete_unleased(
                 is_inline=True,
                 thread_id=thread.node_id,
             )
-            completion.apply_thread_settlement(
-                thread=thread,
-                closure=closure,
-                marker=COMPLETE_MARKER,
-                head_sha=head_sha,
-                fixing_commit=None,
-                maintenance_author=maintenance_author,
-                reply=lambda body, comment=stub: github_api.reply_to_review_comment(
-                    resolved_pr_number, comment, body, cwd
-                ),
-                refetch=lambda node_id=thread.node_id: next(
-                    (
-                        current
-                        for current in github_api.get_review_threads(
-                            resolved_pr_number, cwd, strict=True
-                        )
-                        if current.node_id == node_id
+            try:
+                outcome = completion.apply_thread_settlement(
+                    thread=thread,
+                    closure=closure,
+                    marker=COMPLETE_MARKER,
+                    head_sha=head_sha,
+                    fixing_commit=None,
+                    maintenance_author=maintenance_author,
+                    reply=lambda body, comment=stub: github_api.reply_to_review_comment(
+                        resolved_pr_number, comment, body, cwd
                     ),
-                    None,
-                ),
-                resolve=lambda: False,
-            )
+                    refetch=lambda node_id=thread.node_id: next(
+                        (
+                            current
+                            for current in github_api.get_review_threads(
+                                resolved_pr_number, cwd, strict=True
+                            )
+                            if current.node_id == node_id
+                        ),
+                        None,
+                    ),
+                    resolve=lambda: False,
+                )
+            except Exception as exc:  # noqa: BLE001
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"warning: error publishing deferred settlement for thread "
+                    f"{thread.node_id}: {exc}",
+                    file=sys.stderr,
+                )
+                continue
+            if outcome.actionable:
+                left_unresolved.append(thread.node_id)
+                print(
+                    f"info: leaving thread {thread.node_id} open — its "
+                    "structured settlement is missing, failed, or was reopened",
+                    file=sys.stderr,
+                )
             continue
         if review_context is not None:
             closure = (
@@ -1471,9 +1523,7 @@ def _cmd_complete_unleased(
             fixing_commit = None
             if closure.resolve_thread:
                 candidates = (
-                    commits_by_file.get(path, [])
-                    if path is not None
-                    else new_commits
+                    commits_by_file.get(path, []) if path is not None else new_commits
                 )
                 thread_created_at = _parse_iso(thread.top.created_at)
                 newer_candidates: list[tuple[str, str]] = []
@@ -1491,14 +1541,22 @@ def _cmd_complete_unleased(
                         ):
                             newer_candidates.append((sha, message))
                 if not newer_candidates:
-                    left_unresolved.append(thread.node_id)
-                    print(
-                        f"info: leaving fixed thread {thread.node_id} open — no "
-                        "post-review fixing commit can be cited on the thread",
-                        file=sys.stderr,
+                    fixing_commit = completion.fresh_fixed_reply_commit(
+                        thread,
+                        closure,
+                        marker=COMPLETE_MARKER,
+                        maintenance_author=maintenance_author,
                     )
-                    continue
-                fixing_commit = newer_candidates[-1][0]
+                    if fixing_commit is None:
+                        left_unresolved.append(thread.node_id)
+                        print(
+                            f"info: leaving fixed thread {thread.node_id} open — no "
+                            "post-review fixing commit can be cited on the thread",
+                            file=sys.stderr,
+                        )
+                        continue
+                else:
+                    fixing_commit = newer_candidates[-1][0]
 
             stub = ReviewComment(
                 id=thread.top.database_id,
@@ -1518,10 +1576,8 @@ def _cmd_complete_unleased(
                     head_sha=head_sha,
                     fixing_commit=fixing_commit,
                     maintenance_author=maintenance_author,
-                    reply=lambda body, comment=stub: (
-                        github_api.reply_to_review_comment(
-                            resolved_pr_number, comment, body, cwd
-                        )
+                    reply=lambda body, comment=stub: github_api.reply_to_review_comment(
+                        resolved_pr_number, comment, body, cwd
                     ),
                     refetch=lambda node_id=thread.node_id: next(
                         (
@@ -1604,7 +1660,8 @@ def _cmd_complete_unleased(
         if evidence is None:
             left_unresolved.append(thread.node_id)
             anchor_line = (
-                thread.top.line if thread.top.line is not None
+                thread.top.line
+                if thread.top.line is not None
                 else thread.top.original_line
             )
             print(
@@ -1654,9 +1711,11 @@ def _cmd_complete_unleased(
             # is retry evidence, so do not post it again on the next run.
             if evidence != "reply":
                 body = _completion_reply_body(
-                    COMPLETE_MARKER, path, commits_by_file, new_commits)
+                    COMPLETE_MARKER, path, commits_by_file, new_commits
+                )
                 if not github_api.reply_to_review_comment(
-                        resolved_pr_number, stub, body, cwd):
+                    resolved_pr_number, stub, body, cwd
+                ):
                     left_unresolved.append(thread.node_id)
                     print(
                         f"warning: could not reply to thread {thread.node_id}; "
@@ -1676,7 +1735,10 @@ def _cmd_complete_unleased(
             # self-heals on the next `complete` run; a silently-dropped thread
             # does not.
             left_unresolved.append(thread.node_id)
-            print(f"warning: error completing thread {thread.node_id}: {exc}", file=sys.stderr)
+            print(
+                f"warning: error completing thread {thread.node_id}: {exc}",
+                file=sys.stderr,
+            )
 
     # force=True: re-resolve post-mutation state (threads were just
     # resolved/replied-to above) — a cached pre-mutation snapshot would report
@@ -1693,8 +1755,7 @@ def _cmd_complete_unleased(
         # against `head_sha`; if the live head is no longer that sha, every
         # signal here reads clean only because it was measured against the
         # superseded head, so completion must re-evaluate rather than close.
-        remaining = maintenance.terminal_clean_blockers(
-            fresh, validated_head=head_sha)
+        remaining = maintenance.terminal_clean_blockers(fresh, validated_head=head_sha)
 
     # BOU-2095 P1 (PR #78 review): `blockers_for_pr` sees only the comments the
     # scan path picked, and that path skips `is_outdated` threads — exactly the
@@ -1737,6 +1798,7 @@ def _cmd_complete_unleased(
         try:
             from .config import load as _load_config  # noqa: PLC0415
             from .tracker import get_tracker  # noqa: PLC0415
+
             tracker = get_tracker(_load_config(cwd))
             task_id = tracker.find_task(pr=resolved_pr_number, branch=branch, cwd=cwd)
             if task_id:
@@ -1842,8 +1904,13 @@ def _cmd_release_worktree(args: argparse.Namespace) -> int:
 
 def _cmd_reconcile_prs(args: argparse.Namespace) -> int:
     import json as _json  # noqa: PLC0415
-    records = _owned_pr_records_all_roots(args.session_id, os.path.abspath(args.cwd),
-                                          args.pid, adopt_orphans=args.adopt_orphans)
+
+    records = _owned_pr_records_all_roots(
+        args.session_id,
+        os.path.abspath(args.cwd),
+        args.pid,
+        adopt_orphans=args.adopt_orphans,
+    )
     for r in records:
         print(_json.dumps(r))
     return 0
@@ -1865,6 +1932,7 @@ def _await_anchors(session_id: str, cwd: str) -> list[str]:
         return anchors
     try:
         from agentic_pr_dash import session_ledger  # noqa: PLC0415
+
         for e in session_ledger.read(session_id):
             wt = os.path.abspath(e.worktree) if e.worktree else ""
             if wt and wt not in seen and os.path.isdir(wt):
@@ -1902,6 +1970,7 @@ def _publishable_anchors(anchors: list[str], cwd: str, snap=None) -> list[str]:
     from ._maintenance.ownership_resolution import (  # noqa: PLC0415
         resolve_worktree,
     )
+
     keep = os.path.abspath(cwd)
     out: list[str] = []
     for path in anchors:
@@ -1945,7 +2014,9 @@ _AWAIT_OUTCOMES: dict[int, tuple[str, str]] = {
 }
 
 
-def _emit_await_outcome(outcome: str, *, pr: int | None = None, reason: str = "") -> None:
+def _emit_await_outcome(
+    outcome: str, *, pr: int | None = None, reason: str = ""
+) -> None:
     """Emit exactly one machine-readable JSON outcome line to stderr (BOU-1877).
 
     ``outcome`` is one of ``woke`` | ``deferred_to_loop`` | ``idle`` | ``error``.
@@ -1981,6 +2052,7 @@ def _detached_record_is_adopted(record: dict, snap) -> bool:
     except Exception:  # noqa: BLE001 — ownership must never crash the waiter
         return False
     from agentic_pr_dash.ownership import PROVENANCE_ADOPTED  # noqa: PLC0415
+
     return owner is not None and owner.provenance == PROVENANCE_ADOPTED
 
 
@@ -2030,6 +2102,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
     # so an in-flight pre-BOU-1924 waiter for this session isn't missed, which
     # would launch a SECOND poller for the same session (PR #61 review, P2).
     from ._maintenance.waiter import _await_alive  # noqa: PLC0415
+
     if _await_alive(cwd, session_id):
         print("[pr-watch] waiter already running for this session", file=sys.stderr)
         return 3
@@ -2047,6 +2120,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
     else:
         deadline = None
     from agentic_pr_dash import github_api  # noqa: PLC0415
+
     try:
         while True:
             if not _pid_alive(str(owner_pid)):
@@ -2073,6 +2147,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # a full store read each time and the Stop hook's ~108s budget is
             # fail-closed.
             from agentic_pr_dash import ownership as _ownership_mod  # noqa: PLC0415
+
             _await_snap = _ownership_mod.snapshot()
             covered_anchors = _publishable_anchors(anchors, cwd, _await_snap)
             _update_await_coverage(cwd, session_id, covered_anchors)
@@ -2094,6 +2169,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             from ._maintenance.ownership_resolution import (  # noqa: PLC0415
                 resolve_current_prs as _resolve_current_prs,
             )
+
             current_pr_bindings = _resolve_current_prs(
                 owned,
                 session_id,
@@ -2116,6 +2192,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             from ._maintenance.ownership_resolution import (  # noqa: PLC0415
                 resolve_worktree as _resolve_worktree_ownership,
             )
+
             for worktree in owned:
                 # Provenance is resolved for EVERY owned worktree, not just the
                 # code==10 ones. Deciding it inside a single branch left adopted
@@ -2155,6 +2232,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 from ._maintenance.worktree_check import (  # noqa: PLC0415
                     _use_current_pr_binding,
                 )
+
                 with _use_current_pr_binding(binding):
                     code, text = _check_worktree(worktree, session_id, claim=False)
                 if code == 10:
@@ -2175,8 +2253,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     # state is UNOBSERVABLE, so this tick must not conclude
                     # "clean" (suppresses the BOU-1962 early exit below).
                     gh_unobservable = True
-                elif code == 0 and not is_adopted and text.rstrip().endswith(
-                    WARN_ONLY_MARKER
+                elif (
+                    code == 0
+                    and not is_adopted
+                    and text.rstrip().endswith(WARN_ONLY_MARKER)
                 ):
                     # Warn-only deferral: the PR HAS blockers but a live foreign
                     # owner / active coordinator claim is responsible, so no fix
@@ -2191,9 +2271,7 @@ def _run_await_loop(args: argparse.Namespace) -> int:
             # this live waiter as wake-capable coverage and defers forever even
             # though the waiter intentionally ignores that worktree's blockers.
             watched_owned = [wt for wt in owned if wt not in adopted_worktrees]
-            _update_await_coverage(
-                cwd, session_id, [*covered_anchors, *watched_owned]
-            )
+            _update_await_coverage(cwd, session_id, [*covered_anchors, *watched_owned])
 
             _detached_this_tick: list[dict] = []
             if session_id:
@@ -2273,8 +2351,10 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                 # ownership resolution may simply have come up empty for a session
                 # that does own an open PR (BOU-2294). Say so loudly instead of
                 # exiting 0 next to a clean-looking message.
-                return _unbound_exit(session_id, "no owned worktree and no "
-                                     "detached PR resolved for this session")
+                return _unbound_exit(
+                    session_id,
+                    "no owned worktree and no detached PR resolved for this session",
+                )
 
             # BOU-1962: clean-state early exit. `pending` is empty here (the
             # return-10 above fired otherwise), so no owned or detached PR has
@@ -2342,7 +2422,8 @@ def _run_await_loop(args: argparse.Namespace) -> int:
                     } | {
                         _clean_exit_key(r.get("repo", ""), r["pr"])
                         for r in _detached_this_tick
-                        if r.get("state") not in ("merged", "closed", "draft", "unknown")
+                        if r.get("state")
+                        not in ("merged", "closed", "draft", "unknown")
                     }
                     if not verified:
                         # Owned worktrees exist but none of them resolved to an
@@ -2489,7 +2570,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     monitor_p = subparsers.add_parser(
-        "monitor", help="Foreground Codex settlement polling (bounded; no wake channel)."
+        "monitor",
+        help="Foreground Codex settlement polling (bounded; no wake channel).",
     )
     monitor_p.add_argument("--cwd", default=".")
     monitor_p.add_argument("--session-id", default="")
@@ -2696,20 +2778,23 @@ def main(argv: list[str] | None = None) -> int:
     reconcile_p = subparsers.add_parser(
         "reconcile-prs",
         help="List every PR this session owns — live-worktree AND detached (ledger) "
-             "PRs whose worktree was removed — with live review-thread/CI state, "
-             "severity-first. Prunes merged/closed PRs (BOU-1587).",
+        "PRs whose worktree was removed — with live review-thread/CI state, "
+        "severity-first. Prunes merged/closed PRs (BOU-1587).",
     )
     reconcile_p.add_argument("--session-id", required=True, metavar="ID")
     reconcile_p.add_argument("--cwd", default=".")
     reconcile_p.add_argument("--pid", type=int, default=None, metavar="PID")
-    reconcile_p.add_argument("--adopt-orphans", action="store_true",
-                             help="Also claim PRs orphaned by DEAD sessions (Component G).")
+    reconcile_p.add_argument(
+        "--adopt-orphans",
+        action="store_true",
+        help="Also claim PRs orphaned by DEAD sessions (Component G).",
+    )
 
     # --- hold-worktree / release-worktree (BOU-2590) ---
     hold_p = subparsers.add_parser(
         "hold-worktree",
         help="Claim exclusive WRITE access to a worktree so the maintenance "
-             "loop's executor stands down instead of editing underneath you.",
+        "loop's executor stands down instead of editing underneath you.",
     )
     hold_p.add_argument("--cwd", default=".")
     hold_p.add_argument("--session-id", default="", metavar="ID")
@@ -2719,8 +2804,8 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         metavar="PID",
         help="Holder pid whose liveness keeps the lock (default: this process). "
-             "Pass the SESSION's pid — a lock held by an exited helper is stale "
-             "the moment it returns.",
+        "Pass the SESSION's pid — a lock held by an exited helper is stale "
+        "the moment it returns.",
     )
 
     release_p = subparsers.add_parser(

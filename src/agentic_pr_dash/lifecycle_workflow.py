@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -48,6 +50,10 @@ ReviewContextLoader: TypeAlias = Callable[
 ]
 
 
+class ReviewContextUnavailableError(RuntimeError):
+    """Configured review settlement files exist but cannot be trusted."""
+
+
 def load_review_context(record: MaintenanceIntentRecordV1) -> ReviewContext | None:
     """Load the worktree's review policy and ledger for one lifecycle intent."""
 
@@ -77,8 +83,10 @@ def load_review_context_for_worktree(
         ledger = ReviewLedger.model_validate_json(
             ledger_path.read_text(encoding="utf-8")
         )
-    except Exception:  # noqa: BLE001 - missing/corrupt context remains degraded
-        return None
+    except Exception as exc:
+        raise ReviewContextUnavailableError(
+            f"review context is invalid or unreadable in {cwd}"
+        ) from exc
     return policy, ledger
 
 
@@ -186,9 +194,7 @@ class LifecycleWorkflow:
             eligible_at=self._now(),
         )[: self.batch_size]
         result = LifecycleDrainResult()
-        resolved_records: list[
-            tuple[MaintenanceIntentRecordV1, _ResolvedPR]
-        ] = []
+        resolved_records: list[tuple[MaintenanceIntentRecordV1, _ResolvedPR]] = []
         resolutions = await asyncio.gather(
             *(self._resolve_off_loop(record) for record in records),
             return_exceptions=True,
@@ -226,9 +232,7 @@ class LifecycleWorkflow:
                     result = _count_outcome(result, "deferred")
                     continue
                 try:
-                    outcome = await self._consume_observed(
-                        record, resolved, observed
-                    )
+                    outcome = await self._consume_observed(record, resolved, observed)
                 except Exception:  # noqa: BLE001 - isolate one durable intent
                     outcome = "failed"
                 result = _count_outcome(result, outcome)
@@ -265,6 +269,20 @@ class LifecycleWorkflow:
                 return "no_pr"
             self._persist_unavailable(record, record.intent.pr_number)
             return "deferred"
+        if resolved.payload.get("state") == "MERGED":
+            key = MaintenanceKeyV1(
+                repository=resolved.repository,
+                pr_number=resolved.number,
+                head_sha=record.intent.head_sha,
+                workflow_type=record.intent.workflow_type,
+            )
+            self.store.settle_intent(
+                record.intent,
+                key,
+                expected_generation=record.generation,
+                expected_revision=record.revision,
+            )
+            return "progressed"
         if (
             resolved.payload.get("state") != "OPEN"
             or resolved.payload.get("isDraft") is not False
@@ -427,7 +445,7 @@ class LifecycleWorkflow:
     ) -> _ObservedPR | None:
         context = self._review_context(record)
         if context is None:
-            context = _policy_neutral_context(record)
+            context = _policy_neutral_context(record, resolved.repository)
         policy, ledger = context
         if aggregate is None:
             owner, repo = resolved.repository.split("/", 1)
@@ -532,7 +550,12 @@ class LifecycleWorkflow:
         first_at = previous.stable_observation_first_at or previous.observed_at
         if now - first_at < self.stabilization_interval:
             return _stabilization_pending(current, now, first_at=first_at)
-        combined = combine_clean_observations(observation, observation)
+        if previous.settlement_key != current.settlement_key:
+            return _stabilization_pending(current, now)
+        combined = combine_clean_observations(
+            observation.model_copy(update={"settlement_key": previous.settlement_key}),
+            observation.model_copy(update={"settlement_key": current.settlement_key}),
+        )
         if not combined.settled:
             return _stabilization_pending(current, now, first_at=first_at)
         return current.model_copy(
@@ -547,14 +570,12 @@ class LifecycleWorkflow:
         )
 
 
-def _group_resolved_records(records: list[ResolvedRecord]) -> tuple[
-    list[ResolvedRecord], ...
-]:
+def _group_resolved_records(
+    records: list[ResolvedRecord],
+) -> tuple[list[ResolvedRecord], ...]:
     groups: dict[str, list[ResolvedRecord]] = {}
     for record, resolved in records:
-        groups.setdefault(resolved.repository.casefold(), []).append(
-            (record, resolved)
-        )
+        groups.setdefault(resolved.repository.casefold(), []).append((record, resolved))
     return tuple(groups.values())
 
 
@@ -598,6 +619,7 @@ def _build_snapshot(
         policy_unsettled_finding_count=policy_count,
         raw_unresolved_thread_count=observed.raw_unresolved_thread_count,
         unaddressed_thread_count=observed.unaddressed_thread_count,
+        settlement_key=_lifecycle_settlement_key(observation, observed.pr),
         stable_observation_count=0,
         stable_observation_first_at=None,
         stable_observation_last_at=None,
@@ -615,6 +637,23 @@ def _snapshot_is_clean(
         snapshot.policy_unsettled_finding_count,
         snapshot.unaddressed_thread_count,
     )
+
+
+def _lifecycle_settlement_key(observation: FinalizationObservation, pr: PRData) -> str:
+    """Fingerprint the detailed evidence omitted by aggregate snapshot fields."""
+
+    payload = {
+        "review": observation.settlement_key,
+        "ci_checks": [check.model_dump(mode="json") for check in pr.ci_checks],
+        "threads": sorted(
+            comment.thread_id
+            for comment in pr.review_comments
+            if comment.thread_id is not None
+        ),
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
 
 
 def _snapshot_is_clean_values(
@@ -679,6 +718,7 @@ def _same_snapshot_facts(
         == current.policy_unsettled_finding_count
         and previous.raw_unresolved_thread_count == current.raw_unresolved_thread_count
         and previous.unaddressed_thread_count == current.unaddressed_thread_count
+        and previous.settlement_key == current.settlement_key
     )
 
 
@@ -766,7 +806,9 @@ def _pr_data(
     )
 
 
-def _policy_neutral_context(record: MaintenanceIntentRecordV1) -> ReviewContext:
+def _policy_neutral_context(
+    record: MaintenanceIntentRecordV1, repository: str
+) -> ReviewContext:
     """Represent repositories that have not opted into policy settlement."""
 
     policy = ReviewPolicy.model_validate(
@@ -779,7 +821,7 @@ def _policy_neutral_context(record: MaintenanceIntentRecordV1) -> ReviewContext:
         }
     )
     ledger = ReviewLedger(
-        repository=record.intent.repository,
+        repository=repository,
         head_sha=record.intent.head_sha,
         delivery_id=f"policy-neutral:{record.ingress_id}",
         review_charter_version="policy-neutral-v1",
