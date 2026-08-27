@@ -16,6 +16,9 @@ keywords = ["github", "pull-request", "automation", "agents", "ci", "code-review
 # arm/list-owned/loop) shells out to `gh` + `git` and needs almost nothing.
 dependencies = [
     "pydantic>=2.0",
+    # Dispatch instrumentation emits standard process/GenAI span attributes.
+    # The API is a no-op unless an application configures an SDK/exporter.
+    "opentelemetry-api>=1.40",
     # Provider-neutral review topology, finding normalization, and settlement.
     # Keep this immutable; downstream Gaia pins APD only after this reviewed
     # contract is available from a tagged release.
@@ -62,6 +65,7 @@ serve = [
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "opentelemetry-sdk>=1.40",
     "fastapi>=0.110",
     "uvicorn[standard]>=0.29",
     "jinja2>=3.1",

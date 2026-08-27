@@ -300,6 +300,79 @@ def test_ownership_card_prefers_the_claim_owner(isolated_store):
     assert result["owner_pid_alive"] is True
 
 
+def test_dashboard_cards_share_one_ownership_snapshot(monkeypatch, tmp_path):
+    from agentic_pr_dash import app, orchestrator, session_registry
+
+    worktrees = [
+        {"path": _mk(tmp_path, f"idle-{index}"), "branch": f"idle-{index}"}
+        for index in range(3)
+    ]
+    snapshot = object()
+    snapshot_calls = 0
+    card_snapshots = []
+
+    def _snapshot():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        return snapshot
+
+    def _ownership_for_card(**kwargs):
+        card_snapshots.append(kwargs["ownership_snapshot"])
+        return {}
+
+    monkeypatch.setattr(ownership, "snapshot", _snapshot)
+    monkeypatch.setattr(app, "discover_worktrees", lambda: worktrees)
+    monkeypatch.setattr(app, "get_main_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(app, "discover_active_agents", lambda _paths: {})
+    monkeypatch.setattr(
+        app.session_registry,
+        "summarize_sessions",
+        lambda path=None: session_registry.SessionSummary(),
+    )
+    monkeypatch.setattr(app, "_cached_ownership_for_card", _ownership_for_card)
+    monkeypatch.setattr(app, "_resolve_agent_activity", lambda *_args: "none")
+    monkeypatch.setattr(
+        app, "_selected_worktree_cleanup_reason", lambda *_args, **_kwargs: (False, "")
+    )
+    monkeypatch.setattr(app, "orchestrator", orchestrator.Orchestrator(repo_cwd=None))
+
+    cards, worktree_count, _hidden_count = app.build_worktree_cards()
+
+    assert len(cards) == worktree_count == len(worktrees)
+    assert snapshot_calls == 1
+    assert card_snapshots == [snapshot] * len(worktrees)
+
+
+def test_dashboard_kill_switch_skips_ownership_snapshot(monkeypatch, tmp_path):
+    from agentic_pr_dash import app, orchestrator, session_registry
+
+    worktree = {"path": _mk(tmp_path, "marker-only"), "branch": "marker-only"}
+    monkeypatch.setenv("AGENTIC_PR_DASH_OWNERSHIP_CLAIM_READS", "0")
+    monkeypatch.setattr(
+        ownership,
+        "snapshot",
+        lambda: pytest.fail("claim store must not be read with the kill switch off"),
+    )
+    monkeypatch.setattr(app, "discover_worktrees", lambda: [worktree])
+    monkeypatch.setattr(app, "get_main_repo_root", lambda: str(tmp_path))
+    monkeypatch.setattr(app, "discover_active_agents", lambda _paths: {})
+    monkeypatch.setattr(
+        app.session_registry,
+        "summarize_sessions",
+        lambda path=None: session_registry.SessionSummary(),
+    )
+    monkeypatch.setattr(app, "_cached_ownership_for_card", lambda **_kwargs: {})
+    monkeypatch.setattr(app, "_resolve_agent_activity", lambda *_args: "none")
+    monkeypatch.setattr(
+        app, "_selected_worktree_cleanup_reason", lambda *_args, **_kwargs: (False, "")
+    )
+    monkeypatch.setattr(app, "orchestrator", orchestrator.Orchestrator(repo_cwd=None))
+
+    cards, worktree_count, _hidden_count = app.build_worktree_cards()
+
+    assert len(cards) == worktree_count == 1
+
+
 def test_adoptions_scan_does_not_read_the_store_once_per_worktree(isolated_store, monkeypatch):
     """The store read must be batched per root, never per worktree.
 
