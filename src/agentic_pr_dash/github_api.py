@@ -1547,6 +1547,7 @@ def resolve_pr(
     cwd: str | None = None,
     *,
     force: bool = False,
+    repository: str | None = None,
 ) -> dict | None:
     """Resolve one PR's state, reusing the host-global list snapshot (BOU-2810).
 
@@ -1573,7 +1574,11 @@ def resolve_pr(
     if not wanted:
         return None
 
-    if not force and _SNAPSHOT_SERVABLE_FIELDS.issuperset(wanted):
+    if (
+        repository is None
+        and not force
+        and _SNAPSHOT_SERVABLE_FIELDS.issuperset(wanted)
+    ):
         prs = list_open_prs_cached(cwd) or []
         for pr in prs:
             if pr.get("number") == pr_number:
@@ -1581,7 +1586,10 @@ def resolve_pr(
                 # start depending on a field it never requested.
                 return {key: pr.get(key) for key in wanted}
 
-    result = _run(["gh", "pr", "view", str(pr_number), "--json", fields], cwd=cwd)
+    args = ["gh", "pr", "view", str(pr_number), "--json", fields]
+    if repository:
+        args.extend(["--repo", repository])
+    result = _run(args, cwd=cwd)
     if result.returncode != 0:
         return None
     try:
@@ -1627,6 +1635,7 @@ def find_pr_by_head(
     cwd: str | None = None,
     *,
     head_oid: str | None = None,
+    repository: str | None = None,
 ) -> dict | None:
     """Find a PR by its head branch name, returning the full PR payload.
 
@@ -1677,12 +1686,14 @@ def find_pr_by_head(
         # an exact REST query can only cover the base-repo owner and would MISS a
         # fork-backed PR. Use the (owner-agnostic) `gh pr list --head` lookup,
         # which matches the branch on any head repo, then exact-filter in Python.
-        numbers = _unqualified_head_pr_numbers(branch, rest_state, cwd=cwd)
+        numbers = _unqualified_head_pr_numbers(
+            branch, rest_state, cwd=cwd, repository=repository
+        )
     if numbers is None:
         return None  # gh/API failure → fail open (distinct from "no match" → None)
 
     for number in numbers:
-        pr = _pr_full_payload(number, cwd=cwd)
+        pr = _pr_full_payload(number, cwd=cwd, repository=repository)
         if pr is None:
             return None  # gh failure fetching full fields → fail open
         # The lookup already targets the branch (and, for qualified heads, the
@@ -1762,7 +1773,11 @@ _PR_LIST_STATES = {"open", "closed", "merged", "all"}
 
 
 def _unqualified_head_pr_numbers(
-    branch: str, rest_state: str, cwd: str | None = None
+    branch: str,
+    rest_state: str,
+    cwd: str | None = None,
+    *,
+    repository: str | None = None,
 ) -> list[int] | None:
     """Return PR numbers whose head branch is exactly ``branch`` on *any* repo.
 
@@ -1777,14 +1792,23 @@ def _unqualified_head_pr_numbers(
     ``gh`` failure (fail open) and ``[]`` when nothing matches.
     """
     list_state = rest_state if rest_state in _PR_LIST_STATES else "all"
+    args = [
+        "gh",
+        "pr",
+        "list",
+        "--head",
+        branch,
+        "--state",
+        list_state,
+        "--limit",
+        _PR_HEAD_LIST_LIMIT,
+        "--json",
+        "number,headRefName",
+    ]
+    if repository:
+        args.extend(["--repo", repository])
     r = _run(
-        [
-            "gh", "pr", "list",
-            "--head", branch,
-            "--state", list_state,
-            "--limit", _PR_HEAD_LIST_LIMIT,
-            "--json", "number,headRefName",
-        ],
+        args,
         cwd=cwd,
         timeout_s=30,
     )
@@ -1809,14 +1833,19 @@ def _unqualified_head_pr_numbers(
     return numbers
 
 
-def _pr_full_payload(number: int, cwd: str | None = None) -> dict | None:
+def _pr_full_payload(
+    number: int, cwd: str | None = None, *, repository: str | None = None
+) -> dict | None:
     """Fetch the full Stop/QA-gate contract fields for one PR via ``gh pr view``.
 
     Returns ``None`` on any ``gh`` failure so the caller fails open. The returned
     dict matches the historical ``gh pr list --json`` shape (same ``_PR_HEAD_FIELDS``).
     """
+    args = ["gh", "pr", "view", str(number), "--json", _PR_HEAD_FIELDS]
+    if repository:
+        args.extend(["--repo", repository])
     r = _run(
-        ["gh", "pr", "view", str(number), "--json", _PR_HEAD_FIELDS],
+        args,
         cwd=cwd,
         timeout_s=30,
     )

@@ -183,7 +183,7 @@ async def test_unresolved_intent_lookup_matches_the_exact_head(
     store.enqueue(_intent(pr_number=None, head_sha=HEAD))
     observed: list[str | None] = []
 
-    def find_pr_by_head(branch, state, cwd, *, head_oid=None):
+    def find_pr_by_head(branch, state, cwd, *, head_oid=None, repository=None):
         observed.append(head_oid)
         return _pr_payload()
 
@@ -296,7 +296,7 @@ async def test_push_before_pr_no_pr_then_reactivation_promotes(
     monkeypatch.setattr(
         github_api,
         "find_pr_by_head",
-        lambda branch, state="open", cwd=None: None,
+        lambda branch, state="open", cwd=None, **kwargs: None,
     )
 
     from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
@@ -312,7 +312,7 @@ async def test_push_before_pr_no_pr_then_reactivation_promotes(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
@@ -373,7 +373,7 @@ async def test_open_branch_lookup_without_state_field_can_promote(
     monkeypatch.setattr(
         github_api,
         "find_pr_by_head",
-        lambda branch, state="open", cwd=None, head_oid=None: branch_payload,
+        lambda branch, state="open", cwd=None, head_oid=None, **kwargs: branch_payload,
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
@@ -451,7 +451,7 @@ async def test_pending_ci_is_persisted_without_dispatch(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -506,7 +506,7 @@ async def test_pending_ci_is_derived_from_check_status_when_flag_is_absent(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -545,7 +545,7 @@ async def test_unknown_mergeability_is_unavailable_not_actionable_conflict(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -601,7 +601,7 @@ async def test_actionable_ci_failure_uses_existing_dispatch_seam_once(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -659,7 +659,7 @@ async def test_dispatch_retries_after_coordinator_defers_same_facts(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -725,7 +725,7 @@ async def test_old_intent_head_drift_is_retired_without_observation(
     store.enqueue(old_intent)
     calls = {"batch": 0, "resolve": 0}
 
-    def resolve(number, fields, cwd=None, force=False):
+    def resolve(number, fields, cwd=None, force=False, **kwargs):
         calls["resolve"] += 1
         return {
             **_pr_payload(),
@@ -771,7 +771,7 @@ async def test_resolved_repository_drift_is_not_promoted(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: {
+        lambda number, fields, cwd=None, force=False, **kwargs: {
             **_pr_payload(),
             "url": "https://github.com/Other/Repository/pull/7",
         },
@@ -883,7 +883,7 @@ async def test_missing_batch_observation_is_degraded_and_retryable(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -925,7 +925,7 @@ async def test_failure_for_one_intent_does_not_stop_the_next(
     store.enqueue(failed)
     store.enqueue(healthy)
 
-    def resolve(number, fields, cwd=None, force=False):
+    def resolve(number, fields, cwd=None, force=False, **kwargs):
         if cwd == failed.worktree_path:
             raise RuntimeError("one intent failed")
         return {**_pr_payload(), "number": 8}
@@ -991,7 +991,7 @@ async def test_drain_is_bounded_by_batch_size(
         store.enqueue(intent)
     calls = {"resolve": 0}
 
-    def resolve(number, fields, cwd=None, force=False):
+    def resolve(number, fields, cwd=None, force=False, **kwargs):
         calls["resolve"] += 1
         repo = next(
             intent.repository for intent in intents if intent.worktree_path == cwd
@@ -1026,6 +1026,79 @@ async def test_drain_is_bounded_by_batch_size(
 
 
 @pytest.mark.asyncio
+async def test_drain_prioritizes_oldest_retry_cohort_over_filename_order(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    intents = [
+        _intent(pr_number=number).model_copy(
+            update={
+                "pushed_ref": f"refs/heads/feature/{number}",
+                "head_sha": f"{number:040x}",
+                "requested_at": OBSERVED_AT + timedelta(seconds=number),
+            }
+        )
+        for number in range(1, 5)
+    ]
+    for intent in intents:
+        store.enqueue(intent)
+
+    records = list(store.list_intents())
+    oldest = max(records, key=lambda record: record.intent.requested_at)
+    store.schedule_retry(
+        oldest.intent,
+        next_attempt_at=OBSERVED_AT - timedelta(seconds=1),
+        expected_generation=oldest.generation,
+        expected_revision=oldest.revision,
+    )
+    resolved: list[int] = []
+
+    def resolve(number, fields, cwd=None, force=False, repository=None):
+        resolved.append(number)
+        return {**_pr_payload(), "number": number}
+
+    monkeypatch.setattr(github_api, "resolve_pr", resolve)
+    monkeypatch.setattr(
+        github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *args, **kwargs: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    await LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=_ledger(),
+        now=lambda: OBSERVED_AT + timedelta(minutes=1),
+        batch_size=1,
+    ).drain()
+
+    assert resolved == [oldest.intent.pr_number]
+
+
+def test_resolve_uses_intent_repository_for_github_lookup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow
+
+    store = LifecycleStore(tmp_path / "state")
+    workflow = LifecycleWorkflow(store, policy=_policy(), ledger=_ledger())
+    seen: dict[str, object] = {}
+
+    def resolve(number, fields, cwd=None, force=False, repository=None):
+        seen.update(number=number, cwd=cwd, repository=repository)
+        return _pr_payload()
+
+    monkeypatch.setattr(github_api, "resolve_pr", resolve)
+    workflow._resolve(store.enqueue(_intent(pr_number=7)) and store.list_intents()[0])
+
+    assert seen["repository"] == REPOSITORY
+
+
+@pytest.mark.asyncio
 async def test_promoted_batch_retry_backoff_allows_later_intent_to_run(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1040,7 +1113,7 @@ async def test_promoted_batch_retry_backoff_allows_later_intent_to_run(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: {
+        lambda number, fields, cwd=None, force=False, **kwargs: {
             **_pr_payload(),
             "number": number,
         },
@@ -1321,7 +1394,7 @@ async def test_drain_batches_observations_for_same_repository(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: {
+        lambda number, fields, cwd=None, force=False, **kwargs: {
             **_pr_payload(),
             "number": number,
         },
@@ -1387,7 +1460,7 @@ async def test_first_clean_observation_is_unsettled_then_second_after_interval_s
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
@@ -1446,7 +1519,7 @@ async def test_capability_refusal_never_settles_as_clean(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
@@ -1569,7 +1642,7 @@ async def test_fresh_non_code_reply_settles_with_thread_permitted_open(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -1715,7 +1788,7 @@ async def test_unaddressed_threads_project_to_snapshot_and_dispatch(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -1769,7 +1842,7 @@ async def test_policy_finding_reaches_existing_dispatch_seam(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api, "collect_pr_maintenance_snapshots", lambda *args, **kwargs: _batch()
@@ -1868,7 +1941,7 @@ async def test_live_owner_defers_existing_orchestrator_dispatch(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     monkeypatch.setattr(
         github_api,
@@ -2023,7 +2096,7 @@ async def test_changed_observation_resets_stability(
     monkeypatch.setattr(
         github_api,
         "resolve_pr",
-        lambda number, fields, cwd=None, force=False: _pr_payload(),
+        lambda number, fields, cwd=None, force=False, **kwargs: _pr_payload(),
     )
     observations = iter(
         (_batch(), _batch(merge_state="DIRTY", mergeable="CONFLICTING"))
@@ -2130,7 +2203,7 @@ async def test_same_pr_number_in_two_repositories_stays_isolated(
     store.enqueue(first)
     store.enqueue(second)
 
-    def resolve(number, fields, cwd=None, force=False):
+    def resolve(number, fields, cwd=None, force=False, **kwargs):
         repo = "one/repo" if cwd == first.worktree_path else "two/repo"
         return {
             **_pr_payload(),

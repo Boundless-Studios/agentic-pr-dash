@@ -141,6 +141,19 @@ def test_push_source_branch_consumes_push_option_values():
     )
 
 
+def test_push_source_branch_consumes_recurse_submodules_value():
+    assert git_push_source_branch(
+        "git push --recurse-submodules on-demand origin feature"
+    ) == (True, "feature")
+
+
+def test_push_repo_option_supplies_repository_position():
+    assert git_push_source_branch("git push --repo origin feature") == (
+        True,
+        "feature",
+    )
+
+
 # --- effective_git_cwd ------------------------------------------------------
 
 def test_effective_git_cwd_applies_dash_C_relative_to_base():

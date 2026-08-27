@@ -396,6 +396,18 @@ def build_maintenance_prompt(
                 ]
             )
 
+    if pr.review_decision.strip().upper() == "CHANGES_REQUESTED":
+        sections.extend(
+            [
+                "",
+                "## Changes Requested",
+                (
+                    "A top-level review requested changes. Fetch the review body and "
+                    "address each requested change before completing maintenance."
+                ),
+            ]
+        )
+
     if guidance:
         sections.extend(
             [

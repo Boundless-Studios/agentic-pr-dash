@@ -13,7 +13,7 @@ from agentic_pr_dash.codex_hooks._payload import load_payload, normalized_payloa
 from agentic_pr_dash.codex_hooks.command_parser import (
     cd_target,
     effective_git_cwd,
-    git_push_source_branch,
+    git_push_source_and_destination,
     is_git_push,
     parse_gh_pr_arm_target,
     split_command_segments,
@@ -32,7 +32,7 @@ _PUSH_UPDATE = re.compile(
     r"\[(?:new branch|new tag|deleted|up to date)\])\s+.+\s+->\s+.+$",
     re.IGNORECASE,
 )
-_IndexedTarget = tuple[int, str, str, str | None, str | None]
+_IndexedTarget = tuple[int, str, str, str | None, str | None, str | None]
 
 
 class LocalGitIdentity:
@@ -397,7 +397,7 @@ def _successful_targets(
     *,
     exit_code: int,
     payload: dict,
-) -> tuple[tuple[str, str, str | None, str | None], ...]:
+) -> tuple[tuple[str, str, str | None, str | None, str | None], ...]:
     segments = split_command_segments(command)
     ambiguous = {
         index
@@ -463,8 +463,14 @@ def _successful_targets(
                 next_targets = proven_targets
                 if succeeded and cwd is not None:
                     if push:
-                        has_refspec, source_branch = git_push_source_branch(segment)
-                        if has_refspec and source_branch is None:
+                        has_refspec, source_branch, destination_branch = (
+                            git_push_source_and_destination(segment)
+                        )
+                        if (
+                            has_refspec
+                            and source_branch is None
+                            and destination_branch is None
+                        ):
                             continue
                         next_targets |= {
                             (
@@ -473,11 +479,12 @@ def _successful_targets(
                                 effective_git_cwd(segment, cwd),
                                 None,
                                 source_branch,
+                                destination_branch,
                             )
                         }
                     elif pr_target is not None:
                         pr_number, branch = pr_target
-                        next_targets |= {(index, "pr", cwd, pr_number, branch)}
+                        next_targets |= {(index, "pr", cwd, pr_number, branch, None)}
                 _merge_shell_state(
                     next_states,
                     (succeeded, cwd),
@@ -494,8 +501,8 @@ def _successful_targets(
     if not proven:
         return ()
     return tuple(
-        (kind, cwd, pr_number, branch)
-        for _index, kind, cwd, pr_number, branch in sorted(proven)
+        (kind, cwd, pr_number, branch, destination_branch)
+        for _index, kind, cwd, pr_number, branch, destination_branch in sorted(proven)
     )
 
 
@@ -505,6 +512,7 @@ def _enqueue_target(
     cwd: str,
     explicit_pr_number: str | None,
     target_branch: str | None,
+    destination_branch: str | None,
     payload: dict,
     state_root: str | PathLike[str] | None,
     now: datetime | None,
@@ -516,6 +524,13 @@ def _enqueue_target(
     identity = local_git_identity(cwd, branch=local_branch)
     if identity is None:
         return
+    if kind == "push" and destination_branch is not None:
+        identity = LocalGitIdentity(
+            identity.repository,
+            f"refs/heads/{destination_branch}",
+            identity.head_sha,
+            identity.worktree_path,
+        )
     if kind == "pr" and pr_number is not None and target_branch is None:
         identity = LocalGitIdentity(
             identity.repository,
@@ -671,7 +686,7 @@ def _run_payload(
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return 0
-    for kind, cwd, pr_number, branch in _successful_targets(
+    for kind, cwd, pr_number, branch, destination_branch in _successful_targets(
         command,
         str(normalized["cwd"]),
         exit_code=exit_code,
@@ -682,6 +697,7 @@ def _run_payload(
             cwd=cwd,
             explicit_pr_number=pr_number,
             target_branch=branch,
+            destination_branch=destination_branch,
             payload=payload,
             state_root=state_root,
             now=now,

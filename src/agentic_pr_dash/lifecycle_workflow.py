@@ -189,13 +189,20 @@ class LifecycleWorkflow:
             return await self._drain_locked()
 
     async def _drain_locked(self) -> LifecycleDrainResult:
-        records = self.store.list_intents(
-            states={
-                IntentLifecycleStateV1.PENDING,
-                IntentLifecycleStateV1.NO_PR,
-                IntentLifecycleStateV1.PROMOTED,
-            },
-            eligible_at=self._now(),
+        records = sorted(
+            self.store.list_intents(
+                states={
+                    IntentLifecycleStateV1.PENDING,
+                    IntentLifecycleStateV1.NO_PR,
+                    IntentLifecycleStateV1.PROMOTED,
+                },
+                eligible_at=self._now(),
+            ),
+            key=lambda record: (
+                record.next_attempt_at or record.intent.requested_at,
+                record.intent.requested_at,
+                record.ingress_id,
+            ),
         )[: self.batch_size]
         result = LifecycleDrainResult()
         resolved_records: list[tuple[MaintenanceIntentRecordV1, _ResolvedPR]] = []
@@ -453,7 +460,11 @@ class LifecycleWorkflow:
         if intent.pr_number is None:
             branch = intent.pushed_ref.removeprefix("refs/heads/")
             payload = github_api.find_pr_by_head(
-                branch, "open", cwd, head_oid=intent.head_sha
+                branch,
+                "open",
+                cwd,
+                head_oid=intent.head_sha,
+                repository=intent.repository,
             )
             if isinstance(payload, dict):
                 payload = {**payload, "state": "OPEN"}
@@ -464,6 +475,7 @@ class LifecycleWorkflow:
                 "mergeStateStatus,mergeable,reviewDecision,author",
                 cwd,
                 force=True,
+                repository=intent.repository,
             )
         if not isinstance(payload, dict):
             return None

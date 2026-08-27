@@ -554,6 +554,38 @@ def test_explicit_push_refspec_uses_source_branch_identity(tmp_path: Path) -> No
     assert intent.worktree_path == str(pushed_worktree)
 
 
+def test_renamed_push_refspec_uses_source_sha_and_destination_branch(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, _ = _repository(tmp_path)
+    _git(repo, "checkout", "-b", "feature/local")
+    (repo / "renamed.txt").write_text("renamed\n", encoding="utf-8")
+    _git(repo, "add", "renamed.txt")
+    _git(repo, "commit", "-m", "renamed branch")
+    pushed_head = _git(repo, "rev-parse", "HEAD")
+
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": "git push origin feature/local:feature/pr-head"
+            },
+            "tool_response": {
+                "exit_code": 0,
+                "stderr": "* [new branch] feature/local -> feature/pr-head",
+            },
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=tmp_path / "state",
+        now=NOW,
+    )
+
+    intent = LifecycleStore(tmp_path / "state").list_intents()[0].intent
+    assert intent.pushed_ref == "refs/heads/feature/pr-head"
+    assert intent.head_sha == pushed_head
+
+
 def test_compound_pr_create_url_proves_create_succeeded(tmp_path: Path) -> None:
     adapter = _adapter()
     repo, _ = _repository(tmp_path)

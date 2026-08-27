@@ -274,19 +274,29 @@ def is_git_push(command: str) -> bool:
     return False
 
 
-def git_push_source_branch(command: str) -> tuple[bool, str | None]:
-    """Return whether push has refspecs and its single local branch source."""
+def git_push_source_and_destination(
+    command: str,
+) -> tuple[bool, str | None, str | None]:
+    """Return refspec presence plus its single local source and remote branch."""
     try:
         tokens = shlex.split(command, comments=True)
     except ValueError:
-        return False, None
+        return False, None, None
     index = _skip_command_prefixes(tokens)
     while index < len(tokens) and tokens[index] != "push":
         index += 1
     if index >= len(tokens):
-        return False, None
+        return False, None, None
     index += 1
-    value_options = {"--repo", "--receive-pack", "--exec", "-o", "--push-option"}
+    value_options = {
+        "--repo",
+        "--receive-pack",
+        "--exec",
+        "-o",
+        "--push-option",
+        "--recurse-submodules",
+    }
+    repository_supplied = False
     positionals: list[str] = []
     while index < len(tokens):
         token = tokens[index]
@@ -294,22 +304,37 @@ def git_push_source_branch(command: str) -> tuple[bool, str | None]:
             positionals.extend(tokens[index + 1 :])
             break
         if token in value_options:
+            repository_supplied = repository_supplied or token == "--repo"
             index += 2
+            continue
+        if token.startswith("--repo="):
+            repository_supplied = True
+            index += 1
             continue
         if token.startswith("-"):
             index += 1
             continue
         positionals.append(token)
         index += 1
-    refspecs = positionals[1:] if positionals else []  # first positional is repository
+    refspecs = positionals if repository_supplied else positionals[1:]
     if not refspecs:
-        return False, None
+        return False, None, None
     if len(refspecs) != 1:
-        return True, None
-    source = refspecs[0].lstrip("+").split(":", 1)[0]
-    if not source or source == "HEAD" or source.startswith("refs/tags/"):
-        return True, None
-    return True, source.removeprefix("refs/heads/")
+        return True, None, None
+    source, separator, destination = refspecs[0].lstrip("+").partition(":")
+    remote_branch = destination.removeprefix("refs/heads/") if separator else source
+    if not source or source.startswith("refs/tags/"):
+        return True, None, None
+    local_branch = None if source == "HEAD" else source.removeprefix("refs/heads/")
+    if not remote_branch or remote_branch.startswith("refs/tags/"):
+        remote_branch = None
+    return True, local_branch, remote_branch
+
+
+def git_push_source_branch(command: str) -> tuple[bool, str | None]:
+    """Return whether push has refspecs and its single local branch source."""
+    has_refspec, source, _destination = git_push_source_and_destination(command)
+    return has_refspec, source
 
 
 def effective_git_cwd(command: str, base_cwd: str) -> str:
