@@ -799,9 +799,16 @@ def _outcome(response: dict[object, object]) -> DispatchOutcome:
 
 def _exit_code(response: dict[object, object]) -> int | None:
     exit_code = response.get("exit_code", response.get("exitCode"))
-    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+    if isinstance(exit_code, bool):
         return None
-    return exit_code
+    if isinstance(exit_code, int):
+        return exit_code
+    if not isinstance(exit_code, str):
+        return None
+    try:
+        return int(exit_code)
+    except ValueError:
+        return None
 
 
 def _valid_start_time(value: object) -> bool:

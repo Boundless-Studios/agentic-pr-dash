@@ -574,6 +574,28 @@ def test_legacy_telemetry_omits_fabricated_argument_count() -> None:
     assert "process.args_count" not in telemetry.otel_attributes()
 
 
+def test_legacy_opencode_telemetry_derives_provider_from_qualified_model() -> None:
+    observation = DispatchObservation(
+        provider=DispatchProvider.OPENCODE,
+        source=DispatchSource.DETACHED_RUNNER,
+        session_id="session-1",
+        worktree_root="/repo/worktree",
+        command="opencode run --model openai/gpt-5 prompt",
+        task_type="exec",
+        requested_model="openai/gpt-5",
+        resolved_model="openai/gpt-5",
+        outcome=DispatchOutcome.SUCCESS,
+        classification_authority=ClassificationAuthority.LEGACY_INFERRED,
+    )
+
+    telemetry = DispatchTelemetry.from_legacy_observation(
+        observation,
+        parse_status=DispatchParseStatus.LEGACY_PARSED,
+    )
+
+    assert telemetry.otel_attributes()["gen_ai.provider.name"] == "openai"
+
+
 def test_telemetry_bounds_argument_count_and_values_deterministically() -> None:
     long_model = "m" * (MAX_STRING_LENGTH + 10)
     argv = ("codex", "exec", "--model", long_model) + tuple(

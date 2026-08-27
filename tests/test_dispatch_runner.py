@@ -1145,6 +1145,25 @@ def test_detached_opencode_entrypoint_persists_without_context(
     assert capsys.readouterr().out == ""
 
 
+def test_detached_entrypoint_normalizes_string_exit_code_for_error_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: list[tuple[DispatchTelemetry, dict[str, object]]] = []
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(tmp_path / "dispatch.jsonl"))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **kwargs: captured.append((telemetry, kwargs)),
+    )
+
+    result = run_opencode_dispatch_logger.main(
+        ["--command", "opencode run review", "--exit-code", "1"]
+    )
+
+    assert result == 0
+    assert captured[0][1]["error_type"] == "process.exit_code.1"
+
+
 def test_detached_entrypoint_accepts_adapter_model_resolution(
     tmp_path: Path, monkeypatch
 ) -> None:

@@ -204,9 +204,13 @@ class DispatchTelemetry:
         """Represent one already-parsed legacy observation without raw text."""
 
         executable = observation.provider.value
+        provider_name = _PROVIDER_NAMES[observation.provider]
+        model = observation.resolved_model or observation.requested_model
+        if observation.provider is DispatchProvider.OPENCODE and model and "/" in model:
+            provider_name = _truncate(model.split("/", 1)[0])
         return cls(
             provider=observation.provider,
-            gen_ai_provider_name=_PROVIDER_NAMES[observation.provider],
+            gen_ai_provider_name=provider_name,
             source=observation.source,
             argv=(executable, "<legacy:redacted>"),
             sanitized_argv=(executable, "<legacy:redacted>"),
