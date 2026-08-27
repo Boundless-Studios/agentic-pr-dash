@@ -1616,6 +1616,96 @@ async def test_fresh_non_code_reply_settles_with_thread_permitted_open(
 
 
 @pytest.mark.asyncio
+async def test_fresh_non_code_reply_is_removed_from_dispatch_input(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    thread = _thread()
+    finding = review_settlement.finding_from_thread(
+        thread,
+        repository=REPOSITORY,
+        head_sha=HEAD,
+        reviewer_execution_id="local-visible-review",
+    )
+    ledger = _ledger()
+    ledger.submit(
+        ReviewResult(
+            repository=REPOSITORY,
+            head_sha=HEAD,
+            stage=ReviewStage.LOCAL,
+            round_number=2,
+            slot_number=1,
+            reviewer_execution_id="local-visible-review",
+            findings=[finding],
+        )
+    )
+    ledger.record_disposition(
+        fingerprint=finding.fingerprint,
+        disposition=Disposition.REJECT,
+        rationale="The reported path cannot reach the lifecycle boundary.",
+        evidence="targeted lifecycle boundary reproduction",
+    )
+    closure = review_settlement.classify_thread_closure(
+        thread, policy=_policy(), ledger=ledger
+    )
+    assert closure is not None
+    thread.replies.append(
+        ReviewThreadComment(
+            database_id=11,
+            path=thread.top.path,
+            line=thread.top.line,
+            body=completion.structured_settlement_reply_body(
+                marker="<!-- agentic-pr-dash:completed -->",
+                finding=closure.finding,
+                head_sha=HEAD,
+            ),
+            author="maintenance-bot",
+            created_at=(OBSERVED_AT + timedelta(seconds=1)).isoformat(),
+        )
+    )
+    store = LifecycleStore(tmp_path / "state")
+    store.enqueue(_intent(pr_number=7))
+    monkeypatch.setattr(github_api, "resolve_pr", lambda *a, **k: _pr_payload())
+    aggregate = _batch(unresolved_threads=(thread,)).observed[7]
+    monkeypatch.setattr(
+        github_api,
+        "get_review_submissions_observation",
+        lambda *a, **k: github_api.ObservationReadResult.observed([]),
+    )
+    from agentic_pr_dash import lifecycle_workflow
+    from agentic_pr_dash.lifecycle_workflow import LifecycleWorkflow, _ResolvedPR
+
+    evaluate = lifecycle_workflow.evaluate_pr_snapshot
+
+    def addressed_observation(**kwargs):
+        observation = evaluate(**kwargs)
+        return observation.model_copy(
+            update={
+                "addressed_thread_ids": [thread.node_id],
+                "unaddressed_thread_ids": [],
+            }
+        )
+
+    monkeypatch.setattr(
+        lifecycle_workflow, "evaluate_pr_snapshot", addressed_observation
+    )
+
+    observed = await LifecycleWorkflow(
+        store,
+        policy=_policy(),
+        ledger=ledger,
+        maintenance_author="maintenance-bot",
+    )._observe(
+        store.list_intents()[0],
+        _ResolvedPR(_pr_payload(), REPOSITORY, 7, HEAD),
+        aggregate,
+    )
+
+    assert observed is not None
+    assert observed.observation.addressed_thread_ids == [thread.node_id]
+    assert observed.pr.review_comments == []
+
+
+@pytest.mark.asyncio
 async def test_unaddressed_threads_project_to_snapshot_and_dispatch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1838,6 +1928,37 @@ async def test_lifecycle_dispatch_respects_claim_exclusion_and_adoption(
     await workflow.drain()
 
     assert dispatch.calls == expected_dispatches
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_dispatch_defers_to_intent_live_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from agentic_pr_dash import session_registry
+    from agentic_pr_dash.lifecycle_workflow import _dispatch_allowed
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    intent = _intent(pr_number=7).model_copy(
+        update={"worktree_path": str(worktree), "session_id": "live-session"}
+    )
+
+    class LiveSession:
+        session_id = "live-session"
+
+    monkeypatch.setattr(
+        session_registry,
+        "active_sessions_for_worktree",
+        lambda *a, **k: [LiveSession()],
+    )
+
+    observed = _batch().observed[7]
+    from agentic_pr_dash.lifecycle_workflow import _pr_data, _ResolvedPR
+
+    pr = _pr_data(
+        _ResolvedPR(_pr_payload(), REPOSITORY, 7, HEAD), observed, str(worktree)
+    )
+    assert not _dispatch_allowed(pr, intent)
 
 
 @pytest.mark.asyncio
@@ -2070,6 +2191,21 @@ def test_invalid_configured_review_context_raises(tmp_path: Path) -> None:
     ledger_path = tmp_path / ".agentic-review" / "ledger.json"
     ledger_path.parent.mkdir()
     ledger_path.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(Exception, match="review context"):
+        load_review_context_for_worktree(tmp_path)
+
+
+@pytest.mark.parametrize("configured", ("policy", "ledger"))
+def test_partially_configured_review_context_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str
+) -> None:
+    from agentic_pr_dash.lifecycle_workflow import load_review_context_for_worktree
+
+    if configured == "policy":
+        monkeypatch.setenv("AGENTIC_PR_DASH_REVIEW_POLICY", "policy.yaml")
+    else:
+        monkeypatch.setenv("AGENTIC_PR_DASH_REVIEW_LEDGER", "ledger.json")
 
     with pytest.raises(Exception, match="review context"):
         load_review_context_for_worktree(tmp_path)

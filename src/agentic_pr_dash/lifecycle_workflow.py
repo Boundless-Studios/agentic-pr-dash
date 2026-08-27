@@ -76,8 +76,12 @@ def load_review_context_for_worktree(
         "AGENTIC_PR_DASH_REVIEW_LEDGER",
         (".agentic-review/ledger.json", ".agentic-pr-dash/review-ledger.json"),
     )
-    if policy_path is None or ledger_path is None:
+    if policy_path is None and ledger_path is None:
         return None
+    if policy_path is None or ledger_path is None:
+        raise ReviewContextUnavailableError(
+            f"review context is partially configured in {cwd}"
+        )
     try:
         policy = ReviewPolicy.from_yaml(policy_path.read_text(encoding="utf-8"))
         ledger = ReviewLedger.model_validate_json(
@@ -369,7 +373,7 @@ class LifecycleWorkflow:
         if (
             self.orchestrator is not None
             and _actionable(snapshot)
-            and _dispatch_allowed(observed.pr)
+            and _dispatch_allowed(observed.pr, record.intent)
         ):
             await self.orchestrator.dispatch_pr_maintenance(observed.pr)
         return "progressed"
@@ -490,6 +494,12 @@ class LifecycleWorkflow:
                 ).maintenance_mutation_identity
             ),
         )
+        addressed_thread_ids = set(observation.addressed_thread_ids)
+        pr.review_comments = [
+            comment
+            for comment in pr.review_comments
+            if comment.thread_id not in addressed_thread_ids
+        ]
         pr.review_comments.extend(_policy_review_comments(observation))
         return _ObservedPR(
             observation,
@@ -958,7 +968,20 @@ def _actionable(snapshot: MaintenanceSnapshotV1) -> bool:
     )
 
 
-def _dispatch_allowed(pr: PRData) -> bool:
+def _dispatch_allowed(pr: PRData, intent: object | None = None) -> bool:
+    session_id = str(getattr(intent, "session_id", "") or "")
+    worktree_path = str(getattr(intent, "worktree_path", "") or "")
+    if session_id and session_id != "unattributed" and worktree_path:
+        try:
+            from . import session_registry
+
+            active_sessions = session_registry.active_sessions_for_worktree(
+                worktree_path, require_feature_pipeline=False
+            )
+        except Exception:  # noqa: BLE001 - coordinator remains the fallback fence
+            active_sessions = ()
+        if any(state.session_id == session_id for state in active_sessions):
+            return False
     try:
         return coordinator.dispatch_decision_for_pr(pr).should_dispatch
     except Exception:  # noqa: BLE001 - dispatch remains best effort

@@ -404,9 +404,7 @@ def _successful_targets(
     for index, (leading_op, segment) in enumerate(segments):
         destination = cd_target(segment)
         push = index not in ambiguous and is_git_push(segment)
-        pr_target = (
-            parse_gh_pr_arm_target(segment) if index not in ambiguous else None
-        )
+        pr_target = parse_gh_pr_arm_target(segment) if index not in ambiguous else None
         next_states: dict[tuple[bool, str | None], frozenset[_IndexedTarget]] = {}
         for (previous_succeeded, cwd), proven_targets in states.items():
             executes = (
@@ -487,6 +485,15 @@ def _enqueue_target(
     identity = local_git_identity(cwd, branch=target_branch)
     if identity is None:
         return
+    if kind == "push":
+        canonical_repository = _prior_pr_repository(identity, state_root)
+        if canonical_repository is not None:
+            identity = LocalGitIdentity(
+                canonical_repository,
+                identity.pushed_ref,
+                identity.head_sha,
+                identity.worktree_path,
+            )
     if kind == "pr" and pr_number is None:
         output_identity = _output_pr_identity(payload)
         if output_identity is not None:
@@ -511,6 +518,26 @@ def _enqueue_target(
         ),
         root=state_root,
     )
+
+
+def _prior_pr_repository(
+    identity: LocalGitIdentity,
+    state_root: str | PathLike[str] | None,
+) -> str | None:
+    """Reuse a PR-created upstream identity for later pushes from a fork."""
+
+    from agentic_pr_dash.lifecycle_store import LifecycleStore
+
+    candidates = [
+        record.intent
+        for record in LifecycleStore(state_root).list_intents()
+        if record.intent.pr_number is not None
+        and record.intent.pushed_ref == identity.pushed_ref
+        and record.intent.worktree_path == identity.worktree_path
+    ]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda intent: intent.requested_at).repository
 
 
 def enqueue_maintenance(

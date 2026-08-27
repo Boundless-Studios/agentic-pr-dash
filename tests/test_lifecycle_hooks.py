@@ -473,9 +473,7 @@ def test_pr_create_url_sets_canonical_repository_for_fork_worktree(
     tmp_path: Path,
 ) -> None:
     adapter = _adapter()
-    repo, head = _repository(
-        tmp_path, remote="git@github.com:ForkOwner/Widget.git"
-    )
+    repo, head = _repository(tmp_path, remote="git@github.com:ForkOwner/Widget.git")
     state_root = tmp_path / "state"
     payload = {
         "hook_event_name": "PostToolUse",
@@ -495,6 +493,44 @@ def test_pr_create_url_sets_canonical_repository_for_fork_worktree(
     assert intent.repository == "Upstream/Widget"
     assert intent.pr_number == 42
     assert intent.head_sha == head
+
+
+def test_push_reuses_canonical_repository_from_prior_pr_intent(tmp_path: Path) -> None:
+    adapter = _adapter()
+    repo, _head = _repository(tmp_path, remote="git@github.com:ForkOwner/Widget.git")
+    state_root = tmp_path / "state"
+    create_payload = {
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "gh pr create --fill"},
+        "tool_response": {
+            "exit_code": 0,
+            "stdout": "https://github.com/Upstream/Widget/pull/42\n",
+        },
+        "cwd": str(repo),
+        "session_id": "session-1",
+    }
+    adapter.run_payload(create_payload, state_root=state_root, now=NOW)
+    (repo / "README.md").write_text("new head\n", encoding="utf-8")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-m", "new head")
+
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {"exit_code": 0},
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=state_root,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    intents = LifecycleStore(state_root).list_intents()
+    pushed = max(intents, key=lambda record: record.intent.requested_at).intent
+    assert pushed.repository == "Upstream/Widget"
 
 
 def test_git_url_rewrite_is_applied_to_origin_identity(tmp_path: Path) -> None:
