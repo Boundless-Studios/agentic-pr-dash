@@ -438,6 +438,31 @@ def test_structured_codex_provider_uses_adapter_configured_provider(
     assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "ollama"
 
 
+def test_structured_codex_provider_preserves_explicit_config_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    emitted: list[DispatchTelemetry] = []
+    monkeypatch.setattr(
+        "agentic_pr_dash.codex_hooks.dispatch_runner.emit_dispatch_span",
+        lambda telemetry, **_kwargs: emitted.append(telemetry),
+    )
+    request = _request(
+        tmp_path,
+        provider=DispatchProvider.CODEX,
+        command="<redacted>",
+        model_resolution={"configured_provider": "ollama"},
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["codex", "exec", "-c", 'model_provider="openai"', "prompt"],
+        "task_type": "exec",
+    }
+
+    result = run_dispatch_hook(request)
+
+    assert result.observation is not None
+    assert emitted[0].otel_attributes()["gen_ai.provider.name"] == "openai"
+
+
 @pytest.mark.parametrize(
     "metadata",
     [
@@ -584,6 +609,28 @@ def test_structured_metadata_rejects_wrong_provider_or_subcommand(
     result = run_dispatch_hook(request)
 
     assert result.observation is None
+    assert not request.ledger_path.exists()
+
+
+@pytest.mark.parametrize("terminal_option", ["-h", "--help"])
+def test_structured_opencode_help_invocation_is_rejected(
+    tmp_path: Path, terminal_option: str
+) -> None:
+    callbacks: list[DispatchObservation] = []
+    request = _request(
+        tmp_path, provider=DispatchProvider.OPENCODE, command="<redacted>"
+    )
+    request.payload["dispatch_telemetry"] = {
+        "argv": ["opencode", "run", terminal_option],
+        "task_type": "review",
+    }
+
+    result = run_dispatch_hook(
+        request, lambda observation: callbacks.append(observation)
+    )
+
+    assert result.observation is None
+    assert callbacks == []
     assert not request.ledger_path.exists()
 
 
@@ -1301,6 +1348,32 @@ def test_structured_entrypoint_routes_default_paths_to_overridden_worktree(
     assert not (launch_root / ".beads" / "interactions.jsonl").exists()
 
 
+def test_structured_entrypoint_does_not_create_missing_worktree_override(
+    tmp_path: Path, monkeypatch
+) -> None:
+    launch_root = tmp_path / "launch"
+    missing_root = tmp_path / "missing"
+    launch_root.mkdir()
+    monkeypatch.delenv("MODEL_DISPATCH_LOG", raising=False)
+    monkeypatch.delenv("DISPATCH_AVAILABILITY_PATH", raising=False)
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(launch_root))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(
+            BytesIO(f"codex\0exec\0-C\0{missing_root}\0prompt\0".encode())
+        ),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "exec", "--exit-code", "1"]
+    )
+
+    assert result == 0
+    assert not missing_root.exists()
+    assert (launch_root / ".beads" / "interactions.jsonl").exists()
+
+
 @pytest.mark.parametrize(
     "exit_code_args", [["--exit-code", "not-a-number"], ["--exit-code"]]
 )
@@ -1318,6 +1391,26 @@ def test_structured_detached_entrypoint_rejects_malformed_exit_code(
 
     result = run_codex_dispatch_logger.main(
         ["--structured-stdin", "--task-type", "exec", *exit_code_args]
+    )
+
+    assert result == 0
+    assert not ledger.exists()
+
+
+def test_structured_detached_entrypoint_rejects_option_as_task_type(
+    tmp_path: Path, monkeypatch
+) -> None:
+    ledger = tmp_path / "dispatch.jsonl"
+    monkeypatch.setenv("MODEL_DISPATCH_LOG", str(ledger))
+    monkeypatch.setenv("CLAUDE_PROJECT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        TextIOWrapper(BytesIO(b"codex\0exec\0private prompt\0")),
+    )
+
+    result = run_codex_dispatch_logger.main(
+        ["--structured-stdin", "--task-type", "--exit-code", "0"]
     )
 
     assert result == 0

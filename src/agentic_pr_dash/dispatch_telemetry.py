@@ -115,6 +115,7 @@ class DispatchTelemetry:
     start_time_unix_nano: int | None
     resolution_source: DispatchResolutionSource
     gen_ai_provider_name: str | None = None
+    provider_explicit: bool = False
     parse_status: DispatchParseStatus = DispatchParseStatus.STRUCTURED
     dispatch_id: str = field(default_factory=lambda: str(uuid4()))
     observed_at: str = field(default_factory=lambda: datetime.now(UTC).isoformat())
@@ -139,6 +140,7 @@ class DispatchTelemetry:
         return cls(
             provider=provider,
             gen_ai_provider_name=parsed.gen_ai_provider_name,
+            provider_explicit=parsed.provider_explicit,
             source=source,
             argv=exact_argv,
             sanitized_argv=parsed.sanitized_argv,
@@ -268,6 +270,7 @@ class DispatchTelemetry:
 class _ParsedArgv:
     sanitized_argv: tuple[str, ...]
     gen_ai_provider_name: str | None
+    provider_explicit: bool
     model: str | None
     profile: str | None
     reasoning_effort: str | None
@@ -286,6 +289,7 @@ def _sanitize_and_resolve(
 
     sanitized = [argv[0]]
     gen_ai_provider_name = _PROVIDER_NAMES[provider]
+    provider_explicit = False
     model = None
     profile = None
     reasoning_effort = None
@@ -303,7 +307,7 @@ def _sanitize_and_resolve(
 
     def apply_config(value: str) -> None:
         nonlocal model, reasoning_effort, resolution_source
-        nonlocal gen_ai_provider_name, sandbox_mode, approval_mode
+        nonlocal gen_ai_provider_name, provider_explicit, sandbox_mode, approval_mode
         model, reasoning_effort, resolution_source = _apply_config_value(
             value, model, reasoning_effort, resolution_source
         )
@@ -313,6 +317,7 @@ def _sanitize_and_resolve(
         key, parsed_value = assignment
         if key == "model_provider":
             gen_ai_provider_name = _truncate(parsed_value)
+            provider_explicit = True
         elif key == "sandbox_mode" and not sandbox_explicit and not bypass_policy:
             sandbox_mode = _truncate(parsed_value)
         elif key == "approval_policy" and not approval_explicit and not bypass_policy:
@@ -477,6 +482,7 @@ def _sanitize_and_resolve(
     if provider is DispatchProvider.CODEX and oss_mode:
         if local_provider_candidate:
             gen_ai_provider_name = local_provider_candidate
+            provider_explicit = True
         elif gen_ai_provider_name == _PROVIDER_NAMES[provider]:
             gen_ai_provider_name = None
     if full_auto and not bypass_policy:
@@ -487,9 +493,11 @@ def _sanitize_and_resolve(
         bounded.append(f"<truncated:{len(sanitized) - MAX_ARG_COUNT}-args>")
     if provider is DispatchProvider.OPENCODE and model and "/" in model:
         gen_ai_provider_name = _truncate(model.split("/", 1)[0])
+        provider_explicit = True
     return _ParsedArgv(
         tuple(bounded),
         gen_ai_provider_name,
+        provider_explicit,
         model,
         profile,
         reasoning_effort,

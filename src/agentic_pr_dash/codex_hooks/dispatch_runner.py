@@ -299,16 +299,17 @@ def run_provider_entrypoint(
     structured = _structured_telemetry(request)
     if structured is not None:
         effective_root = Path(structured.cwd)
+        use_effective_root = _usable_working_directory(effective_root)
         request = replace(
             request,
             ledger_path=(
                 request.ledger_path
-                if "MODEL_DISPATCH_LOG" in os.environ
+                if "MODEL_DISPATCH_LOG" in os.environ or not use_effective_root
                 else effective_root / ".beads" / "interactions.jsonl"
             ),
             availability_path=(
                 request.availability_path
-                if "DISPATCH_AVAILABILITY_PATH" in os.environ
+                if "DISPATCH_AVAILABILITY_PATH" in os.environ or not use_effective_root
                 else effective_root
                 / ".agentic-pr-dash"
                 / f"{provider.value}-availability.json"
@@ -331,7 +332,7 @@ def run_provider_entrypoint(
 
 def _structured_stdin_payload(argv: list[str]) -> dict[str, object] | None:
     task_type = _option_value(argv, "--task-type")
-    if not task_type:
+    if not task_type or task_type.startswith("-"):
         return None
     try:
         raw = sys.stdin.buffer.read(_STRUCTURED_STDIN_LIMIT + 1)
@@ -413,6 +414,7 @@ def _observation_from_request(
         if (
             configured_provider is not None
             and structured.gen_ai_provider_name == "openai"
+            and not structured.provider_explicit
         ):
             structured = replace(
                 structured,
@@ -580,7 +582,13 @@ def _structured_telemetry(
 
 def _has_supported_subcommand(argv: list[str], provider: DispatchProvider) -> bool:
     if provider is DispatchProvider.OPENCODE:
-        return len(argv) >= 2 and argv[1] == "run"
+        if len(argv) < 2 or argv[1] != "run":
+            return False
+        option_tokens = argv[2 : argv.index("--")] if "--" in argv else argv[2:]
+        return not any(
+            token in {"-h", "--help", "-V", "--version"}
+            for token in option_tokens
+        )
     if provider is not DispatchProvider.CODEX:
         return False
     option_tokens = argv[1 : argv.index("--")] if "--" in argv else argv[1:]
@@ -684,6 +692,15 @@ def _option_value(argv: list[str], option: str) -> str | None:
     except ValueError:
         return None
     return argv[index + 1] if index + 1 < len(argv) else None
+
+
+def _usable_working_directory(path: Path) -> bool:
+    """Return whether default telemetry files can safely be rooted at *path*."""
+
+    try:
+        return path.is_dir() and os.access(path, os.W_OK | os.X_OK)
+    except OSError:
+        return False
 
 
 def _matches_provider(command: str, provider: DispatchProvider) -> bool:
