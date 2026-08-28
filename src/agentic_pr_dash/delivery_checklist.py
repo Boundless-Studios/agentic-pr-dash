@@ -106,10 +106,11 @@ def _mergeability_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItem
 
 
 def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
-    if (
-        snapshot.policy_unsettled_finding_count
-        or MaintenanceBlockerV1.REVIEW_FINDINGS in snapshot.blockers
-    ):
+    if snapshot.policy_unsettled_finding_count:
+        state = ChecklistItemStateV1.BLOCKED
+    elif snapshot.review_state is ReviewStateV1.PENDING:
+        state = ChecklistItemStateV1.REQUIRED
+    elif MaintenanceBlockerV1.REVIEW_FINDINGS in snapshot.blockers:
         state = ChecklistItemStateV1.BLOCKED
     elif snapshot.observation_health is ObservationHealthV1.PARTIAL:
         state = ChecklistItemStateV1.UNKNOWN
@@ -183,7 +184,14 @@ def project_checklist(
     """Compose provider-owned local evidence with one exact-head PR snapshot."""
 
     snapshot_matches_target = (
-        snapshot is None or target is None or snapshot.key == target
+        snapshot is None
+        or target is None
+        or (
+            snapshot.key.normalized_repository == target.normalized_repository
+            and snapshot.key.pr_number == target.pr_number
+            and snapshot.key.head_sha == target.head_sha
+            and snapshot.key.workflow_type == target.workflow_type
+        )
     )
     if observed_at is not None:
         projection_time = observed_at

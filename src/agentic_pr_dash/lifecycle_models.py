@@ -182,6 +182,12 @@ class DeliveryChecklistItemV1(BaseModel):
             raise ValueError("next_actions must be a sequence")
         return tuple(_required_text(action) for action in value)
 
+    @model_validator(mode="after")
+    def _require_incomplete_action(self) -> "DeliveryChecklistItemV1":
+        if self.state is not ChecklistItemStateV1.SATISFIED and not self.next_actions:
+            raise ValueError("incomplete checklist item requires a next action")
+        return self
+
 
 class LocalDeliveryEvidenceV1(BaseModel):
     """Provider-owned local evidence for the pre-PR checklist items."""

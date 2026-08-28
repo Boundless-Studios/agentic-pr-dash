@@ -96,6 +96,16 @@ def test_complete_requires_every_item_to_be_satisfied() -> None:
         _checklist(items=items, complete=True)
 
 
+def test_incomplete_item_requires_an_action() -> None:
+    with pytest.raises(ValidationError, match="incomplete checklist item"):
+        DeliveryChecklistItemV1(
+            item_id=ChecklistItemIdV1.CODE_QUALITY,
+            state=ChecklistItemStateV1.BLOCKED,
+            authority="test",
+            summary="review is blocked",
+        )
+
+
 def test_missing_local_evidence_remains_unknown() -> None:
     items = tuple(
         _item(
@@ -228,6 +238,20 @@ def test_pending_review_recommends_obtaining_required_review() -> None:
     assert review.next_actions == ("wait for or obtain the required review",)
 
 
+def test_pending_review_with_aggregate_blocker_still_requests_review() -> None:
+    snapshot = _snapshot(
+        review_state=ReviewStateV1.PENDING,
+        blockers=(MaintenanceBlockerV1.REVIEW_FINDINGS,),
+        settled=False,
+        stable_observation_count=0,
+    )
+
+    review = project_checklist(local=_local_evidence(), snapshot=snapshot).items[8]
+
+    assert review.state is ChecklistItemStateV1.REQUIRED
+    assert review.next_actions == ("wait for or obtain the required review",)
+
+
 def test_missing_snapshot_is_visible_without_erasing_local_progress() -> None:
     checklist = project_checklist(local=_local_evidence(), snapshot=None)
 
@@ -283,6 +307,20 @@ def test_snapshot_for_another_target_is_not_used_as_remote_evidence() -> None:
         tuple(item.state for item in checklist.items[5:])
         == (ChecklistItemStateV1.UNKNOWN,) * 5
     )
+
+
+def test_snapshot_repository_identity_matches_case_insensitively() -> None:
+    target = _checklist().key.model_copy(
+        update={"repository": "boundless-studios/EXAMPLE"}
+    )
+
+    checklist = project_checklist(
+        local=_local_evidence(),
+        snapshot=_snapshot(),
+        target=target,
+    )
+
+    assert checklist.complete
 
 
 def test_review_blocker_overrides_clean_aggregate_review_state() -> None:
