@@ -248,6 +248,13 @@ The orchestrator treats GitHub API failures as "skip this poll" rather than "no
 PRs exist." This prevents transient rate limits or outages from incorrectly
 clearing the board.
 
+Green open PRs remain under a durable late-review watch. Successful review
+observations follow `1m, 5m, 15m, 30m, 1h, 2h, 4h, 8h`, then repeat every eight
+hours until merge or closure. New heads and actionable feedback reset the watch
+to one minute; failed observations do not advance it. The lifecycle worker owns
+this schedule—rendering and Stop hooks only read or rearm persisted state and
+never sleep or query GitHub themselves.
+
 ### Web Server
 
 `server.py` starts the web runtime. `app.py` defines the FastAPI routes and HTMX
@@ -277,7 +284,7 @@ durable lifecycle intents; it never observes GitHub or starts a worker.
 | `src/agentic_pr_dash/github_api.py` | GitHub CLI/API access, PR metadata, CI checks, review threads, runner health. |
 | `src/agentic_pr_dash/maintenance_check.py` | Thin CLI layer: `main`, the `_cmd_*` subcommand dispatchers, arg parsing, and a re-export facade over `_maintenance/` (so `maintenance_check.X` keeps resolving for consumers and tests). |
 | `src/agentic_pr_dash/_maintenance/` | Behavior package the CLI delegates to (split out of `maintenance_check.py`): `pr_state.py` (PR resolution + GitHub reads + review threads), `markers.py` (ownership/session markers, heartbeats, leases, claims), `worktrees.py` (worktree iteration + maintenance-root resolution), `worktree_check.py` (the shared per-worktree blocker engine used by both `check` and `stop-gate`), `stop_gate.py` (stop-state, fingerprinting, prompt/waiter rendering), `completion.py` (completion replies + review-comment extraction), `reconcile.py` (orphan adoption + PR records), `waiter.py` (await pidfiles + liveness), `_common.py` (shared primitives). Cross-module calls are module-qualified so the owning module is the single monkeypatch seam. |
-| `src/agentic_pr_dash/stop_hook.py` | Snapshot-only advisory Stop adapter. It reads the current exact-head lifecycle snapshot, enqueues stale/missing/invalid state, renders local blockers/actions, and always allows Stop even when state is unavailable. |
+| `src/agentic_pr_dash/stop_hook.py` | Snapshot-only advisory Stop adapter. It reads the current exact-head lifecycle snapshot, enqueues stale/missing/invalid or unarmed clean state, renders blockers/actions/review-watch ownership, and always allows Stop even when state is unavailable. |
 | `src/agentic_pr_dash/maintenance.py` | Durable maintenance queue/state helpers. |
 | `src/agentic_pr_dash/loop.py` | Continuous check/fix/complete loop and executor dispatch. |
 | `src/agentic_pr_dash/orchestrator.py` | Dashboard polling, PR state machine, queue suppression, card enrichment. |

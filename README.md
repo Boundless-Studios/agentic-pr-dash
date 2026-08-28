@@ -282,6 +282,14 @@ command in that case.
 
 ## The agentic review loop
 
+An open PR is never considered permanently review-clean. After required CI is
+green, the durable lifecycle worker checks for late feedback after 1, 5, 15, 30,
+60, 120, 240, and 480 minutes, then every 480 minutes until the PR merges or
+closes. A new head or actionable comment resets the cadence to one minute;
+unavailable observations retry without advancing it. Interactive agents may
+stop once the current state is clean and this watch is armed—the Stop hook does
+not spend model time waiting through the schedule.
+
 Each tick, the loop walks your open PRs and runs `check` on every one — a
 read-only pass over GitHub that classifies the PR as **clean**, **CI failing**,
 **review comments**, or **merge conflict**. When a PR needs work it does three
