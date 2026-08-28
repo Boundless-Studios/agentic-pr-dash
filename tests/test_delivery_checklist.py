@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
@@ -20,6 +20,8 @@ from agentic_pr_dash.lifecycle_models import (
     MergeabilityStateV1,
     ObservationHealthV1,
     RequiredCIStateV1,
+    ReviewWatchStateV1,
+    ReviewWatchStatusV1,
     ReviewStateV1,
     SnapshotReadStatusV1,
 )
@@ -151,9 +153,10 @@ def _local_evidence() -> LocalDeliveryEvidenceV1:
 
 
 def _snapshot(**updates: object) -> MaintenanceSnapshotV1:
+    observed_at = datetime(2026, 8, 28, tzinfo=UTC)
     values: dict[str, object] = {
         "key": _checklist().key,
-        "observed_at": datetime(2026, 8, 28, tzinfo=UTC),
+        "observed_at": observed_at,
         "observation_health": ObservationHealthV1.HEALTHY,
         "blockers": (),
         "next_actions": (),
@@ -163,6 +166,16 @@ def _snapshot(**updates: object) -> MaintenanceSnapshotV1:
         "policy_unsettled_finding_count": 0,
         "raw_unresolved_thread_count": 0,
         "unaddressed_thread_count": 0,
+        "review_watch": ReviewWatchStateV1(
+            status=ReviewWatchStatusV1.ARMED,
+            head_sha="a" * 40,
+            reset_at=observed_at,
+            last_observed_at=observed_at,
+            next_check_at=observed_at + timedelta(minutes=1),
+            interval_index=0,
+            unresolved_thread_count=0,
+            reset_reason="required CI became green",
+        ),
         "stable_observation_count": 2,
         "stable_observation_first_at": datetime(2026, 8, 28, tzinfo=UTC),
         "stable_observation_last_at": datetime(2026, 8, 28, tzinfo=UTC),
@@ -170,6 +183,17 @@ def _snapshot(**updates: object) -> MaintenanceSnapshotV1:
     }
     values.update(updates)
     return MaintenanceSnapshotV1(**values)
+
+
+def test_clean_open_pr_requires_durable_review_watch_ownership() -> None:
+    checklist = project_checklist(
+        local=_local_evidence(), snapshot=_snapshot(review_watch=None)
+    )
+
+    review = checklist.items[8]
+    assert review.state is ChecklistItemStateV1.REQUIRED
+    assert review.next_actions == ("arm durable late-review monitoring",)
+    assert not checklist.complete
 
 
 def test_projection_combines_local_and_remote_exact_head_evidence() -> None:

@@ -51,6 +51,12 @@ def _render_advisory(
                 f"blockers={blockers}",
                 f"next_actions={actions}",
                 f"settled={str(snapshot.settled).lower()}",
+                "review_watch="
+                + (
+                    snapshot.review_watch.status.value
+                    if snapshot.review_watch is not None
+                    else "unarmed"
+                ),
             )
         )
     if enqueued:
@@ -96,7 +102,11 @@ def run_stop_hook(
             SnapshotReadStatusV1.STALE,
             SnapshotReadStatusV1.MISSING,
             SnapshotReadStatusV1.INVALID,
-        }
+        } or bool(
+            result.snapshot is not None
+            and result.snapshot.settled
+            and result.snapshot.review_watch is None
+        )
         if enqueued:
             enqueue_maintenance(
                 build_maintenance_intent(

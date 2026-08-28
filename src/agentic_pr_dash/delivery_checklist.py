@@ -135,7 +135,14 @@ def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
     )
     if stabilization_pending:
         state = ChecklistItemStateV1.REQUIRED
-    if stabilization_pending:
+    watch_missing = (
+        state is ChecklistItemStateV1.SATISFIED and snapshot.review_watch is None
+    )
+    if watch_missing:
+        state = ChecklistItemStateV1.REQUIRED
+    if watch_missing:
+        action = "arm durable late-review monitoring"
+    elif stabilization_pending:
         action = "wait for lifecycle stabilization"
     elif state is ChecklistItemStateV1.BLOCKED:
         action = "address or disposition review findings"
@@ -147,12 +154,19 @@ def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
         action = "retry remote review observation"
     else:
         action = None
+    watch_summary = (
+        "review watch is unarmed"
+        if snapshot.review_watch is None
+        else f"review watch is {snapshot.review_watch.status.value}; "
+        f"next check {snapshot.review_watch.next_check_at.isoformat()}"
+    )
     return _item(
         ChecklistItemIdV1.REVIEW_SETTLEMENT,
         state,
         "agent-review-coordinator and GitHub review",
         f"review is {snapshot.review_state.value}; "
-        f"{snapshot.policy_unsettled_finding_count} policy finding(s) unsettled",
+        f"{snapshot.policy_unsettled_finding_count} policy finding(s) unsettled; "
+        f"{watch_summary}",
         *((action,) if action else ()),
     )
 
