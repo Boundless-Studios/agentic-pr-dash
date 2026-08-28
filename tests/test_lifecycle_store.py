@@ -20,7 +20,11 @@ from agentic_pr_dash.lifecycle_models import (
     MaintenanceTargetV1,
     ObservationHealthV1,
     RequiredCIStateV1,
+    REVIEW_WATCH_INTERVAL_SECONDS,
+    ReviewWatchStateV1,
+    ReviewWatchStatusV1,
     SnapshotReadStatusV1,
+    review_watch_delay,
 )
 from agentic_pr_dash.lifecycle_store import (
     LifecycleStore,
@@ -80,6 +84,7 @@ def _snapshot(
     settled: bool = False,
     raw_unresolved_thread_count: int = 0,
     unaddressed_thread_count: int = 0,
+    review_watch: ReviewWatchStateV1 | None = None,
 ) -> MaintenanceSnapshotV1:
     return MaintenanceSnapshotV1(
         key=key or _key(),
@@ -93,11 +98,48 @@ def _snapshot(
         policy_unsettled_finding_count=0,
         raw_unresolved_thread_count=raw_unresolved_thread_count,
         unaddressed_thread_count=unaddressed_thread_count,
+        review_watch=review_watch,
         stable_observation_count=2,
         stable_observation_first_at=observed_at - timedelta(seconds=10),
         stable_observation_last_at=observed_at,
         settled=settled,
     )
+
+
+def test_review_watch_schedule_repeats_the_eight_hour_tail() -> None:
+    assert REVIEW_WATCH_INTERVAL_SECONDS == (
+        60,
+        300,
+        900,
+        1800,
+        3600,
+        7200,
+        14400,
+        28800,
+    )
+    assert review_watch_delay(0) == 60
+    assert review_watch_delay(7) == 28800
+    assert review_watch_delay(8) == 28800
+    assert review_watch_delay(100) == 28800
+
+
+def test_snapshot_round_trips_durable_review_watch_state() -> None:
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.ARMED,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT + timedelta(minutes=1),
+        next_check_at=OBSERVED_AT + timedelta(minutes=5),
+        interval_index=1,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+
+    restored = MaintenanceSnapshotV1.model_validate_json(
+        _snapshot(review_watch=watch).model_dump_json()
+    )
+
+    assert restored.review_watch == watch
 
 
 def test_repository_is_trimmed_for_display_and_casefolded_for_identity() -> None:

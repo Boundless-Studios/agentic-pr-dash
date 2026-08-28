@@ -116,6 +116,49 @@ class ReviewStateV1(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
+REVIEW_WATCH_INTERVAL_SECONDS = (60, 300, 900, 1800, 3600, 7200, 14400, 28800)
+
+
+def review_watch_delay(interval_index: int) -> int:
+    """Return the sparse review delay, repeating the eight-hour tail forever."""
+    if interval_index < 0:
+        raise ValueError("review watch interval index cannot be negative")
+    return REVIEW_WATCH_INTERVAL_SECONDS[
+        min(interval_index, len(REVIEW_WATCH_INTERVAL_SECONDS) - 1)
+    ]
+
+
+class ReviewWatchStatusV1(StrEnum):
+    ARMED = "armed"
+    DUE = "due"
+    PAUSED = "paused"
+
+
+class ReviewWatchStateV1(BaseModel):
+    """Durable ownership and schedule for late review feedback on an open PR."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: ReviewWatchStatusV1
+    head_sha: str
+    reset_at: datetime
+    last_observed_at: datetime | None = None
+    next_check_at: datetime
+    interval_index: int = Field(ge=0)
+    unresolved_thread_count: int = Field(ge=0)
+    reset_reason: str
+
+    @field_validator("head_sha", "reset_reason", mode="before")
+    @classmethod
+    def _text(cls, value: Any) -> str:
+        return _required_text(value)
+
+    @field_validator("reset_at", "last_observed_at", "next_check_at", mode="after")
+    @classmethod
+    def _timestamps_utc(cls, value: datetime | None) -> datetime | None:
+        return _utc(value) if value is not None else None
+
+
 class IntentLifecycleStateV1(StrEnum):
     PENDING = "pending"
     NO_PR = "no_pr"
@@ -338,6 +381,7 @@ class MaintenanceSnapshotV1(BaseModel):
     policy_unsettled_finding_count: int = Field(ge=0)
     raw_unresolved_thread_count: int = Field(ge=0)
     unaddressed_thread_count: int = Field(ge=0)
+    review_watch: ReviewWatchStateV1 | None = None
     settlement_key: str = ""
     stable_observation_count: int = Field(ge=0)
     stable_observation_first_at: datetime | None
