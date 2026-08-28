@@ -32,14 +32,111 @@ from agentic_pr_dash.lifecycle_models import (
     MaintenanceTargetV1,
     MergeabilityStateV1,
     RequiredCIStateV1,
+    ReviewWatchStatusV1,
     SnapshotReadStatusV1,
 )
+from agentic_pr_dash.lifecycle_workflow import _next_review_watch
 from agentic_pr_dash.lifecycle_store import LifecycleStore
 from agentic_pr_dash.models import CICheck, PRData
 
 OBSERVED_AT = datetime(2026, 8, 26, 15, 0, tzinfo=UTC)
 HEAD = "a" * 40
 REPOSITORY = "Acme/Widget"
+
+
+def test_review_watch_arms_and_advances_through_repeating_tail() -> None:
+    watch = _next_review_watch(
+        None,
+        now=OBSERVED_AT,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=True,
+        actionable_count=0,
+    )
+    assert watch is not None
+    assert watch.next_check_at == OBSERVED_AT + timedelta(minutes=1)
+
+    for expected_index, minutes in enumerate((5, 15, 30, 60, 120, 240, 480), 1):
+        watch = _next_review_watch(
+            watch,
+            now=watch.next_check_at,
+            head_sha=HEAD,
+            ci_state=RequiredCIStateV1.PASSING,
+            observation_succeeded=True,
+            actionable_count=0,
+        )
+        assert watch.interval_index == expected_index
+        assert watch.next_check_at == watch.last_observed_at + timedelta(minutes=minutes)
+
+    repeated = _next_review_watch(
+        watch,
+        now=watch.next_check_at,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=True,
+        actionable_count=0,
+    )
+    assert repeated.interval_index == 8
+    assert repeated.next_check_at == repeated.last_observed_at + timedelta(minutes=480)
+
+
+def test_review_watch_resets_on_feedback_and_pauses_without_green_ci() -> None:
+    watch = _next_review_watch(
+        None,
+        now=OBSERVED_AT,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=True,
+        actionable_count=0,
+    )
+    reset_at = OBSERVED_AT + timedelta(minutes=5)
+    reset = _next_review_watch(
+        watch,
+        now=reset_at,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=True,
+        actionable_count=2,
+    )
+    assert reset.interval_index == 0
+    assert reset.next_check_at == reset_at + timedelta(minutes=1)
+    assert reset.unresolved_thread_count == 2
+
+    paused = _next_review_watch(
+        reset,
+        now=reset_at + timedelta(seconds=30),
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.FAILING,
+        observation_succeeded=True,
+        actionable_count=0,
+    )
+    assert paused.status is ReviewWatchStatusV1.PAUSED
+    assert paused.next_check_at == reset.next_check_at
+
+
+def test_failed_review_observation_does_not_advance_due_watch() -> None:
+    watch = _next_review_watch(
+        None,
+        now=OBSERVED_AT,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=True,
+        actionable_count=0,
+    )
+    due_at = watch.next_check_at
+
+    unchanged = _next_review_watch(
+        watch,
+        now=due_at,
+        head_sha=HEAD,
+        ci_state=RequiredCIStateV1.PASSING,
+        observation_succeeded=False,
+        actionable_count=0,
+    )
+
+    assert unchanged.interval_index == 0
+    assert unchanged.next_check_at == due_at
+    assert unchanged.status is ReviewWatchStatusV1.DUE
 
 
 def _intent(
@@ -1298,7 +1395,7 @@ async def test_no_pr_retry_eligibility_is_durable_and_does_not_starve_later_inte
 
 
 @pytest.mark.asyncio
-async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
+async def test_watched_clean_record_does_not_starve_later_intent(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     class Clock:
@@ -1335,7 +1432,8 @@ async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
     await workflow.drain()
 
     first_record = store.list_intents()[0]
-    assert first_record.state.value == "settled"
+    assert first_record.state is IntentLifecycleStateV1.PROMOTED
+    assert first_record.next_attempt_at == OBSERVED_AT + timedelta(minutes=1)
     store.enqueue(later)
 
     restarted = LifecycleWorkflow(
@@ -1348,12 +1446,12 @@ async def test_settled_record_does_not_starve_later_intent_and_can_reactivate(
     result = await restarted.drain()
 
     assert result.progressed == 1
-    reactivated = store.enqueue(first.model_copy(update={"reason": "new feedback"}))
-    assert reactivated.status.value == "reactivated"
+    duplicate = store.enqueue(first.model_copy(update={"reason": "new feedback"}))
+    assert duplicate.status.value == "duplicate"
 
 
 @pytest.mark.asyncio
-async def test_reactivated_generation_requires_two_fresh_clean_observations(
+async def test_clean_watch_remains_promoted_after_stabilization(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     class Clock:
@@ -1381,29 +1479,14 @@ async def test_reactivated_generation_requires_two_fresh_clean_observations(
     await workflow.drain()
     clock.current += timedelta(seconds=30)
     await workflow.drain()
-    settled = store.list_intents()[0]
-    assert settled.state is IntentLifecycleStateV1.SETTLED
-
-    store.enqueue(intent.model_copy(update={"reason": "new reviewer feedback"}))
-    reactivated = store.list_intents()[0]
-    assert reactivated.generation == settled.generation + 1
-    await workflow.drain()
-
-    first_fresh = store.read_snapshot(
-        MaintenanceTargetV1.exact(settled.canonical_key), now=clock.current
+    watched = store.list_intents()[0]
+    assert watched.state is IntentLifecycleStateV1.PROMOTED
+    snapshot = store.read_snapshot(
+        MaintenanceTargetV1.exact(watched.canonical_key), now=clock.current
     ).snapshot
-    assert first_fresh is not None
-    assert first_fresh.stable_observation_count == 1
-    assert not first_fresh.settled
-
-    clock.current += timedelta(seconds=30)
-    await workflow.drain()
-    second_fresh = store.read_snapshot(
-        MaintenanceTargetV1.exact(settled.canonical_key), now=clock.current
-    ).snapshot
-    assert second_fresh is not None
-    assert second_fresh.stable_observation_count == 2
-    assert second_fresh.settled
+    assert snapshot is not None and snapshot.settled
+    assert snapshot.review_watch is not None
+    assert watched.next_attempt_at == snapshot.review_watch.next_check_at
 
 
 @pytest.mark.asyncio

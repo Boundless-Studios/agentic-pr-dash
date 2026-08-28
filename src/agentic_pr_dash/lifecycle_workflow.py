@@ -39,7 +39,10 @@ from .lifecycle_models import (
     MergeabilityStateV1,
     ObservationHealthV1,
     RequiredCIStateV1,
+    ReviewWatchStateV1,
+    ReviewWatchStatusV1,
     ReviewStateV1,
+    review_watch_delay,
 )
 from .lifecycle_store import LifecycleStore, StaleIntentVersionError
 from .models import PRData, ReviewComment
@@ -48,6 +51,72 @@ ReviewContext: TypeAlias = tuple[ReviewPolicy, ReviewLedger]
 ReviewContextLoader: TypeAlias = Callable[
     [MaintenanceIntentRecordV1], ReviewContext | None
 ]
+
+
+def _next_review_watch(
+    previous: ReviewWatchStateV1 | None,
+    *,
+    now: datetime,
+    head_sha: str,
+    ci_state: RequiredCIStateV1,
+    observation_succeeded: bool,
+    actionable_count: int,
+) -> ReviewWatchStateV1 | None:
+    """Advance durable late-review monitoring without performing I/O."""
+    now = _utc(now)
+    if previous is not None and previous.head_sha != head_sha:
+        previous = None
+    if ci_state is not RequiredCIStateV1.PASSING:
+        if previous is None:
+            return None
+        return previous.model_copy(update={"status": ReviewWatchStatusV1.PAUSED})
+    if previous is None:
+        return ReviewWatchStateV1(
+            status=ReviewWatchStatusV1.ARMED,
+            head_sha=head_sha,
+            reset_at=now,
+            last_observed_at=now if observation_succeeded else None,
+            next_check_at=now + timedelta(seconds=review_watch_delay(0)),
+            interval_index=0,
+            unresolved_thread_count=actionable_count,
+            reset_reason=(
+                "actionable review feedback observed"
+                if actionable_count
+                else "required CI became green"
+            ),
+        )
+    if not observation_succeeded:
+        status = (
+            ReviewWatchStatusV1.DUE
+            if now >= previous.next_check_at
+            else previous.status
+        )
+        return previous.model_copy(update={"status": status})
+    if actionable_count:
+        return ReviewWatchStateV1(
+            status=ReviewWatchStatusV1.ARMED,
+            head_sha=head_sha,
+            reset_at=now,
+            last_observed_at=now,
+            next_check_at=now + timedelta(seconds=review_watch_delay(0)),
+            interval_index=0,
+            unresolved_thread_count=actionable_count,
+            reset_reason="actionable review feedback observed",
+        )
+    if now < previous.next_check_at:
+        return previous.model_copy(
+            update={"status": ReviewWatchStatusV1.ARMED, "unresolved_thread_count": 0}
+        )
+    next_index = previous.interval_index + 1
+    return previous.model_copy(
+        update={
+            "status": ReviewWatchStatusV1.ARMED,
+            "last_observed_at": now,
+            "next_check_at": now + timedelta(seconds=review_watch_delay(next_index)),
+            "interval_index": next_index,
+            "unresolved_thread_count": 0,
+        }
+    )
 
 
 class ReviewContextUnavailableError(RuntimeError):
@@ -390,23 +459,17 @@ class LifecycleWorkflow:
         )
         snapshot = self._snapshot(record, key, observed)
         try:
-            if snapshot.settled:
-                self.store.settle_intent(
-                    record.intent,
-                    key,
-                    expected_generation=record.generation,
-                    expected_revision=record.revision,
-                    snapshot=snapshot,
-                )
-            else:
-                self.store.promote_intent(
-                    record.intent,
-                    key,
-                    next_attempt_at=self._now() + self.retry_interval,
-                    expected_generation=record.generation,
-                    expected_revision=record.revision,
-                    snapshot=snapshot,
-                )
+            next_attempt = self._now() + self.retry_interval
+            if snapshot.settled and snapshot.review_watch is not None:
+                next_attempt = snapshot.review_watch.next_check_at
+            self.store.promote_intent(
+                record.intent,
+                key,
+                next_attempt_at=next_attempt,
+                expected_generation=record.generation,
+                expected_revision=record.revision,
+                snapshot=snapshot,
+            )
         except StaleIntentVersionError:
             return "deferred"
         if (
@@ -436,7 +499,8 @@ class LifecycleWorkflow:
                 head_sha=record.intent.head_sha,
                 workflow_type=record.intent.workflow_type,
             )
-            snapshot = _head_drift_snapshot(key, self._now())
+            if self._previous_snapshot(key) is None:
+                snapshot = _head_drift_snapshot(key, self._now())
         try:
             self.store.schedule_retry(
                 record.intent,
@@ -581,6 +645,26 @@ class LifecycleWorkflow:
             policy_count,
             observed,
         )
+        previous = (
+            None
+            if record.state is not IntentLifecycleStateV1.PROMOTED
+            else self._previous_snapshot(key)
+        )
+        watch = _next_review_watch(
+            previous.review_watch if previous is not None else None,
+            now=now,
+            head_sha=key.head_sha,
+            ci_state=current.required_ci_state,
+            observation_succeeded=(
+                current.observation_health
+                not in {ObservationHealthV1.UNKNOWN, ObservationHealthV1.UNAVAILABLE}
+            ),
+            actionable_count=(
+                current.policy_unsettled_finding_count
+                + current.unaddressed_thread_count
+            ),
+        )
+        current = current.model_copy(update={"review_watch": watch})
         clean = _snapshot_is_clean(current, observation)
         if not clean:
             return current
