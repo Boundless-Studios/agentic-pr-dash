@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from datetime import UTC, datetime
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .lifecycle_models import (
@@ -14,8 +14,8 @@ from .lifecycle_models import (
     DeliveryChecklistV1,
     LocalDeliveryEvidenceV1,
     MaintenanceKeyV1,
-    MaintenanceTargetV1,
     MaintenanceSnapshotV1,
+    MaintenanceTargetV1,
     MergeabilityStateV1,
     ObservationHealthV1,
     RequiredCIStateV1,
@@ -107,6 +107,8 @@ def _mergeability_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItem
 def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
     if snapshot.policy_unsettled_finding_count:
         state = ChecklistItemStateV1.BLOCKED
+    elif snapshot.observation_health is ObservationHealthV1.PARTIAL:
+        state = ChecklistItemStateV1.UNKNOWN
     else:
         state = {
             ReviewStateV1.CLEAN: ChecklistItemStateV1.SATISFIED,
@@ -115,13 +117,35 @@ def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
             ReviewStateV1.UNKNOWN: ChecklistItemStateV1.UNKNOWN,
             ReviewStateV1.UNAVAILABLE: ChecklistItemStateV1.UNKNOWN,
         }[snapshot.review_state]
+    stabilization_pending = (
+        state is ChecklistItemStateV1.SATISFIED
+        and snapshot.required_ci_state
+        in {RequiredCIStateV1.PASSING, RequiredCIStateV1.NOT_REQUIRED}
+        and snapshot.mergeability is MergeabilityStateV1.MERGEABLE
+        and snapshot.unaddressed_thread_count == 0
+        and not snapshot.settled
+    )
+    if stabilization_pending:
+        state = ChecklistItemStateV1.REQUIRED
+    if stabilization_pending:
+        action = "wait for lifecycle stabilization"
+    elif state is ChecklistItemStateV1.BLOCKED:
+        action = "address or disposition review findings"
+    elif snapshot.observation_health is ObservationHealthV1.PARTIAL:
+        action = "retry remote review observation"
+    elif snapshot.review_state is ReviewStateV1.PENDING:
+        action = "wait for or obtain the required review"
+    elif state is ChecklistItemStateV1.UNKNOWN:
+        action = "retry remote review observation"
+    else:
+        action = None
     return _item(
         ChecklistItemIdV1.REVIEW_SETTLEMENT,
         state,
         "agent-review-coordinator and GitHub review",
         f"review is {snapshot.review_state.value}; "
         f"{snapshot.policy_unsettled_finding_count} policy finding(s) unsettled",
-        *(("address or disposition review findings",) if state is not ChecklistItemStateV1.SATISFIED else ()),
+        *((action,) if action else ()),
     )
 
 
@@ -137,7 +161,11 @@ def _discussion_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1
         "GitHub review threads",
         f"{snapshot.raw_unresolved_thread_count} unresolved, "
         f"{snapshot.unaddressed_thread_count} unaddressed",
-        *(("reply to or resolve every unaddressed thread",) if state is ChecklistItemStateV1.BLOCKED else ()),
+        *(
+            ("reply to or resolve every unaddressed thread",)
+            if state is ChecklistItemStateV1.BLOCKED
+            else ()
+        ),
     )
 
 
@@ -145,6 +173,7 @@ def project_checklist(
     *,
     local: LocalDeliveryEvidenceV1 | None,
     snapshot: MaintenanceSnapshotV1 | None,
+    target: MaintenanceKeyV1 | None = None,
     observed_at: datetime | None = None,
 ) -> DeliveryChecklistV1:
     """Compose provider-owned local evidence with one exact-head PR snapshot."""
@@ -171,25 +200,31 @@ def project_checklist(
     else:
         local_items = local.items
 
+    expected_key = target or (snapshot.key if snapshot is not None else None)
+    if (
+        local is not None
+        and expected_key is not None
+        and (
+            local.repository.casefold() != expected_key.repository.casefold()
+            or local.head_sha != expected_key.head_sha
+        )
+    ):
+        local_items = tuple(
+            item.model_copy(
+                update={
+                    "state": ChecklistItemStateV1.BLOCKED,
+                    "summary": "local evidence does not match the requested exact head",
+                    "next_actions": ("refresh evidence for the same exact head",),
+                }
+            )
+            for item in local.items
+        )
+
     if snapshot is None:
         remote_items = _unknown_remote_items()
         key = None
     else:
         key = snapshot.key
-        if local is not None and (
-            local.repository.casefold() != key.repository.casefold()
-            or local.head_sha != key.head_sha
-        ):
-            local_items = tuple(
-                item.model_copy(
-                    update={
-                        "state": ChecklistItemStateV1.BLOCKED,
-                        "summary": "local evidence does not match the remote exact head",
-                        "next_actions": ("refresh evidence for the same exact head",),
-                    }
-                )
-                for item in local.items
-            )
         if snapshot.observation_health in {
             ObservationHealthV1.UNKNOWN,
             ObservationHealthV1.UNAVAILABLE,
@@ -272,10 +307,12 @@ def main(argv: list[str] | None = None) -> int:
         local = LocalDeliveryEvidenceV1.model_validate_json(
             args.local_evidence.read_text(encoding="utf-8")
         )
-    snapshot = (
-        result.snapshot if result.status is SnapshotReadStatusV1.FRESH else None
+    snapshot = result.snapshot if result.status is SnapshotReadStatusV1.FRESH else None
+    checklist = project_checklist(
+        local=local,
+        snapshot=snapshot,
+        target=target.exact_key,
     )
-    checklist = project_checklist(local=local, snapshot=snapshot)
     if args.json:
         print(json.dumps(checklist.model_dump(mode="json"), indent=2, sort_keys=True))
     else:

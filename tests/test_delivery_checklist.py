@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 import pytest
 from pydantic import ValidationError
 
+from agentic_pr_dash import delivery_checklist
+from agentic_pr_dash.delivery_checklist import project_checklist, render_checklist
 from agentic_pr_dash.lifecycle_models import (
     ChecklistItemIdV1,
     ChecklistItemStateV1,
@@ -12,19 +14,14 @@ from agentic_pr_dash.lifecycle_models import (
     DeliveryChecklistV1,
     LocalDeliveryEvidenceV1,
     MaintenanceKeyV1,
+    MaintenanceSnapshotReadResultV1,
     MaintenanceSnapshotV1,
     MergeabilityStateV1,
     ObservationHealthV1,
     RequiredCIStateV1,
     ReviewStateV1,
-)
-from agentic_pr_dash.delivery_checklist import project_checklist, render_checklist
-from agentic_pr_dash import delivery_checklist
-from agentic_pr_dash.lifecycle_models import (
-    MaintenanceSnapshotReadResultV1,
     SnapshotReadStatusV1,
 )
-
 
 ORDERED_ITEM_IDS = (
     ChecklistItemIdV1.TASK_CRITERIA,
@@ -169,9 +166,65 @@ def test_projection_combines_local_and_remote_exact_head_evidence() -> None:
 
     assert checklist.complete
     assert checklist.key == _snapshot().key
-    assert tuple(item.state for item in checklist.items) == (
-        ChecklistItemStateV1.SATISFIED,
-    ) * 10
+    assert (
+        tuple(item.state for item in checklist.items)
+        == (ChecklistItemStateV1.SATISFIED,) * 10
+    )
+
+
+def test_projection_requires_lifecycle_stabilization_before_completion() -> None:
+    snapshot = _snapshot(
+        settled=False,
+        stable_observation_count=1,
+        next_actions=("retry_observation",),
+    )
+
+    checklist = project_checklist(local=_local_evidence(), snapshot=snapshot)
+
+    review = next(
+        item
+        for item in checklist.items
+        if item.item_id is ChecklistItemIdV1.REVIEW_SETTLEMENT
+    )
+    assert review.state is ChecklistItemStateV1.REQUIRED
+    assert review.next_actions == ("wait for lifecycle stabilization",)
+    assert not checklist.complete
+
+
+def test_partial_observation_marks_clean_review_evidence_unknown() -> None:
+    snapshot = _snapshot(
+        observation_health=ObservationHealthV1.PARTIAL,
+        settled=False,
+        stable_observation_count=0,
+    )
+
+    checklist = project_checklist(local=_local_evidence(), snapshot=snapshot)
+
+    review = next(
+        item
+        for item in checklist.items
+        if item.item_id is ChecklistItemIdV1.REVIEW_SETTLEMENT
+    )
+    assert review.state is ChecklistItemStateV1.UNKNOWN
+    assert review.next_actions == ("retry remote review observation",)
+
+
+def test_pending_review_recommends_obtaining_required_review() -> None:
+    snapshot = _snapshot(
+        review_state=ReviewStateV1.PENDING,
+        settled=False,
+        stable_observation_count=0,
+    )
+
+    checklist = project_checklist(local=_local_evidence(), snapshot=snapshot)
+
+    review = next(
+        item
+        for item in checklist.items
+        if item.item_id is ChecklistItemIdV1.REVIEW_SETTLEMENT
+    )
+    assert review.state is ChecklistItemStateV1.REQUIRED
+    assert review.next_actions == ("wait for or obtain the required review",)
 
 
 def test_missing_snapshot_is_visible_without_erasing_local_progress() -> None:
@@ -179,12 +232,14 @@ def test_missing_snapshot_is_visible_without_erasing_local_progress() -> None:
 
     assert not checklist.complete
     assert checklist.key is None
-    assert tuple(item.state for item in checklist.items[:5]) == (
-        ChecklistItemStateV1.SATISFIED,
-    ) * 5
-    assert tuple(item.state for item in checklist.items[5:]) == (
-        ChecklistItemStateV1.UNKNOWN,
-    ) * 5
+    assert (
+        tuple(item.state for item in checklist.items[:5])
+        == (ChecklistItemStateV1.SATISFIED,) * 5
+    )
+    assert (
+        tuple(item.state for item in checklist.items[5:])
+        == (ChecklistItemStateV1.UNKNOWN,) * 5
+    )
 
 
 def test_projection_is_deterministic_for_the_same_evidence() -> None:
@@ -195,6 +250,20 @@ def test_projection_is_deterministic_for_the_same_evidence() -> None:
 
     assert first == second
     assert first.observed_at == local.observed_at
+
+
+def test_requested_identity_blocks_mismatched_local_evidence_without_snapshot() -> None:
+    target = _checklist().key.model_copy(update={"head_sha": "b" * 40})
+
+    checklist = project_checklist(local=_local_evidence(), snapshot=None, target=target)
+
+    assert (
+        tuple(item.state for item in checklist.items[:5])
+        == (ChecklistItemStateV1.BLOCKED,) * 5
+    )
+    assert checklist.items[0].summary == (
+        "local evidence does not match the requested exact head"
+    )
 
 
 @pytest.mark.parametrize(
