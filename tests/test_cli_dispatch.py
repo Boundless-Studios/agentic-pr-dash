@@ -25,3 +25,20 @@ def test_unknown_command_still_rejected(capsys):
     rc = cli.main(["definitely-not-a-command"])
     assert rc == 2
     assert "unknown command" in capsys.readouterr().err
+
+
+def test_delivery_checklist_routes_to_read_only_projection(monkeypatch):
+    seen = {}
+
+    def fake_main(argv):
+        seen["argv"] = argv
+        return 0
+
+    import agentic_pr_dash.delivery_checklist as checklist
+
+    monkeypatch.setattr(checklist, "main", fake_main)
+
+    rc = cli.main(["delivery-checklist", "--json"])
+
+    assert rc == 0
+    assert seen["argv"] == ["--json"]
