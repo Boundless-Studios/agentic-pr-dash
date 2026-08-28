@@ -273,6 +273,21 @@ def test_stale_clean_pr_snapshot_does_not_hide_merged_cleanup(monkeypatch):
     assert card.status == PRStatus.READY_CLEANUP
 
 
+def test_open_clean_pr_retains_remote_open_safety_check(monkeypatch):
+    observed: list[bool] = []
+
+    def cleanup_reason(worktree, agents, *, check_remote_pr=True):
+        observed.append(check_remote_pr)
+        return (not check_remote_pr, "stale orphan")
+
+    monkeypatch.setattr(app, "_selected_worktree_cleanup_reason", cleanup_reason)
+
+    card = _card(_pr(status=PRStatus.CLEAN), [], None)
+
+    assert observed == [True]
+    assert card.status == PRStatus.CLEAN
+
+
 # ---------------------------------------------------------------------------
 # Scenario (e) — completed worktree + lingering live process
 # ---------------------------------------------------------------------------

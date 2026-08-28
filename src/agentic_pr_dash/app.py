@@ -1148,7 +1148,7 @@ def _build_card_for_worktree(
         and root in orchestrator.observed_roots
     ):
         reclaimable, _ = _selected_worktree_cleanup_reason(
-            worktree, [], check_remote_pr=False
+            worktree, [], check_remote_pr=pr is not None
         )
     cleanup_candidate = reclaimable and not fallback_agents
     status = _card_status(pr, activity, reclaimable)
