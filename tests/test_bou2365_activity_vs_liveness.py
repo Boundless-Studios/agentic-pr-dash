@@ -260,6 +260,19 @@ def test_merged_pr_with_draining_session_is_ready_for_cleanup(monkeypatch):
     assert card.cleanup_candidate is True
 
 
+def test_stale_clean_pr_snapshot_does_not_hide_merged_cleanup(monkeypatch):
+    """A cached CLEAN PR may outlive its merge while GitHub observation is stale."""
+    _reclaimable(monkeypatch)
+
+    card = _card(
+        _pr(status=PRStatus.CLEAN),
+        [],
+        _session(supervisor_state="draining", quiescence="idle"),
+    )
+
+    assert card.status == PRStatus.READY_CLEANUP
+
+
 # ---------------------------------------------------------------------------
 # Scenario (e) — completed worktree + lingering live process
 # ---------------------------------------------------------------------------

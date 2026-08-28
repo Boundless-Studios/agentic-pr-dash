@@ -1143,7 +1143,7 @@ def _build_card_for_worktree(
     reclaimable = False
     root = main_repo_root or get_main_repo_root()
     if (
-        pr is None
+        (pr is None or pr.status == PRStatus.CLEAN)
         and activity != "working"
         and root in orchestrator.observed_roots
     ):
