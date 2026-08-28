@@ -13,6 +13,7 @@ from agentic_pr_dash.lifecycle_models import (
     DeliveryChecklistItemV1,
     DeliveryChecklistV1,
     LocalDeliveryEvidenceV1,
+    MaintenanceBlockerV1,
     MaintenanceKeyV1,
     MaintenanceSnapshotReadResultV1,
     MaintenanceSnapshotV1,
@@ -264,6 +265,42 @@ def test_requested_identity_blocks_mismatched_local_evidence_without_snapshot() 
     assert checklist.items[0].summary == (
         "local evidence does not match the requested exact head"
     )
+
+
+def test_snapshot_for_another_target_is_not_used_as_remote_evidence() -> None:
+    target = _checklist().key.model_copy(update={"head_sha": "b" * 40})
+    local = _local_evidence().model_copy(update={"head_sha": "b" * 40})
+
+    checklist = project_checklist(
+        local=local,
+        snapshot=_snapshot(),
+        target=target,
+    )
+
+    assert not checklist.complete
+    assert checklist.key is None
+    assert (
+        tuple(item.state for item in checklist.items[5:])
+        == (ChecklistItemStateV1.UNKNOWN,) * 5
+    )
+
+
+def test_review_blocker_overrides_clean_aggregate_review_state() -> None:
+    snapshot = _snapshot(
+        blockers=(MaintenanceBlockerV1.REVIEW_FINDINGS,),
+        settled=False,
+        stable_observation_count=0,
+    )
+
+    checklist = project_checklist(local=_local_evidence(), snapshot=snapshot)
+
+    review = next(
+        item
+        for item in checklist.items
+        if item.item_id is ChecklistItemIdV1.REVIEW_SETTLEMENT
+    )
+    assert review.state is ChecklistItemStateV1.BLOCKED
+    assert review.next_actions == ("address or disposition review findings",)
 
 
 @pytest.mark.parametrize(

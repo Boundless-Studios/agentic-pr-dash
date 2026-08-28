@@ -13,6 +13,7 @@ from .lifecycle_models import (
     DeliveryChecklistItemV1,
     DeliveryChecklistV1,
     LocalDeliveryEvidenceV1,
+    MaintenanceBlockerV1,
     MaintenanceKeyV1,
     MaintenanceSnapshotV1,
     MaintenanceTargetV1,
@@ -105,7 +106,10 @@ def _mergeability_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItem
 
 
 def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
-    if snapshot.policy_unsettled_finding_count:
+    if (
+        snapshot.policy_unsettled_finding_count
+        or MaintenanceBlockerV1.REVIEW_FINDINGS in snapshot.blockers
+    ):
         state = ChecklistItemStateV1.BLOCKED
     elif snapshot.observation_health is ObservationHealthV1.PARTIAL:
         state = ChecklistItemStateV1.UNKNOWN
@@ -178,6 +182,9 @@ def project_checklist(
 ) -> DeliveryChecklistV1:
     """Compose provider-owned local evidence with one exact-head PR snapshot."""
 
+    snapshot_matches_target = (
+        snapshot is None or target is None or snapshot.key == target
+    )
     if observed_at is not None:
         projection_time = observed_at
     elif snapshot is not None:
@@ -220,7 +227,7 @@ def project_checklist(
             for item in local.items
         )
 
-    if snapshot is None:
+    if snapshot is None or not snapshot_matches_target:
         remote_items = _unknown_remote_items()
         key = None
     else:
