@@ -238,7 +238,7 @@ def test_pending_review_recommends_obtaining_required_review() -> None:
     assert review.next_actions == ("wait for or obtain the required review",)
 
 
-def test_pending_review_with_aggregate_blocker_still_requests_review() -> None:
+def test_pending_review_with_findings_blocker_requires_addressing_findings() -> None:
     snapshot = _snapshot(
         review_state=ReviewStateV1.PENDING,
         blockers=(MaintenanceBlockerV1.REVIEW_FINDINGS,),
@@ -248,8 +248,25 @@ def test_pending_review_with_aggregate_blocker_still_requests_review() -> None:
 
     review = project_checklist(local=_local_evidence(), snapshot=snapshot).items[8]
 
-    assert review.state is ChecklistItemStateV1.REQUIRED
-    assert review.next_actions == ("wait for or obtain the required review",)
+    assert review.state is ChecklistItemStateV1.BLOCKED
+    assert review.next_actions == ("address or disposition review findings",)
+
+
+def test_pending_ci_with_failure_blocker_requires_fixing_failure() -> None:
+    snapshot = _snapshot(
+        required_ci_state=RequiredCIStateV1.PENDING,
+        blockers=(
+            MaintenanceBlockerV1.REQUIRED_CI_FAILED,
+            MaintenanceBlockerV1.REQUIRED_CI_PENDING,
+        ),
+        settled=False,
+        stable_observation_count=0,
+    )
+
+    ci = project_checklist(local=_local_evidence(), snapshot=snapshot).items[6]
+
+    assert ci.state is ChecklistItemStateV1.BLOCKED
+    assert ci.next_actions == ("fix failing required CI",)
 
 
 def test_missing_snapshot_is_visible_without_erasing_local_progress() -> None:
@@ -415,6 +432,29 @@ def test_compact_render_shows_one_line_per_item_and_next_action() -> None:
     assert "[satisfied] task_criteria" in rendered
     assert "[unknown] required_ci" in rendered
     assert rendered.splitlines()[-1].startswith("next: ")
+
+
+def test_compact_render_sanitizes_multiline_summary_and_next_action() -> None:
+    multiline = _item(
+        ChecklistItemIdV1.TASK_CRITERIA,
+        ChecklistItemStateV1.BLOCKED,
+    ).model_copy(
+        update={
+            "summary": "first line\n[satisfied] forged: result",
+            "next_actions": ("fix it\r\nnext: none",),
+        }
+    )
+    checklist = _checklist(
+        items=(multiline,)
+        + tuple(_item(item_id) for item_id in ORDERED_ITEM_IDS[1:]),
+        complete=False,
+    )
+
+    rendered = render_checklist(checklist)
+
+    assert len(rendered.splitlines()) == 11
+    assert "first line [satisfied] forged: result" in rendered
+    assert rendered.splitlines()[-1] == "next: fix it next: none"
 
 
 def test_cli_reads_local_evidence_and_reports_missing_snapshot_as_json(

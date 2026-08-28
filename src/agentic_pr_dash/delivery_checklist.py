@@ -62,14 +62,17 @@ def _unknown_remote_items() -> tuple[DeliveryChecklistItemV1, ...]:
 
 
 def _ci_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
-    state = {
-        RequiredCIStateV1.PASSING: ChecklistItemStateV1.SATISFIED,
-        RequiredCIStateV1.NOT_REQUIRED: ChecklistItemStateV1.SATISFIED,
-        RequiredCIStateV1.PENDING: ChecklistItemStateV1.REQUIRED,
-        RequiredCIStateV1.FAILING: ChecklistItemStateV1.BLOCKED,
-        RequiredCIStateV1.UNKNOWN: ChecklistItemStateV1.UNKNOWN,
-        RequiredCIStateV1.UNAVAILABLE: ChecklistItemStateV1.UNKNOWN,
-    }[snapshot.required_ci_state]
+    if MaintenanceBlockerV1.REQUIRED_CI_FAILED in snapshot.blockers:
+        state = ChecklistItemStateV1.BLOCKED
+    else:
+        state = {
+            RequiredCIStateV1.PASSING: ChecklistItemStateV1.SATISFIED,
+            RequiredCIStateV1.NOT_REQUIRED: ChecklistItemStateV1.SATISFIED,
+            RequiredCIStateV1.PENDING: ChecklistItemStateV1.REQUIRED,
+            RequiredCIStateV1.FAILING: ChecklistItemStateV1.BLOCKED,
+            RequiredCIStateV1.UNKNOWN: ChecklistItemStateV1.UNKNOWN,
+            RequiredCIStateV1.UNAVAILABLE: ChecklistItemStateV1.UNKNOWN,
+        }[snapshot.required_ci_state]
     action = {
         ChecklistItemStateV1.REQUIRED: "wait for required CI",
         ChecklistItemStateV1.BLOCKED: "fix failing required CI",
@@ -108,10 +111,10 @@ def _mergeability_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItem
 def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
     if snapshot.policy_unsettled_finding_count:
         state = ChecklistItemStateV1.BLOCKED
-    elif snapshot.review_state is ReviewStateV1.PENDING:
-        state = ChecklistItemStateV1.REQUIRED
     elif MaintenanceBlockerV1.REVIEW_FINDINGS in snapshot.blockers:
         state = ChecklistItemStateV1.BLOCKED
+    elif snapshot.review_state is ReviewStateV1.PENDING:
+        state = ChecklistItemStateV1.REQUIRED
     elif snapshot.observation_health is ObservationHealthV1.PARTIAL:
         state = ChecklistItemStateV1.UNKNOWN
     else:
@@ -275,7 +278,7 @@ def render_checklist(checklist: DeliveryChecklistV1) -> str:
     """Render one compact line per item and one actionable tail line."""
 
     lines = [
-        f"[{item.state.value}] {item.item_id.value}: {item.summary}"
+        f"[{item.state.value}] {item.item_id.value}: {_compact_text(item.summary)}"
         for item in checklist.items
     ]
     action = next(
@@ -286,8 +289,14 @@ def render_checklist(checklist: DeliveryChecklistV1) -> str:
         ),
         "none",
     )
-    lines.append(f"next: {action}")
+    lines.append(f"next: {_compact_text(action)}")
     return "\n".join(lines)
+
+
+def _compact_text(value: str) -> str:
+    """Collapse physical line breaks without changing other compact text."""
+
+    return " ".join(value.splitlines())
 
 
 def main(argv: list[str] | None = None) -> int:
