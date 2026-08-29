@@ -20,7 +20,12 @@ from agentic_pr_dash.lifecycle_models import (
     MaintenanceTargetV1,
     ObservationHealthV1,
     RequiredCIStateV1,
+    REVIEW_WATCH_OFFSET_SECONDS,
+    ReviewWatchStateV1,
+    ReviewWatchStatusV1,
     SnapshotReadStatusV1,
+    review_watch_deadline,
+    review_watch_elapsed_seconds,
 )
 from agentic_pr_dash.lifecycle_store import (
     LifecycleStore,
@@ -80,6 +85,7 @@ def _snapshot(
     settled: bool = False,
     raw_unresolved_thread_count: int = 0,
     unaddressed_thread_count: int = 0,
+    review_watch: ReviewWatchStateV1 | None = None,
 ) -> MaintenanceSnapshotV1:
     return MaintenanceSnapshotV1(
         key=key or _key(),
@@ -93,11 +99,109 @@ def _snapshot(
         policy_unsettled_finding_count=0,
         raw_unresolved_thread_count=raw_unresolved_thread_count,
         unaddressed_thread_count=unaddressed_thread_count,
+        review_watch=review_watch,
         stable_observation_count=2,
         stable_observation_first_at=observed_at - timedelta(seconds=10),
         stable_observation_last_at=observed_at,
         settled=settled,
     )
+
+
+def test_review_watch_offsets_are_measured_from_the_reset() -> None:
+    assert REVIEW_WATCH_OFFSET_SECONDS == (
+        60,
+        300,
+        900,
+        1800,
+        3600,
+        7200,
+        14400,
+        28800,
+    )
+    assert review_watch_elapsed_seconds(0) == 60
+    assert review_watch_elapsed_seconds(4) == 3600
+    assert review_watch_elapsed_seconds(7) == 28800
+    assert review_watch_elapsed_seconds(8) == 57600
+    assert review_watch_elapsed_seconds(9) == 86400
+
+    assert review_watch_deadline(OBSERVED_AT, 0) == OBSERVED_AT + timedelta(minutes=1)
+    assert review_watch_deadline(OBSERVED_AT, 7) == OBSERVED_AT + timedelta(minutes=480)
+    assert review_watch_deadline(OBSERVED_AT, 8) == OBSERVED_AT + timedelta(minutes=960)
+
+
+def test_armed_review_watch_keeps_a_sparse_snapshot_fresh(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    key = _key()
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.ARMED,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT,
+        next_check_at=OBSERVED_AT + timedelta(minutes=30),
+        interval_index=3,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+    write_maintenance_snapshot(_snapshot(key, review_watch=watch), root=store.root)
+    target = MaintenanceTargetV1.exact(key)
+
+    owned = store.read_snapshot(target, now=OBSERVED_AT + timedelta(minutes=20))
+    expired = store.read_snapshot(target, now=OBSERVED_AT + timedelta(minutes=31))
+
+    assert owned.status is SnapshotReadStatusV1.FRESH
+    assert expired.status is SnapshotReadStatusV1.STALE
+
+
+def test_due_review_watch_does_not_extend_snapshot_freshness(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    key = _key()
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.DUE,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT,
+        next_check_at=OBSERVED_AT + timedelta(minutes=30),
+        interval_index=3,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+    write_maintenance_snapshot(_snapshot(key, review_watch=watch), root=store.root)
+
+    result = store.read_snapshot(
+        MaintenanceTargetV1.exact(key), now=OBSERVED_AT + timedelta(minutes=20)
+    )
+
+    assert result.status is SnapshotReadStatusV1.STALE
+
+
+def test_one_time_migrations_are_recorded_once(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+
+    assert not store.migration_completed("review-watch-rearm-v1")
+
+    store.mark_migration_completed("review-watch-rearm-v1", now=OBSERVED_AT)
+
+    assert store.migration_completed("review-watch-rearm-v1")
+    assert not store.migration_completed("some-other-migration")
+
+
+def test_snapshot_round_trips_durable_review_watch_state() -> None:
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.ARMED,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT + timedelta(minutes=1),
+        next_check_at=OBSERVED_AT + timedelta(minutes=5),
+        interval_index=1,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+
+    restored = MaintenanceSnapshotV1.model_validate_json(
+        _snapshot(review_watch=watch).model_dump_json()
+    )
+
+    assert restored.review_watch == watch
 
 
 def test_repository_is_trimmed_for_display_and_casefolded_for_identity() -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -114,6 +114,57 @@ class ReviewStateV1(StrEnum):
     PENDING = "pending"
     UNKNOWN = "unknown"
     UNAVAILABLE = "unavailable"
+
+
+REVIEW_WATCH_OFFSET_SECONDS = (60, 300, 900, 1800, 3600, 7200, 14400, 28800)
+
+
+def review_watch_elapsed_seconds(interval_index: int) -> int:
+    """Return seconds from the watch reset to the check at ``interval_index``."""
+    if interval_index < 0:
+        raise ValueError("review watch interval index cannot be negative")
+    last = len(REVIEW_WATCH_OFFSET_SECONDS) - 1
+    if interval_index <= last:
+        return REVIEW_WATCH_OFFSET_SECONDS[interval_index]
+    return REVIEW_WATCH_OFFSET_SECONDS[last] * (interval_index - last + 1)
+
+
+def review_watch_deadline(reset_at: datetime, interval_index: int) -> datetime:
+    """Return the absolute deadline of ``interval_index`` measured from the reset."""
+    return _utc(reset_at) + timedelta(
+        seconds=review_watch_elapsed_seconds(interval_index)
+    )
+
+
+class ReviewWatchStatusV1(StrEnum):
+    ARMED = "armed"
+    DUE = "due"
+    PAUSED = "paused"
+
+
+class ReviewWatchStateV1(BaseModel):
+    """Durable ownership and schedule for late review feedback on an open PR."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: ReviewWatchStatusV1
+    head_sha: str
+    reset_at: datetime
+    last_observed_at: datetime | None = None
+    next_check_at: datetime
+    interval_index: int = Field(ge=0)
+    unresolved_thread_count: int = Field(ge=0)
+    reset_reason: str
+
+    @field_validator("head_sha", "reset_reason", mode="before")
+    @classmethod
+    def _text(cls, value: Any) -> str:
+        return _required_text(value)
+
+    @field_validator("reset_at", "last_observed_at", "next_check_at", mode="after")
+    @classmethod
+    def _timestamps_utc(cls, value: datetime | None) -> datetime | None:
+        return _utc(value) if value is not None else None
 
 
 class IntentLifecycleStateV1(StrEnum):
@@ -338,6 +389,7 @@ class MaintenanceSnapshotV1(BaseModel):
     policy_unsettled_finding_count: int = Field(ge=0)
     raw_unresolved_thread_count: int = Field(ge=0)
     unaddressed_thread_count: int = Field(ge=0)
+    review_watch: ReviewWatchStateV1 | None = None
     settlement_key: str = ""
     stable_observation_count: int = Field(ge=0)
     stable_observation_first_at: datetime | None

@@ -1142,11 +1142,7 @@ def _build_card_for_worktree(
     # it in that case, and the probe shells out to `gh` on every board poll.
     reclaimable = False
     root = main_repo_root or get_main_repo_root()
-    if (
-        pr is None
-        and activity != "working"
-        and root in orchestrator.observed_roots
-    ):
+    if pr is None and activity != "working" and root in orchestrator.observed_roots:
         reclaimable, _ = _selected_worktree_cleanup_reason(
             worktree, [], check_remote_pr=False
         )

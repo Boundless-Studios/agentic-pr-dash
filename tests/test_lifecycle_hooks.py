@@ -926,6 +926,60 @@ def test_stop_renders_fresh_and_stale_snapshot_actions_without_blocking(
     assert "enqueued" in stale
 
 
+def test_stop_rearms_clean_snapshot_missing_durable_review_watch(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    adapter = _adapter()
+    repo, _head = _repository(tmp_path)
+    state_root = tmp_path / "state"
+    adapter.run_payload(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git push"},
+            "tool_response": {"exit_code": 0},
+            "cwd": str(repo),
+            "session_id": "session-1",
+        },
+        state_root=state_root,
+        now=NOW,
+    )
+    store = LifecycleStore(state_root)
+    record = store.list_intents()[0]
+    key = MaintenanceKeyV1(
+        repository=record.intent.repository,
+        pr_number=42,
+        head_sha=record.intent.head_sha,
+        workflow_type=record.intent.workflow_type,
+    )
+    clean = MaintenanceSnapshotV1(
+        key=key,
+        observed_at=NOW,
+        observation_health=ObservationHealthV1.HEALTHY,
+        blockers=(),
+        next_actions=(),
+        required_ci_state=RequiredCIStateV1.PASSING,
+        mergeability=MergeabilityStateV1.MERGEABLE,
+        review_state=ReviewStateV1.CLEAN,
+        policy_unsettled_finding_count=0,
+        raw_unresolved_thread_count=0,
+        unaddressed_thread_count=0,
+        stable_observation_count=2,
+        stable_observation_first_at=NOW,
+        stable_observation_last_at=NOW,
+        settled=True,
+    )
+    store.settle_intent(record.intent, key, snapshot=clean)
+
+    stop_hook.run_stop_hook(
+        stop_hook.StopHookRequest(cwd=str(repo), state_root=state_root), now=NOW
+    )
+
+    output = capsys.readouterr().out
+    assert "review_watch=unarmed" in output
+    assert "enqueued" in output
+
+
 def test_stop_reuses_prior_upstream_repository(tmp_path: Path, capsys) -> None:
     adapter = _adapter()
     repo, _ = _repository(tmp_path, remote="git@github.com:ForkOwner/Widget.git")

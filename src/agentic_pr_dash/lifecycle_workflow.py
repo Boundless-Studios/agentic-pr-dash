@@ -39,15 +39,109 @@ from .lifecycle_models import (
     MergeabilityStateV1,
     ObservationHealthV1,
     RequiredCIStateV1,
+    ReviewWatchStateV1,
+    ReviewWatchStatusV1,
     ReviewStateV1,
+    review_watch_deadline,
 )
 from .lifecycle_store import LifecycleStore, StaleIntentVersionError
 from .models import PRData, ReviewComment
+
+REVIEW_WATCH_MIGRATION = "review-watch-rearm-v1"
 
 ReviewContext: TypeAlias = tuple[ReviewPolicy, ReviewLedger]
 ReviewContextLoader: TypeAlias = Callable[
     [MaintenanceIntentRecordV1], ReviewContext | None
 ]
+
+
+def _next_review_watch(
+    previous: ReviewWatchStateV1 | None,
+    *,
+    now: datetime,
+    head_sha: str,
+    ci_state: RequiredCIStateV1,
+    observation_succeeded: bool,
+    actionable_count: int,
+) -> ReviewWatchStateV1 | None:
+    """Advance durable late-review monitoring without performing I/O."""
+    now = _utc(now)
+    if previous is not None and previous.head_sha != head_sha:
+        previous = None
+    if ci_state is not RequiredCIStateV1.PASSING:
+        if previous is None:
+            return None
+        return previous.model_copy(update={"status": ReviewWatchStatusV1.PAUSED})
+    if previous is None:
+        return _armed_review_watch(
+            head_sha=head_sha,
+            now=now,
+            observed=observation_succeeded,
+            actionable_count=actionable_count,
+            reset_reason=(
+                "actionable review feedback observed"
+                if actionable_count
+                else "required CI became green"
+            ),
+        )
+    if not observation_succeeded:
+        status = (
+            ReviewWatchStatusV1.DUE
+            if now >= previous.next_check_at
+            else previous.status
+        )
+        return previous.model_copy(update={"status": status})
+    if actionable_count:
+        return _armed_review_watch(
+            head_sha=head_sha,
+            now=now,
+            observed=True,
+            actionable_count=actionable_count,
+            reset_reason="actionable review feedback observed",
+        )
+    if now < previous.next_check_at:
+        return previous.model_copy(
+            update={
+                "status": ReviewWatchStatusV1.ARMED,
+                "last_observed_at": now,
+                "unresolved_thread_count": 0,
+            }
+        )
+    next_index = previous.interval_index + 1
+    next_check_at = review_watch_deadline(previous.reset_at, next_index)
+    while next_check_at <= now:
+        next_index += 1
+        next_check_at = review_watch_deadline(previous.reset_at, next_index)
+    return previous.model_copy(
+        update={
+            "status": ReviewWatchStatusV1.ARMED,
+            "last_observed_at": now,
+            "next_check_at": next_check_at,
+            "interval_index": next_index,
+            "unresolved_thread_count": 0,
+        }
+    )
+
+
+def _armed_review_watch(
+    *,
+    head_sha: str,
+    now: datetime,
+    observed: bool,
+    actionable_count: int,
+    reset_reason: str,
+) -> ReviewWatchStateV1:
+    """Arm a watch whose schedule is measured from ``now`` as the reset time."""
+    return ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.ARMED,
+        head_sha=head_sha,
+        reset_at=now,
+        last_observed_at=now if observed else None,
+        next_check_at=review_watch_deadline(now, 0),
+        interval_index=0,
+        unresolved_thread_count=actionable_count,
+        reset_reason=reset_reason,
+    )
 
 
 class ReviewContextUnavailableError(RuntimeError):
@@ -189,6 +283,7 @@ class LifecycleWorkflow:
             return await self._drain_locked()
 
     async def _drain_locked(self) -> LifecycleDrainResult:
+        self._rearm_settled_review_watches()
         records = sorted(
             self.store.list_intents(
                 states={
@@ -312,7 +407,7 @@ class LifecycleWorkflow:
                 expected_revision=record.revision,
             )
             return "progressed"
-        if resolved.payload.get("state") == "MERGED":
+        if resolved.payload.get("state") in {"MERGED", "CLOSED"}:
             key = MaintenanceKeyV1(
                 repository=resolved.repository,
                 pr_number=resolved.number,
@@ -336,6 +431,17 @@ class LifecycleWorkflow:
             self._persist_unavailable(record, resolved.number)
             return "deferred"
         if resolved.head_sha != record.intent.head_sha:
+            self.store.enqueue(
+                record.intent.model_copy(
+                    update={
+                        "repository": resolved.repository,
+                        "head_sha": resolved.head_sha,
+                        "pr_number": resolved.number,
+                        "reason": "remote head change adopted",
+                        "requested_at": self._now(),
+                    }
+                )
+            )
             key = MaintenanceKeyV1(
                 repository=resolved.repository,
                 pr_number=resolved.number,
@@ -390,23 +496,17 @@ class LifecycleWorkflow:
         )
         snapshot = self._snapshot(record, key, observed)
         try:
-            if snapshot.settled:
-                self.store.settle_intent(
-                    record.intent,
-                    key,
-                    expected_generation=record.generation,
-                    expected_revision=record.revision,
-                    snapshot=snapshot,
-                )
-            else:
-                self.store.promote_intent(
-                    record.intent,
-                    key,
-                    next_attempt_at=self._now() + self.retry_interval,
-                    expected_generation=record.generation,
-                    expected_revision=record.revision,
-                    snapshot=snapshot,
-                )
+            next_attempt = self._now() + self.retry_interval
+            if snapshot.settled and snapshot.review_watch is not None:
+                next_attempt = snapshot.review_watch.next_check_at
+            self.store.promote_intent(
+                record.intent,
+                key,
+                next_attempt_at=next_attempt,
+                expected_generation=record.generation,
+                expected_revision=record.revision,
+                snapshot=snapshot,
+            )
         except StaleIntentVersionError:
             return "deferred"
         if (
@@ -416,6 +516,22 @@ class LifecycleWorkflow:
         ):
             await self.orchestrator.dispatch_pr_maintenance(observed.pr)
         return "progressed"
+
+    def _rearm_settled_review_watches(self) -> None:
+        """Reactivate settled records that predate durable review watches."""
+
+        if self.store.migration_completed(REVIEW_WATCH_MIGRATION):
+            return
+        for record in self.store.list_intents(states={IntentLifecycleStateV1.SETTLED}):
+            if record.canonical_key is None:
+                continue
+            snapshot = self._previous_snapshot(record.canonical_key)
+            if snapshot is None or not snapshot.settled:
+                continue
+            if snapshot.review_watch is not None:
+                continue
+            self.store.enqueue(record.intent)
+        self.store.mark_migration_completed(REVIEW_WATCH_MIGRATION, now=self._now())
 
     def _previous_snapshot(self, key: MaintenanceKeyV1) -> MaintenanceSnapshotV1 | None:
         result = self.store.read_snapshot(
@@ -436,7 +552,11 @@ class LifecycleWorkflow:
                 head_sha=record.intent.head_sha,
                 workflow_type=record.intent.workflow_type,
             )
-            snapshot = _head_drift_snapshot(key, self._now())
+            previous = self._previous_snapshot(key)
+            if previous is None:
+                snapshot = _head_drift_snapshot(key, self._now())
+            else:
+                snapshot = _due_review_watch_snapshot(previous, self._now())
         try:
             self.store.schedule_retry(
                 record.intent,
@@ -581,6 +701,26 @@ class LifecycleWorkflow:
             policy_count,
             observed,
         )
+        previous = (
+            None
+            if record.state is not IntentLifecycleStateV1.PROMOTED
+            else self._previous_snapshot(key)
+        )
+        watch = _next_review_watch(
+            previous.review_watch if previous is not None else None,
+            now=now,
+            head_sha=key.head_sha,
+            ci_state=current.required_ci_state,
+            observation_succeeded=(
+                current.observation_health
+                not in {ObservationHealthV1.UNKNOWN, ObservationHealthV1.UNAVAILABLE}
+            ),
+            actionable_count=(
+                current.policy_unsettled_finding_count
+                + current.unaddressed_thread_count
+            ),
+        )
+        current = current.model_copy(update={"review_watch": watch})
         clean = _snapshot_is_clean(current, observation)
         if not clean:
             return current
@@ -1078,4 +1218,24 @@ def _head_drift_snapshot(
         stable_observation_first_at=None,
         stable_observation_last_at=None,
         settled=False,
+    )
+
+
+def _due_review_watch_snapshot(
+    previous: MaintenanceSnapshotV1,
+    now: datetime,
+) -> MaintenanceSnapshotV1 | None:
+    """Mark a passed watch deadline due without advancing its schedule."""
+
+    watch = previous.review_watch
+    if (
+        watch is None
+        or watch.status is not ReviewWatchStatusV1.ARMED
+        or _utc(now) < watch.next_check_at
+    ):
+        return None
+    return previous.model_copy(
+        update={
+            "review_watch": watch.model_copy(update={"status": ReviewWatchStatusV1.DUE})
+        }
     )

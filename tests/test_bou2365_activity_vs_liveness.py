@@ -260,6 +260,37 @@ def test_merged_pr_with_draining_session_is_ready_for_cleanup(monkeypatch):
     assert card.cleanup_candidate is True
 
 
+@pytest.mark.parametrize("status", list(PRStatus))
+def test_tracked_pr_never_triggers_card_level_cleanup_probe(monkeypatch, status):
+    observed: list[bool] = []
+
+    def cleanup_reason(worktree, agents, *, check_remote_pr=True):
+        observed.append(check_remote_pr)
+        return (not check_remote_pr, "stale orphan")
+
+    monkeypatch.setattr(app, "_selected_worktree_cleanup_reason", cleanup_reason)
+
+    card = _card(_pr(status=status), [], None)
+
+    assert observed == []
+    assert card.status == status
+
+
+def test_untracked_worktree_uses_local_cleanup_probe(monkeypatch):
+    observed: list[bool] = []
+
+    def cleanup_reason(worktree, agents, *, check_remote_pr=True):
+        observed.append(check_remote_pr)
+        return (True, "branch merged into main")
+
+    monkeypatch.setattr(app, "_selected_worktree_cleanup_reason", cleanup_reason)
+
+    card = _card(None, [], None)
+
+    assert observed == [False]
+    assert card.status == PRStatus.READY_CLEANUP
+
+
 # ---------------------------------------------------------------------------
 # Scenario (e) — completed worktree + lingering live process
 # ---------------------------------------------------------------------------
