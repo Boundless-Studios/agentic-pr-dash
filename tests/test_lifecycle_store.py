@@ -20,11 +20,12 @@ from agentic_pr_dash.lifecycle_models import (
     MaintenanceTargetV1,
     ObservationHealthV1,
     RequiredCIStateV1,
-    REVIEW_WATCH_INTERVAL_SECONDS,
+    REVIEW_WATCH_OFFSET_SECONDS,
     ReviewWatchStateV1,
     ReviewWatchStatusV1,
     SnapshotReadStatusV1,
-    review_watch_delay,
+    review_watch_deadline,
+    review_watch_elapsed_seconds,
 )
 from agentic_pr_dash.lifecycle_store import (
     LifecycleStore,
@@ -106,8 +107,8 @@ def _snapshot(
     )
 
 
-def test_review_watch_schedule_repeats_the_eight_hour_tail() -> None:
-    assert REVIEW_WATCH_INTERVAL_SECONDS == (
+def test_review_watch_offsets_are_measured_from_the_reset() -> None:
+    assert REVIEW_WATCH_OFFSET_SECONDS == (
         60,
         300,
         900,
@@ -117,10 +118,71 @@ def test_review_watch_schedule_repeats_the_eight_hour_tail() -> None:
         14400,
         28800,
     )
-    assert review_watch_delay(0) == 60
-    assert review_watch_delay(7) == 28800
-    assert review_watch_delay(8) == 28800
-    assert review_watch_delay(100) == 28800
+    assert review_watch_elapsed_seconds(0) == 60
+    assert review_watch_elapsed_seconds(4) == 3600
+    assert review_watch_elapsed_seconds(7) == 28800
+    assert review_watch_elapsed_seconds(8) == 57600
+    assert review_watch_elapsed_seconds(9) == 86400
+
+    assert review_watch_deadline(OBSERVED_AT, 0) == OBSERVED_AT + timedelta(minutes=1)
+    assert review_watch_deadline(OBSERVED_AT, 7) == OBSERVED_AT + timedelta(minutes=480)
+    assert review_watch_deadline(OBSERVED_AT, 8) == OBSERVED_AT + timedelta(minutes=960)
+
+
+def test_armed_review_watch_keeps_a_sparse_snapshot_fresh(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    key = _key()
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.ARMED,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT,
+        next_check_at=OBSERVED_AT + timedelta(minutes=30),
+        interval_index=3,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+    write_maintenance_snapshot(_snapshot(key, review_watch=watch), root=store.root)
+    target = MaintenanceTargetV1.exact(key)
+
+    owned = store.read_snapshot(target, now=OBSERVED_AT + timedelta(minutes=20))
+    expired = store.read_snapshot(target, now=OBSERVED_AT + timedelta(minutes=31))
+
+    assert owned.status is SnapshotReadStatusV1.FRESH
+    assert expired.status is SnapshotReadStatusV1.STALE
+
+
+def test_due_review_watch_does_not_extend_snapshot_freshness(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+    key = _key()
+    watch = ReviewWatchStateV1(
+        status=ReviewWatchStatusV1.DUE,
+        head_sha="a" * 40,
+        reset_at=OBSERVED_AT,
+        last_observed_at=OBSERVED_AT,
+        next_check_at=OBSERVED_AT + timedelta(minutes=30),
+        interval_index=3,
+        unresolved_thread_count=0,
+        reset_reason="required CI became green",
+    )
+    write_maintenance_snapshot(_snapshot(key, review_watch=watch), root=store.root)
+
+    result = store.read_snapshot(
+        MaintenanceTargetV1.exact(key), now=OBSERVED_AT + timedelta(minutes=20)
+    )
+
+    assert result.status is SnapshotReadStatusV1.STALE
+
+
+def test_one_time_migrations_are_recorded_once(tmp_path: Path) -> None:
+    store = LifecycleStore(tmp_path / "state")
+
+    assert not store.migration_completed("review-watch-rearm-v1")
+
+    store.mark_migration_completed("review-watch-rearm-v1", now=OBSERVED_AT)
+
+    assert store.migration_completed("review-watch-rearm-v1")
+    assert not store.migration_completed("some-other-migration")
 
 
 def test_snapshot_round_trips_durable_review_watch_state() -> None:

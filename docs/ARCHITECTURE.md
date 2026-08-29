@@ -249,11 +249,24 @@ PRs exist." This prevents transient rate limits or outages from incorrectly
 clearing the board.
 
 Green open PRs remain under a durable late-review watch. Successful review
-observations follow `1m, 5m, 15m, 30m, 1h, 2h, 4h, 8h`, then repeat every eight
-hours until merge or closure. New heads and actionable feedback reset the watch
-to one minute; failed observations do not advance it. The lifecycle worker owns
+observations happen at `1m, 5m, 15m, 30m, 1h, 2h, 4h, 8h` measured from the most
+recent watch reset, then repeat every eight hours until merge or closure. New
+heads and actionable feedback reset the watch to one minute; failed observations
+do not advance it and mark the passed deadline `due`. The lifecycle worker owns
 this schedule—rendering and Stop hooks only read or rearm persisted state and
 never sleep or query GitHub themselves.
+
+Three lifecycle rules keep that watch honest. A merged **or closed** PR settles
+its intent, so a closed-without-merge PR never reschedules forever. A remote head
+change (a reviewer, bot, or other machine pushing to the branch) enqueues a
+replacement exact-head intent before the superseded one settles, so monitoring
+follows the PR instead of ending with the local push. And because an armed watch
+is durable ownership, a snapshot stays `fresh` until its `next_check_at` even
+though the sparse cadence far exceeds the 90-second default, which keeps
+`delivery-checklist` and the Stop advisory from reporting an armed watch as
+stale. Records settled before this release carry no watch; a one-time
+`review-watch-rearm-v1` store migration re-enqueues them on the first drain so
+they rejoin the schedule without waiting for another Stop event.
 
 ### Web Server
 

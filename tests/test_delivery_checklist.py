@@ -196,6 +196,33 @@ def test_clean_open_pr_requires_durable_review_watch_ownership() -> None:
     assert not checklist.complete
 
 
+def test_review_item_exposes_persisted_watch_diagnostics() -> None:
+    observed_at = datetime(2026, 8, 28, tzinfo=UTC)
+    snapshot = _snapshot(
+        review_watch=ReviewWatchStateV1(
+            status=ReviewWatchStatusV1.ARMED,
+            head_sha="a" * 40,
+            reset_at=observed_at,
+            last_observed_at=observed_at + timedelta(minutes=5),
+            next_check_at=observed_at + timedelta(minutes=15),
+            interval_index=2,
+            unresolved_thread_count=0,
+            reset_reason="actionable review feedback observed",
+        )
+    )
+
+    review = project_checklist(local=_local_evidence(), snapshot=snapshot).items[8]
+
+    assert "review watch is armed at interval 2" in review.summary
+    assert f"next check {(observed_at + timedelta(minutes=15)).isoformat()}" in (
+        review.summary
+    )
+    assert f"last observed {(observed_at + timedelta(minutes=5)).isoformat()}" in (
+        review.summary
+    )
+    assert "reset because actionable review feedback observed" in review.summary
+
+
 def test_projection_combines_local_and_remote_exact_head_evidence() -> None:
     checklist = project_checklist(local=_local_evidence(), snapshot=_snapshot())
 

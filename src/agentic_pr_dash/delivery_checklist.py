@@ -21,6 +21,7 @@ from .lifecycle_models import (
     ObservationHealthV1,
     RequiredCIStateV1,
     ReviewStateV1,
+    ReviewWatchStateV1,
     SnapshotReadStatusV1,
 )
 from .lifecycle_store import read_maintenance_snapshot
@@ -108,6 +109,24 @@ def _mergeability_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItem
     )
 
 
+def _watch_summary(watch: ReviewWatchStateV1 | None) -> str:
+    """Render the persisted review-watch diagnostics without any remote read."""
+
+    if watch is None:
+        return "review watch is unarmed"
+    last_observed = (
+        watch.last_observed_at.isoformat()
+        if watch.last_observed_at is not None
+        else "never"
+    )
+    return (
+        f"review watch is {watch.status.value} at interval {watch.interval_index}; "
+        f"next check {watch.next_check_at.isoformat()}; "
+        f"last observed {last_observed}; "
+        f"reset because {watch.reset_reason}"
+    )
+
+
 def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
     if snapshot.policy_unsettled_finding_count:
         state = ChecklistItemStateV1.BLOCKED
@@ -154,12 +173,7 @@ def _review_item(snapshot: MaintenanceSnapshotV1) -> DeliveryChecklistItemV1:
         action = "retry remote review observation"
     else:
         action = None
-    watch_summary = (
-        "review watch is unarmed"
-        if snapshot.review_watch is None
-        else f"review watch is {snapshot.review_watch.status.value}; "
-        f"next check {snapshot.review_watch.next_check_at.isoformat()}"
-    )
+    watch_summary = _watch_summary(snapshot.review_watch)
     return _item(
         ChecklistItemIdV1.REVIEW_SETTLEMENT,
         state,

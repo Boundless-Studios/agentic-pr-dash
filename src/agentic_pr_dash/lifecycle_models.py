@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Any
 from urllib.parse import urlsplit
@@ -116,16 +116,24 @@ class ReviewStateV1(StrEnum):
     UNAVAILABLE = "unavailable"
 
 
-REVIEW_WATCH_INTERVAL_SECONDS = (60, 300, 900, 1800, 3600, 7200, 14400, 28800)
+REVIEW_WATCH_OFFSET_SECONDS = (60, 300, 900, 1800, 3600, 7200, 14400, 28800)
 
 
-def review_watch_delay(interval_index: int) -> int:
-    """Return the sparse review delay, repeating the eight-hour tail forever."""
+def review_watch_elapsed_seconds(interval_index: int) -> int:
+    """Return seconds from the watch reset to the check at ``interval_index``."""
     if interval_index < 0:
         raise ValueError("review watch interval index cannot be negative")
-    return REVIEW_WATCH_INTERVAL_SECONDS[
-        min(interval_index, len(REVIEW_WATCH_INTERVAL_SECONDS) - 1)
-    ]
+    last = len(REVIEW_WATCH_OFFSET_SECONDS) - 1
+    if interval_index <= last:
+        return REVIEW_WATCH_OFFSET_SECONDS[interval_index]
+    return REVIEW_WATCH_OFFSET_SECONDS[last] * (interval_index - last + 1)
+
+
+def review_watch_deadline(reset_at: datetime, interval_index: int) -> datetime:
+    """Return the absolute deadline of ``interval_index`` measured from the reset."""
+    return _utc(reset_at) + timedelta(
+        seconds=review_watch_elapsed_seconds(interval_index)
+    )
 
 
 class ReviewWatchStatusV1(StrEnum):

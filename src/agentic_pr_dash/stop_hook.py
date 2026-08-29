@@ -59,6 +59,21 @@ def _render_advisory(
                 ),
             )
         )
+        watch = snapshot.review_watch
+        if watch is not None:
+            last_observed = (
+                watch.last_observed_at.isoformat()
+                if watch.last_observed_at is not None
+                else "never"
+            )
+            details.extend(
+                (
+                    f"watch_interval={watch.interval_index}",
+                    f"watch_next_check={watch.next_check_at.isoformat()}",
+                    f"watch_last_observed={last_observed}",
+                    f"watch_reset={watch.reset_reason.replace(' ', '-')}",
+                )
+            )
     if enqueued:
         details.append("enqueued")
     return " ".join(details)

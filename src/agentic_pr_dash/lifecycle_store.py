@@ -27,6 +27,7 @@ from .lifecycle_models import (
     MaintenanceSnapshotReadResultV1,
     MaintenanceSnapshotV1,
     MaintenanceTargetV1,
+    ReviewWatchStatusV1,
     SnapshotReadStatusV1,
 )
 
@@ -95,6 +96,18 @@ def ingress_identity_hash(intent: MaintenanceIntentV1) -> str:
     )
 
 
+def _migration_slug(name: str) -> str:
+    """Return a filesystem-safe identity for a one-time store migration."""
+
+    slug = "".join(
+        character if character.isalnum() or character in "-_" else "-"
+        for character in name.strip()
+    )
+    if not slug.strip("-"):
+        raise ValueError("migration name must contain alphanumeric characters")
+    return slug
+
+
 def canonical_job_hash(key: MaintenanceKeyV1) -> str:
     """Hash the exact repository/PR/head/workflow job identity."""
 
@@ -152,9 +165,15 @@ def _freshness(
 ) -> MaintenanceSnapshotReadResultV1:
     current = _utc(now or datetime.now(UTC))
     age = max(0.0, (current - snapshot.observed_at).total_seconds())
+    watch = snapshot.review_watch
+    owned_until_next_check = (
+        watch is not None
+        and watch.status is ReviewWatchStatusV1.ARMED
+        and current < watch.next_check_at
+    )
     status = (
         SnapshotReadStatusV1.FRESH
-        if age <= max_age_seconds
+        if age <= max_age_seconds or owned_until_next_check
         else SnapshotReadStatusV1.STALE
     )
     return MaintenanceSnapshotReadResultV1(
@@ -177,10 +196,25 @@ class LifecycleStore:
         self.lock_timeout_seconds = lock_timeout_seconds
         self._intent_dir = self.root / "intents"
         self._snapshot_dir = self.root / "snapshots"
+        self._migration_dir = self.root / "migrations"
         self._lock_path = self.root / ".lifecycle.lock"
 
     def intent_path(self, intent: MaintenanceIntentV1) -> Path:
         return self._intent_dir / f"{ingress_identity_hash(intent)}.json"
+
+    def migration_completed(self, name: str) -> bool:
+        """Report whether this store already ran the named one-time migration."""
+
+        return (self._migration_dir / f"{_migration_slug(name)}.json").is_file()
+
+    def mark_migration_completed(self, name: str, *, now: datetime) -> None:
+        """Record that the named one-time migration ran against this store."""
+
+        with self._transaction_lock():
+            _write_json(
+                self._migration_dir / f"{_migration_slug(name)}.json",
+                {"name": name, "completed_at": _utc(now).isoformat()},
+            )
 
     def snapshot_path(self, key: MaintenanceKeyV1) -> Path:
         return self._snapshot_dir / f"{canonical_job_hash(key)}.json"
