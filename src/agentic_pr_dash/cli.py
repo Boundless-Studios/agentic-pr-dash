@@ -16,6 +16,7 @@ Subcommands:
     observe       Inspect the observability event store (comment scans, dispatches, etc.).
     stash         Race-safe labeled-stash push/apply/drop/list (shared cross-worktree stack).
     lifecycle-hook Run the local-only cross-runtime PR convergence hook.
+    delivery-checklist Project local and exact-head remote completion evidence.
 
 ``check/finalize/complete/arm/list-owned/stop-gate/reconcile-prs`` route into
 the stateless maintenance executor; ``record`` / ``session-report`` into the
@@ -182,6 +183,9 @@ def main(argv: list[str] | None = None) -> int:
         from .codex_hooks import run_pr_convergence
         return run_pr_convergence.main(rest)
 
+    if cmd == "delivery-checklist":
+        from . import delivery_checklist
+        return delivery_checklist.main(rest)
     print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
     return 2

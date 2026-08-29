@@ -136,6 +136,124 @@ class SnapshotReadStatusV1(StrEnum):
     INVALID = "invalid"
 
 
+class ChecklistItemIdV1(StrEnum):
+    TASK_CRITERIA = "task_criteria"
+    IMPLEMENTATION = "implementation"
+    CODE_QUALITY = "code_quality"
+    TASK_VALIDATION = "task_validation"
+    EXACT_HEAD_PUSHED = "exact_head_pushed"
+    PULL_REQUEST_OPEN = "pull_request_open"
+    REQUIRED_CI = "required_ci"
+    MERGEABILITY = "mergeability"
+    REVIEW_SETTLEMENT = "review_settlement"
+    DISCUSSION_SETTLEMENT = "discussion_settlement"
+
+
+CANONICAL_CHECKLIST_ITEM_IDS_V1 = tuple(ChecklistItemIdV1)
+
+
+class ChecklistItemStateV1(StrEnum):
+    REQUIRED = "required"
+    SATISFIED = "satisfied"
+    BLOCKED = "blocked"
+    UNKNOWN = "unknown"
+
+
+class DeliveryChecklistItemV1(BaseModel):
+    """One ordered completion criterion and the authority behind its state."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    item_id: ChecklistItemIdV1
+    state: ChecklistItemStateV1
+    authority: str
+    summary: str
+    next_actions: tuple[str, ...] = ()
+
+    @field_validator("authority", "summary", mode="before")
+    @classmethod
+    def _text(cls, value: Any) -> str:
+        return _required_text(value)
+
+    @field_validator("next_actions", mode="before")
+    @classmethod
+    def _actions(cls, value: Any) -> Any:
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("next_actions must be a sequence")
+        return tuple(_required_text(action) for action in value)
+
+    @model_validator(mode="after")
+    def _require_incomplete_action(self) -> "DeliveryChecklistItemV1":
+        if self.state is not ChecklistItemStateV1.SATISFIED and not self.next_actions:
+            raise ValueError("incomplete checklist item requires a next action")
+        return self
+
+
+class LocalDeliveryEvidenceV1(BaseModel):
+    """Provider-owned local evidence for the pre-PR checklist items."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    repository: str
+    head_sha: str
+    observed_at: datetime
+    items: tuple[DeliveryChecklistItemV1, ...]
+
+    @field_validator("repository", mode="before")
+    @classmethod
+    def _repository(cls, value: str) -> str:
+        return canonical_repository(value)
+
+    @field_validator("head_sha", mode="before")
+    @classmethod
+    def _head_sha(cls, value: Any) -> str:
+        return _required_text(value)
+
+    @field_validator("observed_at", mode="after")
+    @classmethod
+    def _observed_at_utc(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+    @model_validator(mode="after")
+    def _validate_items(self) -> "LocalDeliveryEvidenceV1":
+        expected = CANONICAL_CHECKLIST_ITEM_IDS_V1[:5]
+        if tuple(item.item_id for item in self.items) != expected:
+            raise ValueError("local evidence items must use canonical local order")
+        return self
+
+
+class DeliveryChecklistV1(BaseModel):
+    """Exact-head, provider-neutral projection of delivery completion."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    key: "MaintenanceKeyV1 | None" = None
+    observed_at: datetime
+    items: tuple[DeliveryChecklistItemV1, ...]
+    complete: bool
+
+    @field_validator("observed_at", mode="after")
+    @classmethod
+    def _observed_at_utc(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+    @model_validator(mode="after")
+    def _validate_checklist(self) -> "DeliveryChecklistV1":
+        item_ids = tuple(item.item_id for item in self.items)
+        if item_ids != CANONICAL_CHECKLIST_ITEM_IDS_V1:
+            raise ValueError("checklist items must use canonical order exactly once")
+        all_satisfied = all(
+            item.state is ChecklistItemStateV1.SATISFIED for item in self.items
+        )
+        if self.complete and not all_satisfied:
+            raise ValueError("complete checklist requires every item to be satisfied")
+        if self.complete and self.key is None:
+            raise ValueError("complete checklist requires an exact maintenance key")
+        if not self.complete and all_satisfied:
+            raise ValueError("a fully satisfied checklist must be marked complete")
+        return self
+
+
 class MaintenanceIntentV1(BaseModel):
     """One push-triggered maintenance intent, including unresolved PR events."""
 
