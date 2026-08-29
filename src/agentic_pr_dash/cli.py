@@ -186,7 +186,6 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "delivery-checklist":
         from . import delivery_checklist
         return delivery_checklist.main(rest)
-
     print(f"agentic-pr-dash: unknown command {cmd!r}\n", file=sys.stderr)
     print(_USAGE, file=sys.stderr)
     return 2
