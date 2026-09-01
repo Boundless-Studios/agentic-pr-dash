@@ -23,7 +23,8 @@ def authoritative_maintenance_read():
     # The Stop path primes detail snapshots before resolving individual PRs.
     # A maintenance checkpoint must start after that cache boundary so every
     # dependent read (commit, CI, threads, reviews) reaches GitHub again.
-    github_api.clear_pr_batch_cache()
+    if not github_api.pr_batch_cache_is_authoritative():
+        github_api.clear_pr_batch_cache()
     token = _AUTHORITATIVE_MAINTENANCE_READ.set(True)
     try:
         yield
@@ -66,12 +67,12 @@ def _authoritative_ci_checks(pr_number: int, cwd: str):
     return observation.value
 
 
-def _authoritative_identity_still_matches(
+def _authoritative_identity_snapshot(
     pr_number: int,
     expected_head: str,
     expected_base: str,
     cwd: str,
-) -> bool:
+) -> dict | None:
     """Fence a maintenance read against head/base changes during observation."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
@@ -82,11 +83,13 @@ def _authoritative_identity_still_matches(
     if fresh is None:
         fresh = github_api._rest_pr_payload(pr_number, cwd=cwd)
     if fresh is None or str(fresh.get("state") or "open").lower() != "open":
-        return False
-    return bool(
-        fresh.get("headRefOid") == expected_head
-        and fresh.get("baseRefName") == expected_base
-    )
+        return None
+    if (
+        fresh.get("headRefOid") != expected_head
+        or fresh.get("baseRefName") != expected_base
+    ):
+        return None
+    return fresh
 
 
 def _gh_unavailable_message(cwd: str | None = None) -> str:
@@ -478,10 +481,13 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         return _GH_UNAVAILABLE
     observed_head = raw.get("headRefOid") or latest_sha
     observed_base = raw.get("baseRefName", "main")
-    if authoritative and not _authoritative_identity_still_matches(
-        pr_number, observed_head, observed_base, cwd
-    ):
-        return _GH_UNAVAILABLE
+    if authoritative:
+        fresh = _authoritative_identity_snapshot(
+            pr_number, observed_head, observed_base, cwd
+        )
+        if fresh is None:
+            return _GH_UNAVAILABLE
+        raw = fresh
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
 
@@ -596,10 +602,13 @@ def _resolve_pr_by_number(
         return _GH_UNAVAILABLE
     observed_head = (raw or {}).get("headRefOid") or latest_sha
     observed_base = (raw or {}).get("baseRefName", "main")
-    if authoritative and not _authoritative_identity_still_matches(
-        pr_number, observed_head, observed_base, cwd
-    ):
-        return _GH_UNAVAILABLE
+    if authoritative:
+        fresh = _authoritative_identity_snapshot(
+            pr_number, observed_head, observed_base, cwd
+        )
+        if fresh is None:
+            return _GH_UNAVAILABLE
+        raw = fresh
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 
@@ -943,7 +952,7 @@ def _list_my_open_prs(cwd: str, timeout: float = 15) -> dict[str, tuple[int, boo
     return out
 
 
-def _unresolved_review_threads(pr_number: int, cwd: str):
+def _unresolved_review_threads(pr_number: int, cwd: str, *, strict: bool = False):
     """Unresolved review threads for a PR — INCLUDING outdated ones, EXCLUDING
     deliberately-deferred ones.
 
@@ -963,7 +972,7 @@ def _unresolved_review_threads(pr_number: int, cwd: str):
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from . import deferred_review  # noqa: PLC0415
 
-    threads = github_api.get_review_threads(pr_number, cwd)
+    threads = github_api.get_review_threads(pr_number, cwd, strict=strict)
     return [
         t for t in threads
         if not t.is_resolved

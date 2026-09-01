@@ -438,6 +438,7 @@ def _resolve_and_blockers(cwd: str):
     from agentic_pr_dash import maintenance  # noqa: PLC0415 — avoid import cycle
 
     binding = _CURRENT_PR_BINDING.get()
+    unresolved_threads = []
     with pr_state.authoritative_maintenance_read():
         if binding is not None and getattr(binding, "unknown", False):
             pr = pr_state._GH_UNAVAILABLE
@@ -458,13 +459,19 @@ def _resolve_and_blockers(cwd: str):
                 )
         else:
             pr = pr_state._resolve_pr_for_branch(cwd)
+        if pr is not pr_state._GH_UNAVAILABLE and pr is not None and not pr.is_draft:
+            try:
+                unresolved_threads = pr_state._unresolved_review_threads(
+                    pr.number, cwd, strict=True
+                )
+            except RuntimeError:
+                pr = pr_state._GH_UNAVAILABLE
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415
     github_api.record_published_pr_head(pr.number, pr.latest_commit_sha, cwd)
     blockers = maintenance.blockers_for_pr(pr)
     if not blockers:
-        unresolved_threads = pr_state._unresolved_review_threads(pr.number, cwd)
         if unresolved_threads:
             pr.review_comments = completion._review_comments_from_threads(unresolved_threads)
             blockers = ["review_comments"]

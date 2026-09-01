@@ -27,6 +27,7 @@ def _stub_detail_reads(monkeypatch) -> None:
     monkeypatch.setattr(pr_state, "_current_branch", lambda _cwd: "feature")
     monkeypatch.setattr(github_api, "get_latest_commit", lambda *_a: ("sha-b", "2026-09-01T00:00:00Z"))
     monkeypatch.setattr(github_api, "get_ci_checks", lambda *_a: [])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *_a, **_k: [])
     monkeypatch.setattr(
         github_api,
         "get_ci_checks_observation",
@@ -128,6 +129,44 @@ def test_head_change_during_authoritative_read_fails_closed(monkeypatch) -> None
     assert blockers == []
 
 
+def test_mutable_review_state_is_taken_from_final_identity_read(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    initial = _raw_pr()
+    final = {**_raw_pr(), "reviewDecision": "CHANGES_REQUESTED"}
+    snapshots = iter([[initial], [final]])
+    monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots))
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda *_a: github_api.ObservationReadResult.observed(([], [])),
+    )
+
+    pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr.review_decision == "CHANGES_REQUESTED"
+    assert blockers == ["changes_requested"]
+
+
+def test_unresolved_thread_fallback_failure_is_unavailable(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_a, **_k: [_raw_pr()])
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda *_a: github_api.ObservationReadResult.observed(([], [])),
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_review_threads",
+        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("threads unavailable")),
+    )
+
+    pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr is pr_state._GH_UNAVAILABLE
+    assert blockers == []
+
+
 def test_observation_validator_rejects_head_or_base_mismatch() -> None:
     pr = PRData(
         number=77,
@@ -168,6 +207,22 @@ def test_authoritative_scope_discards_primed_detail_cache() -> None:
 
     with pr_state.authoritative_maintenance_read():
         assert github_api.get_primed_mergeability(77, "/worktree") is None
+
+
+def test_authoritative_scope_preserves_fresh_checkpoint_batch() -> None:
+    github_api.clear_pr_batch_cache()
+    github_api.prime_pr_batch_cache(
+        "acme/widgets",
+        {77: {"merge_state": "CLEAN", "mergeable": "MERGEABLE"}},
+        "/worktree",
+    )
+    github_api.mark_pr_batch_cache_authoritative()
+
+    with pr_state.authoritative_maintenance_read():
+        assert github_api.get_primed_mergeability(77, "/worktree") == (
+            "CLEAN",
+            "MERGEABLE",
+        )
 
 
 def test_stop_fingerprint_ignores_only_volatile_observation_time() -> None:

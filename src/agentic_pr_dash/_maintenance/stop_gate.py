@@ -164,6 +164,9 @@ def _cached_clean_binding_matches(
     """Return whether a clean cache entry belongs to this exact PR binding."""
     return bool(
         cached_entry
+        # Exact remote observations are never reusable: reviews and CI can
+        # change without any local binding field changing.
+        and "OBSERVED_AT=" not in str(cached_entry.get("text", ""))
         and binding is not None
         and local_sha
         and cached_entry.get("head_sha") == local_sha
@@ -498,6 +501,7 @@ def _prefetch_owned_pr_state(
             )
             if entries:
                 github_api.prime_pr_batch_cache(repo, entries)
+                github_api.mark_pr_batch_cache_authoritative()
         except Exception:  # noqa: BLE001 - optimization only, never fail the gate
             pass
 
