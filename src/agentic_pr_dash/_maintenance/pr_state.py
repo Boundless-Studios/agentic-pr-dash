@@ -28,14 +28,6 @@ def authoritative_maintenance_read():
 def authoritative_observation_matches(pr) -> bool:
     """Return whether ``pr`` carries a complete exact-head maintenance read."""
     observed_at = pr.maintenance_observed_at
-    if (
-        observed_at is None
-        and not pr.maintenance_observed_head_sha
-        and not pr.maintenance_observed_base_branch
-    ):
-        # Legacy external/test adapters may supply a PRData object directly.
-        # Real resolver results always stamp all three fields below.
-        return True
     return bool(
         observed_at is not None
         and observed_at.tzinfo is not None
@@ -56,6 +48,39 @@ def _authoritative_review_comments(pr_number: int, latest_date: str, cwd: str):
         return _GH_UNAVAILABLE
     comments, _decisions = observation.value
     return comments
+
+
+def _authoritative_ci_checks(pr_number: int, cwd: str):
+    """Read CI without collapsing an unavailable observation into clean."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    observation = github_api.get_ci_checks_observation(pr_number, cwd)
+    if not observation.observable or observation.value is None:
+        return _GH_UNAVAILABLE
+    return observation.value
+
+
+def _authoritative_identity_still_matches(
+    pr_number: int,
+    expected_head: str,
+    expected_base: str,
+    cwd: str,
+) -> bool:
+    """Fence a maintenance read against head/base changes during observation."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    prs = github_api.list_open_prs_cached(cwd, force=True)
+    fresh = None
+    if prs is not None:
+        fresh = next((entry for entry in prs if entry.get("number") == pr_number), None)
+    if fresh is None:
+        fresh = github_api._rest_pr_payload(pr_number, cwd=cwd)
+    if fresh is None or str(fresh.get("state") or "open").lower() != "open":
+        return False
+    return bool(
+        fresh.get("headRefOid") == expected_head
+        and fresh.get("baseRefName") == expected_base
+    )
 
 
 def _gh_unavailable_message(cwd: str | None = None) -> str:
@@ -423,7 +448,13 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # so the tick-based waiter's per-tick accumulation is untouched.
     _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
+    checks = (
+        _authoritative_ci_checks(pr_number, cwd)
+        if authoritative
+        else github_api.get_ci_checks(pr_number, cwd)
+    )
+    if checks is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     failing = [
         c.name
         for c in checks
@@ -438,6 +469,12 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     if review_comments is _GH_UNAVAILABLE:
         return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
+        return _GH_UNAVAILABLE
+    observed_head = raw.get("headRefOid") or latest_sha
+    observed_base = raw.get("baseRefName", "main")
+    if authoritative and not _authoritative_identity_still_matches(
+        pr_number, observed_head, observed_base, cwd
+    ):
         return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
@@ -456,10 +493,10 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,
-        latest_commit_sha=raw.get("headRefOid") or latest_sha,
+        latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
-        maintenance_observed_head_sha=raw.get("headRefOid") or latest_sha,
-        maintenance_observed_base_branch=raw.get("baseRefName", "main"),
+        maintenance_observed_head_sha=observed_head,
+        maintenance_observed_base_branch=observed_base,
         maintenance_observed_at=datetime.now(UTC),
         worktree_path=cwd,
         status=PRStatus.CLEAN,
@@ -525,7 +562,13 @@ def _resolve_pr_by_number(
     # path).
     _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
+    checks = (
+        _authoritative_ci_checks(pr_number, cwd)
+        if authoritative
+        else github_api.get_ci_checks(pr_number, cwd)
+    )
+    if checks is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     failing = [
         c.name
         for c in checks
@@ -545,6 +588,12 @@ def _resolve_pr_by_number(
         return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
+    observed_head = (raw or {}).get("headRefOid") or latest_sha
+    observed_base = (raw or {}).get("baseRefName", "main")
+    if authoritative and not _authoritative_identity_still_matches(
+        pr_number, observed_head, observed_base, cwd
+    ):
+        return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 
@@ -562,10 +611,10 @@ def _resolve_pr_by_number(
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,
-        latest_commit_sha=(raw or {}).get("headRefOid") or latest_sha,
+        latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
-        maintenance_observed_head_sha=(raw or {}).get("headRefOid") or latest_sha,
-        maintenance_observed_base_branch=(raw or {}).get("baseRefName", "main"),
+        maintenance_observed_head_sha=observed_head,
+        maintenance_observed_base_branch=observed_base,
         maintenance_observed_at=datetime.now(UTC),
         worktree_path=cwd,
         status=PRStatus.CLEAN,
