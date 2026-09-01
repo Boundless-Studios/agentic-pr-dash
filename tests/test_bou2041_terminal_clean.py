@@ -29,6 +29,8 @@ we declare this done", which is a strictly stronger question.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from agentic_pr_dash import maintenance
@@ -44,6 +46,7 @@ def pr(**overrides) -> PRData:
         number=8,
         title="feat: something",
         branch="feature-branch",
+        base_branch="main",
         url="https://github.com/Boundless-Studios/agentic-pr-dash/pull/8",
         latest_commit_sha=HEAD,
         merge_state="CLEAN",
@@ -51,6 +54,9 @@ def pr(**overrides) -> PRData:
         status=PRStatus.CLEAN,
     )
     payload.update(overrides)
+    payload.setdefault("maintenance_observed_head_sha", payload["latest_commit_sha"])
+    payload.setdefault("maintenance_observed_base_branch", payload["base_branch"])
+    payload.setdefault("maintenance_observed_at", datetime.now(UTC))
     return PRData(**payload)
 
 
