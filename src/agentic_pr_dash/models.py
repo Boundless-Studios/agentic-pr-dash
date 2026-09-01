@@ -264,6 +264,13 @@ class PRData(BaseModel):
     review_decision: str = "none"
     latest_commit_sha: str = ""
     latest_commit_date: str = ""
+    # Evidence for the authoritative PR-maintenance read that produced this
+    # instance.  These fields are intentionally separate from the ordinary PR
+    # payload so callers cannot mistake a cached discovery record for a fresh
+    # maintenance observation.
+    maintenance_observed_head_sha: str = ""
+    maintenance_observed_base_branch: str = ""
+    maintenance_observed_at: datetime | None = None
     worktree_path: str | None = None
     agent_session_id: str | None = None
     agent_cli_name: str | None = None

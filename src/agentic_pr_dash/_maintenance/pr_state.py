@@ -3,10 +3,59 @@ from __future__ import annotations
 
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
 
 from ._common import _current_branch
 
 _GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
+_AUTHORITATIVE_MAINTENANCE_READ: ContextVar[bool] = ContextVar(
+    "authoritative_maintenance_read", default=False
+)
+
+
+@contextmanager
+def authoritative_maintenance_read():
+    """Force resolver cache bypass without changing its adapter call shape."""
+    token = _AUTHORITATIVE_MAINTENANCE_READ.set(True)
+    try:
+        yield
+    finally:
+        _AUTHORITATIVE_MAINTENANCE_READ.reset(token)
+
+
+def authoritative_observation_matches(pr) -> bool:
+    """Return whether ``pr`` carries a complete exact-head maintenance read."""
+    observed_at = pr.maintenance_observed_at
+    if (
+        observed_at is None
+        and not pr.maintenance_observed_head_sha
+        and not pr.maintenance_observed_base_branch
+    ):
+        # Legacy external/test adapters may supply a PRData object directly.
+        # Real resolver results always stamp all three fields below.
+        return True
+    return bool(
+        observed_at is not None
+        and observed_at.tzinfo is not None
+        and observed_at.utcoffset() is not None
+        and pr.maintenance_observed_head_sha == pr.latest_commit_sha
+        and pr.maintenance_observed_base_branch == pr.base_branch
+    )
+
+
+def _authoritative_review_comments(pr_number: int, latest_date: str, cwd: str):
+    """Read threads and submitted review bodies as one fail-closed slice."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    observation = github_api.scan_review_threads_observation(
+        pr_number, latest_date, cwd
+    )
+    if not observation.observable or observation.value is None:
+        return _GH_UNAVAILABLE
+    comments, _decisions = observation.value
+    return comments
 
 
 def _gh_unavailable_message(cwd: str | None = None) -> str:
@@ -329,6 +378,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
+    authoritative = _AUTHORITATIVE_MAINTENANCE_READ.get()
+    force = force or authoritative
     branch = _current_branch(cwd)
     if not branch:
         return None
@@ -379,7 +430,13 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
         and not github_api._is_infra_check(c.name)
     ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    review_comments = (
+        _authoritative_review_comments(pr_number, latest_date, cwd)
+        if authoritative
+        else github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    )
+    if review_comments is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = raw.get("mergeStateStatus", "unknown")
@@ -401,6 +458,9 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         review_comments=review_comments,
         latest_commit_sha=raw.get("headRefOid") or latest_sha,
         latest_commit_date=latest_date,
+        maintenance_observed_head_sha=raw.get("headRefOid") or latest_sha,
+        maintenance_observed_base_branch=raw.get("baseRefName", "main"),
+        maintenance_observed_at=datetime.now(UTC),
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )
@@ -419,6 +479,8 @@ def _resolve_pr_by_number(
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
+    authoritative = _AUTHORITATIVE_MAINTENANCE_READ.get()
+    force = force or authoritative
     # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
     prs = github_api.list_open_prs_cached(cwd, force=force)
     raw: dict | None = None
@@ -471,10 +533,16 @@ def _resolve_pr_by_number(
         and not github_api._is_infra_check(c.name)
     ]
     review_comments = (
-        github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        (
+            _authoritative_review_comments(pr_number, latest_date, cwd)
+            if authoritative
+            else github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        )
         if include_reviews
         else []
     )
+    if review_comments is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
@@ -496,6 +564,9 @@ def _resolve_pr_by_number(
         review_comments=review_comments,
         latest_commit_sha=(raw or {}).get("headRefOid") or latest_sha,
         latest_commit_date=latest_date,
+        maintenance_observed_head_sha=(raw or {}).get("headRefOid") or latest_sha,
+        maintenance_observed_base_branch=(raw or {}).get("baseRefName", "main"),
+        maintenance_observed_at=datetime.now(UTC),
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )

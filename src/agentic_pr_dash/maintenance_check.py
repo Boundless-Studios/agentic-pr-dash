@@ -1011,10 +1011,13 @@ def _complete_resolve_target_pr(args: argparse.Namespace, cwd: str):
     _cmd_complete): these verbs are about to mutate GitHub state (reply +
     persist a deferral), so a stale cached snapshot is a correctness risk.
     """
+    from ._maintenance import pr_state  # noqa: PLC0415
+
     pr_number_arg = args.pr
-    if pr_number_arg is not None:
-        return _resolve_pr_by_number(int(pr_number_arg), cwd, force=True)
-    return _resolve_pr_for_branch(cwd, force=True)
+    with pr_state.authoritative_maintenance_read():
+        if pr_number_arg is not None:
+            return _resolve_pr_by_number(int(pr_number_arg), cwd, force=True)
+        return _resolve_pr_for_branch(cwd, force=True)
 
 
 def _cmd_complete_defer(args: argparse.Namespace) -> int:
@@ -1291,7 +1294,7 @@ def _cmd_complete_unleased(
     )
 
     from . import github_api, maintenance  # noqa: PLC0415
-    from ._maintenance import completion
+    from ._maintenance import completion, pr_state
     from ._maintenance.completion import PolicyFindingClosure
     from ._maintenance.review_settlement import (
         classify_thread_closure,
@@ -1743,8 +1746,14 @@ def _cmd_complete_unleased(
     # force=True: re-resolve post-mutation state (threads were just
     # resolved/replied-to above) — a cached pre-mutation snapshot would report
     # stale "remaining blockers" (BOU-1923).
-    fresh = _resolve_pr_by_number(resolved_pr_number, cwd, force=True)
-    if fresh is _GH_UNAVAILABLE or fresh is None:
+    with pr_state.authoritative_maintenance_read():
+        fresh = _resolve_pr_by_number(resolved_pr_number, cwd, force=True)
+    if (
+        fresh is _GH_UNAVAILABLE
+        or fresh is None
+        or not pr_state.authoritative_observation_matches(fresh)
+        or fresh.base_branch != pr.base_branch
+    ):
         remaining = ["unknown"]
     else:
         # BOU-2041: completion must clear the *terminal-clean* bar, not merely

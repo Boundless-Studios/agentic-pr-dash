@@ -438,25 +438,26 @@ def _resolve_and_blockers(cwd: str):
     from agentic_pr_dash import maintenance  # noqa: PLC0415 — avoid import cycle
 
     binding = _CURRENT_PR_BINDING.get()
-    if binding is not None and getattr(binding, "unknown", False):
-        pr = pr_state._GH_UNAVAILABLE
-    elif binding is not None and getattr(binding, "resolved", False):
-        number = getattr(binding, "pr_number", None)
-        pr = (
-            pr_state._resolve_pr_by_number(number, cwd)
-            if number is not None
-            else None
-        )
-        if pr is not None and pr is not pr_state._GH_UNAVAILABLE:
-            # The strict resolver validated draft state for this checkout. The
-            # explicit-number detail lookup may still be served by a warm list
-            # snapshot from before a draft/ready transition, so its state must
-            # not override the binding that selected this PR.
-            pr = pr.model_copy(
-                update={"is_draft": bool(getattr(binding, "is_draft", False))}
+    with pr_state.authoritative_maintenance_read():
+        if binding is not None and getattr(binding, "unknown", False):
+            pr = pr_state._GH_UNAVAILABLE
+        elif binding is not None and getattr(binding, "resolved", False):
+            number = getattr(binding, "pr_number", None)
+            pr = (
+                pr_state._resolve_pr_by_number(number, cwd)
+                if number is not None
+                else None
             )
-    else:
-        pr = pr_state._resolve_pr_for_branch(cwd)
+            if pr is not None and pr is not pr_state._GH_UNAVAILABLE:
+                # The strict resolver validated draft state for this checkout. The
+                # explicit-number detail lookup may still be served by a warm list
+                # snapshot from before a draft/ready transition, so its state must
+                # not override the binding that selected this PR.
+                pr = pr.model_copy(
+                    update={"is_draft": bool(getattr(binding, "is_draft", False))}
+                )
+        else:
+            pr = pr_state._resolve_pr_for_branch(cwd)
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415
@@ -468,6 +469,29 @@ def _resolve_and_blockers(cwd: str):
             pr.review_comments = completion._review_comments_from_threads(unresolved_threads)
             blockers = ["review_comments"]
     return pr, blockers
+
+
+def _observation_evidence(pr) -> str:
+    observed = getattr(pr, "maintenance_observed_at", None)
+    head = getattr(pr, "maintenance_observed_head_sha", "")
+    base = getattr(pr, "maintenance_observed_base_branch", "")
+    if observed is None and not head and not base:
+        return ""
+    observed_at = (
+        observed.isoformat()
+        if observed is not None
+        else "missing"
+    )
+    return (
+        f"OBSERVED_HEAD_SHA={head or 'missing'}\n"
+        f"OBSERVED_BASE_BRANCH={base or 'missing'}\n"
+        f"OBSERVED_AT={observed_at}"
+    )
+
+
+def _with_observation(text: str, pr) -> str:
+    evidence = _observation_evidence(pr)
+    return f"{text}\n{evidence}" if evidence else text
 
 
 def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tuple[int, str]:
@@ -667,8 +691,10 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         # same clean-looking text.
         deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
         if deferred_n:
-            return 0, f"nothing pending (deferred: {deferred_n})"
-        return 0, "nothing pending"
+            return 0, _with_observation(
+                f"nothing pending (deferred: {deferred_n})", pr
+            )
+        return 0, _with_observation("nothing pending", pr)
 
     # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
     # heartbeat/lease (BOU-1540). Blockers are known here, so name them rather
@@ -857,7 +883,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # something else is also pending.
     deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
     summary = maintenance.build_maintenance_summary(pr, deferred_count=deferred_n)
-    text = f"{prompt}\nSUMMARY={summary}\nPR_NUMBER={pr.number}"
+    text = _with_observation(f"{prompt}\nSUMMARY={summary}", pr)
+    text = f"{text}\nPR_NUMBER={pr.number}"
     if coordinator_claim is not None:
         text += (
             f"\nCOORDINATOR_CLAIM_ID={coordinator_claim.claim_id}"
