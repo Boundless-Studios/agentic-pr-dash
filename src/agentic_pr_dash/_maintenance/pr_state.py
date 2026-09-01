@@ -18,6 +18,12 @@ _AUTHORITATIVE_MAINTENANCE_READ: ContextVar[bool] = ContextVar(
 @contextmanager
 def authoritative_maintenance_read():
     """Force resolver cache bypass without changing its adapter call shape."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    # The Stop path primes detail snapshots before resolving individual PRs.
+    # A maintenance checkpoint must start after that cache boundary so every
+    # dependent read (commit, CI, threads, reviews) reaches GitHub again.
+    github_api.clear_pr_batch_cache()
     token = _AUTHORITATIVE_MAINTENANCE_READ.set(True)
     try:
         yield

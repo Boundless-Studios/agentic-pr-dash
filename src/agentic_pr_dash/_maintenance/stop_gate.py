@@ -298,9 +298,12 @@ def _stop_fingerprint(pending: list[tuple[str, str]]) -> str:
     """Stable hash of the pending (worktree, prompt) set."""
     h = hashlib.sha256()
     for path, text in sorted(pending):
+        stable_text = "\n".join(
+            line for line in text.splitlines() if not line.startswith("OBSERVED_AT=")
+        )
         h.update(path.encode("utf-8"))
         h.update(b"\0")
-        h.update(text.encode("utf-8"))
+        h.update(stable_text.encode("utf-8"))
         h.update(b"\0")
     return h.hexdigest()
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from agentic_pr_dash import github_api
-from agentic_pr_dash._maintenance import pr_state, worktree_check
+from agentic_pr_dash._maintenance import pr_state, stop_gate, worktree_check
 from agentic_pr_dash.models import PRData, PRStatus, ReviewComment
 
 
@@ -157,3 +157,23 @@ def test_observation_validator_rejects_missing_evidence() -> None:
     )
 
     assert pr_state.authoritative_observation_matches(pr) is False
+
+
+def test_authoritative_scope_discards_primed_detail_cache() -> None:
+    github_api.prime_pr_batch_cache(
+        "acme/widgets",
+        {77: {"merge_state": "CLEAN", "mergeable": "MERGEABLE", "threads": []}},
+        "/worktree",
+    )
+
+    with pr_state.authoritative_maintenance_read():
+        assert github_api.get_primed_mergeability(77, "/worktree") is None
+
+
+def test_stop_fingerprint_ignores_only_volatile_observation_time() -> None:
+    first = [("/worktree", "blocked\nOBSERVED_HEAD_SHA=sha-a\nOBSERVED_AT=2026-09-01T00:00:00Z")]
+    later = [("/worktree", "blocked\nOBSERVED_HEAD_SHA=sha-a\nOBSERVED_AT=2026-09-01T00:01:00Z")]
+    moved = [("/worktree", "blocked\nOBSERVED_HEAD_SHA=sha-b\nOBSERVED_AT=2026-09-01T00:01:00Z")]
+
+    assert stop_gate._stop_fingerprint(first) == stop_gate._stop_fingerprint(later)
+    assert stop_gate._stop_fingerprint(first) != stop_gate._stop_fingerprint(moved)
