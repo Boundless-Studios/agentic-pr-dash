@@ -251,7 +251,7 @@ def test_batch_snapshot_preserves_observed_results_when_another_pr_is_missing(mo
 # ---------------------------------------------------------------------------
 
 
-def test_stop_gate_prefetches_once_for_many_owned_worktrees_same_repo(
+def test_stop_gate_skips_stale_preloop_prefetch_for_authoritative_checks(
     monkeypatch, tmp_path, capsys,
 ):
     pr_numbers = list(range(200, 208))  # 8 owned PRs, same repo
@@ -284,10 +284,9 @@ def test_stop_gate_prefetches_once_for_many_owned_worktrees_same_repo(
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
 
-    # 8 owned PRs in one repo used to cost (at least) 8 serial "review + CI"
-    # pairs; the batch call must fire exactly ONCE, covering all 8 numbers.
-    assert len(batch_calls) == 1
-    assert sorted(batch_calls[0]) == pr_numbers
+    # A pre-loop snapshot can become stale before a later PR is checked, so the
+    # exact-observation gate must not pay for or consume it.
+    assert batch_calls == []
     assert rc in (0, 2)  # not asserting the waiter/clean branch here — just the batching
 
 
@@ -427,7 +426,7 @@ def test_stop_gate_still_blocks_on_genuine_pending_with_budget_available(
 # ---------------------------------------------------------------------------
 
 
-def test_stop_gate_head_sha_cache_skips_recheck_of_unchanged_clean_worktree(
+def test_stop_gate_head_sha_cache_rechecks_unchanged_clean_worktree(
     monkeypatch, tmp_path, capsys,
 ):
     # A positive STOP_INTERVAL so the per-PR cache TTL has room to matter;
@@ -465,9 +464,9 @@ def test_stop_gate_head_sha_cache_skips_recheck_of_unchanged_clean_worktree(
     checked.clear()
     rc2 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     assert rc2 == 2  # pending_wt still blocks -> gate keeps running every tick
-    # clean_wt's head sha did not change and its last result was CLEAN -> the
-    # cache skips re-checking it; only pending_wt is actually re-examined.
-    assert checked == [str(pending_wt)]
+    # Review and CI state can change without the local head moving, so both
+    # worktrees receive a fresh remote check on the next stop attempt.
+    assert checked == [str(clean_wt), str(pending_wt)]
 
 
 def test_stop_gate_head_sha_cache_rechecks_after_new_commit(monkeypatch, tmp_path):

@@ -585,6 +585,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             take_over = _wakeless_grace_exhausted(cwd, owner)
         if not take_over:
             owner_pr, owner_blockers = _resolve_and_blockers(cwd)
+            if owner_pr is pr_state._GH_UNAVAILABLE:
+                return 2, pr_state._gh_unavailable_message(cwd)
             if not owner_blockers:
                 _clear_no_progress(cwd)  # owner's PR is clean → reset the streak
                 return 0, f"deferring to live PR-watch owner session {owner}"

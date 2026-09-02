@@ -161,24 +161,8 @@ def _cached_clean_binding_matches(
     now: float,
     interval: float,
 ) -> bool:
-    """Return whether a clean cache entry belongs to this exact PR binding."""
-    return bool(
-        cached_entry
-        # Exact remote observations are never reusable: reviews and CI can
-        # change without any local binding field changing.
-        and "OBSERVED_AT=" not in str(cached_entry.get("text", ""))
-        and binding is not None
-        and local_sha
-        and cached_entry.get("head_sha") == local_sha
-        and cached_entry.get("branch") == binding.branch
-        and cached_entry.get("pr_number") == binding.pr_number
-        # A draft verdict is not reusable after the same PR becomes ready (or
-        # the inverse transition). Older cache entries lack this field and
-        # therefore fail closed into a fresh check.
-        and cached_entry.get("is_draft") == bool(binding.is_draft)
-        and cached_entry.get("code") == 0
-        and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
-    )
+    """Never reuse a remote-clean result without a fresh mutable-state read."""
+    return False
 
 
 def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
@@ -722,7 +706,10 @@ def _stop_gate_impl(args) -> int:
         {**pr_for, **current_pr_for},
         current_resolved=current_resolved_worktrees,
     )
-    _prefetch_owned_pr_state(effective_pr_pairs, deadline=gate_deadline)
+    # Exact per-PR observations must not consume a pre-loop snapshot: reviews
+    # and CI can change without changing the local checkout identity. The
+    # aggregate prefetch remains available to dashboard/orchestrator callers,
+    # but the stop gate intentionally performs current per-PR reads.
 
     # BOU-2556: give the per-worktree loop below a wall-clock budget so a
     # session owning many PRs degrades gracefully instead of blowing the

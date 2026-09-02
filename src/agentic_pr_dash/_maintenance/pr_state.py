@@ -527,9 +527,9 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         review_comments=review_comments,
         latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
-        maintenance_observed_head_sha=observed_head,
-        maintenance_observed_base_branch=observed_base,
-        maintenance_observed_at=datetime.now(UTC),
+        maintenance_observed_head_sha=observed_head if authoritative else "",
+        maintenance_observed_base_branch=observed_base if authoritative else "",
+        maintenance_observed_at=datetime.now(UTC) if authoritative else None,
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )
@@ -639,6 +639,10 @@ def _resolve_pr_by_number(
             if diagnostic:
                 return _GH_UNAVAILABLE
             raw["reviewDecision"] = review_decision or "none"
+            if _authoritative_identity_snapshot(
+                pr_number, observed_head, observed_base, observed_branch, cwd
+            ) is None:
+                return _GH_UNAVAILABLE
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 
@@ -658,9 +662,9 @@ def _resolve_pr_by_number(
         review_comments=review_comments,
         latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
-        maintenance_observed_head_sha=observed_head,
-        maintenance_observed_base_branch=observed_base,
-        maintenance_observed_at=datetime.now(UTC),
+        maintenance_observed_head_sha=observed_head if authoritative else "",
+        maintenance_observed_base_branch=observed_base if authoritative else "",
+        maintenance_observed_at=datetime.now(UTC) if authoritative else None,
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )
