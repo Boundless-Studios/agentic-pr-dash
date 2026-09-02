@@ -45,7 +45,7 @@
             <span class="bug-bash-banner-slot"
                   data-dashboard-poller
                   hx-get="/partials/bug-bash-banner"
-                  hx-trigger="every 5s, dashboardRefresh"
+                  hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                   hx-swap="innerHTML">
                 {% include 'partials/bug_bash_banner.html' %}
             </span>
@@ -97,7 +97,7 @@
         <section class="runner-issues-panel"
                  data-dashboard-poller
                  hx-get="{{ runner_issues_partial_url }}"
-                 hx-trigger="every 5s, dashboardRefresh"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/runner_issues.html' %}
         </section>
@@ -105,7 +105,7 @@
         <section class="worktrees-panel"
                  data-dashboard-poller
                  hx-get="{{ worktrees_partial_url | default('/partials/worktrees', true) }}"
-                 hx-trigger="every 5s, dashboardRefresh"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/worktrees.html' %}
         </section>
@@ -113,7 +113,7 @@
         <section class="board"
                  data-dashboard-poller
                  hx-get="{{ board_partial_url }}"
-                 hx-trigger="every 5s, dashboardRefresh"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/board.html' %}
         </section>
@@ -123,7 +123,7 @@
             {% if runner_fleet is defined %}
             <div data-dashboard-poller
                  hx-get="/partials/runner-fleet"
-                 hx-trigger="every 15s, dashboardRefresh"
+                 hx-trigger="every 15s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/runner_fleet.html' %}
             </div>
@@ -132,7 +132,7 @@
             <div class="quota-status-slot"
                  data-dashboard-poller
                  hx-get="/partials/quota"
-                 hx-trigger="every 15s, dashboardRefresh"
+                 hx-trigger="every 15s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/quota_status.html' %}
             </div>
@@ -141,7 +141,7 @@
             <div class="event-list"
                  data-dashboard-poller
                  hx-get="/partials/event-log"
-                 hx-trigger="every 3s, dashboardRefresh"
+                 hx-trigger="every 3s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/event_log.html' %}
             </div>

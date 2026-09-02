@@ -191,13 +191,32 @@ function canPollDashboard() {
 
 let dashboardPollingActive = canPollDashboard();
 
+function renderDashboardPaused() {
+    const dot = document.getElementById('live-dot');
+    const label = document.getElementById('live-label');
+    if (!dot || !label) {
+        return;
+    }
+
+    dot.classList.add('live-dot-stale');
+    label.classList.add('live-label-stale');
+    label.textContent = 'Paused';
+    label.title = 'Dashboard polling is paused while this window is inactive';
+}
+
 function syncDashboardPolling() {
     const wasActive = dashboardPollingActive;
     dashboardPollingActive = canPollDashboard();
-    if (!wasActive && dashboardPollingActive) {
+    if (dashboardPollingActive) {
+        if (wasActive) {
+            return;
+        }
+        renderBoardFreshness();
         document.querySelectorAll('[data-dashboard-poller]').forEach(function(poller) {
             htmx.trigger(poller, 'dashboardRefresh');
         });
+    } else if (wasActive) {
+        renderDashboardPaused();
     }
 }
 
@@ -211,6 +230,10 @@ document.addEventListener('htmx:beforeRequest', function(event) {
         event.preventDefault();
     }
 });
+
+if (!dashboardPollingActive) {
+    renderDashboardPaused();
+}
 
 // Re-render on an interval so the age keeps ticking while the board sits stale,
 // rather than freezing at whatever it read when the first poll failed.

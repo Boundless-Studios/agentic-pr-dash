@@ -16,7 +16,11 @@ def test_every_periodic_partial_is_lifecycle_gated_and_resumable() -> None:
     # variants renders, so a live page runs at most five concurrently.
     assert periodic_pollers == 7, "measurement changed: update the resource budget"
     assert source.count('data-dashboard-poller') == periodic_pollers
-    assert source.count(', dashboardRefresh"') == periodic_pollers
+    assert source.count(', dashboardRefresh queue:none"') == periodic_pollers
+    assert source.count('every 5s queue:none') == 4
+    assert source.count('every 15s queue:none') == 2
+    assert source.count('every 3s queue:none') == 1
+    assert source.count('dashboardRefresh queue:none') == periodic_pollers
 
 
 def test_background_polling_stops_and_resumes_once() -> None:
@@ -30,6 +34,9 @@ def test_background_polling_stops_and_resumes_once() -> None:
     assert source.count("addEventListener('htmx:beforeRequest'") == 1
     assert "event.preventDefault()" in source
     assert "htmx.trigger(poller, 'dashboardRefresh')" in source
+    assert "renderDashboardPaused()" in source
+    assert "label.textContent = 'Paused'" in source
+    assert "dashboardPollingActive = canPollDashboard();\n    if (dashboardPollingActive)" in source
 
 
 def test_board_swap_does_not_force_layout_for_each_card() -> None:
