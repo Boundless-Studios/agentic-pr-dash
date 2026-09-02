@@ -147,6 +147,34 @@ def test_mutable_review_state_is_taken_from_final_identity_read(monkeypatch) -> 
     assert blockers == ["changes_requested"]
 
 
+def test_explicit_pr_retains_mutable_state_from_post_probe_snapshot(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    initial = _raw_pr()
+    final = {**_raw_pr(), "isDraft": True, "mergeStateStatus": "DRAFT"}
+    snapshots = iter([[], [initial], [final]])
+    monkeypatch.setattr(
+        github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
+    )
+    monkeypatch.setattr(
+        github_api,
+        "_rest_pr_payload",
+        lambda *_a, **_k: {**initial, "state": "open"},
+    )
+    monkeypatch.setattr(pr_state, "_gh_pr_view_field", lambda *_a: ("APPROVED", ""))
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda *_a: github_api.ObservationReadResult.observed(([], [])),
+    )
+
+    with pr_state.authoritative_maintenance_read():
+        pr = pr_state._resolve_pr_by_number(77, "/worktree")
+
+    assert pr.is_draft is True
+    assert pr.merge_state == "DRAFT"
+    assert pr.review_decision == "APPROVED"
+
+
 def test_unresolved_thread_fallback_failure_is_unavailable(monkeypatch) -> None:
     _stub_detail_reads(monkeypatch)
     monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_a, **_k: [_raw_pr()])

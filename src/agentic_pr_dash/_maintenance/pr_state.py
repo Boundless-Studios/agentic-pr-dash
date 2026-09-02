@@ -639,10 +639,13 @@ def _resolve_pr_by_number(
             if diagnostic:
                 return _GH_UNAVAILABLE
             raw["reviewDecision"] = review_decision or "none"
-            if _authoritative_identity_snapshot(
+            post_probe = _authoritative_identity_snapshot(
                 pr_number, observed_head, observed_base, observed_branch, cwd
-            ) is None:
+            )
+            if post_probe is None:
                 return _GH_UNAVAILABLE
+            post_probe["reviewDecision"] = review_decision or "none"
+            raw = post_probe
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 

@@ -570,16 +570,14 @@ def _stop_gate_impl(args) -> int:
     # pid, bounded by a short shared budget for Stop-hook deadline safety. A PR
     # created mid-session whose arm hook was missed is adopted here (its marker is
     # written), so the passive owned-worktree collection below sees it. A FRESH
-    # adoption must NOT stay hidden behind the clean-stop rate-limit, so it
-    # bypasses the early-return for this one tick (BOU-1787). The adoption pass is
+    # adoption must be included in this tick (BOU-1787). The adoption pass is
     # cheap on the common "everything already armed" stop: no candidate is
     # unmarked, so it never makes the gh call.
-    newly_adopted: list[str] = []
     detached: list[dict] = []
     if session_id:
         budget = _env_int("STOP_RECONCILE_BUDGET", 8)
         deadline = time.monotonic() + budget if budget > 0 else None
-        reconciled_owned, newly_adopted = _reconcile_owned_across_roots(
+        reconciled_owned, _ = _reconcile_owned_across_roots(
             session_id, cwd, owner_pid, deadline
         )
     else:
@@ -588,18 +586,6 @@ def _stop_gate_impl(args) -> int:
     interval = _env_int("STOP_INTERVAL", 180)
     state = _load_stop_state(cwd)
     now = time.time()
-    # A released fingerprint is still a pending observation whose durable
-    # identity must be rechecked on every stop.  Treating it as clean here
-    # would hide a newly published head (or restarted CI) until STOP_INTERVAL
-    # expires.
-    last_pending = bool(
-        state.get("fingerprint") or state.get("released_fingerprint")
-    )
-    rate_limited = (
-        interval > 0
-        and not last_pending
-        and (now - float(state.get("ts", 0) or 0)) < interval
-    )
     gate_budget = _env_int("STOP_GATE_BUDGET", 60)
     gate_deadline = time.monotonic() + gate_budget if gate_budget > 0 else None
     checkout_identity, identity_complete = _bounded_checkout_identity(
@@ -615,12 +601,9 @@ def _stop_gate_impl(args) -> int:
             file=sys.stderr,
         )
         return 2
-    if (
-        rate_limited
-        and not newly_adopted
-        and state.get("checkout_identity") == checkout_identity
-    ):
-        return 0
+    # Remote review and CI state can change without changing any checkout
+    # identity.  Every stop attempt therefore proceeds to an authoritative
+    # observation, even immediately after a clean tick.
     _save_stop_state(cwd, {**state, "ts": now, "checkout_identity": checkout_identity})
 
     # BOU-2223 Stage 2: flip ownership reads onto the claim store, with the
@@ -725,19 +708,9 @@ def _stop_gate_impl(args) -> int:
     checked_count = 0
     unknown_worktrees: list[str] = []
 
-    # BOU-2556: per-PR cache across FIRINGS (separate stop-gate subprocesses),
-    # keyed on each owned worktree's local head sha — distinct from, and
-    # deliberately reusing, `interval` (STOP_INTERVAL) above rather than
-    # inventing a second cache-lifetime knob. STOP_INTERVAL already skips the
-    # WHOLE gate for up to `interval` seconds when the LAST tick found nothing
-    # pending; this cache extends that exact tolerance to the per-PR case,
-    # which STOP_INTERVAL cannot help with once ANY owned PR is pending (the
-    # whole-gate skip is disabled the moment `last_pending` is true, so a
-    # session with one blocked PR among many re-pays every OTHER PR's query on
-    # every single stop without this). Only ever short-circuits a CLEAN (code
-    # 0) verdict for an UNCHANGED head sha within `interval` seconds — a cached
-    # PENDING or unobservable result is never trusted stale, so real work
-    # always keeps re-surfacing and an outage is never papered over.
+    # Retain the legacy cache file only for compatible state cleanup. Remote
+    # clean entries never short-circuit a check: reviews and CI can change
+    # while the local head remains unchanged.
     pr_head_cache = {
         wt: entry for wt, entry in _load_pr_head_cache(cwd).items() if wt in owned
     }
