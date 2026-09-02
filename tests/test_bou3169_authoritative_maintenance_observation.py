@@ -209,7 +209,7 @@ def test_authoritative_scope_discards_primed_detail_cache() -> None:
         assert github_api.get_primed_mergeability(77, "/worktree") is None
 
 
-def test_authoritative_scope_preserves_fresh_checkpoint_batch() -> None:
+def test_authoritative_scope_discards_preloop_checkpoint_batch() -> None:
     github_api.clear_pr_batch_cache()
     github_api.prime_pr_batch_cache(
         "acme/widgets",
@@ -219,10 +219,7 @@ def test_authoritative_scope_preserves_fresh_checkpoint_batch() -> None:
     github_api.mark_pr_batch_cache_authoritative()
 
     with pr_state.authoritative_maintenance_read():
-        assert github_api.get_primed_mergeability(77, "/worktree") == (
-            "CLEAN",
-            "MERGEABLE",
-        )
+        assert github_api.get_primed_mergeability(77, "/worktree") is None
 
 
 def test_stop_fingerprint_ignores_only_volatile_observation_time() -> None:

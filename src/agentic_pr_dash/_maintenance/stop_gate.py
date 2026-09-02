@@ -501,7 +501,6 @@ def _prefetch_owned_pr_state(
             )
             if entries:
                 github_api.prime_pr_batch_cache(repo, entries)
-                github_api.mark_pr_batch_cache_authoritative()
         except Exception:  # noqa: BLE001 - optimization only, never fail the gate
             pass
 

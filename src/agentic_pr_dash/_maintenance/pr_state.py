@@ -23,8 +23,10 @@ def authoritative_maintenance_read():
     # The Stop path primes detail snapshots before resolving individual PRs.
     # A maintenance checkpoint must start after that cache boundary so every
     # dependent read (commit, CI, threads, reviews) reaches GitHub again.
-    if not github_api.pr_batch_cache_is_authoritative():
-        github_api.clear_pr_batch_cache()
+    # A pre-loop batch can change before this particular PR is checked. Exact
+    # maintenance observations therefore always discard it and re-read the
+    # current PR; batching remains an optimization for non-authoritative probes.
+    github_api.clear_pr_batch_cache()
     token = _AUTHORITATIVE_MAINTENANCE_READ.set(True)
     try:
         yield
@@ -84,9 +86,10 @@ def _authoritative_identity_snapshot(
     pr_number: int,
     expected_head: str,
     expected_base: str,
+    expected_branch: str,
     cwd: str,
 ) -> dict | None:
-    """Fence a maintenance read against head/base changes during observation."""
+    """Fence a maintenance read against PR identity changes during observation."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
 
     prs = github_api.list_open_prs_cached(cwd, force=True)
@@ -100,6 +103,7 @@ def _authoritative_identity_snapshot(
     if (
         fresh.get("headRefOid") != expected_head
         or fresh.get("baseRefName") != expected_base
+        or fresh.get("headRefName") != expected_branch
     ):
         return None
     return fresh
@@ -494,11 +498,12 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         return _GH_UNAVAILABLE
     observed_head = raw.get("headRefOid") or latest_sha
     observed_base = raw.get("baseRefName", "main")
+    observed_branch = raw.get("headRefName") or branch
     if authoritative:
         if not latest_sha or latest_sha != observed_head:
             return _GH_UNAVAILABLE
         fresh = _authoritative_identity_snapshot(
-            pr_number, observed_head, observed_base, cwd
+            pr_number, observed_head, observed_base, observed_branch, cwd
         )
         if fresh is None:
             return _GH_UNAVAILABLE
@@ -617,15 +622,23 @@ def _resolve_pr_by_number(
         return _GH_UNAVAILABLE
     observed_head = (raw or {}).get("headRefOid") or latest_sha
     observed_base = (raw or {}).get("baseRefName", "main")
+    observed_branch = (raw or {}).get("headRefName", "")
     if authoritative:
         if not latest_sha or latest_sha != observed_head:
             return _GH_UNAVAILABLE
         fresh = _authoritative_identity_snapshot(
-            pr_number, observed_head, observed_base, cwd
+            pr_number, observed_head, observed_base, observed_branch, cwd
         )
         if fresh is None:
             return _GH_UNAVAILABLE
         raw = fresh
+        if needs_review_decision_probe:
+            review_decision, diagnostic = _gh_pr_view_field(
+                cwd, pr_number, "reviewDecision"
+            )
+            if diagnostic:
+                return _GH_UNAVAILABLE
+            raw["reviewDecision"] = review_decision or "none"
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 
