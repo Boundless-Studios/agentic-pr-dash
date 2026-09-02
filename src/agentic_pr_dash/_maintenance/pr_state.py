@@ -441,6 +441,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # underlying `gh` call within the TTL window instead of one per caller.
     prs = github_api.list_open_prs_cached(cwd, force=force)
     raw: dict | None = None
+    needs_review_decision_probe = prs is None
     if prs is None:
         # Quota-safe REST fallback (BOU-1966): a rate-limited author list can
         # still verify THIS branch's PR via per-PR REST calls. Any other
@@ -460,6 +461,35 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
             return None
 
     pr_number = int(raw["number"])
+    if authoritative:
+        early_head = raw.get("headRefOid", "")
+        early_base = raw.get("baseRefName", "main")
+        early_branch = raw.get("headRefName") or branch
+        fresh = _authoritative_identity_snapshot(
+            pr_number, early_head, early_base, early_branch, cwd
+        )
+        if fresh is None:
+            return _GH_UNAVAILABLE
+        raw = fresh
+        if raw.get("isDraft", False):
+            return PRData(
+                number=pr_number,
+                author=_payload_author_login(raw),
+                title=raw.get("title", ""),
+                branch=branch,
+                base_branch=raw.get("baseRefName", "main"),
+                url=raw.get("url", ""),
+                is_draft=True,
+                merge_state=raw.get("mergeStateStatus", "unknown"),
+                mergeable=raw.get("mergeable", "unknown"),
+                review_decision=raw.get("reviewDecision", "") or "none",
+                latest_commit_sha=early_head,
+                maintenance_observed_head_sha=early_head,
+                maintenance_observed_base_branch=early_base,
+                maintenance_observed_at=datetime.now(UTC),
+                worktree_path=cwd,
+                status=PRStatus.CLEAN,
+            )
     # Preserve a live gh-availability signal across the detail fetch (BOU-1923
     # review, BOU-1966). A warm snapshot (or the REST fallback above) skips the
     # `list_open_prs` failure that used to turn a current gh/rate-limit outage
@@ -508,6 +538,19 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         if fresh is None:
             return _GH_UNAVAILABLE
         raw = fresh
+        if needs_review_decision_probe:
+            review_decision, diagnostic = _gh_pr_view_field(
+                cwd, pr_number, "reviewDecision"
+            )
+            if diagnostic:
+                return _GH_UNAVAILABLE
+            post_probe = _authoritative_identity_snapshot(
+                pr_number, observed_head, observed_base, observed_branch, cwd
+            )
+            if post_probe is None:
+                return _GH_UNAVAILABLE
+            post_probe["reviewDecision"] = review_decision or "none"
+            raw = post_probe
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
 

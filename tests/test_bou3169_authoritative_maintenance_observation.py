@@ -52,7 +52,7 @@ def test_check_forces_a_fresh_pr_list_and_records_exact_observation(monkeypatch)
 
     pr, blockers = worktree_check._resolve_and_blockers("/worktree")
 
-    assert forced == [True, True]
+    assert forced == [True, True, True, True]
     assert blockers == []
     assert pr.latest_commit_sha == "sha-b"
     assert pr.maintenance_observed_head_sha == "sha-b"
@@ -133,7 +133,7 @@ def test_mutable_review_state_is_taken_from_final_identity_read(monkeypatch) -> 
     _stub_detail_reads(monkeypatch)
     initial = _raw_pr()
     final = {**_raw_pr(), "reviewDecision": "CHANGES_REQUESTED"}
-    snapshots = iter([[initial], [final]])
+    snapshots = iter([[initial], [initial], [final], [final]])
     monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots))
     monkeypatch.setattr(
         github_api,
@@ -173,6 +173,67 @@ def test_explicit_pr_retains_mutable_state_from_post_probe_snapshot(monkeypatch)
     assert pr.is_draft is True
     assert pr.merge_state == "DRAFT"
     assert pr.review_decision == "APPROVED"
+
+
+def test_draft_short_circuits_before_unavailable_blocker_details(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    draft = {**_raw_pr(), "isDraft": True}
+    snapshots = iter([[_raw_pr()], [draft]])
+    monkeypatch.setattr(
+        github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
+    )
+    monkeypatch.setattr(
+        github_api,
+        "get_ci_checks_observation",
+        lambda *_a: github_api.ObservationReadResult.unavailable("CI unavailable"),
+    )
+
+    pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr.is_draft is True
+    assert blockers == []
+
+
+def test_branch_rest_fallback_preserves_probed_review_decision(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    monkeypatch.setattr(github_api, "list_open_prs_cached", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        pr_state, "_rest_fallback_entry_for_branch", lambda *_a: _raw_pr()
+    )
+    monkeypatch.setattr(github_api, "_rest_pr_payload", lambda *_a, **_k: _raw_pr())
+    monkeypatch.setattr(
+        pr_state, "_gh_pr_view_field", lambda *_a: ("CHANGES_REQUESTED", "")
+    )
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda *_a: github_api.ObservationReadResult.observed(([], [])),
+    )
+
+    pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr.review_decision == "CHANGES_REQUESTED"
+    assert blockers == ["changes_requested"]
+
+
+def test_head_change_during_unresolved_thread_read_fails_closed(monkeypatch) -> None:
+    _stub_detail_reads(monkeypatch)
+    snapshots = iter(
+        [[_raw_pr()], [_raw_pr()], [_raw_pr()], [_raw_pr("sha-new")]]
+    )
+    monkeypatch.setattr(
+        github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
+    )
+    monkeypatch.setattr(
+        github_api,
+        "scan_review_threads_observation",
+        lambda *_a: github_api.ObservationReadResult.observed(([], [])),
+    )
+
+    pr, blockers = worktree_check._resolve_and_blockers("/worktree")
+
+    assert pr is pr_state._GH_UNAVAILABLE
+    assert blockers == []
 
 
 def test_unresolved_thread_fallback_failure_is_unavailable(monkeypatch) -> None:

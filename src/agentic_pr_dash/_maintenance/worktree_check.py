@@ -466,6 +466,20 @@ def _resolve_and_blockers(cwd: str):
             )
             if unresolved_threads is pr_state._GH_UNAVAILABLE:
                 pr = pr_state._GH_UNAVAILABLE
+            elif resolver_is_native:
+                final = pr_state._authoritative_identity_snapshot(
+                    pr.number,
+                    pr.maintenance_observed_head_sha,
+                    pr.maintenance_observed_base_branch,
+                    pr.branch,
+                    cwd,
+                )
+                if final is None:
+                    pr = pr_state._GH_UNAVAILABLE
+                else:
+                    pr.is_draft = bool(final.get("isDraft", False))
+                    pr.merge_state = final.get("mergeStateStatus", "unknown")
+                    pr.mergeable = final.get("mergeable", "unknown")
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415
