@@ -1088,7 +1088,7 @@ def test_bounded_repo_slug_rejects_local_origin(monkeypatch):
     assert markers._bounded_repo_slug("/worktree", time.monotonic() + 10) == ""
 
 
-def test_strict_binding_draft_state_overrides_stale_pr_snapshot(monkeypatch):
+def test_fresh_resolver_draft_state_overrides_stale_binding(monkeypatch):
     binding = CurrentPRResolution(
         "/worktree",
         "feature-a",
@@ -1097,7 +1097,7 @@ def test_strict_binding_draft_state_overrides_stale_pr_snapshot(monkeypatch):
         is_draft=True,
         resolved=True,
     )
-    stale_pr = models.PRData(
+    fresh_pr = models.PRData(
         number=3017,
         title="PR",
         branch="feature-a",
@@ -1105,12 +1105,12 @@ def test_strict_binding_draft_state_overrides_stale_pr_snapshot(monkeypatch):
         is_draft=False,
         latest_commit_sha="same-sha",
     )
-    monkeypatch.setattr(pr_state, "_resolve_pr_by_number", lambda number, cwd: stale_pr)
+    monkeypatch.setattr(pr_state, "_resolve_pr_by_number", lambda number, cwd: fresh_pr)
 
     with worktree_check._use_current_pr_binding(binding):
         pr, blockers = worktree_check._resolve_and_blockers("/worktree")
 
-    assert pr.is_draft is True
+    assert pr.is_draft is False
     assert blockers == []
 
 

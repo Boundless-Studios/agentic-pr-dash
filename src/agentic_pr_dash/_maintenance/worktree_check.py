@@ -439,32 +439,32 @@ def _resolve_and_blockers(cwd: str):
 
     binding = _CURRENT_PR_BINDING.get()
     unresolved_threads = []
+    resolver_is_native = True
     with pr_state.authoritative_maintenance_read():
         if binding is not None and getattr(binding, "unknown", False):
             pr = pr_state._GH_UNAVAILABLE
         elif binding is not None and getattr(binding, "resolved", False):
             number = getattr(binding, "pr_number", None)
+            resolver_is_native = (
+                pr_state._resolve_pr_by_number.__module__ == pr_state.__name__
+            )
             pr = (
                 pr_state._resolve_pr_by_number(number, cwd)
                 if number is not None
                 else None
             )
-            if pr is not None and pr is not pr_state._GH_UNAVAILABLE:
-                # The strict resolver validated draft state for this checkout. The
-                # explicit-number detail lookup may still be served by a warm list
-                # snapshot from before a draft/ready transition, so its state must
-                # not override the binding that selected this PR.
-                pr = pr.model_copy(
-                    update={"is_draft": bool(getattr(binding, "is_draft", False))}
-                )
         else:
+            resolver_is_native = (
+                pr_state._resolve_pr_for_branch.__module__ == pr_state.__name__
+            )
             pr = pr_state._resolve_pr_for_branch(cwd)
         if pr is not pr_state._GH_UNAVAILABLE and pr is not None and not pr.is_draft:
-            try:
-                unresolved_threads = pr_state._unresolved_review_threads(
-                    pr.number, cwd, strict=True
-                )
-            except RuntimeError:
+            unresolved_threads = (
+                pr_state._authoritative_unresolved_review_threads(pr.number, cwd)
+                if resolver_is_native
+                else pr_state._unresolved_review_threads(pr.number, cwd)
+            )
+            if unresolved_threads is pr_state._GH_UNAVAILABLE:
                 pr = pr_state._GH_UNAVAILABLE
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []

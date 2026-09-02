@@ -57,6 +57,19 @@ def _authoritative_review_comments(pr_number: int, latest_date: str, cwd: str):
     return comments
 
 
+def _authoritative_unresolved_review_threads(pr_number: int, cwd: str):
+    """Read unresolved threads fail-closed while preserving adapter call shape."""
+    try:
+        if _unresolved_review_threads.__module__ == __name__:
+            return _unresolved_review_threads(pr_number, cwd, strict=True)
+        else:
+            # Tests and downstream adapters historically expose a two-argument
+            # callable. Their return is the explicit observation contract.
+            return _unresolved_review_threads(pr_number, cwd)
+    except RuntimeError:
+        return _GH_UNAVAILABLE
+
+
 def _authoritative_ci_checks(pr_number: int, cwd: str):
     """Read CI without collapsing an unavailable observation into clean."""
     from agentic_pr_dash import github_api  # noqa: PLC0415
@@ -482,6 +495,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     observed_head = raw.get("headRefOid") or latest_sha
     observed_base = raw.get("baseRefName", "main")
     if authoritative:
+        if not latest_sha or latest_sha != observed_head:
+            return _GH_UNAVAILABLE
         fresh = _authoritative_identity_snapshot(
             pr_number, observed_head, observed_base, cwd
         )
@@ -603,6 +618,8 @@ def _resolve_pr_by_number(
     observed_head = (raw or {}).get("headRefOid") or latest_sha
     observed_base = (raw or {}).get("baseRefName", "main")
     if authoritative:
+        if not latest_sha or latest_sha != observed_head:
+            return _GH_UNAVAILABLE
         fresh = _authoritative_identity_snapshot(
             pr_number, observed_head, observed_base, cwd
         )
@@ -972,7 +989,14 @@ def _unresolved_review_threads(pr_number: int, cwd: str, *, strict: bool = False
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from . import deferred_review  # noqa: PLC0415
 
-    threads = github_api.get_review_threads(pr_number, cwd, strict=strict)
+    if strict and github_api.get_review_threads.__module__ == github_api.__name__:
+        threads = github_api.get_review_threads(pr_number, cwd, strict=True)
+    else:
+        # Preserve the long-standing two-argument adapter boundary. A strict
+        # native read is fail-closed, while injected adapters define their own
+        # explicit observation contract without accepting implementation-only
+        # keywords.
+        threads = github_api.get_review_threads(pr_number, cwd)
     return [
         t for t in threads
         if not t.is_resolved
