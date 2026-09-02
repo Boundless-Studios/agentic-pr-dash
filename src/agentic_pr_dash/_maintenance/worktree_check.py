@@ -480,6 +480,11 @@ def _resolve_and_blockers(cwd: str):
                     pr.is_draft = bool(final.get("isDraft", False))
                     pr.merge_state = final.get("mergeStateStatus", "unknown")
                     pr.mergeable = final.get("mergeable", "unknown")
+                    pr.review_decision = (
+                        final.get("reviewDecision", "")
+                        or pr.review_decision
+                        or "none"
+                    )
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415
