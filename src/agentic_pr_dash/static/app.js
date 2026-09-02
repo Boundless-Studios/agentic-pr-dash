@@ -154,6 +154,13 @@ function formatStaleAge(ms) {
 }
 
 function renderBoardFreshness() {
+    // A request that began before blur can finish after polling is paused.
+    // Keep the inactive lifecycle state authoritative over late responses.
+    if (!dashboardPollingActive) {
+        renderDashboardPaused();
+        return;
+    }
+
     const dot = document.getElementById('live-dot');
     const label = document.getElementById('live-label');
     if (!dot || !label) {

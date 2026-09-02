@@ -37,6 +37,11 @@ def test_background_polling_stops_and_resumes_once() -> None:
     assert "renderDashboardPaused()" in source
     assert "label.textContent = 'Paused'" in source
     assert "dashboardPollingActive = canPollDashboard();\n    if (dashboardPollingActive)" in source
+    freshness_body = source.split("function renderBoardFreshness()", 1)[1].split(
+        "function canPollDashboard()", 1
+    )[0]
+    assert "if (!dashboardPollingActive)" in freshness_body
+    assert "renderDashboardPaused();" in freshness_body
 
 
 def test_board_swap_does_not_force_layout_for_each_card() -> None:
