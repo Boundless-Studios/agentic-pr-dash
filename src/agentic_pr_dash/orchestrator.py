@@ -902,17 +902,15 @@ class Orchestrator:
         this one. A PR whose ``updatedAt`` has not moved is left alone, so the
         hourly floor still bounds background spend on quiet PRs.
 
-        Note where the value comes from: ``PR_SNAPSHOT_FIELDS`` does NOT request
-        ``updatedAt``, so the rich ``gh pr list`` payload has none and
-        :meth:`_cache_metadata` drops the merged value every time it replaces
-        the cache. That is fine and deliberate — the REST probe is the source of
-        this signal, and it supplies it exactly when it matters: the conditional
-        response body contains every open PR's ``updated_at``, so a comment
-        changes the body, changes the ETag, and the probe returns 200 rather
-        than 304. ``_pr_last_updated_at`` survives the cache replacement, so the
-        re-supplied value does not read as a spurious change. Do not "fix" the
-        wipe by adding ``updatedAt`` to ``PR_SNAPSHOT_FIELDS`` without checking
-        ``_SNAPSHOT_SERVABLE_FIELDS`` and the snapshot-shape tests.
+        Note where the value comes from: both the REST probe and, since
+        BOU-3169, the rich ``gh pr list`` payload (``PR_SNAPSHOT_FIELDS`` now
+        requests ``updatedAt`` so the stop gate can key its per-PR clean cache
+        on it). The conditional REST response body contains every open PR's
+        ``updated_at``, so a comment changes the body, changes the ETag, and
+        the probe returns 200 rather than 304. ``_pr_last_updated_at`` is the
+        only state this detection reads, and it survives every cache
+        replacement, so a re-supplied value never reads as a spurious change
+        whichever source carried it.
         """
 
         updated_at = raw.get("updatedAt")
@@ -927,9 +925,10 @@ class Orchestrator:
             # every slice, so there is nothing to invalidate. Just seed.
             return
         if previous is None:
-            # A PR we already track, seeing its first timestamp. Because
-            # PR_SNAPSHOT_FIELDS omits updatedAt, this is the normal state after
-            # startup — and if the REST 200 that produced it was itself caused by
+            # A PR we already track, seeing its first timestamp. This is the
+            # normal state right after startup for a PR discovered before its
+            # first listing carried updatedAt — and if the REST 200 that
+            # produced it was itself caused by
             # a comment, swallowing it loses the only signal that PR changed
             # (BOU-3095 PR #169 review). Later probes would see the same value
             # and do nothing. Be conservative and treat it as a change.
