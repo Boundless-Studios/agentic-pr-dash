@@ -154,6 +154,13 @@ function formatStaleAge(ms) {
 }
 
 function renderBoardFreshness() {
+    // A request that began before blur can finish after polling is paused.
+    // Keep the inactive lifecycle state authoritative over late responses.
+    if (!dashboardPollingActive) {
+        renderDashboardPaused();
+        return;
+    }
+
     const dot = document.getElementById('live-dot');
     const label = document.getElementById('live-label');
     if (!dot || !label) {
@@ -177,9 +184,71 @@ function renderBoardFreshness() {
         age + ' old.';
 }
 
+// --- Standalone-app polling lifecycle ---
+// Chrome keeps an installed app alive when it is covered or unfocused. HTMX's
+// interval triggers otherwise continue hitting every partial indefinitely.
+// Cancel only dashboard-owned periodic requests; manual forms and other HTMX
+// interactions retain their normal behaviour. A transition back to active
+// emits exactly one refresh per poller, irrespective of whether Chrome reports
+// focus and visibility changes together.
+
+function canPollDashboard() {
+    return !document.hidden && document.hasFocus();
+}
+
+let dashboardPollingActive = canPollDashboard();
+
+function renderDashboardPaused() {
+    const dot = document.getElementById('live-dot');
+    const label = document.getElementById('live-label');
+    if (!dot || !label) {
+        return;
+    }
+
+    dot.classList.add('live-dot-stale');
+    label.classList.add('live-label-stale');
+    label.textContent = 'Paused';
+    label.title = 'Dashboard polling is paused while this window is inactive';
+}
+
+function syncDashboardPolling() {
+    const wasActive = dashboardPollingActive;
+    dashboardPollingActive = canPollDashboard();
+    if (dashboardPollingActive) {
+        if (wasActive) {
+            return;
+        }
+        renderBoardFreshness();
+        document.querySelectorAll('[data-dashboard-poller]').forEach(function(poller) {
+            htmx.trigger(poller, 'dashboardRefresh');
+        });
+    } else if (wasActive) {
+        renderDashboardPaused();
+    }
+}
+
+document.addEventListener('visibilitychange', syncDashboardPolling);
+window.addEventListener('focus', syncDashboardPolling);
+window.addEventListener('blur', syncDashboardPolling);
+
+document.addEventListener('htmx:beforeRequest', function(event) {
+    const source = event.detail && event.detail.elt;
+    if (source && source.matches('[data-dashboard-poller]') && !dashboardPollingActive) {
+        event.preventDefault();
+    }
+});
+
+if (!dashboardPollingActive) {
+    renderDashboardPaused();
+}
+
 // Re-render on an interval so the age keeps ticking while the board sits stale,
 // rather than freezing at whatever it read when the first poll failed.
-setInterval(renderBoardFreshness, 1000);
+setInterval(function() {
+    if (dashboardPollingActive) {
+        renderBoardFreshness();
+    }
+}, 1000);
 
 function isBoardRequest(detail) {
     const target = detail && detail.target;
@@ -221,11 +290,8 @@ document.addEventListener('htmx:afterSwap', function(event) {
         renderBoardFreshness();
         applyCardFilter();
         restoreBoardScroll(target);
-        target.querySelectorAll('.card').forEach(function(card) {
-            card.style.animation = 'none';
-            card.offsetHeight; // trigger reflow
-            card.style.animation = '';
-        });
+        // Cards have no entry animation. Do not synchronously read layout for
+        // every card after every five-second swap.
     } else if (target.classList.contains('worktrees-panel')) {
         // The tab's 5s poll replaces every row; without this the search box
         // stops filtering the moment the first swap lands.

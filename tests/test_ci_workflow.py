@@ -22,3 +22,11 @@ def test_ci_uses_only_github_hosted_runner() -> None:
             "fromJSON(",
         )
     )
+
+
+def test_ci_matrix_runs_every_python_lane_after_a_failure() -> None:
+    workflow = yaml.safe_load(WORKFLOW_PATH.read_text())
+
+    strategy = workflow["jobs"]["test"]["strategy"]
+    assert strategy["fail-fast"] is False
+    assert strategy["matrix"]["python-version"] == ["3.11", "3.12", "3.13"]

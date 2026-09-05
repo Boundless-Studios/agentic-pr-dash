@@ -43,8 +43,9 @@
             </span>
             <span class="runner-summary">{{ runner_summary_label }}</span>
             <span class="bug-bash-banner-slot"
+                  data-dashboard-poller
                   hx-get="/partials/bug-bash-banner"
-                  hx-trigger="every 5s"
+                  hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                   hx-swap="innerHTML">
                 {% include 'partials/bug_bash_banner.html' %}
             </span>
@@ -94,22 +95,25 @@
     <div class="layout">
         {% if active_tab == 'runner_issues' %}
         <section class="runner-issues-panel"
+                 data-dashboard-poller
                  hx-get="{{ runner_issues_partial_url }}"
-                 hx-trigger="every 5s"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/runner_issues.html' %}
         </section>
         {% elif active_tab == 'worktrees' %}
         <section class="worktrees-panel"
+                 data-dashboard-poller
                  hx-get="{{ worktrees_partial_url | default('/partials/worktrees', true) }}"
-                 hx-trigger="every 5s"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/worktrees.html' %}
         </section>
         {% else %}
         <section class="board"
+                 data-dashboard-poller
                  hx-get="{{ board_partial_url }}"
-                 hx-trigger="every 5s"
+                 hx-trigger="every 5s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
             {% include 'partials/board.html' %}
         </section>
@@ -117,24 +121,27 @@
 
         <aside class="sidebar">
             {% if runner_fleet is defined %}
-            <div hx-get="/partials/runner-fleet"
-                 hx-trigger="every 15s"
+            <div data-dashboard-poller
+                 hx-get="/partials/runner-fleet"
+                 hx-trigger="every 15s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/runner_fleet.html' %}
             </div>
             {% endif %}
             {% if quota is defined %}
             <div class="quota-status-slot"
+                 data-dashboard-poller
                  hx-get="/partials/quota"
-                 hx-trigger="every 15s"
+                 hx-trigger="every 15s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/quota_status.html' %}
             </div>
             {% endif %}
             <h2>Activity</h2>
             <div class="event-list"
+                 data-dashboard-poller
                  hx-get="/partials/event-log"
-                 hx-trigger="every 3s"
+                 hx-trigger="every 3s queue:none, dashboardRefresh queue:none"
                  hx-swap="innerHTML">
                 {% include 'partials/event_log.html' %}
             </div>
