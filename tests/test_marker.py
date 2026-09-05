@@ -8,6 +8,7 @@ import pytest
 
 from agentic_pr_dash import agents
 from agentic_pr_dash import config
+from agentic_pr_dash import github_api
 from agentic_pr_dash import maintenance_check as mc
 from agentic_pr_dash import session_registry
 from agentic_pr_dash._maintenance import worktrees as _worktrees_mod
@@ -578,6 +579,10 @@ def test_check_worktree_defers_to_live_independent_owner(tmp_path, monkeypatch):
     heartbeats = []
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    # BOU-3169: unresolved threads are read through the authoritative (strict)
+    # path unconditionally now, regardless of whether the resolver is native
+    # or (as here) faked — this fake must accept the `strict` kwarg.
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *_a, **_k: [])
     monkeypatch.setattr(
         _markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work)
     )
@@ -623,6 +628,10 @@ def test_check_worktree_clean_tick_does_not_refresh_stolen_marker(tmp_path, monk
     heartbeats = []
     monkeypatch.setattr(_markers_mod, "_live_foreign_owner", lambda cwd, sid: None)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: pr)
+    # BOU-3169: unresolved threads are read through the authoritative (strict)
+    # path unconditionally now, regardless of whether the resolver is native
+    # or (as here) faked — this fake must accept the `strict` kwarg.
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *_a, **_k: [])
     monkeypatch.setattr(_markers_mod, "_touch_owner_heartbeat", lambda cwd, sid, work: heartbeats.append(work))
     from agentic_pr_dash import maintenance as _maint
     monkeypatch.setattr(_maint, "blockers_for_pr", lambda pr: [])  # CLEAN

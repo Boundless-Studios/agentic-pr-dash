@@ -439,34 +439,34 @@ def _resolve_and_blockers(cwd: str):
 
     binding = _CURRENT_PR_BINDING.get()
     unresolved_threads = []
-    resolver_is_native = True
     with pr_state.authoritative_maintenance_read():
         if binding is not None and getattr(binding, "unknown", False):
             pr = pr_state._GH_UNAVAILABLE
         elif binding is not None and getattr(binding, "resolved", False):
             number = getattr(binding, "pr_number", None)
-            resolver_is_native = (
-                pr_state._resolve_pr_by_number.__module__ == pr_state.__name__
-            )
             pr = (
                 pr_state._resolve_pr_by_number(number, cwd)
                 if number is not None
                 else None
             )
         else:
-            resolver_is_native = (
-                pr_state._resolve_pr_for_branch.__module__ == pr_state.__name__
-            )
             pr = pr_state._resolve_pr_for_branch(cwd)
         if pr is not pr_state._GH_UNAVAILABLE and pr is not None and not pr.is_draft:
-            unresolved_threads = (
-                pr_state._authoritative_unresolved_review_threads(pr.number, cwd)
-                if resolver_is_native
-                else pr_state._unresolved_review_threads(pr.number, cwd)
+            unresolved_threads = pr_state._authoritative_unresolved_review_threads(
+                pr.number, cwd
             )
             if unresolved_threads is pr_state._GH_UNAVAILABLE:
                 pr = pr_state._GH_UNAVAILABLE
-            elif resolver_is_native:
+            elif getattr(pr, "maintenance_observed_at", None) is not None:
+                # The resolver actually produced an authoritative observation
+                # (a fake standing in for it did not stamp these fields) — a
+                # data condition, not a check on which module defined the
+                # resolver. Fence the final blocker computation against
+                # identity/state drift that happened while threads were being
+                # read. A resolver that never stamped an observation simply
+                # has no ``OBSERVED_*`` evidence in the rendered text, which
+                # the stop-gate/check contract already treats as not
+                # observed-clean.
                 final = pr_state._authoritative_identity_snapshot(
                     pr.number,
                     pr.maintenance_observed_head_sha,
@@ -477,14 +477,23 @@ def _resolve_and_blockers(cwd: str):
                 if final is None:
                     pr = pr_state._GH_UNAVAILABLE
                 else:
-                    pr.is_draft = bool(final.get("isDraft", False))
-                    pr.merge_state = final.get("mergeStateStatus", "unknown")
-                    pr.mergeable = final.get("mergeable", "unknown")
-                    pr.review_decision = (
-                        final.get("reviewDecision", "")
-                        or pr.review_decision
-                        or "none"
-                    )
+                    payload = final.payload
+                    pr.is_draft = bool(payload.get("isDraft", False))
+                    pr.merge_state = payload.get("mergeStateStatus", "unknown")
+                    pr.mergeable = payload.get("mergeable", "unknown")
+                    if final.from_listing:
+                        # The author listing exposes reviewDecision directly —
+                        # trust it completely, including a dismissal (e.g. a
+                        # CHANGES_REQUESTED review superseded by a fresh push)
+                        # that clears it back to "none". Falling back to the
+                        # earlier value here would resurrect a stale decision
+                        # the PR no longer actually carries (BOU-3169 review,
+                        # "clear stale review decisions from the final
+                        # snapshot").
+                        pr.review_decision = payload.get("reviewDecision") or "none"
+                    # else: the REST single-PR fallback cannot expose
+                    # reviewDecision at all (always ""), so keep whatever the
+                    # resolver already observed rather than clobbering it.
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415

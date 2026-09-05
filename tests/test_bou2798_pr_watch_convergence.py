@@ -1010,7 +1010,7 @@ def test_clean_cache_identity_includes_current_pr_and_branch(tmp_path: Path):
     }
 
     assert not _cached_clean_binding_matches(
-        cached, "same-sha", binding, now=101, interval=180
+        cached, "same-sha", binding, now=101, interval=180, updated_at=None,
     )
 
 
@@ -1033,7 +1033,7 @@ def test_clean_cache_identity_includes_validated_draft_state():
     }
 
     assert not _cached_clean_binding_matches(
-        cached, "same-sha", binding, now=101, interval=180
+        cached, "same-sha", binding, now=101, interval=180, updated_at=None,
     )
 
 
@@ -1106,6 +1106,11 @@ def test_fresh_resolver_draft_state_overrides_stale_binding(monkeypatch):
         latest_commit_sha="same-sha",
     )
     monkeypatch.setattr(pr_state, "_resolve_pr_by_number", lambda number, cwd: fresh_pr)
+    # BOU-3169: unresolved threads are now ALWAYS read through the
+    # authoritative (strict) path, regardless of whether the resolver is
+    # native or faked — so this fake must accept the `strict` kwarg the real
+    # adapter is called with.
+    monkeypatch.setattr(github_api, "get_review_threads", lambda *_a, **_k: [])
 
     with worktree_check._use_current_pr_binding(binding):
         pr, blockers = worktree_check._resolve_and_blockers("/worktree")

@@ -52,7 +52,10 @@ def test_check_forces_a_fresh_pr_list_and_records_exact_observation(monkeypatch)
 
     pr, blockers = worktree_check._resolve_and_blockers("/worktree")
 
-    assert forced == [True, True, True, True]
+    # Single-fence design (BOU-3169 review): _resolve_pr_for_branch itself
+    # forces the initial listing and ONE final identity snapshot (2 calls);
+    # worktree_check's own post-threads fence adds a 3rd. No double-fencing.
+    assert forced == [True, True, True]
     assert blockers == []
     assert pr.latest_commit_sha == "sha-b"
     assert pr.maintenance_observed_head_sha == "sha-b"
@@ -147,11 +150,15 @@ def test_mutable_review_state_is_taken_from_final_identity_read(monkeypatch) -> 
     assert blockers == ["changes_requested"]
 
 
-def test_explicit_pr_retains_mutable_state_from_post_probe_snapshot(monkeypatch) -> None:
+def test_explicit_pr_retains_mutable_state_from_single_final_snapshot(monkeypatch) -> None:
+    """Single-fence design (BOU-3169 review): the REST-fallback path probes
+    reviewDecision and THEN takes exactly one final identity snapshot — never
+    a snapshot on both sides of the probe. That one snapshot is still the
+    final word on mutable state discovered after the initial REST read."""
     _stub_detail_reads(monkeypatch)
     initial = _raw_pr()
     final = {**_raw_pr(), "isDraft": True, "mergeStateStatus": "DRAFT"}
-    snapshots = iter([[], [initial], [final]])
+    snapshots = iter([[], [final]])
     monkeypatch.setattr(
         github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
     )
@@ -176,11 +183,13 @@ def test_explicit_pr_retains_mutable_state_from_post_probe_snapshot(monkeypatch)
 
 
 def test_draft_short_circuits_before_unavailable_blocker_details(monkeypatch) -> None:
+    """The draft short-circuit answers from the INITIAL listing already in
+    hand — no extra identity-snapshot call — so a transient CI outage during
+    the (skipped) detail fetch can never turn a draft PR into unavailable."""
     _stub_detail_reads(monkeypatch)
     draft = {**_raw_pr(), "isDraft": True}
-    snapshots = iter([[_raw_pr()], [draft]])
     monkeypatch.setattr(
-        github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
+        github_api, "list_open_prs_cached", lambda *_a, **_k: [draft]
     )
     monkeypatch.setattr(
         github_api,
@@ -217,9 +226,13 @@ def test_branch_rest_fallback_preserves_probed_review_decision(monkeypatch) -> N
 
 
 def test_head_change_during_unresolved_thread_read_fails_closed(monkeypatch) -> None:
+    """Single-fence design: _resolve_pr_for_branch pays 2 calls (initial list
+    + its one final snapshot); worktree_check's OWN post-threads fence is the
+    3rd — and the one that must catch a head that moved while threads were
+    being read."""
     _stub_detail_reads(monkeypatch)
     snapshots = iter(
-        [[_raw_pr()], [_raw_pr()], [_raw_pr()], [_raw_pr("sha-new")]]
+        [[_raw_pr()], [_raw_pr()], [_raw_pr("sha-new")]]
     )
     monkeypatch.setattr(
         github_api, "list_open_prs_cached", lambda *_a, **_k: next(snapshots)
@@ -257,6 +270,7 @@ def test_unresolved_thread_fallback_failure_is_unavailable(monkeypatch) -> None:
 
 
 def test_observation_validator_rejects_head_or_base_mismatch() -> None:
+    observed_at = datetime.now(UTC)
     pr = PRData(
         number=77,
         title="Fresh maintenance",
@@ -267,10 +281,10 @@ def test_observation_validator_rejects_head_or_base_mismatch() -> None:
         status=PRStatus.CLEAN,
         maintenance_observed_head_sha="sha-a",
         maintenance_observed_base_branch="release",
-        maintenance_observed_at=datetime.now(UTC),
+        maintenance_observed_at=observed_at,
     )
 
-    assert pr_state.authoritative_observation_matches(pr) is False
+    assert pr_state.authoritative_observation_matches(pr, observed_at) is False
 
 
 def test_observation_validator_rejects_missing_evidence() -> None:
@@ -284,10 +298,43 @@ def test_observation_validator_rejects_missing_evidence() -> None:
         status=PRStatus.CLEAN,
     )
 
-    assert pr_state.authoritative_observation_matches(pr) is False
+    assert pr_state.authoritative_observation_matches(pr, datetime.now(UTC)) is False
 
 
-def test_authoritative_scope_discards_primed_detail_cache() -> None:
+def test_observation_validator_rejects_evidence_older_than_scope() -> None:
+    """BOU-3169 review, 'require evidence from the current authoritative
+    scope': a complete, head/base-matching observation stamped BEFORE the
+    scope this caller is validating against must not satisfy it — that
+    evidence was threaded through from an earlier, unrelated authoritative
+    read, not produced by the read this scope covers."""
+    earlier_scope = datetime(2026, 1, 1, tzinfo=UTC)
+    later_scope = datetime(2026, 1, 2, tzinfo=UTC)
+
+    pr = PRData(
+        number=77,
+        title="Fresh maintenance",
+        branch="feature",
+        base_branch="main",
+        url="https://github.com/acme/widgets/pull/77",
+        latest_commit_sha="sha-b",
+        status=PRStatus.CLEAN,
+        maintenance_observed_head_sha="sha-b",
+        maintenance_observed_base_branch="main",
+        maintenance_observed_at=earlier_scope,
+    )
+
+    assert pr_state.authoritative_observation_matches(pr, later_scope) is False
+    assert pr_state.authoritative_observation_matches(pr, earlier_scope) is True
+
+
+def test_authoritative_scope_does_not_implicitly_clear_batch_cache() -> None:
+    """BOU-3169 review: entering the scope no longer clears the pre-loop
+    batch cache itself — that is now the CALLER's job (the stop gate clears
+    once at tick start; a completion checkpoint clears explicitly right
+    before entering scope, see ``maintenance_check._cmd_complete_unleased``).
+    A scope entered without an explicit clear therefore still sees whatever
+    was primed before it."""
+    github_api.clear_pr_batch_cache()
     github_api.prime_pr_batch_cache(
         "acme/widgets",
         {77: {"merge_state": "CLEAN", "mergeable": "MERGEABLE", "threads": []}},
@@ -295,18 +342,23 @@ def test_authoritative_scope_discards_primed_detail_cache() -> None:
     )
 
     with pr_state.authoritative_maintenance_read():
-        assert github_api.get_primed_mergeability(77, "/worktree") is None
+        assert github_api.get_primed_mergeability(77, "/worktree") == (
+            "CLEAN", "MERGEABLE",
+        )
 
 
-def test_authoritative_scope_discards_preloop_checkpoint_batch() -> None:
+def test_explicit_clear_before_scope_discards_preloop_checkpoint_batch() -> None:
+    """The actual BOU-3169 contract: a checkpoint that must not consume a
+    pre-mutation snapshot clears the batch cache EXPLICITLY, immediately
+    before entering the scope."""
     github_api.clear_pr_batch_cache()
     github_api.prime_pr_batch_cache(
         "acme/widgets",
         {77: {"merge_state": "CLEAN", "mergeable": "MERGEABLE"}},
         "/worktree",
     )
-    github_api.mark_pr_batch_cache_authoritative()
 
+    github_api.clear_pr_batch_cache()
     with pr_state.authoritative_maintenance_read():
         assert github_api.get_primed_mergeability(77, "/worktree") is None
 

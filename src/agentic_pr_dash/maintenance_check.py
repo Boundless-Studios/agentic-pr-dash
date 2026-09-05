@@ -1745,13 +1745,18 @@ def _cmd_complete_unleased(
 
     # force=True: re-resolve post-mutation state (threads were just
     # resolved/replied-to above) — a cached pre-mutation snapshot would report
-    # stale "remaining blockers" (BOU-1923).
-    with pr_state.authoritative_maintenance_read():
+    # stale "remaining blockers" (BOU-1923). Clear the pre-loop batch cache
+    # explicitly BEFORE entering the scope (BOU-3169): this checkpoint must
+    # not consume a batch primed for an earlier, non-authoritative probe, and
+    # `authoritative_maintenance_read` no longer clears it implicitly — that
+    # would also discard a stop-gate tick's OWN cache out from under it.
+    github_api.clear_pr_batch_cache()
+    with pr_state.authoritative_maintenance_read() as scope:
         fresh = _resolve_pr_by_number(resolved_pr_number, cwd, force=True)
     if (
         fresh is _GH_UNAVAILABLE
         or fresh is None
-        or not pr_state.authoritative_observation_matches(fresh)
+        or not pr_state.authoritative_observation_matches(fresh, scope)
         or fresh.base_branch != pr.base_branch
     ):
         remaining = ["unknown"]

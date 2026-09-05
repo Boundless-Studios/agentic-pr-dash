@@ -76,7 +76,7 @@ def test_control_undeferred_thread_still_blocks(tmp_path: Path, monkeypatch) -> 
     variant below is contrasted against."""
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None, **kw: [_thread()])
 
     code, text = mc._check_worktree(str(tmp_path), SID)
 
@@ -92,7 +92,7 @@ def test_deferred_thread_does_not_block_check_or_loop_dispatch(
     read the PR as clean — not merely stop printing the comment body."""
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None, **kw: [_thread()])
     dr.defer_thread(
         str(tmp_path), PR_NUMBER, thread_id="T1", comment_id=42, severity="P1",
         ticket="BOU-2559", reason="out of scope: requires files this PR does not own",
@@ -114,7 +114,7 @@ def test_deferred_count_is_reported_distinctly_from_unresolved(
     unresolved threads."""
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None, **kw: [_thread()])
     dr.defer_thread(
         str(tmp_path), PR_NUMBER, thread_id="T1", comment_id=42, severity="P2",
         ticket="BOU-1000",
@@ -137,7 +137,7 @@ def test_mixed_one_deferred_one_live_thread_still_blocks_on_the_live_one(
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
     monkeypatch.setattr(
         github_api, "get_review_threads",
-        lambda pr, cwd=None: [_thread("T1"), _thread("T2")],
+        lambda pr, cwd=None, **kw: [_thread("T1"), _thread("T2")],
     )
     dr.defer_thread(
         str(tmp_path), PR_NUMBER, thread_id="T1", comment_id=42, severity="P2",
@@ -167,7 +167,7 @@ def test_stop_gate_does_not_block_on_a_deferred_only_pr(
 
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None, **kw: [_thread()])
     monkeypatch.setattr(
         _worktrees_mod, "_owned_worktrees_across_roots",
         lambda session_id, anchor: [str(tmp_path)],
@@ -208,7 +208,7 @@ def test_stop_gate_surfaces_deferred_count_on_an_otherwise_clean_pass(
 
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
-    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None: [_thread()])
+    monkeypatch.setattr(github_api, "get_review_threads", lambda pr, cwd=None, **kw: [_thread()])
     monkeypatch.setattr(
         _worktrees_mod, "_owned_worktrees_across_roots",
         lambda session_id, anchor: [str(tmp_path)],
