@@ -438,36 +438,95 @@ def _resolve_and_blockers(cwd: str):
     from agentic_pr_dash import maintenance  # noqa: PLC0415 — avoid import cycle
 
     binding = _CURRENT_PR_BINDING.get()
-    if binding is not None and getattr(binding, "unknown", False):
-        pr = pr_state._GH_UNAVAILABLE
-    elif binding is not None and getattr(binding, "resolved", False):
-        number = getattr(binding, "pr_number", None)
-        pr = (
-            pr_state._resolve_pr_by_number(number, cwd)
-            if number is not None
-            else None
-        )
-        if pr is not None and pr is not pr_state._GH_UNAVAILABLE:
-            # The strict resolver validated draft state for this checkout. The
-            # explicit-number detail lookup may still be served by a warm list
-            # snapshot from before a draft/ready transition, so its state must
-            # not override the binding that selected this PR.
-            pr = pr.model_copy(
-                update={"is_draft": bool(getattr(binding, "is_draft", False))}
+    unresolved_threads = []
+    with pr_state.authoritative_maintenance_read():
+        if binding is not None and getattr(binding, "unknown", False):
+            pr = pr_state._GH_UNAVAILABLE
+        elif binding is not None and getattr(binding, "resolved", False):
+            number = getattr(binding, "pr_number", None)
+            pr = (
+                pr_state._resolve_pr_by_number(number, cwd)
+                if number is not None
+                else None
             )
-    else:
-        pr = pr_state._resolve_pr_for_branch(cwd)
+        else:
+            pr = pr_state._resolve_pr_for_branch(cwd)
+        if pr is not pr_state._GH_UNAVAILABLE and pr is not None and not pr.is_draft:
+            unresolved_threads = pr_state._authoritative_unresolved_review_threads(
+                pr.number, cwd
+            )
+            if unresolved_threads is pr_state._GH_UNAVAILABLE:
+                pr = pr_state._GH_UNAVAILABLE
+            elif getattr(pr, "maintenance_observed_at", None) is not None:
+                # The resolver actually produced an authoritative observation
+                # (a fake standing in for it did not stamp these fields) — a
+                # data condition, not a check on which module defined the
+                # resolver. Fence the final blocker computation against
+                # identity/state drift that happened while threads were being
+                # read. A resolver that never stamped an observation simply
+                # has no ``OBSERVED_*`` evidence in the rendered text, which
+                # the stop-gate/check contract already treats as not
+                # observed-clean.
+                final = pr_state._authoritative_identity_snapshot(
+                    pr.number,
+                    pr.maintenance_observed_head_sha,
+                    pr.maintenance_observed_base_branch,
+                    pr.branch,
+                    cwd,
+                )
+                if final is None:
+                    pr = pr_state._GH_UNAVAILABLE
+                else:
+                    payload = final.payload
+                    pr.is_draft = bool(payload.get("isDraft", False))
+                    pr.merge_state = payload.get("mergeStateStatus", "unknown")
+                    pr.mergeable = payload.get("mergeable", "unknown")
+                    if final.from_listing:
+                        # The author listing exposes reviewDecision directly —
+                        # trust it completely, including a dismissal (e.g. a
+                        # CHANGES_REQUESTED review superseded by a fresh push)
+                        # that clears it back to "none". Falling back to the
+                        # earlier value here would resurrect a stale decision
+                        # the PR no longer actually carries (BOU-3169 review,
+                        # "clear stale review decisions from the final
+                        # snapshot").
+                        pr.review_decision = payload.get("reviewDecision") or "none"
+                    # else: the REST single-PR fallback cannot expose
+                    # reviewDecision at all (always ""), so keep whatever the
+                    # resolver already observed rather than clobbering it.
     if pr is pr_state._GH_UNAVAILABLE or pr is None or pr.is_draft:
         return pr, []
     from agentic_pr_dash import github_api  # noqa: PLC0415
     github_api.record_published_pr_head(pr.number, pr.latest_commit_sha, cwd)
     blockers = maintenance.blockers_for_pr(pr)
     if not blockers:
-        unresolved_threads = pr_state._unresolved_review_threads(pr.number, cwd)
         if unresolved_threads:
             pr.review_comments = completion._review_comments_from_threads(unresolved_threads)
             blockers = ["review_comments"]
     return pr, blockers
+
+
+def _observation_evidence(pr) -> str:
+    observed = getattr(pr, "maintenance_observed_at", None)
+    head = getattr(pr, "maintenance_observed_head_sha", "")
+    base = getattr(pr, "maintenance_observed_base_branch", "")
+    if observed is None and not head and not base:
+        return ""
+    observed_at = (
+        observed.isoformat()
+        if observed is not None
+        else "missing"
+    )
+    return (
+        f"OBSERVED_HEAD_SHA={head or 'missing'}\n"
+        f"OBSERVED_BASE_BRANCH={base or 'missing'}\n"
+        f"OBSERVED_AT={observed_at}"
+    )
+
+
+def _with_observation(text: str, pr) -> str:
+    evidence = _observation_evidence(pr)
+    return f"{text}\n{evidence}" if evidence else text
 
 
 def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tuple[int, str]:
@@ -554,6 +613,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
             take_over = _wakeless_grace_exhausted(cwd, owner)
         if not take_over:
             owner_pr, owner_blockers = _resolve_and_blockers(cwd)
+            if owner_pr is pr_state._GH_UNAVAILABLE:
+                return 2, pr_state._gh_unavailable_message(cwd)
             if not owner_blockers:
                 _clear_no_progress(cwd)  # owner's PR is clean → reset the streak
                 return 0, f"deferring to live PR-watch owner session {owner}"
@@ -667,8 +728,10 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
         # same clean-looking text.
         deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
         if deferred_n:
-            return 0, f"nothing pending (deferred: {deferred_n})"
-        return 0, "nothing pending"
+            return 0, _with_observation(
+                f"nothing pending (deferred: {deferred_n})", pr
+            )
+        return 0, _with_observation("nothing pending", pr)
 
     # Work exists — but defer to a live INDEPENDENT owner BEFORE writing any
     # heartbeat/lease (BOU-1540). Blockers are known here, so name them rather
@@ -857,7 +920,8 @@ def _check_worktree(cwd: str, self_session_id: str, *, claim: bool = True) -> tu
     # something else is also pending.
     deferred_n = len(pr_state._deferred_review_threads(pr.number, cwd))
     summary = maintenance.build_maintenance_summary(pr, deferred_count=deferred_n)
-    text = f"{prompt}\nSUMMARY={summary}\nPR_NUMBER={pr.number}"
+    text = _with_observation(f"{prompt}\nSUMMARY={summary}", pr)
+    text = f"{text}\nPR_NUMBER={pr.number}"
     if coordinator_claim is not None:
         text += (
             f"\nCOORDINATOR_CLAIM_ID={coordinator_claim.claim_id}"

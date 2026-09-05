@@ -29,6 +29,8 @@ we declare this done", which is a strictly stronger question.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import pytest
 
 from agentic_pr_dash import maintenance
@@ -44,6 +46,7 @@ def pr(**overrides) -> PRData:
         number=8,
         title="feat: something",
         branch="feature-branch",
+        base_branch="main",
         url="https://github.com/Boundless-Studios/agentic-pr-dash/pull/8",
         latest_commit_sha=HEAD,
         merge_state="CLEAN",
@@ -51,6 +54,9 @@ def pr(**overrides) -> PRData:
         status=PRStatus.CLEAN,
     )
     payload.update(overrides)
+    payload.setdefault("maintenance_observed_head_sha", payload["latest_commit_sha"])
+    payload.setdefault("maintenance_observed_base_branch", payload["base_branch"])
+    payload.setdefault("maintenance_observed_at", datetime.now(UTC))
     return PRData(**payload)
 
 
@@ -242,12 +248,27 @@ def test_no_single_defect_is_silently_tolerated(overrides):
 # ---------------------------------------------------------------------------
 
 
+def _fresh(pr_obj: PRData) -> PRData:
+    """Re-stamp ``maintenance_observed_at`` to the current instant.
+
+    BOU-3169: completion validates the post-mutation re-resolve against the
+    scope token captured when it entered ``authoritative_maintenance_read()``
+    — evidence stamped before that scope began does not satisfy it. A fixed
+    fixture object built once at test-setup time therefore fails once
+    resolved several instants later inside the scope; a resolver fake must
+    behave like the real one and stamp its evidence at CALL time.
+    """
+    from datetime import UTC, datetime
+
+    return pr_obj.model_copy(update={"maintenance_observed_at": datetime.now(UTC)})
+
+
 def _wire_complete(monkeypatch, *, live_pr, threads=()):
     """Stub only the gh boundary; the completion decision logic stays real."""
     from agentic_pr_dash import github_api
     from agentic_pr_dash import maintenance_check as mc
 
-    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: live_pr)
+    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: _fresh(live_pr))
     monkeypatch.setattr(github_api, "get_local_pr_head", lambda branch, cwd: ("", ""))
     monkeypatch.setattr(github_api, "_is_ancestor", lambda a, d, cwd: False)
     monkeypatch.setattr(github_api, "get_new_pr_commits", lambda *a, **k: [])
@@ -323,7 +344,7 @@ def test_complete_still_declares_clean_on_a_genuinely_finished_pr(
 
     done = pr(ci_watch_pending=False)
     _wire_complete(monkeypatch, live_pr=done)
-    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: done)
+    monkeypatch.setattr(mc, "_resolve_pr_by_number", lambda n, cwd, **kw: _fresh(done))
 
     rc = mc._cmd_complete(_complete_args())
     out = capsys.readouterr().out

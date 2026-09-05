@@ -866,7 +866,7 @@ _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 PR_SNAPSHOT_FIELDS = (
     "number,title,body,url,state,isDraft,mergeStateStatus,mergeable,"
     "reviewDecision,headRefOid,headRefName,headRepositoryOwner,baseRefName,"
-    "mergedAt,author,labels,createdAt"
+    "mergedAt,author,labels,createdAt,updatedAt"
 )
 
 #: Fields a caller may request and still be served from the snapshot. Anything

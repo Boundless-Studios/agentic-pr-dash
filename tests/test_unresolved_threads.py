@@ -72,8 +72,10 @@ def test_get_unaddressed_comments_skips_outdated_thread(monkeypatch):
 def test_check_outdated_only_thread_blocks_with_details(monkeypatch):
     _patch_check_env(monkeypatch)
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
+    # BOU-3169: unresolved threads are read through the authoritative (strict)
+    # path unconditionally, so this fake must accept the `strict` kwarg.
     monkeypatch.setattr(github_api, "get_review_threads",
-                        lambda pr, cwd=None: [_thread(outdated=True)])
+                        lambda pr, cwd=None, **kw: [_thread(outdated=True)])
     code, text = mc._check_worktree("/wt", "sess-A")
     assert code == 10
     assert "## Review Comments" in text
@@ -87,8 +89,10 @@ def test_check_unresolved_thread_blocks_with_details(monkeypatch):
     _patch_check_env(monkeypatch)
     # PR resolves clean (get_unaddressed_comments missed the old thread).
     monkeypatch.setattr(_pr_state_mod, "_resolve_pr_for_branch", lambda cwd: _clean_pr())
+    # BOU-3169: unresolved threads are read through the authoritative (strict)
+    # path unconditionally, so this fake must accept the `strict` kwarg.
     monkeypatch.setattr(github_api, "get_review_threads",
-                        lambda pr, cwd=None: [_thread()])
+                        lambda pr, cwd=None, **kw: [_thread()])
     code, text = mc._check_worktree("/wt", "sess-A")
     assert code == 10
     # The synthetic blocker hydrated the thread into the prompt with file/line/body.

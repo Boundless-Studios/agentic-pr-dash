@@ -3,10 +3,153 @@ from __future__ import annotations
 
 import subprocess
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import UTC, datetime
+from typing import NamedTuple
 
 from ._common import _current_branch
 
 _GH_UNAVAILABLE = object()  # sentinel: gh CLI failed
+_AUTHORITATIVE_MAINTENANCE_READ: ContextVar[bool] = ContextVar(
+    "authoritative_maintenance_read", default=False
+)
+
+
+class IdentitySnapshot(NamedTuple):
+    """One fenced identity read plus where it came from.
+
+    ``from_listing`` distinguishes a snapshot served by the author-scoped
+    listing (which exposes ``reviewDecision``) from one served by the REST
+    single-PR fallback (which cannot: :func:`github_api._normalize_rest_pr_payload`
+    always sets it to ``""``). A caller merging this snapshot's fields onto an
+    existing ``PRData`` must know which case it is in — clearing
+    ``review_decision`` from a REST payload would silently erase a real,
+    previously-observed decision (BOU-3169 review, "clear stale review
+    decisions from the final snapshot").
+    """
+
+    payload: dict
+    from_listing: bool
+
+
+@contextmanager
+def authoritative_maintenance_read():
+    """Fence resolver reads to a fresh scope without changing adapter call shape.
+
+    Does NOT clear ``github_api``'s pre-loop batch cache itself — that cache is
+    a stop-gate/orchestrator-tick concern, not a per-scope one. The stop gate
+    clears it once at the top of each tick (before any per-PR cache-hit
+    decision is made); a completion checkpoint that must not consume a
+    pre-mutation snapshot clears it explicitly, immediately before entering
+    this scope (see ``maintenance_check._cmd_complete_unleased``).
+
+    Yields the UTC instant the scope began. Every dependent read (commit, CI,
+    threads, reviews) performed inside it must observe evidence at or after
+    this instant — :func:`authoritative_observation_matches` enforces that
+    against the returned ``PRData.maintenance_observed_at``.
+    """
+    scope = datetime.now(UTC)
+    token = _AUTHORITATIVE_MAINTENANCE_READ.set(True)
+    try:
+        yield scope
+    finally:
+        _AUTHORITATIVE_MAINTENANCE_READ.reset(token)
+
+
+def authoritative_observation_matches(pr, scope: datetime) -> bool:
+    """Return whether ``pr`` carries a complete, in-scope exact-head read.
+
+    ``scope`` is the token :func:`authoritative_maintenance_read` yielded for
+    the read that produced ``pr`` — evidence stamped before the scope began
+    (e.g. a value threaded through from an earlier, unrelated authoritative
+    read) must not satisfy a caller validating against THIS scope (BOU-3169
+    review, "require evidence from the current authoritative scope").
+    """
+    observed_at = pr.maintenance_observed_at
+    return bool(
+        observed_at is not None
+        and observed_at.tzinfo is not None
+        and observed_at.utcoffset() is not None
+        and observed_at >= scope
+        and pr.maintenance_observed_head_sha == pr.latest_commit_sha
+        and pr.maintenance_observed_base_branch == pr.base_branch
+    )
+
+
+def _authoritative_review_comments(pr_number: int, latest_date: str, cwd: str):
+    """Read threads and submitted review bodies as one fail-closed slice."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    observation = github_api.scan_review_threads_observation(
+        pr_number, latest_date, cwd
+    )
+    if not observation.observable or observation.value is None:
+        return _GH_UNAVAILABLE
+    comments, _decisions = observation.value
+    return comments
+
+
+def _authoritative_unresolved_review_threads(pr_number: int, cwd: str):
+    """Read unresolved threads fail-closed for an authoritative maintenance read.
+
+    Strictness lives inside :func:`_unresolved_review_threads` itself (it reads
+    the same ``_AUTHORITATIVE_MAINTENANCE_READ`` contextvar this function's
+    caller already entered), so there is nothing left to branch on here beyond
+    turning an unavailable read into the fail-closed sentinel.
+    """
+    try:
+        return _unresolved_review_threads(pr_number, cwd)
+    except RuntimeError:
+        return _GH_UNAVAILABLE
+
+
+def _authoritative_ci_checks(pr_number: int, cwd: str):
+    """Read CI without collapsing an unavailable observation into clean."""
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    observation = github_api.get_ci_checks_observation(pr_number, cwd)
+    if not observation.observable or observation.value is None:
+        return _GH_UNAVAILABLE
+    return observation.value
+
+
+def _authoritative_identity_snapshot(
+    pr_number: int,
+    expected_head: str,
+    expected_base: str,
+    expected_branch: str,
+    cwd: str,
+) -> IdentitySnapshot | None:
+    """Fence a maintenance read against PR identity changes during observation.
+
+    Every resolver below (and :func:`worktree_check._resolve_and_blockers`)
+    calls this EXACTLY once per read — a single fresh look at the PR's
+    identity, taken as late as possible (after every other GitHub read has
+    already happened), so a change mid-observation is caught without paying
+    for more than one extra round trip.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    prs = github_api.list_open_prs_cached(cwd, force=True)
+    fresh = None
+    from_listing = False
+    if prs is not None:
+        fresh = next((entry for entry in prs if entry.get("number") == pr_number), None)
+        if fresh is not None:
+            from_listing = True
+    if fresh is None:
+        fresh = github_api._rest_pr_payload(pr_number, cwd=cwd)
+        from_listing = False
+    if fresh is None or str(fresh.get("state") or "open").lower() != "open":
+        return None
+    if (
+        fresh.get("headRefOid") != expected_head
+        or fresh.get("baseRefName") != expected_base
+        or fresh.get("headRefName") != expected_branch
+    ):
+        return None
+    return IdentitySnapshot(fresh, from_listing)
 
 
 def _gh_unavailable_message(cwd: str | None = None) -> str:
@@ -329,6 +472,8 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
+    authoritative = _AUTHORITATIVE_MAINTENANCE_READ.get()
+    force = force or authoritative
     branch = _current_branch(cwd)
     if not branch:
         return None
@@ -339,6 +484,7 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # underlying `gh` call within the TTL window instead of one per caller.
     prs = github_api.list_open_prs_cached(cwd, force=force)
     raw: dict | None = None
+    needs_review_decision_probe = prs is None
     if prs is None:
         # Quota-safe REST fallback (BOU-1966): a rate-limited author list can
         # still verify THIS branch's PR via per-PR REST calls. Any other
@@ -358,6 +504,32 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
             return None
 
     pr_number = int(raw["number"])
+    if authoritative and bool(raw.get("isDraft", False)):
+        # Draft short-circuit: answered entirely from the listing entry
+        # already in hand — NO extra identity-snapshot call. A transient CI/
+        # review outage during the detail fetch below must never turn a draft
+        # PR into _GH_UNAVAILABLE; this is evidence enough on its own because
+        # a draft carries no blockers regardless of CI/review state.
+        early_head = raw.get("headRefOid", "")
+        early_base = raw.get("baseRefName", "main")
+        return PRData(
+            number=pr_number,
+            author=_payload_author_login(raw),
+            title=raw.get("title", ""),
+            branch=branch,
+            base_branch=early_base,
+            url=raw.get("url", ""),
+            is_draft=True,
+            merge_state=raw.get("mergeStateStatus", "unknown"),
+            mergeable=raw.get("mergeable", "unknown"),
+            review_decision=raw.get("reviewDecision", "") or "none",
+            latest_commit_sha=early_head,
+            maintenance_observed_head_sha=early_head,
+            maintenance_observed_base_branch=early_base,
+            maintenance_observed_at=datetime.now(UTC),
+            worktree_path=cwd,
+            status=PRStatus.CLEAN,
+        )
     # Preserve a live gh-availability signal across the detail fetch (BOU-1923
     # review, BOU-1966). A warm snapshot (or the REST fallback above) skips the
     # `list_open_prs` failure that used to turn a current gh/rate-limit outage
@@ -372,16 +544,53 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
     # so the tick-based waiter's per-tick accumulation is untouched.
     _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
+    checks = (
+        _authoritative_ci_checks(pr_number, cwd)
+        if authoritative
+        else github_api.get_ci_checks(pr_number, cwd)
+    )
+    if checks is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     failing = [
         c.name
         for c in checks
         if c.status == "completed" and c.conclusion not in {"success", "skipped", "neutral"}
         and not github_api._is_infra_check(c.name)
     ]
-    review_comments = github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    review_comments = (
+        _authoritative_review_comments(pr_number, latest_date, cwd)
+        if authoritative
+        else github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+    )
+    if review_comments is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
+    observed_head = raw.get("headRefOid") or latest_sha
+    observed_base = raw.get("baseRefName", "main")
+    observed_branch = raw.get("headRefName") or branch
+    if authoritative:
+        if not latest_sha or latest_sha != observed_head:
+            return _GH_UNAVAILABLE
+        # Single identity fence, taken as the LAST GitHub read: the
+        # reviewDecision probe (REST-fallback path only) happens BEFORE it, so
+        # this one snapshot is the final word on both identity and mutable
+        # state — never two snapshots either side of the probe.
+        review_decision = None
+        if needs_review_decision_probe:
+            review_decision, diagnostic = _gh_pr_view_field(
+                cwd, pr_number, "reviewDecision"
+            )
+            if diagnostic:
+                return _GH_UNAVAILABLE
+        fresh = _authoritative_identity_snapshot(
+            pr_number, observed_head, observed_base, observed_branch, cwd
+        )
+        if fresh is None:
+            return _GH_UNAVAILABLE
+        raw = fresh.payload
+        if needs_review_decision_probe:
+            raw["reviewDecision"] = review_decision or "none"
     merge_state = raw.get("mergeStateStatus", "unknown")
     mergeable = raw.get("mergeable", "unknown")
 
@@ -399,8 +608,11 @@ def _resolve_pr_for_branch(cwd: str, *, force: bool = False):
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,
-        latest_commit_sha=raw.get("headRefOid") or latest_sha,
+        latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
+        maintenance_observed_head_sha=observed_head if authoritative else "",
+        maintenance_observed_base_branch=observed_base if authoritative else "",
+        maintenance_observed_at=datetime.now(UTC) if authoritative else None,
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )
@@ -419,6 +631,8 @@ def _resolve_pr_by_number(
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from agentic_pr_dash.models import PRData, PRStatus  # noqa: PLC0415
 
+    authoritative = _AUTHORITATIVE_MAINTENANCE_READ.get()
+    force = force or authoritative
     # See _resolve_pr_for_branch: shares the same short-TTL snapshot (BOU-1923).
     prs = github_api.list_open_prs_cached(cwd, force=force)
     raw: dict | None = None
@@ -447,7 +661,37 @@ def _resolve_pr_by_number(
             return None
         needs_review_decision_probe = True
 
-    if needs_review_decision_probe:
+    if authoritative and bool((raw or {}).get("isDraft", False)):
+        # Draft short-circuit (BOU-3169 review, "short-circuit draft PRs in
+        # the by-number resolver"): answered from the resolution already in
+        # hand, no CI/review read and no identity-snapshot call, so a
+        # transient outage during those reads can never turn a draft PR into
+        # _GH_UNAVAILABLE.
+        head = (raw or {}).get("headRefOid", "")
+        base = (raw or {}).get("baseRefName", "main")
+        return PRData(
+            number=pr_number,
+            author=_payload_author_login(raw or {}),
+            title=(raw or {}).get("title", ""),
+            branch=(raw or {}).get("headRefName", ""),
+            base_branch=base,
+            url=(raw or {}).get("url", ""),
+            is_draft=True,
+            merge_state=(raw or {}).get("mergeStateStatus", "unknown"),
+            mergeable=(raw or {}).get("mergeable", "unknown"),
+            review_decision=(raw or {}).get("reviewDecision", "") or "none",
+            latest_commit_sha=head,
+            maintenance_observed_head_sha=head,
+            maintenance_observed_base_branch=base,
+            maintenance_observed_at=datetime.now(UTC),
+            worktree_path=cwd,
+            status=PRStatus.CLEAN,
+        )
+
+    if needs_review_decision_probe and not authoritative:
+        # The authoritative path re-probes (for freshness) immediately before
+        # its single final identity fence below — probing here too would just
+        # be a redundant `gh pr view` paid twice for the same value.
         review_decision, diagnostic = _gh_pr_view_field(
             cwd, pr_number, "reviewDecision"
         )
@@ -463,7 +707,13 @@ def _resolve_pr_by_number(
     # path).
     _rl_events_before = github_api.rate_limit_events()
     latest_sha, latest_date = github_api.get_latest_commit(pr_number, cwd)
-    checks = github_api.get_ci_checks(pr_number, cwd)
+    checks = (
+        _authoritative_ci_checks(pr_number, cwd)
+        if authoritative
+        else github_api.get_ci_checks(pr_number, cwd)
+    )
+    if checks is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     failing = [
         c.name
         for c in checks
@@ -471,12 +721,43 @@ def _resolve_pr_by_number(
         and not github_api._is_infra_check(c.name)
     ]
     review_comments = (
-        github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        (
+            _authoritative_review_comments(pr_number, latest_date, cwd)
+            if authoritative
+            else github_api.get_unaddressed_comments(pr_number, latest_date, cwd)
+        )
         if include_reviews
         else []
     )
+    if review_comments is _GH_UNAVAILABLE:
+        return _GH_UNAVAILABLE
     if github_api.rate_limit_events() != _rl_events_before:
         return _GH_UNAVAILABLE
+    observed_head = (raw or {}).get("headRefOid") or latest_sha
+    observed_base = (raw or {}).get("baseRefName", "main")
+    observed_branch = (raw or {}).get("headRefName", "")
+    if authoritative:
+        if not latest_sha or latest_sha != observed_head:
+            return _GH_UNAVAILABLE
+        # Single identity fence, taken as the LAST GitHub read (see
+        # _resolve_pr_for_branch): the reviewDecision probe happens BEFORE it
+        # so one snapshot is the final word on both identity and mutable
+        # state.
+        review_decision = None
+        if needs_review_decision_probe:
+            review_decision, diagnostic = _gh_pr_view_field(
+                cwd, pr_number, "reviewDecision"
+            )
+            if diagnostic:
+                return _GH_UNAVAILABLE
+        fresh = _authoritative_identity_snapshot(
+            pr_number, observed_head, observed_base, observed_branch, cwd
+        )
+        if fresh is None:
+            return _GH_UNAVAILABLE
+        raw = fresh.payload
+        if needs_review_decision_probe:
+            raw["reviewDecision"] = review_decision or "none"
     merge_state = (raw or {}).get("mergeStateStatus", "unknown")
     mergeable = (raw or {}).get("mergeable", "unknown")
 
@@ -494,8 +775,11 @@ def _resolve_pr_by_number(
         ci_checks=checks,
         failing_checks=failing,
         review_comments=review_comments,
-        latest_commit_sha=(raw or {}).get("headRefOid") or latest_sha,
+        latest_commit_sha=observed_head,
         latest_commit_date=latest_date,
+        maintenance_observed_head_sha=observed_head if authoritative else "",
+        maintenance_observed_base_branch=observed_base if authoritative else "",
+        maintenance_observed_at=datetime.now(UTC) if authoritative else None,
         worktree_path=cwd,
         status=PRStatus.CLEAN,
     )
@@ -833,11 +1117,20 @@ def _unresolved_review_threads(pr_number: int, cwd: str):
     resolved and unresolved — it is a verified, tracked, deliberate exclusion,
     not silence. Use :func:`_deferred_review_threads` to report those
     separately; they must never simply vanish from every count.
+
+    BOU-3169: strictness is driven by the ``_AUTHORITATIVE_MAINTENANCE_READ``
+    contextvar (the caller already entered ``authoritative_maintenance_read()``
+    scope), not by introspecting which module defined the adapter — a fake
+    that stands in for ``get_review_threads`` under that scope must accept the
+    same ``strict`` keyword the real adapter does.
     """
     from agentic_pr_dash import github_api  # noqa: PLC0415
     from . import deferred_review  # noqa: PLC0415
 
-    threads = github_api.get_review_threads(pr_number, cwd)
+    if _AUTHORITATIVE_MAINTENANCE_READ.get():
+        threads = github_api.get_review_threads(pr_number, cwd, strict=True)
+    else:
+        threads = github_api.get_review_threads(pr_number, cwd)
     return [
         t for t in threads
         if not t.is_resolved
