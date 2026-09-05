@@ -160,9 +160,40 @@ def _cached_clean_binding_matches(
     *,
     now: float,
     interval: float,
+    updated_at: str | None,
 ) -> bool:
-    """Never reuse a remote-clean result without a fresh mutable-state read."""
-    return False
+    """Return whether a clean cache entry belongs to this exact PR binding.
+
+    BOU-3169: an unchanged local head is not, by itself, evidence that
+    nothing remote changed — GitHub advances a PR's ``updatedAt`` when a
+    review or comment is posted, or a thread is resolved, WITHOUT a push. A
+    cache hit therefore ALSO requires the cached entry's own ``updated_at``
+    (recorded when the entry was written; see :func:`_owned_pr_updated_at_map`)
+    to still equal the PR's CURRENT ``updatedAt`` observed this tick. An entry
+    written before this field existed, or written on a tick where the
+    forced listing was unavailable, has no ``updated_at`` and fails closed
+    into a fresh check — as does a tick where the current value itself could
+    not be observed (``updated_at`` here is ``None``). This mirrors the
+    precedent in ``orchestrator._tracked_projection`` (BOU-3095): ``updatedAt``
+    is the cheap, already-available signal that something happened.
+    """
+    return bool(
+        cached_entry
+        and binding is not None
+        and local_sha
+        and cached_entry.get("head_sha") == local_sha
+        and cached_entry.get("branch") == binding.branch
+        and cached_entry.get("pr_number") == binding.pr_number
+        # A draft verdict is not reusable after the same PR becomes ready (or
+        # the inverse transition). Older cache entries lack this field and
+        # therefore fail closed into a fresh check.
+        and cached_entry.get("is_draft") == bool(binding.is_draft)
+        and cached_entry.get("code") == 0
+        and (now - float(cached_entry.get("checked_at", 0) or 0)) < interval
+        and cached_entry.get("updated_at")
+        and updated_at
+        and cached_entry.get("updated_at") == updated_at
+    )
 
 
 def _binding_matches_live_checkout(binding, branch: str, head_sha: str) -> bool:
@@ -489,6 +520,62 @@ def _prefetch_owned_pr_state(
             pass
 
 
+def _owned_pr_updated_at_map(
+    owned: list[str], pr_for: dict[str, int]
+) -> dict[str, str]:
+    """Map each owned worktree to its own PR's current ``updatedAt`` (BOU-3169).
+
+    One FORCED ``gh pr list`` per distinct repo among ``owned`` — never one
+    per worktree — so the freshness signal :func:`_cached_clean_binding_matches`
+    needs costs at most one extra round trip per repo, regardless of how many
+    owned PRs live in it. GitHub advances a PR's ``updatedAt`` when a review
+    or comment is posted, or a thread is resolved, WITHOUT a push — the
+    cheap, already-fetched signal that something changed remotely even though
+    the local head (and therefore the old head-sha-only cache key) did not
+    move.
+
+    A repo whose forced listing is unavailable this tick (rate limit, auth,
+    connectivity) contributes NO entries: every worktree in that repo then
+    simply misses the cache-hit test in :func:`_cached_clean_binding_matches`
+    (which requires a non-empty ``updated_at`` on both sides) and falls
+    through to a full fresh check — never a stale "clean" served on an
+    outage.
+    """
+    from agentic_pr_dash import github_api  # noqa: PLC0415
+
+    by_repo: dict[str, list[str]] = {}
+    for wt in owned:
+        try:
+            repo = github_api.repo_slug_for_prefetch(wt)
+        except Exception:  # noqa: BLE001 - optimization only, never fail the gate
+            repo = ""
+        if not repo or "/" not in repo:
+            continue
+        by_repo.setdefault(repo, []).append(wt)
+
+    result: dict[str, str] = {}
+    for repo, worktrees in by_repo.items():
+        try:
+            prs = github_api.list_open_prs_cached(worktrees[0], force=True)
+        except Exception:  # noqa: BLE001 - optimization only, never fail the gate
+            prs = None
+        if not prs:
+            continue
+        updated_by_number = {
+            entry.get("number"): entry.get("updatedAt")
+            for entry in prs
+            if isinstance(entry, dict) and isinstance(entry.get("number"), int)
+        }
+        for wt in worktrees:
+            pr_number = pr_for.get(wt)
+            if pr_number is None:
+                continue
+            updated_at = updated_by_number.get(pr_number)
+            if isinstance(updated_at, str) and updated_at:
+                result[wt] = updated_at
+    return result
+
+
 def _build_budget_block(
     unknown_worktrees: list[str], *, checked_count: int, total: int,
     pr_for: dict[str, int],
@@ -672,27 +759,17 @@ def _stop_gate_impl(args) -> int:
         for binding in current_pr_bindings.values()
         if binding.resolved and binding.stale_pr_number is not None
     }
-    # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
-    # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
-    # Stop-hook timeout at seven (the incident this fixes). Prefetch all of
-    # them in as few round trips as possible BEFORE the loop runs, grouped by
-    # repo (almost always exactly one for a single session's owned set), and
-    # prime `github_api`'s per-process cache with the results; the loop below
-    # is UNCHANGED — `_check_worktree`'s internal calls to
-    # `get_review_threads`/`required_checks_pending` transparently become cache
-    # hits. Best-effort: a prefetch failure just leaves the cache unprimed and
-    # the loop falls back to its original per-PR calls (never a wrong answer,
-    # only a slower one).
+    # BOU-2556: batch-prefetch the review-thread + CI-rollup data every owned
+    # PR would otherwise pay for serially. This tick clears the cache here
+    # (once, up front) and primes it below with ONLY the PRs the per-PR clean
+    # cache could not already answer (BOU-3169) — see the prefetch call after
+    # the precompute pass below.
     github_api.clear_pr_batch_cache()
     effective_pr_pairs = _effective_pr_pairs(
         owned,
         {**pr_for, **current_pr_for},
         current_resolved=current_resolved_worktrees,
     )
-    # Exact per-PR observations must not consume a pre-loop snapshot: reviews
-    # and CI can change without changing the local checkout identity. The
-    # aggregate prefetch remains available to dashboard/orchestrator callers,
-    # but the stop gate intentionally performs current per-PR reads.
 
     # BOU-2556: give the per-worktree loop below a wall-clock budget so a
     # session owning many PRs degrades gracefully instead of blowing the
@@ -708,9 +785,16 @@ def _stop_gate_impl(args) -> int:
     checked_count = 0
     unknown_worktrees: list[str] = []
 
-    # Retain the legacy cache file only for compatible state cleanup. Remote
-    # clean entries never short-circuit a check: reviews and CI can change
-    # while the local head remains unchanged.
+    # BOU-2556/BOU-3169: per-PR cache across FIRINGS (separate stop-gate
+    # subprocesses), keyed on each owned worktree's local head sha AND its
+    # PR's current `updatedAt` (see `_cached_clean_binding_matches` /
+    # `_owned_pr_updated_at_map`) — a remote-clean verdict is reused only when
+    # NEITHER could have changed since it was recorded: an unchanged head
+    # sha alone is not proof nothing remote changed, since GitHub advances
+    # `updatedAt` on a review/comment/thread-resolution with no push. Only
+    # ever short-circuits a CLEAN (code 0) verdict for an unchanged PR — a
+    # cached PENDING or unobservable result is never trusted stale, so real
+    # work always keeps re-surfacing and an outage is never papered over.
     pr_head_cache = {
         wt: entry for wt, entry in _load_pr_head_cache(cwd).items() if wt in owned
     }
@@ -740,16 +824,34 @@ def _stop_gate_impl(args) -> int:
     # never a blocker (see `_extract_deferred_count`'s docstring above), but
     # the count must still be visible at this surface, not merely at `check`'s.
     total_deferred = 0
+    # BOU-3169: each owned PR's current `updatedAt` — one FORCED listing per
+    # distinct repo among `owned`, never per worktree — obtained BEFORE
+    # deciding which worktrees the per-PR clean cache can serve. This is the
+    # freshness signal a head-sha-only cache cannot see: GitHub advances
+    # `updatedAt` on a review/comment/thread-resolution that never touches
+    # the head.
+    updated_at_by_worktree = _owned_pr_updated_at_map(
+        owned, {**pr_for, **current_pr_for}
+    )
+
+    # First pass: resolve each worktree's live checkout identity and current
+    # PR binding, and decide the per-PR clean-cache verdict for it — WITHOUT
+    # running `_check_worktree` yet. This must happen BEFORE the batch
+    # prefetch below: the prefetch's entire point is to cover the PRs that
+    # actually need a fresh check this tick, not the ones the cache already
+    # answers for free.
+    precomputed: dict[str, dict] = {}
     for worktree in owned:
         live_identity, identity_complete = _bounded_checkout_identity(
             [worktree], deadline=gate_deadline
         )
         if not identity_complete:
-            unknown_worktrees.append(worktree)
+            precomputed[worktree] = {"identity_complete": False}
             continue
         _, live_branch, local_sha = live_identity[0]
         cached_entry = pr_head_cache.get(worktree)
         binding = current_pr_bindings.get(worktree)
+        replaced_unknown = False
         if (
             binding is not None
             and binding.resolved
@@ -766,6 +868,46 @@ def _stop_gate_impl(args) -> int:
             )
             current_pr_bindings[worktree] = binding
             current_pr_for.pop(worktree, None)
+            replaced_unknown = True
+        is_hit = _cached_clean_binding_matches(
+            cached_entry, local_sha, binding, now=now, interval=interval,
+            updated_at=updated_at_by_worktree.get(worktree),
+        )
+        precomputed[worktree] = {
+            "identity_complete": True,
+            "local_sha": local_sha,
+            "binding": binding,
+            "cached_entry": cached_entry,
+            "is_hit": is_hit,
+            "replaced_unknown": replaced_unknown,
+        }
+
+    # BOU-2556: the per-worktree loop below used to pay a serial "review-thread
+    # query + CI-rollup query" for EVERY owned PR — fine at one PR, a ~108s
+    # Stop-hook timeout at seven (the incident this fixes). Prefetch only the
+    # PRs the pass above could NOT already answer from cache, in as few round
+    # trips as possible, grouped by repo (almost always exactly one for a
+    # single session's owned set), and prime `github_api`'s per-process cache
+    # with the results; the loop below is UNCHANGED — `_check_worktree`'s
+    # internal calls to `get_review_threads`/`required_checks_pending`
+    # transparently become cache hits. Best-effort: a prefetch failure just
+    # leaves the cache unprimed and the loop falls back to its normal per-PR
+    # calls (never a wrong answer, only a slower one).
+    miss_pairs = [
+        (wt, pr) for wt, pr in effective_pr_pairs
+        if not precomputed.get(wt, {}).get("is_hit", False)
+    ]
+    _prefetch_owned_pr_state(miss_pairs, deadline=gate_deadline)
+
+    for worktree in owned:
+        info = precomputed.get(worktree) or {}
+        if not info.get("identity_complete", False):
+            unknown_worktrees.append(worktree)
+            continue
+        local_sha = info["local_sha"]
+        binding = info["binding"]
+        cached_entry = info["cached_entry"]
+        if info["replaced_unknown"]:
             is_adopted = not _unknown_binding_blocks_stop(worktree, provenance_for)
             # A replacement binding that changed underneath an adopted
             # worktree is informational maintenance-loop scope, not a blocker
@@ -779,9 +921,7 @@ def _stop_gate_impl(args) -> int:
                 ]
             if not is_adopted and worktree not in current_unknown_worktrees:
                 current_unknown_worktrees.append(worktree)
-        if _cached_clean_binding_matches(
-            cached_entry, local_sha, binding, now=now, interval=interval
-        ):
+        if info["is_hit"]:
             code, text = 0, cached_entry.get("text", "nothing pending")
             checked_count += 1
         elif gate_deadline is not None and time.monotonic() >= gate_deadline:
@@ -814,6 +954,7 @@ def _stop_gate_impl(args) -> int:
                 "checked_at": now,
                 "code": code,
                 "text": text,
+                "updated_at": updated_at_by_worktree.get(worktree),
             }
             pr_head_cache_dirty = True
         # BOU-2567: accumulate from WHICHEVER branch above produced `text` —

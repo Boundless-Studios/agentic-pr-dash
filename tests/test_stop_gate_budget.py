@@ -251,7 +251,7 @@ def test_batch_snapshot_preserves_observed_results_when_another_pr_is_missing(mo
 # ---------------------------------------------------------------------------
 
 
-def test_stop_gate_skips_stale_preloop_prefetch_for_authoritative_checks(
+def test_stop_gate_prefetches_once_for_many_owned_worktrees_same_repo(
     monkeypatch, tmp_path, capsys,
 ):
     pr_numbers = list(range(200, 208))  # 8 owned PRs, same repo
@@ -266,6 +266,9 @@ def test_stop_gate_skips_stale_preloop_prefetch_for_authoritative_checks(
     monkeypatch.setattr(
         _github_api_mod, "repo_slug_for_prefetch", lambda cwd: "acme/widgets",
     )
+    # No prior cache entries and no positively-observed `updatedAt` (the
+    # listing call is not mocked here), so every one of the 8 is a cache
+    # MISS this tick — the whole owned set is the prefetch's target.
     batch_calls: list[list[int]] = []
 
     def _fake_batch(owner, repo, numbers, cwd=None, *, deadline=None):
@@ -284,9 +287,11 @@ def test_stop_gate_skips_stale_preloop_prefetch_for_authoritative_checks(
 
     rc = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
 
-    # A pre-loop snapshot can become stale before a later PR is checked, so the
-    # exact-observation gate must not pay for or consume it.
-    assert batch_calls == []
+    # 8 owned PRs in one repo, all cache MISSES, used to cost (at least) 8
+    # serial "review + CI" pairs; the batch call must fire exactly ONCE,
+    # covering all 8 numbers.
+    assert len(batch_calls) == 1
+    assert sorted(batch_calls[0]) == pr_numbers
     assert rc in (0, 2)  # not asserting the waiter/clean branch here — just the batching
 
 
@@ -426,7 +431,24 @@ def test_stop_gate_still_blocks_on_genuine_pending_with_budget_available(
 # ---------------------------------------------------------------------------
 
 
-def test_stop_gate_head_sha_cache_rechecks_unchanged_clean_worktree(
+def _mock_updated_at_listing(monkeypatch, updated_at_by_pr: dict[int, str]) -> None:
+    """Make ``_owned_pr_updated_at_map``'s forced listing return a fixed
+    ``updatedAt`` per PR number, for one shared "repo" covering every
+    worktree in the test (matching production: one forced ``gh pr list`` per
+    distinct repo, never per worktree)."""
+    monkeypatch.setattr(
+        _github_api_mod, "repo_slug_for_prefetch", lambda cwd: "acme/widgets",
+    )
+    monkeypatch.setattr(
+        _github_api_mod,
+        "list_open_prs_cached",
+        lambda cwd=None, *, force=False, ttl_s=None: [
+            {"number": n, "updatedAt": u} for n, u in updated_at_by_pr.items()
+        ],
+    )
+
+
+def test_stop_gate_head_sha_cache_skips_recheck_of_unchanged_clean_worktree(
     monkeypatch, tmp_path, capsys,
 ):
     # A positive STOP_INTERVAL so the per-PR cache TTL has room to matter;
@@ -446,6 +468,10 @@ def test_stop_gate_head_sha_cache_rechecks_unchanged_clean_worktree(
         _reconcile_mod, "_detached_pr_records",
         lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
     )
+    # Both PRs' `updatedAt` is stable across both ticks below.
+    _mock_updated_at_listing(
+        monkeypatch, {601: "2026-01-01T00:00:00Z", 602: "2026-01-01T00:00:00Z"}
+    )
 
     checked: list[str] = []
 
@@ -464,9 +490,155 @@ def test_stop_gate_head_sha_cache_rechecks_unchanged_clean_worktree(
     checked.clear()
     rc2 = mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
     assert rc2 == 2  # pending_wt still blocks -> gate keeps running every tick
-    # Review and CI state can change without the local head moving, so both
-    # worktrees receive a fresh remote check on the next stop attempt.
-    assert checked == [str(clean_wt), str(pending_wt)]
+    # clean_wt's head sha AND its PR's updatedAt are both unchanged, and its
+    # last result was CLEAN -> the cache skips re-checking it; only
+    # pending_wt (a real blocker) is actually re-examined.
+    assert checked == [str(pending_wt)]
+
+
+def test_stop_gate_head_sha_cache_rechecks_on_advanced_updated_at(
+    monkeypatch, tmp_path, capsys,
+):
+    """Same local head, but GitHub's `updatedAt` moved (e.g. a comment landed
+    with no push) -> the cache must not serve a stale clean verdict."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "120")
+    config.load.cache_clear()
+
+    clean_wt = _make_git_worktree(tmp_path, "clean-adv", SID, 611)
+    pending_wt = _make_armed_worktree(tmp_path, "pending-adv", SID, 612)
+
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(clean_wt), str(pending_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    updated_at = {"611": "2026-01-01T00:00:00Z", "612": "2026-01-01T00:00:00Z"}
+    monkeypatch.setattr(
+        _github_api_mod, "repo_slug_for_prefetch", lambda cwd: "acme/widgets",
+    )
+    monkeypatch.setattr(
+        _github_api_mod,
+        "list_open_prs_cached",
+        lambda cwd=None, *, force=False, ttl_s=None: [
+            {"number": 611, "updatedAt": updated_at["611"]},
+            {"number": 612, "updatedAt": updated_at["612"]},
+        ],
+    )
+
+    checked: list[str] = []
+
+    def _fake_check(path, sid, *, claim=True):
+        checked.append(path)
+        if path == str(clean_wt):
+            return 0, "nothing pending"
+        return 10, "real blocker\nPR_NUMBER=612"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", _fake_check)
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    checked.clear()
+
+    # A comment lands on clean_wt's PR: `updatedAt` advances, head does not.
+    updated_at["611"] = "2026-01-01T01:00:00Z"
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert str(clean_wt) in checked
+
+
+def test_stop_gate_head_sha_cache_rechecks_when_listing_unavailable(
+    monkeypatch, tmp_path, capsys,
+):
+    """The forced listing this tick can't observe `updatedAt` at all (rate
+    limit / outage) -> no cache hit is possible, never a stale "clean"."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "120")
+    config.load.cache_clear()
+
+    clean_wt = _make_git_worktree(tmp_path, "clean-outage", SID, 621)
+    pending_wt = _make_armed_worktree(tmp_path, "pending-outage", SID, 622)
+
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(clean_wt), str(pending_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    _mock_updated_at_listing(
+        monkeypatch, {621: "2026-01-01T00:00:00Z", 622: "2026-01-01T00:00:00Z"}
+    )
+
+    checked: list[str] = []
+
+    def _fake_check(path, sid, *, claim=True):
+        checked.append(path)
+        if path == str(clean_wt):
+            return 0, "nothing pending"
+        return 10, "real blocker\nPR_NUMBER=622"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", _fake_check)
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    checked.clear()
+
+    # The listing is unavailable this tick — no `updatedAt` evidence for
+    # ANY owned PR, so no cache hit is possible for this repo's worktrees.
+    monkeypatch.setattr(
+        _github_api_mod, "list_open_prs_cached",
+        lambda cwd=None, *, force=False, ttl_s=None: None,
+    )
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert str(clean_wt) in checked
+
+
+def test_stop_gate_head_sha_cache_rechecks_entry_missing_updated_at(
+    monkeypatch, tmp_path, capsys,
+):
+    """A cache entry written before this field existed (or on a tick where the
+    listing was unavailable) has no ``updated_at`` -> fails closed."""
+    monkeypatch.setenv("GAIA_PR_WATCH_STOP_INTERVAL", "120")
+    config.load.cache_clear()
+
+    clean_wt = _make_git_worktree(tmp_path, "clean-noua", SID, 631)
+    pending_wt = _make_armed_worktree(tmp_path, "pending-noua", SID, 632)
+
+    monkeypatch.setattr(
+        _worktrees_mod, "_collect_stop_gate_worktrees",
+        lambda sid, cwd: [str(clean_wt), str(pending_wt)],
+    )
+    monkeypatch.setattr(
+        _reconcile_mod, "_detached_pr_records",
+        lambda sid, cwd, include_legacy=True, prune_legacy=True: [],
+    )
+    _mock_updated_at_listing(
+        monkeypatch, {631: "2026-01-01T00:00:00Z", 632: "2026-01-01T00:00:00Z"}
+    )
+
+    checked: list[str] = []
+
+    def _fake_check(path, sid, *, claim=True):
+        checked.append(path)
+        if path == str(clean_wt):
+            return 0, "nothing pending"
+        return 10, "real blocker\nPR_NUMBER=632"
+
+    monkeypatch.setattr(_worktree_check_mod, "_check_worktree", _fake_check)
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    checked.clear()
+
+    # Strip `updated_at` from the persisted entry, as if it had been written
+    # before this field existed.
+    cache = _stop_gate_mod._load_pr_head_cache(str(tmp_path))
+    cache[str(clean_wt)].pop("updated_at", None)
+    _stop_gate_mod._save_pr_head_cache(str(tmp_path), cache)
+
+    mc.main(["stop-gate", "--cwd", str(tmp_path), "--session-id", SID])
+    assert str(clean_wt) in checked
 
 
 def test_stop_gate_head_sha_cache_rechecks_after_new_commit(monkeypatch, tmp_path):

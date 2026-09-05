@@ -866,7 +866,7 @@ _LAST_LIST_OPEN_PRS_FAILURE: GhFailure | None = None
 PR_SNAPSHOT_FIELDS = (
     "number,title,body,url,state,isDraft,mergeStateStatus,mergeable,"
     "reviewDecision,headRefOid,headRefName,headRepositoryOwner,baseRefName,"
-    "mergedAt,author,labels,createdAt"
+    "mergedAt,author,labels,createdAt,updatedAt"
 )
 
 #: Fields a caller may request and still be served from the snapshot. Anything
@@ -2322,7 +2322,6 @@ def _parse_review_thread_nodes(nodes: list) -> list[ReviewThread]:
 # the same number can exist in two different maintenance repos, BOU-1801/#50).
 # ---------------------------------------------------------------------------
 _PR_BATCH_CACHE: dict[tuple[str, int], dict] = {}
-_PR_BATCH_CACHE_AUTHORITATIVE = False
 _PR_BATCH_REPO_BY_CWD: dict[str, str] = {}
 
 
@@ -2387,15 +2386,8 @@ def clear_pr_batch_cache() -> None:
     """Drop every primed batch entry (call at the top of each stop-gate tick —
     this is a plain module global and would otherwise leak across ticks in a
     long-lived process, e.g. across pytest cases in the same interpreter)."""
-    global _PR_BATCH_CACHE_AUTHORITATIVE
     _PR_BATCH_CACHE.clear()
     _PR_BATCH_REPO_BY_CWD.clear()
-    _PR_BATCH_CACHE_AUTHORITATIVE = False
-
-
-def pr_batch_cache_is_authoritative() -> bool:
-    """Whether the current batch was freshly fetched for this checkpoint."""
-    return _PR_BATCH_CACHE_AUTHORITATIVE
 
 
 def prime_pr_batch_cache(
@@ -2413,12 +2405,6 @@ def prime_pr_batch_cache(
     # mapping for it too, so a successful batch is still consumed from cache
     # instead of triggering the old per-PR GraphQL lookup.
     _PR_BATCH_REPO_BY_CWD[str(Path(cwd).resolve()) if cwd else ""] = repo_slug
-
-
-def mark_pr_batch_cache_authoritative() -> None:
-    """Allow a freshly fetched stop-gate batch to serve authoritative reads."""
-    global _PR_BATCH_CACHE_AUTHORITATIVE
-    _PR_BATCH_CACHE_AUTHORITATIVE = True
 
 
 def get_primed_mergeability(
